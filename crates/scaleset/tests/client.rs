@@ -15,12 +15,12 @@ async fn a_scale_set_is_created_once_and_found_again_with_its_labels_set() {
     let h = harness().await;
     let first = h
         .client
-        .ensure_scale_set("air--cf-2g", &labels(&["Self-Hosted", "CF-2G"]))
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["Self-Hosted", "CF-2G"]))
         .await
         .unwrap();
     let again = h
         .client
-        .ensure_scale_set("air--cf-2g", &labels(&["cf-2g", "self-hosted"]))
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["cf-2g", "self-hosted"]))
         .await
         .unwrap();
     assert_eq!(first.id, again.id);
@@ -29,7 +29,7 @@ async fn a_scale_set_is_created_once_and_found_again_with_its_labels_set() {
     // The labels changed: the set is updated, not duplicated.
     let changed = h
         .client
-        .ensure_scale_set("air--cf-2g", &labels(&["self-hosted", "cf-4g"]))
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-4g"]))
         .await
         .unwrap();
     assert_eq!(changed.id, first.id);
@@ -63,12 +63,12 @@ async fn a_queued_job_arrives_is_acquired_and_gets_a_one_job_runner() {
 
     let jit = h
         .client
-        .generate_jit_config(set.id, "air-j0000001", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000001", "_work")
         .await
         .unwrap();
-    assert_eq!(jit.runner.name, "air-j0000001");
+    assert_eq!(jit.runner.name, "mac-a-j0000001");
     assert!(!jit.encoded.expose().is_empty());
-    assert_eq!(h.fake.runners(), vec!["air-j0000001"]);
+    assert_eq!(h.fake.runners(), vec!["mac-a-j0000001"]);
     assert!(
         !format!("{jit:?}").contains(jit.encoded.expose()),
         "the configuration is a credential"
@@ -117,11 +117,11 @@ async fn the_lifecycle_messages_carry_the_runner_and_the_result() {
     session.acquire_jobs(&[request]).await.unwrap();
     let jit = h
         .client
-        .generate_jit_config(set.id, "air-jabc", "_work")
+        .generate_jit_config(set.id, "mac-a-jabc", "_work")
         .await
         .unwrap();
-    h.fake.start_job("air-jabc");
-    h.fake.complete_job("air-jabc", "failed");
+    h.fake.start_job("mac-a-jabc");
+    h.fake.complete_job("mac-a-jabc", "failed");
     let mut seen = Message::default();
     let mut after = 0;
     for _ in 0..4 {
@@ -143,9 +143,9 @@ async fn the_lifecycle_messages_carry_the_runner_and_the_result() {
         ),
         (1, 1, 1, 1)
     );
-    assert_eq!(seen.started[0].runner_name, "air-jabc");
+    assert_eq!(seen.started[0].runner_name, "mac-a-jabc");
     assert_eq!(seen.completed[0].result, "failed");
-    assert_eq!(seen.completed[0].runner_name, "air-jabc");
+    assert_eq!(seen.completed[0].runner_name, "mac-a-jabc");
     assert_eq!(seen.completed[0].workflow_run_id, 7000 + request);
     assert!(seen.completed[0].queue_time.is_some());
     let _ = jit;
@@ -156,12 +156,12 @@ async fn a_second_session_of_the_machine_is_refused_until_the_first_is_closed() 
     let h = harness().await;
     let (set, first) = with_session(&h).await;
     assert_eq!(
-        h.client.open_session(set.id, "air").await.unwrap_err(),
+        h.client.open_session(set.id, "mac-a").await.unwrap_err(),
         Error::SessionExists
     );
     first.close().await.unwrap();
     assert!(!h.fake.scale_sets()[0].has_session);
-    h.client.open_session(set.id, "air").await.unwrap();
+    h.client.open_session(set.id, "mac-a").await.unwrap();
 }
 
 #[tokio::test]
@@ -263,12 +263,12 @@ async fn a_session_whose_queue_is_on_another_host_is_refused_and_closed() {
     let h = harness().await;
     let set = h
         .client
-        .ensure_scale_set("air--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
         .await
         .unwrap();
     let (other, visits) = elsewhere().await;
     h.fake.send_the_queue_to(&format!("{}/messages", other.url()));
-    let error = h.client.open_session(set.id, "air").await.unwrap_err();
+    let error = h.client.open_session(set.id, "mac-a").await.unwrap_err();
     assert!(
         matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
         "{error:?}"
@@ -315,14 +315,66 @@ async fn a_job_named_twice_in_the_answer_is_acquired_once_and_a_stranger_not_at_
 }
 
 #[tokio::test]
+async fn an_answer_of_the_wrong_shape_keeps_its_text_out_of_the_error() {
+    let h = harness().await;
+    // serde names the value it met where it expected another: here that value is the service's token.
+    h.fake.fail(
+        "POST /actions/runner-registration",
+        Reply::text(200, r#""admin-token-leaked""#),
+        1,
+    );
+    let error = h
+        .client
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Api(cf_ghapp::Error::Decode { .. })),
+        "{error:?}"
+    );
+    let said = format!("{error} {error:?}");
+    assert!(!said.contains("admin-token-leaked"), "{said}");
+}
+
+#[tokio::test]
+async fn a_configuration_that_does_not_name_its_runner_is_refused_and_its_registration_removed() {
+    let h = harness().await;
+    let (set, _session) = with_session(&h).await;
+    // The service has the Actions runner; its answers leave out which one it is, or the configuration.
+    for answer in [
+        serde_json::json!({"encodedJITConfig": "abc"}),
+        serde_json::json!({"runner": null, "encodedJITConfig": "abc"}),
+        serde_json::json!({"runner": {"id": 0, "name": "mac-a-cf-2g-who"}, "encodedJITConfig": "abc"}),
+        serde_json::json!({"runner": {"id": 7, "name": "mac-a-cf-2g-who"}, "encodedJITConfig": ""}),
+    ] {
+        h.client
+            .generate_jit_config(set.id, "mac-a-cf-2g-who", "_work")
+            .await
+            .expect("registered");
+        assert_eq!(h.fake.runners(), vec!["mac-a-cf-2g-who".to_string()]);
+        h.fake.fail("generatejitconfig", Reply::json(&answer), 1);
+        let error = h
+            .client
+            .generate_jit_config(set.id, "mac-a-cf-2g-who", "_work")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Api(cf_ghapp::Error::Decode { .. })),
+            "{answer}: {error:?}"
+        );
+        assert_eq!(h.fake.runners(), Vec::<String>::new(), "{answer}");
+    }
+}
+
+#[tokio::test]
 async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine() {
     let h = harness().await;
     let (set, _session) = with_session(&h).await;
-    // The service registers the runner, the answer is lost, and the next try meets the name it just took.
+    // The service registers the Actions runner, the answer is lost, and the next try meets the name it just took.
     h.fake.lose_answer("generatejitconfig", 1);
     let error = h
         .client
-        .generate_jit_config(set.id, "air-cf-2g-lost", "_work")
+        .generate_jit_config(set.id, "mac-a-cf-2g-lost", "_work")
         .await
         .unwrap_err();
     assert_eq!(error.status(), Some(409), "{error:?}");
@@ -332,7 +384,7 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
     h.fake.lose_answer("generatejitconfig", 3);
     let error = h
         .client
-        .generate_jit_config(set.id, "air-cf-2g-gone", "_work")
+        .generate_jit_config(set.id, "mac-a-cf-2g-gone", "_work")
         .await
         .unwrap_err();
     assert!(error.is_transient(), "{error:?}");
@@ -347,7 +399,7 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
     );
     let error = h
         .client
-        .generate_jit_config(set.id, "air-cf-2g-no", "_work")
+        .generate_jit_config(set.id, "mac-a-cf-2g-no", "_work")
         .await
         .unwrap_err();
     assert_eq!(
@@ -364,12 +416,12 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
     // And a name that works is found by its name.
     let jit = h
         .client
-        .generate_jit_config(set.id, "air-cf-2g-ok", "_work")
+        .generate_jit_config(set.id, "mac-a-cf-2g-ok", "_work")
         .await
         .unwrap();
     assert_eq!(
-        h.client.runner_by_name("air-cf-2g-ok").await.unwrap(),
+        h.client.runner_by_name("mac-a-cf-2g-ok").await.unwrap(),
         Some(jit.runner.clone())
     );
-    assert_eq!(h.client.runner_by_name("air-cf-2g-nobody").await.unwrap(), None);
+    assert_eq!(h.client.runner_by_name("mac-a-cf-2g-nobody").await.unwrap(), None);
 }

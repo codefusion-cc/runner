@@ -32,7 +32,7 @@ pub struct FakeSlots {
 }
 
 impl FakeSlots {
-    /// A machine with `total_gb` of memory for runners, open for new jobs.
+    /// A machine with `total_gb` of memory for Actions runners, open for new jobs.
     pub fn new(clock: Arc<dyn Clock>, total_gb: u32, ttl: Duration) -> Arc<FakeSlots> {
         Arc::new(FakeSlots {
             clock,
@@ -69,7 +69,7 @@ impl FakeSlots {
         st.held.values().map(|(gb, _)| gb).sum()
     }
 
-    /// How many slots are claimed by runners.
+    /// How many slots are claimed by Actions runners.
     pub fn claimed(&self) -> usize {
         self.state
             .lock()
@@ -180,7 +180,7 @@ impl FakeHosts {
         self.0.lock().expect("hosts").fail_stop = n;
     }
 
-    /// The machine of this runner lost a process for memory.
+    /// The machine of this Actions runner lost a process for memory.
     pub fn mark_out_of_memory(&self, runner: &str) {
         self.0.lock().expect("hosts").oom.push(runner.to_string());
     }
@@ -190,7 +190,7 @@ impl FakeHosts {
         self.0.lock().expect("hosts").oom_unanswered = true;
     }
 
-    /// The runners started, as `(name, service runner id, slot)`.
+    /// The Actions runners started, as `(name, service runner id, slot)`.
     pub fn started(&self) -> Vec<(String, i64, Ticket)> {
         self.0.lock().expect("hosts").started.clone()
     }
@@ -210,7 +210,7 @@ impl Hosts for FakeHosts {
         }
         assert!(
             !spec.jit_config.expose().is_empty(),
-            "a runner starts with its configuration"
+            "an Actions runner starts with its configuration"
         );
         st.started.push((spec.name.clone(), spec.runner_id, spec.ticket));
         Ok(spec.name)

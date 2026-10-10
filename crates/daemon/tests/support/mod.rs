@@ -12,7 +12,7 @@ use cf_fake_github::harness::{fast, harness_with as github};
 use cf_fake_github::{FakeGithub, Options};
 use cf_scaleset::{Message, MessageSession, ScaleSet, ScaleSetClient, Statistics};
 
-pub const MACHINE: &str = "macmini";
+pub const MACHINE: &str = "mac-b";
 
 pub type TestScaler = Scaler<MessageSession, SetRegistry, FakeHosts>;
 
@@ -29,7 +29,7 @@ pub struct Harness {
     pub scaler: TestScaler,
 }
 
-/// A machine with room for `gb` runners of 1 GB, serving one scale set `cf-1g`.
+/// A machine with room for `gb` Actions runners of 1 GB, serving one scale set `cf-1g`.
 pub async fn harness(gb: u32) -> Harness {
     harness_with(gb, Options::default()).await
 }
@@ -40,7 +40,7 @@ pub async fn harness_with(gb: u32, options: Options) -> Harness {
     } = github(options, fast(), Duration::from_secs(10)).await;
     let labels = vec!["self-hosted".to_string(), "cf-1g".to_string()];
     let set = client
-        .ensure_scale_set("macmini--cf-1g", &labels)
+        .ensure_scale_set("mac-b--cf-1g", &labels)
         .await
         .expect("scale set");
     let session = client.open_session(set.id, MACHINE).await.expect("session");
@@ -96,7 +96,7 @@ pub fn stats(assigned: i64) -> Message {
     })
 }
 
-/// The next message the service has for the scale set, with room for `capacity` runners.
+/// The next message the service has for the scale set, with room for `capacity` Actions runners.
 pub async fn next_message(h: &Harness, capacity: usize) -> Message {
     h.session
         .poll(0, capacity)

@@ -21,11 +21,6 @@ impl<T> Secret<T> {
     pub fn expose(&self) -> &T {
         &self.0
     }
-
-    /// Takes the value out.
-    pub fn into_inner(self) -> T {
-        self.0
-    }
 }
 
 impl<T> fmt::Debug for Secret<T> {
@@ -62,17 +57,16 @@ mod tests {
         let shown = format!(
             "{:?}",
             Holder {
-                name: "air",
+                name: "mac-a",
                 token: Secret::new("ghs_abc123".into())
             }
         );
-        assert_eq!(shown, r#"Holder { name: "air", token: Secret(..) }"#);
+        assert_eq!(shown, r#"Holder { name: "mac-a", token: Secret(..) }"#);
     }
 
     #[test]
-    fn expose_and_into_inner_give_the_value_back() {
+    fn expose_gives_the_value_back() {
         let secret = Secret::new(vec![1u8, 2, 3]);
         assert_eq!(secret.expose(), &[1, 2, 3]);
-        assert_eq!(secret.into_inner(), vec![1, 2, 3]);
     }
 }

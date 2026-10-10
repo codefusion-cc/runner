@@ -1,12 +1,13 @@
 //! A check against the real GitHub, for one throwaway repository: registers a scale set under its own name, opens a
-//! session, waits for a queued job on the long poll (offered, or assigned by the service itself), acquires it if it
-//! was only offered, fetches (and removes) a one-job runner
-//! configuration for it, then closes the session and deletes the scale set.
+//! session, registers an Actions runner, finds it by its name and removes it, waits for a queued job on the long
+//! poll (offered, or assigned by the service itself), acquires it if it was only offered, fetches (and removes) a
+//! one-job Actions runner configuration for it, then closes the session and deletes the scale set. Every address the
+//! service hands back passes the client's check on the way, or the probe fails naming the host.
 //!
 //! `github_probe <credentials folder> <owner/name> <scale set name> <seconds to wait> <label>...`
 //!
 //! The folder holds `app.json` and `app.pem` (see `cf_ghapp::AppCredentials::load`). It prints ids, counts and
-//! statuses, never a token, a key or a runner configuration.
+//! statuses, never a token, a key or an Actions runner configuration.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -62,7 +63,6 @@ async fn probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         installation,
         repo,
         &format!("https://github.com/{repo}"),
-        Arc::new(SystemClock),
         Duration::from_secs(75),
     );
     let set = client.ensure_scale_set(name, &labels).await?;
@@ -87,6 +87,21 @@ async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn 
         "session open; at the start: available {}, assigned {}",
         stats.total_available_jobs, stats.total_assigned_jobs
     ));
+    // An Actions runner is found by its name and gone after its removal: what a registration whose answer was lost
+    // is cleaned up with.
+    let lookup = "cf-runner-probe-l0000001";
+    let registered = client.generate_jit_config(id, lookup, "_work").await?;
+    let found = client.runner_by_name(lookup).await?;
+    say(&format!(
+        "Actions runner {} found by its name: {}",
+        registered.runner.id,
+        found.as_ref() == Some(&registered.runner)
+    ));
+    client.remove_runner(registered.runner.id).await?;
+    say(&format!(
+        "after its removal the name finds nothing: {}",
+        client.runner_by_name(lookup).await?.is_none()
+    ));
     let deadline = Instant::now() + Duration::from_secs(wait);
     let mut after = 0;
     let mut outcome: Result<(), Box<dyn std::error::Error>> = Err("no job was offered in time".into());
@@ -110,11 +125,11 @@ async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn 
         }
         for done in &message.completed {
             say(&format!(
-                "completed: request {} result {:?} by runner {:?}",
+                "completed: request {} result {:?} by Actions runner {:?}",
                 done.runner_request_id, done.result, done.runner_name
             ));
         }
-        // With room for the job (the poll says how many runners the machine would take) the service assigns it
+        // With room for the job (the poll says how many Actions runners the machine would take) the service assigns it
         // by itself; without, it only offers it and it has to be acquired first.
         let mut job = None;
         if let Some(offer) = message.available.first() {
@@ -145,12 +160,12 @@ async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn 
                 .generate_jit_config(id, "cf-runner-probe-j0000001", "_work")
                 .await?;
             say(&format!(
-                "runner {} registered, configuration of {} bytes fetched",
+                "Actions runner {} registered, configuration of {} bytes fetched",
                 jit.runner.id,
                 jit.encoded.expose().len()
             ));
             client.remove_runner(jit.runner.id).await?;
-            say("runner removed");
+            say("Actions runner removed");
             outcome = Ok(());
         }
         session.acknowledge(message.id).await?;

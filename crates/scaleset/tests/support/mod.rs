@@ -10,9 +10,9 @@ use cf_scaleset::{MessageSession, ScaleSet};
 pub async fn with_session(h: &Harness) -> (ScaleSet, MessageSession) {
     let set = h
         .client
-        .ensure_scale_set("air--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
         .await
         .expect("scale set");
-    let session = h.client.open_session(set.id, "air").await.expect("session");
+    let session = h.client.open_session(set.id, "mac-a").await.expect("session");
     (set, session)
 }

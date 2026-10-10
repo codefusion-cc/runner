@@ -9,14 +9,14 @@ use crate::names::runner_name;
 use crate::roster::{JobInfo, Roster, Runner};
 use crate::traits::{EventKind, Events, Hosts, JobEvent, Jobs, Registry, RunnerSpec, Slots, Ticket};
 
-/// How long a new runner may wait for its job before it counts as surplus.
+/// How long a new Actions runner may wait for its job before it counts as surplus.
 pub const IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
 
 /// How long a slot stays promised to an acquired job the service has not assigned. The Go manager's reservations
 /// ran out after the same two minutes.
 pub const PROMISE_TTL: Duration = Duration::from_secs(2 * 60);
 
-/// How often a runner whose name is taken is registered again under another.
+/// How often an Actions runner whose name is taken is registered again under another.
 const NAME_TRIES: usize = 3;
 
 /// What one scale set's scaler needs to know about itself.
@@ -26,9 +26,9 @@ pub struct ScalerConfig {
     pub scale_set_id: i64,
     /// Its repository, `owner/name`.
     pub repo: String,
-    /// This machine's name, the start of every runner's name.
+    /// This machine's name, the start of every Actions runner's name.
     pub machine: String,
-    /// The memory size class of the scale set's runners in GB.
+    /// The memory size class of the scale set's Actions runners in GB.
     pub size_gb: u32,
 }
 
@@ -39,17 +39,18 @@ struct Promise {
     since: SystemTime,
 }
 
-/// Asks whether a runner whose machine is gone had lost a process for memory, once per runner.
+/// Asks whether an Actions runner whose machine is gone had lost a process for memory, once per Actions runner.
 pub type WasOutOfMemory = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-/// Turns one scale set's messages into runners: it takes jobs while the machine has room, starts one runner per
-/// assigned job, and retires runners whose job went away. [`cf_scaleset::listen`] calls it one message at a time.
+/// Turns one scale set's messages into Actions runners: it takes jobs while the machine has room, starts one Actions
+/// runner per assigned job, and retires Actions runners whose job went away. [`cf_scaleset::listen`] calls it one
+/// message at a time.
 ///
-/// A message may arrive again after a failure: acquiring a job twice does nothing, and runners follow the service's
-/// counts, not the number of messages.
+/// A message may arrive again after a failure: acquiring a job twice does nothing, and Actions runners follow the
+/// service's counts, not the number of messages.
 ///
-/// The slots it promised and no runner took go back by themselves: after [`PROMISE_TTL`] without an assignment, and
-/// when the scaler is dropped.
+/// The slots it promised and no Actions runner took go back by themselves: after [`PROMISE_TTL`] without an assignment,
+/// and when the scaler is dropped.
 pub struct Scaler<J, R, H> {
     config: ScalerConfig,
     jobs: J,
@@ -60,9 +61,13 @@ pub struct Scaler<J, R, H> {
     clock: Arc<dyn Clock>,
     events: Option<Arc<dyn Events>>,
     was_out_of_memory: Option<WasOutOfMemory>,
-    /// Slots promised to jobs this scaler acquired and whose runners have not started, oldest first.
+    /// Slots promised to jobs this scaler acquired and whose Actions runners have not started, oldest first.
     promised: Vec<Promise>,
+    /// The counts as the service last reported them.
     last: Arc<Mutex<Option<Statistics>>>,
+    /// How many Actions runners the scale set's assigned jobs need now: the service's count, less the jobs that ended
+    /// since without a new one. None before the first report.
+    wanted: Option<usize>,
 }
 
 impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
@@ -88,6 +93,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             was_out_of_memory: None,
             promised: vec![],
             last: Arc::new(Mutex::new(None)),
+            wanted: None,
         }
     }
 
@@ -97,7 +103,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         self
     }
 
-    /// Who knows whether a runner whose machine is already gone had lost a process for memory.
+    /// Who knows whether an Actions runner whose machine is already gone had lost a process for memory.
     pub fn with_out_of_memory_check(mut self, was: WasOutOfMemory) -> Self {
         self.was_out_of_memory = Some(was);
         self
@@ -130,8 +136,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         }
     }
 
-    /// Whether the runner's machine lost a process to the kernel for memory. The completion usually comes while the
-    /// machine still stands; for one already gone, or one whose host does not answer, whoever removed it knows.
+    /// Whether the Actions runner's machine lost a process to the kernel for memory. The completion usually comes while
+    /// the machine still stands; for one already gone, or one whose host does not answer, whoever removed it knows.
     async fn out_of_memory(&self, runner: &str) -> bool {
         if runner.is_empty() {
             return false;
@@ -154,6 +160,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         for started in &message.started {
             let event = self.event(EventKind::Started, &started.runner_name, &started.job, "");
             self.roster.mark_busy(
+                self.config.scale_set_id,
                 &started.runner_name,
                 JobInfo {
                     repo: event.repo.clone(),
@@ -172,7 +179,10 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         for done in &message.completed {
             let mut event = self.event(EventKind::Completed, &done.runner_name, &done.job, &done.result);
             event.out_of_memory = self.out_of_memory(&done.runner_name).await;
-            if self.roster.mark_done(&done.runner_name, self.clock.now()) {
+            if self
+                .roster
+                .mark_done(self.config.scale_set_id, &done.runner_name, self.clock.now())
+            {
                 finished += 1;
             }
             tracing::info!(runner = %done.runner_name, job = %done.job.job_display_name, result = %done.result, "job completed");
@@ -186,22 +196,20 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                     events.out_of_memory(&event);
                 }
             }
-            // A job cancelled before any runner took it completes without one: nothing ran here.
+            // A job cancelled before any Actions runner took it completes without one: nothing ran here.
             if let (Some(events), false) = (&self.events, done.runner_name.is_empty()) {
                 events.job(&event);
             }
         }
-        let mut last = self.last.lock().expect("statistics");
         match message.statistics {
-            Some(stats) => *last = Some(stats),
-            // Without new counts the old ones still name the jobs that just ended, and a runner would start for
-            // each. Every job that ended on a runner of this machine is one assigned job fewer; only the service's
-            // own counts raise the number again.
-            None => {
-                if let Some(kept) = last.as_mut() {
-                    kept.total_assigned_jobs = (kept.total_assigned_jobs - finished).max(0);
-                }
+            Some(stats) => {
+                self.wanted = Some(stats.assigned());
+                *self.last.lock().expect("statistics") = Some(stats);
             }
+            // Without new counts the old ones still name the jobs that just ended, and an Actions runner would start
+            // for each. Every job that ended on an Actions runner of this scale set is one Actions runner fewer to
+            // have; only the service's own counts raise the number again.
+            None => self.wanted = self.wanted.map(|wanted| wanted.saturating_sub(finished)),
         }
         Ok(())
     }
@@ -261,14 +269,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         Ok(())
     }
 
-    fn give_back(&mut self, promises: std::ops::Range<usize>) {
-        for promise in self.promised.drain(promises) {
-            self.slots.release(promise.ticket);
-        }
-    }
-
     /// Gives back the slots promised to jobs the service did not assign within [`PROMISE_TTL`]: cancelled, or taken
-    /// by a runner elsewhere. A job assigned later still gets a slot, a free one ([`Slots::claim`]).
+    /// by an Actions runner elsewhere. A job assigned later still gets a slot, a free one ([`Slots::claim`]).
     fn expire_promises(&mut self) {
         let now = self.clock.now();
         let slots = &self.slots;
@@ -283,13 +285,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         });
     }
 
-    /// Starts runners for the jobs assigned to the scale set that have none, and retires the surplus.
+    /// Starts Actions runners for the jobs assigned to the scale set that have none, and retires the surplus.
     async fn converge(&mut self) -> Result<(), Error> {
-        let Some(last) = *self.last.lock().expect("statistics") else {
+        let Some(assigned) = self.wanted else {
             return Ok(());
         };
         let active = self.roster.active(self.config.scale_set_id);
-        let assigned = last.assigned();
         for _ in active..assigned {
             let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
             let Some(ticket) = self.slots.claim(self.config.size_gb, promised) else {
@@ -308,23 +309,20 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     async fn start(&mut self, ticket: Ticket) -> Result<(), Error> {
-        let (mut name, mut jit) = (String::new(), None);
-        for attempt in 0..NAME_TRIES {
-            name = runner_name(&self.config.machine, rand::random::<u32>());
+        let mut tries = 0;
+        let (name, jit) = loop {
+            tries += 1;
+            let name = runner_name(&self.config.machine, rand::random::<u32>());
             match self.registry.generate_jit(&name).await {
-                Ok(config) => {
-                    jit = Some(config);
-                    break;
-                }
+                Ok(jit) => break (name, jit),
                 // The name is taken: names are random, another try uses another.
-                Err(e) if e.status() == Some(409) && attempt + 1 < NAME_TRIES => continue,
+                Err(e) if e.status() == Some(409) && tries < NAME_TRIES => {}
                 Err(e) => {
-                    tracing::warn!(runner = %name, error = %e, "could not register a runner");
+                    tracing::warn!(runner = %name, error = %e, "could not register an Actions runner");
                     return Err(e);
                 }
             }
-        }
-        let jit = jit.expect("the loop returns or sets it");
+        };
         let runner_id = jit.runner.id;
         let spec = RunnerSpec {
             name: name.clone(),
@@ -341,9 +339,11 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 if runner_id != 0
                     && let Err(remove) = self.registry.remove_runner(runner_id).await
                 {
-                    tracing::warn!(runner = %name, error = %remove, "could not unregister a runner that failed to start");
+                    tracing::warn!(runner = %name, error = %remove, "could not unregister an Actions runner that failed to start");
                 }
-                return Err(Error::Scaler(format!("start the machine of runner {name}: {e}")));
+                return Err(Error::Scaler(format!(
+                    "start the machine of Actions runner {name}: {e}"
+                )));
             }
         };
         self.roster.add(Runner {
@@ -358,12 +358,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             done: None,
             job: None,
         });
-        tracing::info!(runner = %name, "runner started");
+        tracing::info!(runner = %name, "Actions runner started");
         Ok(())
     }
 
-    /// Removes up to `n` runners that waited past [`IDLE_GRACE`] for a job that never came, such as one cancelled
-    /// before it started. Busy, finished and adopted runners are left alone.
+    /// Removes up to `n` Actions runners that waited past [`IDLE_GRACE`] for a job that never came, such as one
+    /// cancelled before it started. Busy, finished and adopted Actions runners are left alone.
     async fn retire_surplus(&mut self, mut n: usize) {
         for runner in self.roster.runners(self.config.scale_set_id) {
             if n == 0 {
@@ -383,7 +383,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 Err(e) if e.is_not_found() => {}
                 Err(e) => {
                     // It may have just taken a job; try again on a later poll.
-                    tracing::info!(runner = %runner.name, error = %e, "surplus runner not removed");
+                    tracing::info!(runner = %runner.name, error = %e, "surplus Actions runner not removed");
                     continue;
                 }
             }
@@ -391,20 +391,21 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             if let Err(e) = self.hosts.stop(&runner.handle).await {
                 // The machine may still stand and use its memory: it keeps its slot until whoever watches the
                 // machines sees it gone. Its registration is removed, so it takes no job and no longer counts.
-                tracing::warn!(runner = %runner.name, error = %e, "could not remove a surplus runner's machine");
-                self.roster.mark_done(&runner.name, self.clock.now());
+                tracing::warn!(runner = %runner.name, error = %e, "could not remove a surplus Actions runner's machine");
+                self.roster
+                    .mark_done(self.config.scale_set_id, &runner.name, self.clock.now());
                 continue;
             }
             self.roster.exited(&runner.name, &*self.slots);
-            tracing::info!(runner = %runner.name, "surplus runner removed");
+            tracing::info!(runner = %runner.name, "surplus Actions runner removed");
         }
     }
 
-    /// How many runners this scale set may have at once right now, which every wait carries to the service: those it
-    /// has, the slots promised to it, and one more while the machine has a free slot. The service may fill every
-    /// number it is given before any reports back, so offering all free slots to every scale set would let it assign
-    /// this machine several times the jobs it can run while other machines stay idle. One at a time, a burst still
-    /// fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
+    /// How many Actions runners this scale set may have at once right now, which every wait carries to the service:
+    /// those it has, the slots promised to it, and one more while the machine has a free slot. The service may fill
+    /// every number it is given before any reports back, so offering all free slots to every scale set would let it
+    /// assign this machine several times the jobs it can run while other machines stay idle. One at a time, a burst
+    /// still fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
     pub fn capacity(&self) -> usize {
         self.roster.active(self.config.scale_set_id)
             + self.promised.len()
@@ -417,17 +418,23 @@ impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
         if let Some(message) = message {
             self.handle(message).await?;
         }
-        // After the runners started: a job assigned late still finds the slot promised to it.
+        // After the Actions runners started: a job assigned late still finds the slot promised to it.
         self.converge().await?;
         self.expire_promises();
         Ok(self.capacity())
     }
 }
 
-impl<J, R, H> Drop for Scaler<J, R, H> {
-    fn drop(&mut self) {
-        for promise in self.promised.drain(..) {
+impl<J, R, H> Scaler<J, R, H> {
+    fn give_back(&mut self, promises: std::ops::Range<usize>) {
+        for promise in self.promised.drain(promises) {
             self.slots.release(promise.ticket);
         }
+    }
+}
+
+impl<J, R, H> Drop for Scaler<J, R, H> {
+    fn drop(&mut self) {
+        self.give_back(0..self.promised.len());
     }
 }

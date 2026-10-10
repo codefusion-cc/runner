@@ -1,5 +1,5 @@
 use cf_ghapp::Repo;
-use cf_workflows::LabelSet;
+use cf_workflows::{LabelSet, POOL_LABEL};
 use sha2::{Digest, Sha256};
 
 /// Lowercases `text`, joins its runs of letters and digits with single dashes, and cuts it to at most `max` bytes
@@ -25,26 +25,26 @@ pub fn slug(text: &str, max: usize) -> String {
     out
 }
 
-/// Turns a host name like `Mac-Mini-M1.local` into a short lowercase name like `mac-mini-m1`.
+/// Turns a host name like `Build-Mac-2.local` into a short lowercase name like `build-mac-2`.
 pub fn machine_name(hostname: &str) -> String {
     let name = slug(hostname.strip_suffix(".local").unwrap_or(hostname), 24);
     if name.is_empty() { "mac".into() } else { name }
 }
 
 /// Names an Actions runner after the machine, with a random part that never is all digits: some workflows read a
-/// number from the end of the runner name.
+/// number from the end of the Actions runner name.
 pub fn runner_name(machine: &str, random: u32) -> String {
     format!("{machine}-j{:07x}", random & 0x0fff_ffff)
 }
 
 /// Names a machine's scale set for one label set: the machine, a double dash (which machine names never contain,
-/// so `air` never claims the sets of `air-2`), the labels that tell repositories' sets apart, and a hash of the
+/// so `mac-a` never claims the sets of `mac-a-2`), the labels that tell repositories' sets apart, and a hash of the
 /// whole set so that two sets never share a name.
 pub fn scale_set_name(machine: &str, set: &LabelSet) -> String {
     let parts: Vec<String> = set
         .labels()
         .iter()
-        .filter(|l| !matches!(l.as_str(), "self-hosted" | "linux" | "arm64"))
+        .filter(|l| !matches!(l.as_str(), POOL_LABEL | "linux" | "arm64"))
         .map(|l| slug(l, 0))
         .filter(|s| !s.is_empty())
         .collect();
@@ -104,9 +104,9 @@ mod tests {
     proptest! {
         #[test]
         fn a_runner_name_never_ends_in_a_number(random in any::<u32>()) {
-            let name = runner_name("mac-mini-m1", random);
+            let name = runner_name("build-mac-2", random);
             let last = name.rsplit('-').next().unwrap();
-            prop_assert!(name.starts_with("mac-mini-m1-j"));
+            prop_assert!(name.starts_with("build-mac-2-j"));
             prop_assert_eq!(last.len(), 8);
             prop_assert!(last.chars().any(|c| !c.is_ascii_digit()));
             prop_assert!(name.len() <= 64);
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn machine_names_come_from_host_names() {
-        assert_eq!(machine_name("Mac-Mini-M1.local"), "mac-mini-m1");
+        assert_eq!(machine_name("Build-Mac-2.local"), "build-mac-2");
         assert_eq!(machine_name("Ünïcode Host"), "n-code-host");
         assert_eq!(machine_name("...local"), "mac");
         assert_eq!(machine_name(""), "mac");
@@ -140,20 +140,20 @@ mod tests {
     fn scale_set_names_tell_sets_apart_and_machines_never_claim_each_others() {
         let plain = LabelSet::new(["self-hosted", "cf-2g"]);
         let other = LabelSet::new(["self-hosted", "cf-4g"]);
-        let a = scale_set_name("air", &plain);
-        assert!(a.starts_with("air--cf-2g-"), "{a}");
-        assert_ne!(a, scale_set_name("air", &other));
-        assert_ne!(scale_set_name("air", &plain), scale_set_name("air-2", &plain));
+        let a = scale_set_name("mac-a", &plain);
+        assert!(a.starts_with("mac-a--cf-2g-"), "{a}");
+        assert_ne!(a, scale_set_name("mac-a", &other));
+        assert_ne!(scale_set_name("mac-a", &plain), scale_set_name("mac-a-2", &plain));
         assert!(
-            !scale_set_name("air-2", &plain).starts_with("air--"),
-            "air must not claim the sets of air-2"
+            !scale_set_name("mac-a-2", &plain).starts_with("mac-a--"),
+            "mac-a must not claim the sets of mac-a-2"
         );
         assert_eq!(
             a,
-            scale_set_name("air", &LabelSet::new(["CF-2G", "Self-Hosted"])),
+            scale_set_name("mac-a", &LabelSet::new(["CF-2G", "Self-Hosted"])),
             "case and order do not matter"
         );
-        assert!(scale_set_name("air", &LabelSet::new(["self-hosted", &"x".repeat(80)])).len() <= 50 + 5);
+        assert!(scale_set_name("mac-a", &LabelSet::new(["self-hosted", &"x".repeat(80)])).len() <= 50 + 5);
     }
 
     #[test]

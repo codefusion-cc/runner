@@ -20,11 +20,11 @@ pub const API: &str = "https://api.github.com";
 
 const API_VERSION: &str = "2022-11-28";
 
-/// A workflow file longer than this is not fetched: `cf-workflows` reads none that long, and GitHub runs none.
-pub const MAX_WORKFLOW_FILE_BYTES: u64 = 512 * 1024;
-
 /// An installation token is replaced this long before it expires.
 const TOKEN_MARGIN_SECS: i64 = 300;
+
+/// How many pages of one listing are read: 10 000 entries at GitHub's hundred a page.
+const MAX_PAGES: usize = 100;
 
 /// One account the App is installed on.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -136,6 +136,12 @@ impl GitHubApp {
         self.inner.signer.skew()
     }
 
+    /// GitHub's time as this machine knows it, in seconds since the epoch: its own clock plus that offset. What
+    /// the expiry of a token GitHub issued is compared with.
+    pub fn now_epoch(&self) -> i64 {
+        self.inner.signer.now_epoch()
+    }
+
     /// The App's own signed token, valid nine minutes and issued a minute in the past.
     pub fn jwt(&self) -> Result<Secret<String>, Error> {
         self.inner.signer.token()
@@ -154,15 +160,12 @@ impl GitHubApp {
         let bearer = format!("Bearer {}", auth.expose());
         self.inner
             .http
-            .send(
-                |c| {
-                    c.request(method.clone(), &url)
-                        .header("Accept", "application/vnd.github+json")
-                        .header("X-GitHub-Api-Version", API_VERSION)
-                        .header(AUTHORIZATION, &bearer)
-                },
-                true,
-            )
+            .send(|c| {
+                c.request(method.clone(), &url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .header(AUTHORIZATION, &bearer)
+            })
             .await
     }
 
@@ -208,20 +211,47 @@ impl GitHubApp {
     }
 
     fn decode<T: DeserializeOwned>(&self, what: &str, response: &Response) -> Result<T, Error> {
-        serde_json::from_slice(&response.body).map_err(|e| Error::Decode {
-            what: what.into(),
-            why: e.to_string(),
-        })
+        serde_json::from_slice(&response.body).map_err(|e| Error::not_the_json(what, &e))
+    }
+
+    /// The token in an answer; one without a token is no answer.
+    fn token_from(&self, what: &str, response: &Response) -> Result<TokenResponse, Error> {
+        let parsed: TokenResponse = self.decode(what, response)?;
+        if parsed.token.is_empty() {
+            return Err(Error::Decode {
+                what: what.into(),
+                why: "GitHub returned an empty token".into(),
+            });
+        }
+        Ok(parsed)
+    }
+
+    /// Every page of a listing from `first` on, as the App itself or as an installation. A listing of more than
+    /// [`MAX_PAGES`] pages is [`Error::Refused`]: one that names a next page for ever is not read for ever.
+    async fn pages(&self, installation: Option<i64>, first: &str) -> Result<Vec<Response>, Error> {
+        let mut pages = vec![];
+        let mut next = Some(first.to_string());
+        while let Some(page) = next {
+            if pages.len() == MAX_PAGES {
+                return Err(Error::Refused(format!(
+                    "{first}: a listing of more than {MAX_PAGES} pages"
+                )));
+            }
+            let response = match installation {
+                Some(installation) => self.as_installation(installation, Method::GET, &page).await?,
+                None => self.as_app(Method::GET, &page).await?,
+            };
+            next = self.next_page(&response);
+            pages.push(response);
+        }
+        Ok(pages)
     }
 
     /// Lists every account the App is installed on.
     pub async fn installations(&self) -> Result<Vec<Installation>, Error> {
         let mut all = vec![];
-        let mut next = Some("/app/installations?per_page=100".to_string());
-        while let Some(page) = next {
-            let response = self.as_app(Method::GET, &page).await?;
-            all.extend(self.decode::<Vec<Installation>>("installations", &response)?);
-            next = self.next_page(&response);
+        for page in self.pages(None, "/app/installations?per_page=100").await? {
+            all.extend(self.decode::<Vec<Installation>>("installations", &page)?);
         }
         Ok(all)
     }
@@ -260,13 +290,7 @@ impl GitHubApp {
                 &format!("/app/installations/{installation}/access_tokens"),
             )
             .await?;
-        let parsed: TokenResponse = self.decode("installation token", &response)?;
-        if parsed.token.is_empty() {
-            return Err(Error::Decode {
-                what: "installation token".into(),
-                why: "GitHub returned an empty token".into(),
-            });
-        }
+        let parsed = self.token_from("installation token", &response)?;
         let value = Secret::new(parsed.token);
         *cached = Some(CachedToken {
             value: value.clone(),
@@ -280,13 +304,7 @@ impl GitHubApp {
     pub async fn registration_token(&self, installation: i64, repo: &str) -> Result<Secret<String>, Error> {
         let path = format!("/repos/{repo}/actions/runners/registration-token");
         let response = self.as_installation(installation, Method::POST, &path).await?;
-        let parsed: TokenResponse = self.decode("runner registration token", &response)?;
-        if parsed.token.is_empty() {
-            return Err(Error::Decode {
-                what: "runner registration token".into(),
-                why: "GitHub returned an empty token".into(),
-            });
-        }
+        let parsed = self.token_from("Actions runner registration token", &response)?;
         Ok(Secret::new(parsed.token))
     }
 
@@ -313,23 +331,24 @@ impl GitHubApp {
             repositories: Vec<Repo>,
         }
         let mut all = vec![];
-        let mut next = Some("/installation/repositories?per_page=100".to_string());
-        while let Some(page) = next {
-            let response = self.as_installation(installation, Method::GET, &page).await?;
-            all.extend(self.decode::<Page>("repositories", &response)?.repositories);
-            next = self.next_page(&response);
+        for page in self
+            .pages(Some(installation), "/installation/repositories?per_page=100")
+            .await?
+        {
+            all.extend(self.decode::<Page>("repositories", &page)?.repositories);
         }
         Ok(all)
     }
 
     /// The workflow files on the repository's default branch by file name; none when it has no `.github/workflows`
-    /// folder. A file is fetched only when its content changed since the last call, and one over
-    /// [`MAX_WORKFLOW_FILE_BYTES`] not at all. Any other failure is an error, not "no workflows": that would drop
-    /// the repository's Actions runners.
+    /// folder. A file is fetched only when its content changed since the last call, and one over `max_file_bytes`
+    /// (what the reader of the files would refuse anyway) not at all. Any other failure is an error, not "no
+    /// workflows": that would drop the repository's Actions runners.
     pub async fn workflow_files(
         &self,
         installation: i64,
         repo: &str,
+        max_file_bytes: u64,
     ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
         #[derive(Deserialize)]
         struct Entry {
@@ -354,7 +373,10 @@ impl GitHubApp {
             .await
         {
             Ok(r) => r,
-            Err(Error::Status(s)) if s.status == 404 => return Ok(BTreeMap::new()),
+            Err(Error::Status(s)) if s.status == 404 => {
+                self.inner.blobs.lock().expect("blobs").remove(repo);
+                return Ok(BTreeMap::new());
+            }
             Err(e) => return Err(e),
         };
         let entries: Vec<Entry> = self.decode("workflow listing", &listing)?;
@@ -370,7 +392,7 @@ impl GitHubApp {
         let mut current = HashMap::new();
         for e in entries {
             let yaml = e.name.ends_with(".yml") || e.name.ends_with(".yaml");
-            if e.kind != "file" || !yaml || e.size > MAX_WORKFLOW_FILE_BYTES {
+            if e.kind != "file" || !yaml || e.size > max_file_bytes {
                 continue;
             }
             let content = match known.get(&e.sha) {
@@ -395,6 +417,10 @@ impl GitHubApp {
                         what: format!("{repo}/{}", e.name),
                         why: err.to_string(),
                     })?;
+                    // The listing's size is a claim; what counts is what came.
+                    if bytes.len() as u64 > max_file_bytes {
+                        continue;
+                    }
                     Arc::new(bytes)
                 }
             };
@@ -430,17 +456,15 @@ impl GitHubApp {
             ),
             (format!("/repos/{repo}/actions/variables?per_page=30"), true),
         ] {
-            let mut next = Some(path);
-            while let Some(page) = next {
-                let response = match self.as_installation(installation, Method::GET, &page).await {
-                    Ok(r) => r,
-                    Err(Error::Status(s)) if !required && (s.status == 403 || s.status == 404) => break,
-                    Err(e) => return Err(e),
-                };
-                for v in self.decode::<Page>("variables", &response)?.variables {
+            let pages = match self.pages(Some(installation), &path).await {
+                Ok(pages) => pages,
+                Err(Error::Status(s)) if !required && (s.status == 403 || s.status == 404) => continue,
+                Err(e) => return Err(e),
+            };
+            for page in &pages {
+                for v in self.decode::<Page>("variables", page)?.variables {
                     vars.insert(v.name, v.value);
                 }
-                next = self.next_page(&response);
             }
         }
         Ok(vars)

@@ -48,15 +48,18 @@ impl Signer {
         }
     }
 
-    /// Our idea of GitHub's current time, in seconds since the epoch.
-    pub(crate) fn now_epoch(&self) -> i64 {
-        let ours = self
-            .clock
+    /// This machine's time, in seconds since the epoch.
+    fn ours(&self) -> i64 {
+        self.clock
             .now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
-        ours + self.skew.load(Ordering::Relaxed)
+            .as_secs() as i64
+    }
+
+    /// Our idea of GitHub's current time, in seconds since the epoch.
+    pub(crate) fn now_epoch(&self) -> i64 {
+        self.ours() + self.skew.load(Ordering::Relaxed)
     }
 
     /// The offset between GitHub's time and ours, in seconds.
@@ -67,13 +70,7 @@ impl Signer {
     /// Takes the time from a response's `Date` header. Returns whether the offset changed by more than a few
     /// seconds, which tells the caller that a token refused for its clock is worth signing again.
     pub(crate) fn learn_server_time(&self, server_epoch: i64) -> bool {
-        let ours = self
-            .clock
-            .now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
-        let new = server_epoch - ours;
+        let new = server_epoch - self.ours();
         let old = self.skew.swap(new, Ordering::Relaxed);
         (new - old).abs() > 5
     }

@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use crate::traits::{Slots, Ticket};
 
-/// What a runner works on.
+/// What an Actions runner works on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobInfo {
     /// `owner/name`.
@@ -19,7 +19,7 @@ pub struct JobInfo {
     pub started: SystemTime,
 }
 
-/// One runner of this machine: a registered Actions runner and the machine it runs in.
+/// One Actions runner of this machine: a registered Actions runner and the machine it runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Runner {
     /// The Actions runner's name.
@@ -34,7 +34,7 @@ pub struct Runner {
     pub ticket: Option<Ticket>,
     /// When it started.
     pub started: SystemTime,
-    /// Set once the service reports the runner took a job.
+    /// Set once the service reports the Actions runner took a job.
     pub busy: bool,
     /// Already running when the Runner started, so whether it has a job is unknown: never scaled down.
     pub adopted: bool,
@@ -44,8 +44,8 @@ pub struct Runner {
     pub job: Option<JobInfo>,
 }
 
-/// The runners of this machine, for every scale set. Safe to share between the scalers and whoever watches machines
-/// come and go.
+/// The Actions runners of this machine, for every scale set. Safe to share between the scalers and whoever watches
+/// machines come and go.
 #[derive(Debug, Default)]
 pub struct Roster {
     runners: Mutex<BTreeMap<String, Runner>>,
@@ -61,7 +61,7 @@ impl Roster {
         self.runners.lock().expect("roster")
     }
 
-    /// Records a started runner.
+    /// Records a started Actions runner.
     pub fn add(&self, runner: Runner) {
         self.lock().insert(runner.name.clone(), runner);
     }
@@ -72,29 +72,32 @@ impl Roster {
         self.lock().entry(runner.name.clone()).or_insert(runner);
     }
 
-    /// A runner by name.
+    /// An Actions runner by name.
     pub fn get(&self, name: &str) -> Option<Runner> {
         self.lock().get(name).cloned()
     }
 
-    /// Forgets a runner and returns it.
+    /// Forgets an Actions runner and returns it.
     pub fn remove(&self, name: &str) -> Option<Runner> {
         self.lock().remove(name)
     }
 
-    /// Records that a runner took a job. Runners this machine does not know are ignored.
-    pub fn mark_busy(&self, name: &str, job: JobInfo) {
-        if let Some(r) = self.lock().get_mut(name) {
+    /// Records that an Actions runner of a scale set took a job. A name this machine does not know is ignored, and so
+    /// is one of another scale set: whoever can register Actions runners there chooses their names.
+    pub fn mark_busy(&self, scale_set_id: i64, name: &str, job: JobInfo) {
+        if let Some(r) = self.lock().get_mut(name)
+            && r.scale_set_id == scale_set_id
+        {
             r.busy = true;
             r.job = Some(job);
         }
     }
 
-    /// Records that a runner's job completed, and says whether this was news: `false` for a runner this machine does
-    /// not know and for one whose job was already over.
-    pub fn mark_done(&self, name: &str, at: SystemTime) -> bool {
+    /// Records that the job of a scale set's Actions runner completed, and says whether this was news: `false` for an
+    /// Actions runner this machine does not know, for one of another scale set and for one whose job was already over.
+    pub fn mark_done(&self, scale_set_id: i64, name: &str, at: SystemTime) -> bool {
         match self.lock().get_mut(name) {
-            Some(r) if r.done.is_none() => {
+            Some(r) if r.scale_set_id == scale_set_id && r.done.is_none() => {
                 r.done = Some(at);
                 true
             }
@@ -102,7 +105,7 @@ impl Roster {
         }
     }
 
-    /// Every runner of a scale set (all of them for 0), by name.
+    /// Every Actions runner of a scale set (all of them for 0), by name.
     pub fn runners(&self, scale_set_id: i64) -> Vec<Runner> {
         self.lock()
             .values()
@@ -111,7 +114,7 @@ impl Roster {
             .collect()
     }
 
-    /// How many runners of a scale set have a job to do or wait for one.
+    /// How many Actions runners of a scale set have a job to do or wait for one.
     pub fn active(&self, scale_set_id: i64) -> usize {
         self.lock()
             .values()
@@ -119,7 +122,7 @@ impl Roster {
             .count()
     }
 
-    /// A runner's machine is gone: forgets the runner and gives its slot back, once.
+    /// An Actions runner's machine is gone: forgets the Actions runner and gives its slot back, once.
     pub fn exited(&self, name: &str, slots: &dyn Slots) -> Option<Runner> {
         let runner = self.remove(name)?;
         if let Some(ticket) = runner.ticket {

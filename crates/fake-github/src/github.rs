@@ -47,11 +47,11 @@ impl Default for Options {
 pub enum JobState {
     /// Offered to every scale set that matches.
     Available,
-    /// Taken by a scale set (this id), waiting for its runner.
+    /// Taken by a scale set (this id), waiting for its Actions runner.
     Acquired(i64),
     /// Taken by someone else, not a scale set the test watches.
     TakenElsewhere,
-    /// Running on this runner.
+    /// Running on this Actions runner.
     Running(String),
     /// Done, with its result.
     Completed(String),
@@ -72,7 +72,6 @@ struct Session {
     id: String,
     token: String,
     owner: String,
-    serial: u32,
     /// The token is refused until a refresh.
     expired: bool,
     expires_at: i64,
@@ -130,8 +129,6 @@ pub struct Logged {
     pub body: String,
     /// The `x-scalesetmaxcapacity` header of polls.
     pub max_capacity: Option<String>,
-    /// The `lastMessageId` of polls.
-    pub last_message_id: Option<String>,
 }
 
 /// A scale set as the service has it.
@@ -152,14 +149,14 @@ pub struct ScaleSetInfo {
 }
 
 /// A scale set's job counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stats {
+#[derive(Debug, Clone, Copy, Default)]
+struct Stats {
     /// Jobs offered and not taken.
-    pub available: usize,
+    available: usize,
     /// Jobs assigned to the scale set that have not completed (running ones included).
-    pub assigned: usize,
+    assigned: usize,
     /// Jobs running.
-    pub running: usize,
+    running: usize,
 }
 
 struct State {
@@ -258,17 +255,9 @@ impl State {
 
     fn stats(&self, id: i64) -> Stats {
         let Some(set) = self.scale_sets.iter().find(|s| s.id == id) else {
-            return Stats {
-                available: 0,
-                assigned: 0,
-                running: 0,
-            };
+            return Stats::default();
         };
-        let mut s = Stats {
-            available: 0,
-            assigned: 0,
-            running: 0,
-        };
+        let mut s = Stats::default();
         for job in &self.jobs {
             match &job.state {
                 JobState::Available if matches(&set.labels, &job.labels) && job.repo == set.repo => {
@@ -398,16 +387,6 @@ impl FakeGithub {
         self.lock().base.clone()
     }
 
-    /// The App's client ID.
-    pub fn client_id(&self) -> String {
-        self.lock().opts.client_id.clone()
-    }
-
-    /// The App's private key as PEM (a throwaway made for the test process).
-    pub fn private_key_pem(&self) -> String {
-        test_key().private_pem.clone()
-    }
-
     fn lock(&self) -> MutexGuard<'_, State> {
         self.inner.state.lock().expect("state")
     }
@@ -445,16 +424,6 @@ impl FakeGithub {
         self.lock().clock_offset = seconds;
     }
 
-    /// Changes how long the admin token lives from now on.
-    pub fn set_admin_token_ttl(&self, ttl: Duration) {
-        self.lock().opts.admin_token_ttl = ttl;
-    }
-
-    /// Changes how long a session's token lives from now on.
-    pub fn set_session_token_ttl(&self, ttl: Duration) {
-        self.lock().opts.session_token_ttl = ttl;
-    }
-
     /// Changes how long a long poll waits.
     pub fn set_poll_timeout(&self, timeout: Duration) {
         self.lock().opts.poll_timeout = timeout;
@@ -477,7 +446,7 @@ impl FakeGithub {
         self.lock().lost.push((matcher.to_string(), times));
     }
 
-    /// Makes runner registration name `url` as the Actions service from now on.
+    /// Makes Actions runner registration name `url` as the Actions service from now on.
     pub fn send_the_service_to(&self, url: &str) {
         self.lock().service_at = Some(url.to_string());
     }
@@ -542,7 +511,7 @@ impl FakeGithub {
         id
     }
 
-    /// Another runner takes the job before this one's scale sets do.
+    /// Another Actions runner takes the job before this one's scale sets do.
     pub fn take_job(&self, request_id: i64) {
         if let Some(j) = self.lock().jobs.iter_mut().find(|j| j.request_id == request_id) {
             j.state = JobState::TakenElsewhere;
@@ -550,7 +519,7 @@ impl FakeGithub {
         self.inner.notify.notify_waiters();
     }
 
-    /// The runner with this name takes its job and starts it.
+    /// The Actions runner with this name takes its job and starts it.
     pub fn start_job(&self, runner_name: &str) {
         let mut st = self.lock();
         let Some(runner) = st.runners.iter().find(|r| r.name == runner_name).cloned() else {
@@ -575,8 +544,8 @@ impl FakeGithub {
         self.inner.notify.notify_waiters();
     }
 
-    /// The job of the runner with this name completes with a result (`succeeded`, `failed`, ...). A one-job runner
-    /// unregisters itself, as GitHub's does.
+    /// The job of the Actions runner with this name completes with a result (`succeeded`, `failed`, ...). A one-job
+    /// Actions runner unregisters itself, as GitHub's does.
     pub fn complete_job(&self, runner_name: &str, result: &str) {
         let mut st = self.lock();
         let Some(runner) = st.runners.iter().find(|r| r.name == runner_name).cloned() else {
@@ -602,7 +571,7 @@ impl FakeGithub {
         self.inner.notify.notify_waiters();
     }
 
-    /// The job is cancelled. One a scale set had acquired completes as `canceled` with no runner.
+    /// The job is cancelled. One a scale set had acquired completes as `canceled` with no Actions runner.
     pub fn cancel_job(&self, request_id: i64) {
         let mut st = self.lock();
         let Some(i) = st.jobs.iter().position(|j| j.request_id == request_id) else {
@@ -641,7 +610,7 @@ impl FakeGithub {
             .collect()
     }
 
-    /// The names of the runners currently registered.
+    /// The names of the Actions runners currently registered.
     pub fn runners(&self) -> Vec<String> {
         self.lock().runners.iter().map(|r| r.name.clone()).collect()
     }
@@ -653,11 +622,6 @@ impl FakeGithub {
             .iter()
             .find(|j| j.request_id == request_id)
             .map(|j| j.state.clone())
-    }
-
-    /// A scale set's counts.
-    pub fn stats(&self, scale_set: i64) -> Stats {
-        self.lock().stats(scale_set)
     }
 
     /// Every request seen so far.
@@ -681,7 +645,6 @@ impl FakeGithub {
                 authorization: req.header("authorization").map(String::from),
                 body: String::from_utf8_lossy(&req.body).to_string(),
                 max_capacity: req.header("x-scalesetmaxcapacity").map(String::from),
-                last_message_id: req.query("lastMessageId").map(String::from),
             });
             st.hooks
                 .iter()
@@ -882,7 +845,8 @@ impl FakeGithub {
             .unwrap_or("")
             .to_string();
         let m = req.method.as_str();
-        // /svc/_apis/runtime/runnerscalesets[/id[/sessions[/sid] | /acquirejobs | /generatejitconfig | /messages[/mid]]]
+        // /svc/_apis/runtime/runnerscalesets[/id[/sessions[/sid] | /acquirejobs | /generatejitconfig |
+        // /messages[/mid]]]
         if let ["_apis", "runtime", "runnerscalesets", rest @ ..] = segs {
             match (m, rest) {
                 ("GET", []) => return self.admin(&bearer, |st, repo| list_scale_sets(st, req, repo)),
@@ -1050,8 +1014,8 @@ impl FakeGithub {
     }
 }
 
-/// Assigns queued jobs to the scale set up to `capacity` runners, as the service does for a poll that says it has
-/// room: the offers for them are withdrawn and a `JobAssigned` replaces each.
+/// Assigns queued jobs to the scale set up to `capacity` Actions runners, as the service does for a poll that says it
+/// has room: the offers for them are withdrawn and a `JobAssigned` replaces each.
 fn auto_assign(st: &mut State, id: i64, capacity: usize) {
     if !st.opts.auto_assign {
         return;
@@ -1244,7 +1208,6 @@ fn create_session(st: &mut State, id: i64, req: &Request) -> Reply {
         id: sid,
         token,
         owner,
-        serial: 0,
         expired: false,
         expires_at: now + ttl,
     };
@@ -1262,7 +1225,6 @@ fn refresh_session(st: &mut State, id: i64, sid: &str) -> Reply {
     match &mut set.session {
         Some(s) if s.id == sid => {
             s.token = token;
-            s.serial += 1;
             s.expired = false;
             s.expires_at = now + ttl;
             let s = s.clone();

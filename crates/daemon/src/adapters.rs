@@ -8,7 +8,7 @@ impl Jobs for MessageSession {
     }
 }
 
-/// A scale set's runner registry: the client and the scale set it registers runners with.
+/// A scale set's Actions runner registry: the client and the scale set it registers Actions runners with.
 #[derive(Debug, Clone)]
 pub struct SetRegistry {
     /// The scale set client.

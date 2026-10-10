@@ -19,6 +19,9 @@ struct Harness {
     clock: Arc<TestClock>,
 }
 
+/// The largest workflow file the tests' caller reads, as the Runner's own limit is.
+const FILE_LIMIT: u64 = 512 * 1024;
+
 async fn harness_with(retry: RetryPolicy, timeout: Duration) -> Harness {
     let fake = FakeGithub::start(Options::default()).await;
     fake.add_repo("org/app", true);
@@ -239,6 +242,18 @@ async fn a_next_page_on_another_host_is_never_followed_with_the_token() {
     );
 }
 
+#[tokio::test]
+async fn a_listing_that_names_a_next_page_for_ever_is_refused() {
+    let h = harness().await;
+    let link = format!("<{}/app/installations?page=2>; rel=\"next\"", h.fake.url());
+    let page =
+        Reply::json(&serde_json::json!([{"id": 1, "account": {"login": "org"}}])).with_header("link", &link);
+    h.fake.fail("GET /app/installations", page, 150);
+    let error = h.app.installations().await.unwrap_err();
+    assert!(matches!(error, Error::Refused(_)), "{error:?}");
+    assert_eq!(h.fake.count("GET /app/installations"), 100);
+}
+
 // Go: TestWorkflowFiles
 #[tokio::test]
 async fn workflow_files_are_fetched_only_when_their_content_changed() {
@@ -250,13 +265,20 @@ async fn workflow_files_are_fetched_only_when_their_content_changed() {
     );
     h.fake.set_workflow("org/app", "release.yaml", "on: push\n");
     h.fake.set_workflow("org/app", "README.md", "not a workflow");
-    let files = h.app.workflow_files(1, "org/app").await.unwrap();
+    let files = h.app.workflow_files(1, "org/app", FILE_LIMIT).await.unwrap();
     assert_eq!(files.len(), 2, "only workflow files: {:?}", files.keys());
     assert!(String::from_utf8_lossy(&files["ci.yml"]).starts_with("jobs: {}\n# long line"));
     assert_eq!(files["release.yaml"], b"on: push\n");
     assert_eq!(h.fake.count("git/blobs"), 2);
 
-    assert_eq!(h.app.workflow_files(1, "org/app").await.unwrap().len(), 2);
+    assert_eq!(
+        h.app
+            .workflow_files(1, "org/app", FILE_LIMIT)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         h.fake.count("git/blobs"),
         2,
@@ -264,7 +286,7 @@ async fn workflow_files_are_fetched_only_when_their_content_changed() {
     );
 
     h.fake.set_workflow("org/app", "release.yaml", "changed\n");
-    let files = h.app.workflow_files(1, "org/app").await.unwrap();
+    let files = h.app.workflow_files(1, "org/app", FILE_LIMIT).await.unwrap();
     assert_eq!(files["release.yaml"], b"changed\n");
     assert_eq!(h.fake.count("git/blobs"), 3, "only the changed file is fetched");
 }
@@ -273,11 +295,17 @@ async fn workflow_files_are_fetched_only_when_their_content_changed() {
 #[tokio::test]
 async fn no_workflow_folder_is_empty_and_a_failing_api_is_an_error() {
     let h = harness().await;
-    assert!(h.app.workflow_files(1, "org/other").await.unwrap().is_empty());
+    assert!(
+        h.app
+            .workflow_files(1, "org/other", FILE_LIMIT)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     h.fake.set_workflow("org/app", "ci.yml", "jobs: {}\n");
     h.fake
         .fail("contents/.github/workflows", Reply::text(502, "boom"), 10);
-    let err = h.app.workflow_files(1, "org/app").await.unwrap_err();
+    let err = h.app.workflow_files(1, "org/app", FILE_LIMIT).await.unwrap_err();
     assert_eq!(
         err.status(),
         Some(502),
@@ -296,7 +324,7 @@ async fn content_in_an_unknown_encoding_is_refused() {
         1,
     );
     assert!(matches!(
-        h.app.workflow_files(1, "org/app").await,
+        h.app.workflow_files(1, "org/app", FILE_LIMIT).await,
         Err(Error::Decode { .. })
     ));
 }
@@ -429,7 +457,7 @@ async fn a_workflow_file_too_long_to_be_one_is_not_fetched() {
     h.fake.set_workflow("org/app", "ci.yml", "jobs: {}\n");
     h.fake
         .set_workflow("org/app", "huge.yml", &"# padding\n".repeat(60 * 1024));
-    let files = h.app.workflow_files(1, "org/app").await.unwrap();
+    let files = h.app.workflow_files(1, "org/app", FILE_LIMIT).await.unwrap();
     assert_eq!(files.keys().collect::<Vec<_>>(), ["ci.yml"]);
     assert_eq!(h.fake.count("git/blobs"), 1, "the long file was fetched");
 }
@@ -644,6 +672,60 @@ async fn a_slow_cut_off_or_dropped_response_is_a_network_error() {
     }
     h.fake.fail("GET /app/installations", Reply::Drop, 10);
     assert!(matches!(h.app.installations().await, Err(Error::Transport(_))));
+}
+
+#[tokio::test]
+async fn an_answer_of_the_wrong_shape_keeps_its_text_out_of_the_error() {
+    let h = harness().await;
+    // serde names the value it met where it expected another: here that value is the token.
+    for body in [
+        r#""ghs_leaked""#,
+        r#"{"token": {"ghs_leaked": 1}}"#,
+        r#"{"token": "ghs_leaked""#,
+    ] {
+        h.fake.fail(
+            "POST /app/installations/1/access_tokens",
+            Reply::text(201, body),
+            1,
+        );
+        let error = h.app.installation_token(1).await.unwrap_err();
+        assert!(matches!(error, Error::Decode { .. }), "{error:?}");
+        let said = format!("{error} {error:?}");
+        assert!(!said.contains("ghs_leaked"), "{said}");
+        assert!(
+            said.contains("line 1"),
+            "where the answer went wrong is gone too: {said}"
+        );
+    }
+}
+
+#[test]
+fn an_answer_shown_for_debugging_shows_none_of_its_body() {
+    let answer = cf_ghapp::Response {
+        status: reqwest::StatusCode::CREATED,
+        headers: reqwest::header::HeaderMap::new(),
+        body: r#"{"token":"ghs_leaked"}"#.into(),
+    };
+    let shown = format!("{answer:?}");
+    assert!(!shown.contains("ghs_leaked"), "{shown}");
+    assert!(shown.contains("201"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_workflow_file_larger_than_its_listing_said_is_left_out() {
+    let h = harness().await;
+    h.fake.set_workflow("org/app", "ci.yml", "on: push\n");
+    let long = base64::engine::general_purpose::STANDARD.encode("x".repeat(100));
+    h.fake.fail(
+        "GET /repos/org/app/git/blobs",
+        Reply::json(&serde_json::json!({"content": long, "encoding": "base64"})),
+        1,
+    );
+    let files = h.app.workflow_files(1, "org/app", 64).await.unwrap();
+    assert!(files.is_empty(), "{:?}", files.keys());
+    // By the listing alone it fits, and what fits is read.
+    let files = h.app.workflow_files(1, "org/app", 64).await.unwrap();
+    assert_eq!(files["ci.yml"], b"on: push\n");
 }
 
 // added: malformed bodies are results

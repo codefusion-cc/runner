@@ -65,14 +65,7 @@ pub async fn harness_with(options: Options, retry: RetryPolicy, timeout: Duratio
     fake.add_repo(REPO, true);
     let clock = Arc::new(TestClock::default());
     let app = app(&fake, Http::new(timeout, retry), clock.clone());
-    let client = ScaleSetClient::new(
-        app.clone(),
-        1,
-        REPO,
-        &format!("{}/{REPO}", fake.url()),
-        clock.clone(),
-        timeout,
-    );
+    let client = ScaleSetClient::new(app.clone(), 1, REPO, &format!("{}/{REPO}", fake.url()), timeout);
     Harness {
         fake,
         app,

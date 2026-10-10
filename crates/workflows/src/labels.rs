@@ -5,17 +5,18 @@ use serde_yaml_ng::Value;
 use crate::expression::{evaluate, is_pool_expression};
 use crate::size::is_size_label;
 
-/// The label these runners serve for a job that takes its runner from a repository variable
-/// (`runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}`) when the variable names no label of theirs yet. CodeFusion
-/// Console's runner pool sends a repository's jobs to the Macs by setting the variable to a label of these runners
-/// (`self-hosted`, or a size label); until it does, the repository is still served under this label.
+/// The label these Actions runners serve for a job that takes its Actions runner from a repository variable (`runs-on:
+/// ${{ vars.CI_RUNNER || 'ubuntu-latest' }}`) when the variable names no label of theirs yet. CodeFusion Console's
+/// Actions runner pool sends a repository's jobs to the Macs by setting the variable to a label of these Actions
+/// runners (`self-hosted`, or a size label); until it does, the repository is still served under this label.
 pub const POOL_LABEL: &str = "self-hosted";
 
-/// A workflow file bigger than this is not read. GitHub's own limit is far lower; the cap keeps a hostile file from
-/// costing the Runner time or memory.
-const MAX_FILE_BYTES: usize = 512 * 1024;
+/// A workflow file bigger than this is not read, and whoever fetches the files need not fetch it. GitHub's own limit
+/// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
+pub const MAX_FILE_BYTES: usize = 512 * 1024;
 
-/// Labels that name a platform these runners are not: a job asking for one of them is left to other runners.
+/// Labels that name a platform these Actions runners are not: a job asking for one of them is left to other Actions
+/// runners.
 const FOREIGN: [&str; 6] = ["macos", "osx", "windows", "x64", "x86", "arm"];
 
 /// One `runs-on` request: its labels lowercased, deduplicated and sorted. GitHub compares labels without regard to
@@ -59,19 +60,19 @@ pub fn self_hosted(files: &BTreeMap<String, Vec<u8>>) -> Vec<LabelSet> {
     self_hosted_with(files, &BTreeMap::new())
 }
 
-/// Every distinct label set that jobs in the given workflow files request from self-hosted runners these runners
-/// can serve: sets that include `self-hosted` or a valid size label (`cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`), name no
-/// other platform, and are plain labels or expressions over repository variables, rather than other expressions or
-/// runner groups.
+/// Every distinct label set that jobs in the given workflow files request from self-hosted Actions runners these
+/// Actions runners can serve: sets that include `self-hosted` or a valid size label (`cf-2g`, `cf-4g`, `cf-6g`,
+/// `cf-8g`), name no other platform, and are plain labels or expressions over repository variables, rather than other
+/// expressions or Actions runner groups.
 ///
 /// An expression over `vars.` alone (string literals and functions aside) is a job the console's pool may point at
-/// these runners. It is evaluated with `vars` when it can be (`||` chains of variables and literals); a value that
-/// names a label of these runners stands for that label, any other value, or an expression that cannot be
+/// these Actions runners. It is evaluated with `vars` when it can be (`||` chains of variables and literals); a value
+/// that names a label of these Actions runners stands for that label, any other value, or an expression that cannot be
 /// evaluated, for [`POOL_LABEL`]. One that reads anything else (a matrix value, an input) cannot be known ahead of a
-/// run and is not served. A call to a reusable workflow counts by its `with: runs-on` input, the runner it passes
-/// on. Files that are not valid YAML, or are over 512 KiB, are skipped, since GitHub runs none of their jobs
-/// either; a job of a shape that cannot be read is skipped alone. The result is sorted by key and does not depend
-/// on the order of files.
+/// run and is not served. A call to a reusable workflow counts by its `with: runs-on` input, the Actions runner it
+/// passes on. Files that are not valid YAML, or are over 512 KiB, are skipped, since GitHub runs none of their jobs
+/// either; a job of a shape that cannot be read is skipped alone. The result is sorted by key and does not depend on
+/// the order of files.
 pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<String, String>) -> Vec<LabelSet> {
     let mut seen = BTreeSet::new();
     for content in files.values() {
@@ -88,7 +89,7 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
             if let Some(set) = job.get("runs-on").and_then(|node| label_set(node, vars)) {
                 seen.insert(set);
             }
-            // The reusable workflow runs in this repository, on the runner its input names.
+            // The reusable workflow runs in this repository, on the Actions runner its input names.
             let uses = job
                 .get("uses")
                 .and_then(Value::as_str)
@@ -107,7 +108,7 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
     seen.into_iter().collect()
 }
 
-/// What a pool expression stands for: the label of these runners it evaluates to, else [`POOL_LABEL`].
+/// What a pool expression stands for: the label of these Actions runners it evaluates to, else [`POOL_LABEL`].
 fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> String {
     evaluate(expression, vars)
         .map(|v| v.trim().to_lowercase())
@@ -130,7 +131,8 @@ fn label_set(node: &Value, vars: &BTreeMap<String, String>) -> Option<LabelSet> 
     let labels: Vec<String> = match node {
         Value::Sequence(items) => items.iter().map(scalar).collect::<Option<_>>()?,
         Value::Mapping(map) => {
-            // `runs-on: {group: …, labels: …}`: a runner group is an organization feature these runners are not in.
+            // `runs-on: {group: …, labels: …}`: an Actions runner group is an organization feature these Actions
+            // runners are not in.
             if map.contains_key("group") {
                 return None;
             }

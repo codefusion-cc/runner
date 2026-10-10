@@ -176,7 +176,7 @@ async fn items_that_are_not_understood_are_left_out_one_by_one() {
         {"messageType": "SomethingNew", "runnerRequestId": 6},
         {"nothing": "typed"},
         "a string",
-        {"messageType": "JobCompleted", "runnerRequestId": 5, "result": "succeeded", "runnerName": "air-j1"},
+        {"messageType": "JobCompleted", "runnerRequestId": 5, "result": "succeeded", "runnerName": "mac-a-j1"},
     ]);
     h.fake.fail(
         &poll_line(&set),
@@ -198,7 +198,7 @@ async fn a_session_lost_mid_poll_is_opened_again_and_the_next_job_still_arrives(
     let h = harness().await;
     let set = h
         .client
-        .ensure_scale_set("air--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
         .await
         .unwrap();
     let scaler = Recorder::new(1);
@@ -219,7 +219,7 @@ async fn a_session_lost_mid_poll_is_opened_again_and_the_next_job_still_arrives(
                 move || {
                     let (client, stop, mut scaler) = (client.clone(), stop.clone(), scaler.clone());
                     async move {
-                        let session = client.open_session(set.id, "air").await?;
+                        let session = client.open_session(set.id, "mac-a").await?;
                         let result = listen(&session, &mut scaler, stop).await;
                         let _ = session.close().await;
                         result
@@ -321,10 +321,10 @@ async fn a_refresh_for_a_session_the_service_forgot_is_a_lost_session() {
     let (set2, session2) = {
         let set = h
             .client
-            .ensure_scale_set("air--cf-4g", &labels(&["self-hosted", "cf-4g"]))
+            .ensure_scale_set("mac-a--cf-4g", &labels(&["self-hosted", "cf-4g"]))
             .await
             .unwrap();
-        let session = h.client.open_session(set.id, "air").await.unwrap();
+        let session = h.client.open_session(set.id, "mac-a").await.unwrap();
         (set, session)
     };
     h.fake

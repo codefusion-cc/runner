@@ -51,6 +51,26 @@ pub enum Error {
 }
 
 impl Error {
+    /// A body that is not the JSON a call needs: [`Error::Decode`] that says what kind of fault and where, and none
+    /// of the body's text. serde's own message quotes the value it met, and an answer may hold a token.
+    pub fn not_the_json(what: &str, error: &serde_json::Error) -> Error {
+        use serde_json::error::Category;
+        let kind = match error.classify() {
+            Category::Io => "could not be read",
+            Category::Syntax => "is not JSON",
+            Category::Data => "is not what the call needs",
+            Category::Eof => "ends early",
+        };
+        Error::Decode {
+            what: what.into(),
+            why: format!(
+                "the answer {kind} (line {}, column {})",
+                error.line(),
+                error.column()
+            ),
+        }
+    }
+
     /// The HTTP status, when GitHub answered with one.
     pub fn status(&self) -> Option<u16> {
         match self {

@@ -8,7 +8,7 @@ use reqwest::{RequestBuilder, StatusCode, Url};
 use crate::error::{Error, StatusError};
 
 /// The largest response body that is read. GitHub's answers to these calls are a few kilobytes, a workflow file at
-/// most [`crate::MAX_WORKFLOW_FILE_BYTES`] before its encoding; anything longer is refused instead of held in memory.
+/// most 512 KiB before its encoding; anything longer is refused instead of held in memory.
 pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// How many redirects on the same host are followed (a renamed repository answers with one).
@@ -83,8 +83,8 @@ impl Default for RetryPolicy {
     }
 }
 
-/// A complete response: status, headers and the whole body.
-#[derive(Debug)]
+/// A complete response: status, headers and the whole body. Its `Debug` shows the status and the body's length
+/// only: an answer may be a token.
 pub struct Response {
     /// The status.
     pub status: StatusCode,
@@ -92,6 +92,15 @@ pub struct Response {
     pub headers: HeaderMap,
     /// The body, read in full.
     pub body: bytes::Bytes,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status.as_u16())
+            .field("body_bytes", &self.body.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Sends requests and tries them again when GitHub or the network is the problem.
@@ -121,15 +130,11 @@ impl Http {
         self
     }
 
-    /// Sends the request `build` makes. With `retry`, a network failure, a 429, a 5xx, and a 403 that carries
+    /// Sends the request `build` makes. A network failure, a 429, a 5xx, and a 403 that carries
     /// `Retry-After` are tried again after a wait with jitter (the header's wait when there is one); a status
     /// outside 2xx that is not retried comes back as [`Error::Status`]. A body that ends early is a
     /// [`Error::Transport`]; an address a token may not go to and a body over the limit are [`Error::Refused`].
-    pub async fn send(
-        &self,
-        build: impl Fn(&reqwest::Client) -> RequestBuilder,
-        retry: bool,
-    ) -> Result<Response, Error> {
+    pub async fn send(&self, build: impl Fn(&reqwest::Client) -> RequestBuilder) -> Result<Response, Error> {
         let mut attempt = 0u32;
         loop {
             let result = self.once(build(&self.client)).await;
@@ -137,7 +142,7 @@ impl Http {
                 Ok(response) => return Ok(response),
                 Err(error) => error,
             };
-            if !retry || attempt >= self.retry.retries || !error.is_transient() {
+            if attempt >= self.retry.retries || !error.is_transient() {
                 return Err(error);
             }
             let wait = match error.retry_after() {
@@ -228,7 +233,7 @@ pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// An exponential wait with jitter: between half and the whole of `base * 2^attempt`, at most `cap`.
-pub fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
+fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
     let full = base
         .saturating_mul(1u32.checked_shl(attempt.min(20)).unwrap_or(u32::MAX))
         .min(cap);

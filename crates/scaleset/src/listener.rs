@@ -7,11 +7,12 @@ use crate::error::Error;
 use crate::session::MessageSession;
 use crate::types::Message;
 
-/// What turns the service's messages into runners. [`listen`] calls it one message at a time, never twice at once.
+/// What turns the service's messages into Actions runners. [`listen`] calls it one message at a time, never twice at
+/// once.
 pub trait Scaler: Send {
     /// Handles the scale set's counts at the start (a message with only `statistics`), each batch of job messages,
     /// and `None` when the wait ended quietly. Handling a message again is harmless: after a failure the service
-    /// sends it again. Returns how many runners the machine would take now, which the next wait carries to the
+    /// sends it again. Returns how many Actions runners the machine would take now, which the next wait carries to the
     /// service. An error ends the session without acknowledging the message.
     fn scale(&mut self, message: Option<&Message>) -> impl Future<Output = Result<usize, Error>> + Send;
 }

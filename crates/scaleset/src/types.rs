@@ -20,7 +20,7 @@ pub struct Label {
 pub struct ScaleSet {
     /// The service's ID for it.
     pub id: i64,
-    /// Its name, unique in the runner group.
+    /// Its name, unique in the Actions runner group.
     pub name: String,
     /// The labels jobs must ask for.
     #[serde(default, deserialize_with = "null_default")]
@@ -42,7 +42,7 @@ impl ScaleSet {
 pub struct Statistics {
     /// Jobs offered and not taken by anyone.
     pub total_available_jobs: i64,
-    /// Jobs a runner of the scale set acquired and that have no runner yet.
+    /// Jobs an Actions runner of the scale set acquired and that have no Actions runner yet.
     pub total_acquired_jobs: i64,
     /// Jobs assigned to the scale set, running ones included.
     pub total_assigned_jobs: i64,
@@ -82,7 +82,7 @@ impl std::fmt::Debug for SessionInfo {
     }
 }
 
-/// A runner registered with the scale set.
+/// An Actions runner registered with the scale set.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RunnerRef {
     /// The service's ID for it.
@@ -95,7 +95,7 @@ pub struct RunnerRef {
 /// The configuration of one Actions runner that takes one job: it registers itself and goes away after the job.
 #[derive(Debug, Clone)]
 pub struct JitConfig {
-    /// The registered runner.
+    /// The registered Actions runner.
     pub runner: RunnerRef,
     /// What the Actions runner is started with. A credential: it never reaches a log.
     pub encoded: Secret<String>,
@@ -157,7 +157,7 @@ pub struct JobBase {
     /// When the job was queued.
     #[serde(deserialize_with = "lenient_time")]
     pub queue_time: Option<OffsetDateTime>,
-    /// When a runner got the job.
+    /// When an Actions runner got the job.
     #[serde(deserialize_with = "lenient_time")]
     pub runner_assign_time: Option<OffsetDateTime>,
 }
@@ -176,14 +176,14 @@ impl JobBase {
 /// A job the service offers.
 pub type JobAvailable = JobBase;
 
-/// A job a runner of the scale set took.
+/// A job an Actions runner of the scale set took.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct JobStarted {
     /// The job.
     #[serde(flatten)]
     pub job: JobBase,
-    /// The runner that took it.
+    /// The Actions runner that took it.
     #[serde(deserialize_with = "null_default")]
     pub runner_name: String,
 }
@@ -198,7 +198,7 @@ pub struct JobCompleted {
     /// `succeeded`, `failed`, `canceled`, `skipped` or `abandoned`.
     #[serde(deserialize_with = "null_default")]
     pub result: String,
-    /// The runner that ran it; empty for a job cancelled before any runner had it.
+    /// The Actions runner that ran it; empty for a job cancelled before any Actions runner had it.
     #[serde(deserialize_with = "null_default")]
     pub runner_name: String,
 }
@@ -214,7 +214,7 @@ pub struct Message {
     pub available: Vec<JobAvailable>,
     /// Jobs acquired by this scale set.
     pub assigned: Vec<JobBase>,
-    /// Jobs started on this scale set's runners.
+    /// Jobs started on this scale set's Actions runners.
     pub started: Vec<JobStarted>,
     /// Jobs completed.
     pub completed: Vec<JobCompleted>,
@@ -256,37 +256,36 @@ impl RawMessage {
         let mut message = Message {
             id: self.message_id,
             statistics: self.statistics,
-            raw: self.body.clone(),
             ..Message::default()
         };
-        if self.message_type != "RunnerScaleSetJobMessages" || self.body.trim().is_empty() {
-            return message;
-        }
-        let items: Vec<Value> = match serde_json::from_str(&self.body) {
-            Ok(items) => items,
-            Err(e) => {
-                tracing::warn!(message = self.message_id, error = %e, "a message body is not a list of jobs; using its counts only");
-                message.skipped += 1;
-                return message;
+        if self.message_type == "RunnerScaleSetJobMessages" && !self.body.trim().is_empty() {
+            match serde_json::from_str::<Vec<Value>>(&self.body) {
+                Ok(items) => {
+                    for item in items {
+                        let kind = item
+                            .get("messageType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let understood = match kind.as_str() {
+                            "JobAvailable" => take(item, &mut message.available, |j| j.runner_request_id > 0),
+                            "JobAssigned" => take(item, &mut message.assigned, |_| true),
+                            "JobStarted" => take(item, &mut message.started, |_| true),
+                            "JobCompleted" => take(item, &mut message.completed, |_| true),
+                            _ => false,
+                        };
+                        if !understood {
+                            message.skipped += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(message = self.message_id, error = %e, "a message body is not a list of jobs; using its counts only");
+                    message.skipped += 1;
+                }
             }
-        };
-        for item in items {
-            let kind = item
-                .get("messageType")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let understood = match kind.as_str() {
-                "JobAvailable" => take(item, &mut message.available, |j| j.runner_request_id > 0),
-                "JobAssigned" => take(item, &mut message.assigned, |_| true),
-                "JobStarted" => take(item, &mut message.started, |_| true),
-                "JobCompleted" => take(item, &mut message.completed, |_| true),
-                _ => false,
-            };
-            if !understood {
-                message.skipped += 1;
-            }
         }
+        message.raw = self.body;
         message
     }
 }

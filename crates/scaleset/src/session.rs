@@ -1,13 +1,13 @@
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use cf_ghapp::Error as ApiError;
+use cf_ghapp::Response;
 use cf_secret::Secret;
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::client::{API_VERSION, ScaleSetClient, encode};
+use crate::client::{API_VERSION, ScaleSetClient, decode, encode};
 use crate::error::Error;
 use crate::types::{Message, RawMessage, SessionInfo, Statistics};
 
@@ -43,6 +43,15 @@ impl std::fmt::Debug for MessageSession {
 struct Acquired {
     #[serde(default, deserialize_with = "crate::types::null_default")]
     value: Vec<i64>,
+}
+
+/// A queue the service no longer has means the session is gone: the caller opens a new one.
+fn lost(error: Error) -> Error {
+    if error.status() == Some(404) {
+        Error::SessionLost("the service has no queue for the session".into())
+    } else {
+        error
+    }
 }
 
 impl MessageSession {
@@ -91,86 +100,74 @@ impl MessageSession {
         Ok(())
     }
 
-    /// Waits for the next message after `after`, for about a minute. `Ok(None)` is a quiet end of the wait. A token
-    /// the service refuses is replaced once and the wait goes on; a session the service no longer has is
-    /// [`Error::SessionLost`]. `max_capacity` is how many runners the machine would take now (the service offers no
-    /// more jobs than that).
-    pub async fn poll(&self, after: i64, max_capacity: usize) -> Result<Option<Message>, Error> {
+    /// Sends the request `url` names for the session as it is now. A token the service refuses is replaced once and
+    /// the request made again; a second refusal is the caller's error.
+    async fn call(
+        &self,
+        method: Method,
+        url: impl Fn(&str, &str) -> String,
+        body: Option<&Value>,
+        timeout: Option<Duration>,
+        capacity: Option<usize>,
+    ) -> Result<Response, Error> {
         let mut refreshed = false;
         loop {
             let (session_id, queue_url, token) = self.snapshot();
-            let mut url = format!(
-                "{queue_url}?sessionId={}&api-version={API_VERSION}",
-                encode(&session_id)
-            );
-            if after > 0 {
-                url.push_str(&format!("&lastMessageId={after}"));
-            }
+            let url = url(&session_id, &queue_url);
             let result = self
                 .inner
                 .client
-                .send(
-                    Method::GET,
-                    &url,
-                    &token,
-                    None,
-                    Some(self.inner.client.poll_timeout()),
-                    Some(max_capacity),
-                )
+                .send(method.clone(), &url, &token, body, timeout, capacity)
                 .await;
             match result {
-                Ok(r) if r.status.as_u16() == 202 || r.body.is_empty() => return Ok(None),
-                Ok(r) => {
-                    let raw: RawMessage = serde_json::from_slice(&r.body).map_err(|e| {
-                        Error::Api(ApiError::Decode {
-                            what: "message".into(),
-                            why: e.to_string(),
-                        })
-                    })?;
-                    return Ok(Some(raw.into_message()));
-                }
                 Err(e) if e.status() == Some(401) && !refreshed => {
                     refreshed = true;
                     self.refresh().await?;
                 }
-                Err(e) if e.status() == Some(404) => {
-                    return Err(Error::SessionLost(
-                        "the service has no queue for the session".into(),
-                    ));
-                }
-                Err(e) => return Err(e),
+                other => return other,
             }
         }
     }
 
+    /// Waits for the next message after `after`, for about a minute. `Ok(None)` is a quiet end of the wait. A token the
+    /// service refuses is replaced once and the wait goes on; a session the service no longer has is
+    /// [`Error::SessionLost`]. `max_capacity` is how many Actions runners the machine would take now (the service
+    /// offers no more jobs than that).
+    pub async fn poll(&self, after: i64, max_capacity: usize) -> Result<Option<Message>, Error> {
+        let url = |session_id: &str, queue_url: &str| {
+            let mut url = format!(
+                "{queue_url}?sessionId={}&api-version={API_VERSION}",
+                encode(session_id)
+            );
+            if after > 0 {
+                url.push_str(&format!("&lastMessageId={after}"));
+            }
+            url
+        };
+        let timeout = Some(self.inner.client.poll_timeout());
+        let response = self
+            .call(Method::GET, url, None, timeout, Some(max_capacity))
+            .await
+            .map_err(lost)?;
+        if response.status.as_u16() == 202 || response.body.is_empty() {
+            return Ok(None);
+        }
+        let raw: RawMessage = decode("message", &response)?;
+        Ok(Some(raw.into_message()))
+    }
+
     /// Tells the service the message was handled, so it is not sent again.
     pub async fn acknowledge(&self, message_id: i64) -> Result<(), Error> {
-        let mut refreshed = false;
-        loop {
-            let (session_id, queue_url, token) = self.snapshot();
-            let url = format!(
+        let url = |session_id: &str, queue_url: &str| {
+            format!(
                 "{queue_url}/{message_id}?sessionId={}&api-version={API_VERSION}",
-                encode(&session_id)
-            );
-            match self
-                .inner
-                .client
-                .send(Method::DELETE, &url, &token, None, None, None)
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(e) if e.status() == Some(401) && !refreshed => {
-                    refreshed = true;
-                    self.refresh().await?;
-                }
-                Err(e) if e.status() == Some(404) => {
-                    return Err(Error::SessionLost(
-                        "the service has no queue for the session".into(),
-                    ));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+                encode(session_id)
+            )
+        };
+        self.call(Method::DELETE, url, None, None, None)
+            .await
+            .map_err(lost)?;
+        Ok(())
     }
 
     /// Acquires jobs by their request IDs and returns the ones this scale set got; the others went to another
@@ -185,39 +182,19 @@ impl MessageSession {
             self.inner.scale_set_id
         );
         let body = Value::from(request_ids.to_vec());
-        let mut refreshed = false;
-        loop {
-            let (_, _, token) = self.snapshot();
-            match self
-                .inner
-                .client
-                .send(Method::POST, &url, &token, Some(&body), None, None)
-                .await
-            {
-                Ok(r) => {
-                    let parsed: Acquired = serde_json::from_slice(&r.body).map_err(|e| {
-                        Error::Api(ApiError::Decode {
-                            what: "acquired jobs".into(),
-                            why: e.to_string(),
-                        })
-                    })?;
-                    // Only what was asked for counts, and once: the service has no business handing out other
-                    // IDs, and a job named twice is still one job.
-                    let mut got: Vec<i64> = vec![];
-                    for id in parsed.value {
-                        if request_ids.contains(&id) && !got.contains(&id) {
-                            got.push(id);
-                        }
-                    }
-                    return Ok(got);
-                }
-                Err(e) if e.status() == Some(401) && !refreshed => {
-                    refreshed = true;
-                    self.refresh().await?;
-                }
-                Err(e) => return Err(e),
+        let response = self
+            .call(Method::POST, |_, _| url.clone(), Some(&body), None, None)
+            .await?;
+        let acquired: Acquired = decode("acquired jobs", &response)?;
+        // Only what was asked for counts, and once: the service has no business handing out other IDs, and a job
+        // named twice is still one job.
+        let mut got: Vec<i64> = vec![];
+        for id in acquired.value {
+            if request_ids.contains(&id) && !got.contains(&id) {
+                got.push(id);
             }
         }
+        Ok(got)
     }
 
     /// Ends the session on the service, so the next one of this machine opens without waiting for this one to

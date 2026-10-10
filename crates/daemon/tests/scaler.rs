@@ -40,7 +40,7 @@ async fn initial_statistics_start_one_runner_per_assigned_job() {
     let started = h.hosts.started();
     assert_eq!(started.len(), 2);
     for (name, runner_id, _) in &started {
-        assert!(name.starts_with("macmini-j"), "{name} does not say the machine");
+        assert!(name.starts_with("mac-b-j"), "{name} does not say the machine");
         assert_ne!(*runner_id, 0);
     }
     let mut registered = h.fake.runners();
@@ -67,7 +67,7 @@ async fn assigned_jobs_beyond_the_machine_wait_for_a_slot() {
     let mut h = harness(2).await;
     h.scaler.scale(Some(&stats(5))).await.unwrap();
     assert_eq!(h.hosts.started().len(), 2, "a machine of 2 starts 2");
-    // A runner finishes and its machine is gone: the next quiet poll starts a waiting job.
+    // An Actions runner finishes and its machine is gone: the next quiet poll starts a waiting job.
     let first = names(&h)[0].clone();
     h.roster.exited(&first, &*h.slots).expect("known runner");
     h.scaler.scale(None).await.unwrap();
@@ -127,7 +127,7 @@ async fn jobs_taken_elsewhere_free_their_slots() {
         })
         .collect();
     let message = next_messages(&h, 3, 3).await;
-    // Another machine's runner takes two of them between the offer and the acquire.
+    // Another machine's Actions runner takes two of them between the offer and the acquire.
     h.fake.take_job(ids[1]);
     h.fake.take_job(ids[2]);
     h.scaler.scale(Some(&message)).await.unwrap();
@@ -172,7 +172,7 @@ async fn a_closed_machine_acquires_nothing_but_runs_what_it_has() {
         "the refused job stays offered at GitHub"
     );
     assert_eq!(h.slots.used_gb(), 0);
-    // A job assigned before the machine closed still gets its runner.
+    // A job assigned before the machine closed still gets its Actions runner.
     let capacity = h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert_eq!(
         h.hosts.started().len(),
@@ -262,6 +262,7 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
     let all = h.hosts.started();
     let busy = all[0].0.clone();
     h.roster.mark_busy(
+        h.set.id,
         &busy,
         JobInfo {
             repo: REPO.into(),
@@ -283,7 +284,7 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
         done: None,
         job: None,
     });
-    // The two idle jobs were cancelled: only the busy runner's job is assigned.
+    // The two idle jobs were cancelled: only the busy Actions runner's job is assigned.
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert!(
         h.hosts.stopped().is_empty(),
@@ -344,7 +345,7 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
     assert_eq!(assigned.statistics.unwrap().assigned(), 1);
     h.scaler.scale(Some(&assigned)).await.unwrap();
     assert_eq!(h.hosts.started().len(), 1);
-    // The job is cancelled before the runner took it.
+    // The job is cancelled before the Actions runner took it.
     h.fake.cancel_job(id);
     let cancelled = next_message(&h, 1).await;
     h.scaler.scale(Some(&cancelled)).await.unwrap();
@@ -414,8 +415,8 @@ async fn job_events_name_the_repository_job_and_run() {
     assert!(runner.done.is_some());
     assert_eq!(
         h.scaler.statistics_handle().lock().unwrap().unwrap().assigned(),
-        0,
-        "the completion came without counts: the job that ended is no longer one to start a runner for"
+        1,
+        "the counts are the service's own: a completion without counts changes none of them"
     );
 }
 
@@ -455,7 +456,7 @@ async fn a_job_that_ran_out_of_memory_is_reported_as_such() {
             completed(&killed, "failed", job.clone()),
             completed(&fine, "failed", job.clone()),
             completed("", "canceled", job.clone()),
-            completed("macmini-j0000000", "failed", job),
+            completed("mac-b-j0000000", "failed", job),
         ],
         ..Message::default()
     };
@@ -472,7 +473,7 @@ async fn a_job_that_ran_out_of_memory_is_reported_as_such() {
     );
     assert_eq!(
         *asked.lock().unwrap(),
-        vec!["macmini-j0000000".to_string()],
+        vec!["mac-b-j0000000".to_string()],
         "only the runner this machine no longer has is asked about"
     );
 }
@@ -500,11 +501,11 @@ async fn a_job_whose_machine_is_gone_is_still_out_of_memory() {
     let mut h = harness(1).await;
     h.scaler = h
         .scaler
-        .with_out_of_memory_check(std::sync::Arc::new(|r| r == "macmini-gone"));
+        .with_out_of_memory_check(std::sync::Arc::new(|r| r == "mac-b-gone"));
     let done = Message {
         completed: vec![
-            completed("macmini-gone", "failed", JobBase::default()),
-            completed("macmini-other", "failed", JobBase::default()),
+            completed("mac-b-gone", "failed", JobBase::default()),
+            completed("mac-b-other", "failed", JobBase::default()),
         ],
         ..Message::default()
     };
@@ -633,7 +634,6 @@ async fn a_completed_job_without_new_counts_gets_no_second_runner() {
     let mut h = harness(3).await;
     h.scaler.scale(Some(&stats(2))).await.unwrap();
     let (first, second) = (names(&h)[0].clone(), names(&h)[1].clone());
-    let counts = h.scaler.statistics_handle();
     let done = |runner: &str| Message {
         completed: vec![completed(runner, "succeeded", JobBase::default())],
         ..Message::default()
@@ -645,14 +645,18 @@ async fn a_completed_job_without_new_counts_gets_no_second_runner() {
         2,
         "a runner started for a job that is over"
     );
-    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 1);
 
-    // The same completion again, one without a runner and one of a runner nobody knows take nothing off.
-    for runner in [first.as_str(), "", "macmini-stranger"] {
+    // The same completion again, one without an Actions runner and one of an Actions runner nobody knows take nothing
+    // off: the second job keeps its Actions runner however long it waits.
+    h.clock.advance(IDLE_GRACE + Duration::from_secs(1));
+    for runner in [first.as_str(), "", "mac-b-stranger"] {
         h.scaler.scale(Some(&done(runner))).await.unwrap();
     }
-    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 1);
     assert_eq!(h.hosts.started().len(), 2);
+    assert!(
+        h.hosts.stopped().is_empty(),
+        "the runner of a job still assigned was retired"
+    );
     assert_eq!(
         h.roster.active(h.set.id),
         1,
@@ -660,17 +664,16 @@ async fn a_completed_job_without_new_counts_gets_no_second_runner() {
     );
 
     h.scaler.scale(Some(&done(&second))).await.unwrap();
-    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 0);
     assert_eq!(h.hosts.started().len(), 2);
     assert!(h.hosts.stopped().is_empty());
 
-    // Only the service's own counts bring new runners.
+    // Only the service's own counts bring new Actions runners.
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert_eq!(h.hosts.started().len(), 3);
 }
 
 #[tokio::test]
-async fn kept_counts_never_go_below_zero() {
+async fn a_completion_after_counts_that_left_the_job_out_takes_nothing_more_off() {
     let mut h = harness(2).await;
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     let name = names(&h)[0].clone();
@@ -681,8 +684,47 @@ async fn kept_counts_never_go_below_zero() {
         ..Message::default()
     };
     h.scaler.scale(Some(&done)).await.unwrap();
-    let counts = h.scaler.statistics_handle();
-    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 0);
+    assert_eq!(h.hosts.started().len(), 1, "a count below zero started runners");
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    assert_eq!(h.hosts.started().len(), 2);
+}
+
+#[tokio::test]
+async fn a_message_that_names_a_runner_of_another_scale_set_leaves_that_runner_alone() {
+    let mut h = harness(2).await;
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    // Whoever may register Actions runners in this scale set's repository chooses their names, also the name of an
+    // Actions runner this machine has for another repository.
+    h.roster.add(Runner {
+        name: "mac-b-theirs".into(),
+        handle: "vm-theirs".into(),
+        runner_id: 9,
+        scale_set_id: h.set.id + 1,
+        ticket: None,
+        started: h.clock_now(),
+        busy: false,
+        adopted: false,
+        done: None,
+        job: None,
+    });
+    h.scaler
+        .scale(Some(&started("mac-b-theirs", JobBase::default())))
+        .await
+        .unwrap();
+    let done = Message {
+        completed: vec![completed("mac-b-theirs", "succeeded", JobBase::default())],
+        ..Message::default()
+    };
+    h.clock.advance(IDLE_GRACE + Duration::from_secs(1));
+    h.scaler.scale(Some(&done)).await.unwrap();
+
+    let theirs = h.roster.get("mac-b-theirs").unwrap();
+    assert!(!theirs.busy && theirs.job.is_none(), "marked busy: {theirs:?}");
+    assert_eq!(theirs.done, None, "marked done");
+    assert!(
+        h.hosts.stopped().is_empty(),
+        "the completion counted against this scale set's own job"
+    );
 }
 
 #[tokio::test]
@@ -732,7 +774,7 @@ async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
         "whoever watches the machines still finds it"
     );
 
-    // A new job gets its own runner and slot beside it, and the watcher's word frees the old one.
+    // A new job gets its own Actions runner and slot beside it, and the watcher's word frees the old one.
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert_eq!(h.hosts.started().len(), 2);
     assert_eq!(h.slots.used_gb(), 2);

@@ -17,17 +17,18 @@ pub enum SizeError {
     Conflict(String, String),
 }
 
-/// The digits of a (lowercase) label that has the shape of a size label, `cf-<digits>g`, valid or not.
-fn size_shape(label: &str) -> Option<&str> {
-    let digits = label.strip_prefix("cf-")?.strip_suffix('g')?;
-    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
+/// Whether a (lowercase) label has the shape of a size label, `cf-<digits>g`, valid or not.
+fn has_size_shape(label: &str) -> bool {
+    label
+        .strip_prefix("cf-")
+        .and_then(|rest| rest.strip_suffix('g'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The size in GB a (lowercase) label names, when it is one of the size labels spelled the one way they are:
 /// `cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`. `cf-04g` is not one: two spellings of a size would be two scale sets.
 fn size_of(label: &str) -> Option<u32> {
-    let n = size_shape(label)?.parse::<u32>().ok()?;
-    (SIZES_GB.contains(&n) && label == format!("cf-{n}g")).then_some(n)
+    SIZES_GB.into_iter().find(|n| label == format!("cf-{n}g"))
 }
 
 /// Whether a (lowercase) label is one of the valid size labels: `cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`.
@@ -41,7 +42,7 @@ pub fn is_size_label(label: &str) -> bool {
 pub fn size_gb(set: &LabelSet) -> Result<u32, SizeError> {
     let mut found: Option<(&str, u32)> = None;
     for label in set.labels() {
-        if size_shape(label).is_none() {
+        if !has_size_shape(label) {
             continue;
         }
         let n = size_of(label).ok_or_else(|| SizeError::Unknown(label.clone()))?;

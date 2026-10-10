@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cf_ghapp::{Clock, Error as ApiError, GitHubApp, Response};
+use cf_ghapp::{Error as ApiError, GitHubApp, Response};
 use cf_secret::Secret;
 use reqwest::header::AUTHORIZATION;
 use reqwest::{Method, Url};
@@ -47,7 +47,6 @@ struct Inner {
     installation: i64,
     repo: String,
     config_url: String,
-    clock: Arc<dyn Clock>,
     admin: tokio::sync::Mutex<Option<Admin>>,
     poll_timeout: Duration,
 }
@@ -73,13 +72,8 @@ struct Page<T> {
     value: Vec<T>,
 }
 
-fn decode<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error> {
-    serde_json::from_slice(&response.body).map_err(|e| {
-        Error::Api(ApiError::Decode {
-            what: what.into(),
-            why: e.to_string(),
-        })
-    })
+pub(crate) fn decode<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error> {
+    serde_json::from_slice(&response.body).map_err(|e| Error::Api(ApiError::not_the_json(what, &e)))
 }
 
 /// The `exp` claim of a token, without checking anything: the service decides whether the token is good.
@@ -126,7 +120,6 @@ impl ScaleSetClient {
         installation: i64,
         repo: &str,
         config_url: &str,
-        clock: Arc<dyn Clock>,
         poll_timeout: Duration,
     ) -> ScaleSetClient {
         ScaleSetClient {
@@ -135,7 +128,6 @@ impl ScaleSetClient {
                 installation,
                 repo: repo.to_string(),
                 config_url: config_url.to_string(),
-                clock,
                 admin: tokio::sync::Mutex::new(None),
                 poll_timeout,
             }),
@@ -154,18 +146,6 @@ impl ScaleSetClient {
         self.inner.poll_timeout
     }
 
-    /// The time on the service's side: this machine's clock plus the offset the App learned from GitHub's responses.
-    fn now(&self) -> i64 {
-        let ours = self
-            .inner
-            .clock
-            .now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as i64;
-        ours + self.inner.app.clock_skew_secs()
-    }
-
     /// Trades the App's token for the service's.
     async fn register(&self) -> Result<Admin, Error> {
         let reg = self
@@ -180,25 +160,22 @@ impl ScaleSetClient {
             .inner
             .app
             .http()
-            .send(
-                |c| {
-                    c.post(&url)
-                        .header(AUTHORIZATION, &auth)
-                        .header("Content-Type", "application/json")
-                        .body(body.clone())
-                },
-                true,
-            )
+            .send(|c| {
+                c.post(&url)
+                    .header(AUTHORIZATION, &auth)
+                    .header("Content-Type", "application/json")
+                    .body(body.clone())
+            })
             .await?;
-        let parsed: Registration = decode("runner registration", &response)?;
+        let parsed: Registration = decode("Actions runner registration", &response)?;
         if parsed.token.is_empty() || parsed.url.is_empty() {
             return Err(Error::Api(ApiError::Decode {
-                what: "runner registration".into(),
+                what: "Actions runner registration".into(),
                 why: "the answer has no service address or no token".into(),
             }));
         }
-        self.check_address("runner registration", &parsed.url)?;
-        let expires = expiry_of(&parsed.token).unwrap_or(self.now() + UNKNOWN_EXPIRY_SECS);
+        self.check_address("Actions runner registration", &parsed.url)?;
+        let expires = expiry_of(&parsed.token).unwrap_or(self.inner.app.now_epoch() + UNKNOWN_EXPIRY_SECS);
         Ok(Admin {
             url: parsed.url.trim_end_matches('/').to_string(),
             token: Secret::new(parsed.token),
@@ -213,7 +190,7 @@ impl ScaleSetClient {
         let mut slot = self.inner.admin.lock().await;
         let fresh = slot
             .as_ref()
-            .is_some_and(|a| refused != Some(&a.token) && is_fresh(a.expires, self.now()));
+            .is_some_and(|a| refused != Some(&a.token) && is_fresh(a.expires, self.inner.app.now_epoch()));
         if !fresh {
             *slot = Some(self.register().await?);
         }
@@ -231,31 +208,31 @@ impl ScaleSetClient {
         timeout: Option<Duration>,
         max_capacity: Option<usize>,
     ) -> Result<Response, Error> {
+        // Every request with one of the service's tokens passes here, so whatever address a caller was handed, the
+        // token goes to GitHub only.
+        self.check_address("request", url)?;
         let bearer = format!("Bearer {}", token.expose());
         let payload = body.map(Value::to_string);
         Ok(self
             .inner
             .app
             .http()
-            .send(
-                |c| {
-                    let mut r = c
-                        .request(method.clone(), url)
-                        .header(AUTHORIZATION, &bearer)
-                        .header("Accept", "application/json");
-                    if let Some(n) = max_capacity {
-                        r = r.header("X-ScaleSetMaxCapacity", n.to_string());
-                    }
-                    if let Some(p) = &payload {
-                        r = r.header("Content-Type", "application/json").body(p.clone());
-                    }
-                    if let Some(t) = timeout {
-                        r = r.timeout(t);
-                    }
-                    r
-                },
-                true,
-            )
+            .send(|c| {
+                let mut r = c
+                    .request(method.clone(), url)
+                    .header(AUTHORIZATION, &bearer)
+                    .header("Accept", "application/json");
+                if let Some(n) = max_capacity {
+                    r = r.header("X-ScaleSetMaxCapacity", n.to_string());
+                }
+                if let Some(p) = &payload {
+                    r = r.header("Content-Type", "application/json").body(p.clone());
+                }
+                if let Some(t) = timeout {
+                    r = r.timeout(t);
+                }
+                r
+            })
             .await?)
     }
 
@@ -276,7 +253,7 @@ impl ScaleSetClient {
         }
     }
 
-    /// Every scale set of the repository's runner group.
+    /// Every scale set of the repository's Actions runner group.
     pub async fn list_scale_sets(&self) -> Result<Vec<ScaleSet>, Error> {
         let response = self
             .admin_call(
@@ -341,7 +318,7 @@ impl ScaleSetClient {
         }
     }
 
-    /// Deletes a scale set; its queued jobs wait for another runner.
+    /// Deletes a scale set; its queued jobs wait for another Actions runner.
     pub async fn delete_scale_set(&self, id: i64) -> Result<(), Error> {
         self.admin_call(Method::DELETE, &format!("runtime/runnerscalesets/{id}"), None)
             .await
@@ -442,21 +419,24 @@ impl ScaleSetClient {
                 return Err(e);
             }
         };
-        let parsed: JitResponse = decode("runner configuration", &response)?;
-        let runner = parsed.runner.unwrap_or(RunnerRef {
-            id: 0,
-            name: name.to_string(),
-        });
-        if parsed.encoded_jit_config.is_empty() {
-            return Err(Error::Api(ApiError::Decode {
-                what: "runner configuration".into(),
-                why: "the service sent no configuration".into(),
-            }));
-        }
-        Ok(JitConfig {
-            runner,
-            encoded: Secret::new(parsed.encoded_jit_config),
-        })
+        let parsed: JitResponse = decode("Actions runner configuration", &response)?;
+        // A registration whose ID is unknown could never be removed again, and one without a configuration never
+        // starts: neither is kept.
+        let why = match parsed.runner.filter(|runner| runner.id > 0) {
+            Some(runner) if !parsed.encoded_jit_config.is_empty() => {
+                return Ok(JitConfig {
+                    runner,
+                    encoded: Secret::new(parsed.encoded_jit_config),
+                });
+            }
+            Some(_) => "the service sent no configuration",
+            None => "the service did not say which Actions runner it registered",
+        };
+        self.remove_leftover(name).await;
+        Err(Error::Api(ApiError::Decode {
+            what: "Actions runner configuration".into(),
+            why: why.into(),
+        }))
     }
 
     /// Removes the registration a failed [`ScaleSetClient::generate_jit_config`] may have left, as far as the
@@ -484,14 +464,14 @@ impl ScaleSetClient {
     pub async fn runner_by_name(&self, name: &str) -> Result<Option<RunnerRef>, Error> {
         let path = format!("distributedtask/pools/0/agents?agentName={}", encode(name));
         let response = self.admin_call(Method::GET, &path, None).await?;
-        Ok(decode::<Page<RunnerRef>>("runners", &response)?
+        Ok(decode::<Page<RunnerRef>>("Actions runners", &response)?
             .value
             .into_iter()
             .find(|r| r.name == name))
     }
 
-    /// Removes a registered runner. A runner with a job refuses (the service answers 422); one that is gone is
-    /// [`Error::is_not_found`].
+    /// Removes a registered Actions runner. An Actions runner with a job refuses (the service answers 422); one that is
+    /// gone is [`Error::is_not_found`].
     pub async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {
         self.admin_call(
             Method::DELETE,
