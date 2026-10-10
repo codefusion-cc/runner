@@ -169,6 +169,12 @@ dependencies = [
 [[package]]
 name = "cf-guest-proto"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "cf-host-macos"
@@ -228,23 +234,45 @@ version = "0.1.0"
 name = "cf-supervisor"
 version = "0.1.0"
 dependencies = [
+ "cf-guest-proto",
  "libc",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cf-vmhost"
+version = "0.1.0"
+dependencies = [
+ "cf-guest-proto",
+ "cf-vmm",
+ "libc",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
 name = "cf-vmm"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "cf-vmm-vz"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "cf-vmm",
+ "dispatch2",
  "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
- "thiserror",
 ]
 
 [[package]]
@@ -266,9 +294,14 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "codefusion-runner"
 version = "0.1.0"
 dependencies = [
+ "cf-guest-proto",
  "cf-image",
+ "cf-vmhost",
+ "cf-vmm",
  "cf-vmm-vz",
  "ed25519-dalek",
+ "libc",
+ "serde_json",
  "tempfile",
 ]
 
@@ -387,6 +420,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags",
+ "block2",
+ "libc",
  "objc2",
 ]
 

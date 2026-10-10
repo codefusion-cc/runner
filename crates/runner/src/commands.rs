@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::Path;
 
-use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify, verify_embedded};
+use cf_image::store::Store;
+use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
-const USAGE: &str = "usage: codefusion-runner version | image verify <folder> --version <v> | boot-proof [--memory-mb N] [--timeout-s N]";
+const USAGE: &str = "usage: codefusion-runner version | image verify <folder> --version <v> | image install <folder> --version <v> --state-dir <folder> | vm --state-dir <folder> | boot-proof [--memory-mb N] [--timeout-s N]";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -13,6 +13,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         ["image", "verify", folder, "--version", version] => verify_folder(folder, version),
+        [
+            "image",
+            "install",
+            folder,
+            "--version",
+            version,
+            "--state-dir",
+            state,
+        ] => install(folder, version, state),
+        ["vm", "--state-dir", state] => vm_host(state),
         ["boot-proof", rest @ ..] => boot_proof(rest),
         _ => Err(USAGE.into()),
     }
@@ -26,6 +36,27 @@ fn verify_folder(folder: &str, version: &str) -> Result<(), String> {
         verify(&DirFiles::new(folder), &key, version, 0).map_err(|error| format!("refused: {error}"))?;
     println!("ok: image {} verified", verified.manifest.version);
     Ok(())
+}
+
+/// Installs a downloaded release folder into the state folder's images, where a job's machine takes its root
+/// file system from. The store there remembers the newest release it accepted and refuses an older one.
+fn install(folder: &str, version: &str, state: &str) -> Result<(), String> {
+    let key = parse_public_key(TRUSTED_PUBLIC_KEY).map_err(|error| error.to_string())?;
+    let manifest = Store::new(Path::new(state).join("images"))
+        .install(Path::new(folder), version, &key)
+        .map_err(|error| error.to_string())?;
+    println!("ok: image {} installed", manifest.version);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn vm_host(state: &str) -> Result<(), String> {
+    crate::vm::host(state)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vm_host(_state: &str) -> Result<(), String> {
+    Err("a vm-host runs on macOS only".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -50,83 +81,7 @@ fn boot_proof(options: &[&str]) -> Result<(), String> {
     let memory_bytes = memory_mb
         .checked_mul(1024 * 1024)
         .ok_or("--memory-mb is too large")?;
-
-    // The embedded image is verified before a byte of it reaches the hypervisor.
-    let verified =
-        verify_embedded().map_err(|error| format!("the embedded guest image is refused: {error}"))?;
-    let bundle = cf_image::embedded_bundle().ok_or("no embedded guest image")?;
-    let scratch = Scratch::new()?;
-    let write = |name: &str| -> Result<PathBuf, String> {
-        scratch.write(name, bundle.file(name).ok_or(name.to_string())?)
-    };
-    let spec = cf_vmm_vz::BootSpec {
-        kernel: write(&verified.manifest.kernel.name)?,
-        initramfs: write(&verified.manifest.initramfs.name)?,
-        memory_bytes,
-        cpus: 1,
-        timeout: Duration::from_secs(timeout),
-    };
-    let report = cf_vmm_vz::boot_to_ready(&spec).map_err(|error| error.to_string())?;
-    drop(scratch);
-
-    print!("{}", report.console);
-    println!(
-        "image {}: ready after {:.2?}, stopped {:.2?} after the request ({})",
-        verified.manifest.version,
-        report.ready_after,
-        report.stopped_after,
-        if report.clean_poweroff {
-            "guest powered itself off"
-        } else {
-            "stopped by the host"
-        }
-    );
-    if report.clean_poweroff {
-        Ok(())
-    } else {
-        Err("the guest did not power off by itself".into())
-    }
-}
-
-/// A folder of this process alone for the proof's kernel and initramfs, removed when it goes out of scope, however
-/// the proof ends. What the hypervisor loads from it is what was verified: nobody else can write there.
-#[cfg(target_os = "macos")]
-struct Scratch(PathBuf);
-
-#[cfg(target_os = "macos")]
-impl Scratch {
-    fn new() -> Result<Self, String> {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let path = std::env::temp_dir().join(format!("codefusion-runner-proof-{}", std::process::id()));
-        // Made new and private in one step. A folder already there is not ours to trust, whoever left it.
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        Ok(Self(path))
-    }
-
-    /// Writes a file that did not exist, readable by this user only.
-    fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let path = self.0.join(name);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut file| file.write_all(bytes))
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        Ok(path)
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+    crate::vm::boot_proof(memory_bytes, std::time::Duration::from_secs(timeout))
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -18,8 +18,20 @@ use crate::kernel::{APK_SHA256, APK_URL, APK_VERSION, unpack_zboot};
 use crate::keys::{ephemeral_key, release_key};
 use crate::{Result, cargo, run_command};
 
-/// The modules the guest loads at boot, with what they need. M0 loads them to prove the path works; M1 uses them.
-const MODULES: &[&str] = &["virtio_blk", "erofs", "overlay", "vmw_vsock_virtio_transport"];
+/// The modules the guest loads at boot, with what they need: the machine's devices, the file systems of a job's
+/// disks, and what its network and firewall take.
+const MODULES: &[&str] = &[
+    "virtio_blk",
+    "virtio_net",
+    "virtio-rng",
+    "vmw_vsock_virtio_transport",
+    "erofs",
+    "ext4",
+    "overlay",
+    "af_packet",
+    "nf_tables",
+    "nft_ct",
+];
 /// A release asset may be at most 2 GiB; the root filesystem is cut a little below that.
 const MAX_PART: u64 = 1_900_000_000;
 /// The names of the kernel and the initramfs in the bundle and in a release.

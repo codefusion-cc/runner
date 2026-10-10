@@ -1,13 +1,14 @@
-//! The virtual machine monitor on Apple's Virtualization.framework. M0 holds only the boot proof: start the guest
-//! image with a console, wait for the supervisor to say `ready`, and power it off. M1 grows this into the `Vmm`
-//! implementation behind `cf-vmm`.
+//! The virtual machine monitor on Apple's Virtualization.framework: [`VzVmm`] implements `cf-vmm`'s `Vmm`.
 //!
-//! Virtualization.framework works on the main queue: [`boot_to_ready`] must be called on the process's main thread,
-//! which it keeps running the main run loop while the guest boots. The process needs the
-//! `com.apple.security.virtualization` entitlement.
+//! Each machine gets a dispatch queue of its own and every call to the framework runs on it, so the methods may be
+//! called from any thread and the process needs no main run loop. The process needs the
+//! `com.apple.security.virtualization` entitlement; without it [`VzVmm::new`] or the first start says so.
+//!
+//! The machine itself lives in a process the framework starts (`com.apple.Virtualization.VirtualMachine`), which
+//! ends when the machine stops, when its `Vm` is dropped and when this process dies.
 
 #[cfg(target_os = "macos")]
-mod proof;
+mod vz;
 
 #[cfg(target_os = "macos")]
-pub use proof::{BootError, BootReport, BootSpec, boot_to_ready};
+pub use vz::VzVmm;

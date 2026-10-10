@@ -2,10 +2,13 @@
 
 | Path | What |
 | --- | --- |
-| `crates/image` (`cf-image`) | The guest image: `Manifest`, `verify` (signature, hashes, sizes, version), `write_release`, and the embedded kernel and initramfs (`build.rs` reads `target/guest`). Tests in `tests/verify.rs`, `tests/embedded.rs`. `trusted-key.txt` is the public key of the image signing key. |
-| `crates/vmm-vz` (`cf-vmm-vz`) | Virtualization.framework through `objc2-virtualization`. M0: `boot_to_ready`. M1 turns it into the `Vmm` implementation. |
-| `crates/supervisor` (`cf-supervisor`) | PID 1 of the guest, a static `aarch64-unknown-linux-musl` binary. M0: mounts, loads modules, says `ready`, powers off. |
-| `crates/runner` (`codefusion-runner`) | The binary. M0: `version`, `image verify`, `boot-proof`. `runner.entitlements` is signed into it. |
+| `crates/image` (`cf-image`) | The guest image: `Manifest`, `verify` (signature, hashes, sizes, version, not older than the newest accepted), `write_release`, the embedded kernel and initramfs (`build.rs` reads `target/guest`), and `store`: installed images under `<state>/images/<version>/rootfs.img`, each verified in a folder of the Runner's own before it is used, with the newest accepted build time in `accepted.json`. Tests in `tests/verify.rs`, `tests/embedded.rs`, `tests/store.rs`. `trusted-key.txt` is the public key of the image signing key. |
+| `crates/guest-proto` (`cf-guest-proto`) | What the vm-host and the guest supervisor say to each other over vsock port 6000: frames (4 bytes of length, JSON), `HostMessage`, `GuestMessage`, `Task` (probe, format the scratch disk, a job), `Secret` (prints nothing). Tests in `tests/protocol.rs`. |
+| `crates/vmm` (`cf-vmm`) | The seam to the hypervisor: `Vmm`, `Vm` (channel, wait, stop, kill), `VmSpec`, and `testing::FakeVmm`, a machine a test scripts. |
+| `crates/vmm-vz` (`cf-vmm-vz`) | `VzVmm`: Virtualization.framework through `objc2-virtualization`, each machine on its own queue, disks by serial, NAT, vsock, the console to a file. macOS only. |
+| `crates/vmhost` (`cf-vmhost`) | One job in one machine, the body of `codefusion-runner vm`. `lib.rs` has the contract with the daemon: the `JobRequest` on standard input, `run/<job>.json` (`JobState`), the control socket `run/<job>.sock` (`control`), the folders (`Layout`). `machine.rs` is the job's state machine with every wait (pure, `tests/machine.rs`), `driver.rs` runs it against a `Vmm` (`tests/driver.rs`, with `FakeVmm`), `scratch.rs` keeps one formatted empty disk per image and size and clones it, `task.rs` runs a small task in a machine. |
+| `crates/supervisor` (`cf-supervisor`) | PID 1 of the guest, a static `aarch64-unknown-linux-musl` binary. `src/lib.rs` is what it decides, tested on any host (`tests/decisions.rs`): `firewall` (the rules and their nf_tables netlink form), `dhcp`, `oom` (the kernel's report), `processes`, `environment`, `tell` (what a job's log is told). `src/linux/` is what it does: `init` (root, modules, the channel), `net`, `job` (disks, cgroup, the watch loop), `container` (namespaces, the image's user), `hook` (the Actions runner's job hooks). |
+| `crates/runner` (`codefusion-runner`) | The binary: `version`, `image verify`, `image install`, `vm` (the vm-host, `src/vm.rs`), `boot-proof`. `runner.entitlements` is signed into it. |
 | `crates/budget` (`cf-budget`) | Admission, with no I/O: `Budget` (`observe`, `claim`, `confirm`, `assign` and `withdraw` for a job GitHub assigned without asking, `adopt`, `usage`, `release`, `hold`, and `status`, which names every slot with how it started and every waiting job with what keeps it), the pure `admit`, `Settings` (every number, `for_host` has the defaults), `Size` and its labels, and the `Host` trait with `HostReading`. Tests: `admission`, `assigned`, `levels`, `races`, `properties`. |
 | `crates/host-macos` (`cf-host-macos`) | `MacHost` reads macOS behind `cf_budget::Host` (page counts, pressure, swap, idle time, thermal, power, disk); `Raw` and `reading` are the arithmetic; `FakeHost` is the host tests script. `examples/host-probe.rs` prints a Mac's readings. |
 | `crates/lifecycle` (`cf-lifecycle`) | `Slot`: the state machine of one slot and its job (events in, effects out, watchdogs, `saved` and `restore` for a daemon restart), and `StartBreaker` (`admit` before a claim, `holds` for the budget's hold). `tests/model.rs` searches every state it can reach. |
@@ -15,7 +18,7 @@
 | `crates/workflows` (`cf-workflows`) | `self_hosted` / `self_hosted_with`: the label sets a repository's workflows ask for (port of the Go `workflows` package, tests in `tests/labels.rs`), `size_gb` for the `cf-2g/4g/6g/8g` labels, `self-hosted` = 4 GB, the `vars.*` expressions evaluated with the repository's variables, and `MAX_FILE_BYTES`, the largest workflow file read. |
 | `crates/secret` (`cf-secret`) | `Secret<T>`: a value whose `Debug` prints `Secret(..)`. Every token and key is wrapped in it. |
 | `crates/fake-github` (`cf-fake-github`) | A stateful fake GitHub over real sockets, for tests only: App JWT checks, tokens, repositories, scale sets, sessions, long poll, acquire, JIT configs, with `Options::auto_assign` (the real service hands a queued job to a poll that has room), with faults (`fail`, `before`, `lose_answer`, `lose_session`, `expire_session_token`, `revoke_admin_tokens`, `send_the_service_to`, `send_the_queue_to`, clock offset). `harness` is what every crate's tests start from: the fake with the real App and scale set clients in front of it, `TestClock`, `fast` retries, `until`, and `elsewhere` (a host no token may reach). |
-| `crates/vmm`, `guest-proto`, `console-client` | Empty until their milestone (M1 to M4); each file says which. |
+| `crates/console-client` | Empty until its milestone (M4); the file says which. |
 | `xtask` | `cargo xtask keygen | guest | release | build`. Kernel package pinned in `xtask/src/kernel.rs`. |
 | `image/Dockerfile` | The root filesystem a job runs in: GitHub's Actions runner image plus tools. Packed by `.github/workflows/image.yml`. |
 | `.github/workflows` | `ci.yml` (macos-14: fmt, guest, clippy, tests, release build; ubuntu: cargo deny), `image.yml` (the image: built and verified on every change to it, signed and published from main, weekly), `automerge.yml`. |
@@ -38,8 +41,8 @@ hash of the whole root filesystem and when the release was built, so all of that
 `verify` checks the signature first (strictly: no weak key, no altered signature), then that the list and the manifest
 agree, then every byte. It answers for the moment it read the files: use them from a folder only the Runner can write
 to. `verify` also takes the build time of the newest image the machine has accepted and refuses an older one, so an
-old release offered again under its old name does not come back. Nothing stores that time yet: `image verify` passes
-0, and the Runner keeps it from M1 on.
+old release offered again under its old name does not come back. `image verify` passes 0 and only reads; `image install` copies the release into the store, verifies the copy
+against the time the store keeps and moves that time forward.
 
 The key signs image lists only. Anything else that gets signed later, such as the Runner's own updates, gets a key of
 its own, so a list signed for one purpose never passes for another.
