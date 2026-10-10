@@ -146,6 +146,38 @@ fn a_vm_that_does_not_get_ready_is_killed_and_started_once_more() {
 }
 
 #[test]
+fn a_retry_that_is_no_longer_wanted_starts_no_second_vm() {
+    // The first VM was killed and its process is still going: whatever ends the slot now also ends the retry.
+    let cases = [
+        (MEMORY, End::EvictedMemory),
+        (DISK, End::EvictedDisk),
+        (Event::Stop, End::Stopped),
+        (Event::Slept(Millis::mins(5).plus(Millis(1))), End::HostSlept),
+    ];
+    for (event, end) in cases {
+        let mut slot = starting();
+        slot.on(s(21), Event::Tick);
+        assert_eq!(slot.phase(), Phase::Retrying);
+        assert_eq!(slot.on(s(22), event), [], "{event:?}: the kill was sent already");
+        assert_eq!(slot.phase(), Phase::Killing, "{event:?}");
+        assert!(slot.holds_memory());
+        assert_eq!(
+            slot.on(s(23), Event::VmExited),
+            [Effect::Unregister, Effect::Release, ended(end, false)],
+            "{event:?}"
+        );
+    }
+    // A sleep of five minutes or less changes nothing: the second VM is started when the first is gone.
+    for nap in [Millis(1), Millis::secs(30), Millis::mins(5)] {
+        let mut slot = starting();
+        slot.on(s(21), Event::Tick);
+        assert_eq!(slot.on(s(22), Event::Slept(nap)), []);
+        assert_eq!(slot.phase(), Phase::Retrying, "{nap:?}");
+        assert_eq!(slot.on(s(23), Event::VmExited), [Effect::StartVm]);
+    }
+}
+
+#[test]
 fn a_vm_that_dies_while_booting_counts_as_a_failed_start() {
     let mut slot = starting();
     assert_eq!(

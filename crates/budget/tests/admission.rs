@@ -701,6 +701,18 @@ fn a_vm_found_after_a_restart_counts_without_being_asked_for() {
 }
 
 #[test]
+fn the_count_of_free_slots_has_an_end_on_a_host_of_any_size() {
+    // 4 TiB and 5000 cores: by the cap 1536 VMs of 2 GB would fit, by the CPUs 4998.
+    let facts = HostFacts {
+        total_bytes: 4096 * GIB,
+        cores: 5000,
+    };
+    let mut budget = Budget::new(one_vcpu(Settings::for_host(facts, Mode::Dedicated))).unwrap();
+    watch(&mut budget, 0, 60, |reading| reading.available_bytes = 4096 * GIB);
+    assert_eq!(budget.free(secs(60)), Free([1024, 768, 512, 384]));
+}
+
+#[test]
 fn free_slots_and_status_say_what_a_claim_would() {
     let mut budget = open(one_vcpu(dedicated()));
     let mut reading = calm(secs(61));

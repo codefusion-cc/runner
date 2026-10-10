@@ -275,7 +275,6 @@ impl Slot {
                     End::StartFailed
                 }
                 Phase::Retrying => End::StartFailed,
-                Phase::Idle | Phase::Running => End::GuestLost,
                 _ => saved.end.unwrap_or(End::GuestLost),
             };
             slot.starts = slot.starts.max(u32::from(saved.phase != Phase::Reserved));
@@ -364,6 +363,9 @@ impl Slot {
     /// (a message that came twice or late) does nothing.
     pub fn on(&mut self, now: Millis, event: Event) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.phase == Phase::Released {
+            return effects;
+        }
         let out = &mut effects;
         let due = |at: Option<Millis>| at.is_some_and(|at| now >= at);
         let long_sleep = matches!(event, Event::Slept(span) if span > self.limits.long_sleep);
@@ -374,15 +376,12 @@ impl Slot {
             }
         }
         match (self.phase, event) {
-            (Phase::Released, _) => {}
-
             (Phase::Reserved, Event::Assigned) => self.start(now, out),
             (Phase::Reserved, Event::Lost | Event::Stop | Event::Evict(_)) => self.release(End::Lost, out),
             (Phase::Reserved, Event::Expired) => {
                 self.memory = false;
                 self.release(End::Lost, out);
             }
-            (Phase::Reserved, _) => {}
 
             // The VM's process is gone, wherever the slot was.
             (Phase::Starting, Event::VmExited) => {

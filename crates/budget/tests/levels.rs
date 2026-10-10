@@ -387,6 +387,17 @@ fn sleep_closes_the_mac_and_ends_reservations() {
 }
 
 #[test]
+fn two_looks_in_the_same_moment_are_not_a_clock_gone_back() {
+    let mut budget = open(dedicated());
+    // The daemon may look twice within a millisecond, after an event and on its tick.
+    for _ in 0..3 {
+        budget.observe(secs(60), Some(calm(secs(60))));
+        assert_eq!(budget.level(secs(60)), Level::Open);
+    }
+    assert!(budget.claim(secs(60), Size::G4).is_ok());
+}
+
+#[test]
 fn a_clock_that_goes_back_closes_the_mac_and_frees_nothing_early() {
     let mut budget = open(dedicated());
     watch(&mut budget, 61, 100, |_| {});
