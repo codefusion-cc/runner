@@ -1,10 +1,16 @@
 [package]
 name = "cf-budget"
-description = "The memory and CPU budget: how many job slots of each size fit now (pure, no I/O). Filled in M2."
+description = "The memory and CPU budget: whether a job slot of a size fits this Mac now (pure, no I/O)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
