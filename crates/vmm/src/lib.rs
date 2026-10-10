@@ -7,12 +7,14 @@
 //! Every method may be called from any thread. A failure to start or reach a machine is a [`VmmError`]; nothing here
 //! panics for what a host or a guest does.
 
+mod exit;
 mod spec;
 pub mod testing;
 
 use std::io::{Read, Write};
 use std::time::Duration;
 
+pub use exit::ExitCell;
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 
 /// Why the monitor could not do what was asked.

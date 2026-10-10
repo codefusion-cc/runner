@@ -3,8 +3,8 @@
 use cf_guest_proto::{Limits, OomEvent, Process as Used, StopReason};
 use cf_supervisor::dhcp::{self, Lease, Reply};
 use cf_supervisor::environment::{find_user, workload_environment};
-use cf_supervisor::firewall::{self, BLOCKED, Packet, Verdict, decide, policy};
-use cf_supervisor::oom::{Kill, Log, kills_in_events, message_of};
+use cf_supervisor::firewall::{self, BLOCKED, Packet, Verdict, decide, own_network, policy};
+use cf_supervisor::oom::{Count, Kill, Log, kills_in_events, message_of};
 use cf_supervisor::processes::{Process, Table, parse_stat};
 use cf_supervisor::tell::{JobFacts, out_of_memory_line, out_of_memory_summary, size, started, stopped};
 use proptest::prelude::*;
@@ -20,7 +20,7 @@ fn out(dest: [u8; 4], protocol: u8, dest_port: u16) -> Verdict {
         dest_port,
         established: false,
     };
-    decide(&policy(&[GATEWAY]).output, Verdict::Accept, &packet)
+    decide(&policy(&[GATEWAY], &[]).output, Verdict::Accept, &packet)
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn a_job_reaches_no_private_network() {
 
 #[test]
 fn ipv6_leaves_only_through_loopback() {
-    let rules = policy(&[GATEWAY]);
+    let rules = policy(&[GATEWAY], &[]);
     let mut packet = Packet {
         ipv6: true,
         loopback: false,
@@ -124,14 +124,14 @@ fn loopback_carries_everything_even_to_the_guests_own_private_address() {
         dest_port: 8080,
         established: false,
     };
-    let rules = policy(&[GATEWAY]);
+    let rules = policy(&[GATEWAY], &[]);
     assert_eq!(decide(&rules.output, Verdict::Accept, &packet), Verdict::Accept);
     assert_eq!(decide(&rules.input, Verdict::Drop, &packet), Verdict::Accept);
 }
 
 #[test]
 fn nothing_new_comes_in_and_answers_do() {
-    let rules = policy(&[GATEWAY]);
+    let rules = policy(&[GATEWAY], &[]);
     let mut packet = Packet {
         ipv6: false,
         loopback: false,
@@ -149,7 +149,7 @@ fn nothing_new_comes_in_and_answers_do() {
 
 #[test]
 fn without_a_name_server_no_private_address_is_reachable_at_all() {
-    let rules = policy(&[]);
+    let rules = policy(&[], &[]);
     let packet = Packet {
         ipv6: false,
         loopback: false,
@@ -172,7 +172,7 @@ proptest! {
         let host_bits = if prefix == 32 { 0 } else { host >> prefix };
         let dest = (u32::from_be_bytes(network) | host_bits).to_be_bytes();
         let packet = Packet { ipv6: false, loopback: false, dest, protocol, dest_port: port, established: false };
-        let verdict = decide(&policy(&servers).output, Verdict::Accept, &packet);
+        let verdict = decide(&policy(&servers, &[]).output, Verdict::Accept, &packet);
         let dns = servers.contains(&dest) && port == 53 && (protocol == 6 || protocol == 17);
         prop_assert_eq!(verdict, if dns { Verdict::Accept } else { Verdict::Drop });
     }
@@ -201,7 +201,7 @@ fn attributes(mut bytes: &[u8], depth: usize, names: &mut Vec<String>) {
 
 #[test]
 fn the_netlink_form_is_one_well_formed_transaction_with_every_rule() {
-    let rules = policy(&[GATEWAY]);
+    let rules = policy(&[GATEWAY], &[]);
     let batch = firewall::netlink(&rules);
     let mut bytes = batch.bytes.as_slice();
     let (mut kinds, mut sequences, mut expression_names) = (Vec::new(), Vec::new(), Vec::new());
@@ -593,7 +593,7 @@ fn a_stat_line_is_read_whatever_the_name_holds() {
 
 fn facts() -> JobFacts {
     JobFacts {
-        host: "mini".into(),
+        host: "mac-1".into(),
         limits: Limits {
             memory_bytes: 4026531840,
             pids: 4096,
@@ -648,7 +648,7 @@ fn sizes_read_as_people_write_them() {
 fn a_job_is_told_its_size_at_the_start() {
     assert_eq!(
         started(&facts()),
-        "This job runs on mini with 3.75 GB memory, 4 CPUs, 30 GB disk."
+        "This job runs on mac-1 with 3.75 GB memory, 4 CPUs, 30 GB disk."
     );
 }
 
@@ -675,11 +675,11 @@ fn an_out_of_memory_job_is_told_what_was_stopped_and_the_next_size_to_ask_for() 
 #[test]
 fn a_job_the_runner_stopped_is_told_why_and_whose_fault_it_was() {
     assert_eq!(
-        stopped(StopReason::EvictedMemory, "mini"),
-        "Stopped by the CodeFusion Runner: mini ran low on memory because of other work on it. This job did nothing wrong."
+        stopped(StopReason::EvictedMemory, "mac-1"),
+        "Stopped by the CodeFusion Runner: mac-1 ran low on memory because of other work on it. This job did nothing wrong."
     );
-    assert!(stopped(StopReason::EvictedDisk, "air").contains("air ran low on disk space"));
-    assert!(!stopped(StopReason::Timeout, "air").contains("nothing wrong"));
+    assert!(stopped(StopReason::EvictedDisk, "mac-2").contains("mac-2 ran low on disk space"));
+    assert!(!stopped(StopReason::Timeout, "mac-2").contains("nothing wrong"));
 }
 
 #[test]
@@ -778,4 +778,143 @@ fn a_process_nobody_saw_is_of_the_one_step_that_runs() {
     // What an earlier step left behind hangs below the container's first process and is nobody's step.
     assert_eq!(only(job(&[(50, 11, "leftover")])), None);
     assert_eq!(only(job(&[(50, 11, "leftover"), (20, 14, "bash")])), Some(20));
+}
+
+#[test]
+fn a_job_does_not_reach_its_own_network_wherever_the_mac_put_it() {
+    // The Mac's network for its machines can be set to any range, also one no list of private ranges has.
+    let (address, netmask, gateway) = ([203, 0, 113, 9], [255, 255, 255, 0], [203, 0, 113, 1]);
+    let own = [own_network(address, netmask), (gateway, 32)];
+    assert_eq!(own[0], ([203, 0, 113, 0], 24));
+    let rules = policy(&[gateway], &own).output;
+    let to = |dest: [u8; 4], protocol: u8, dest_port: u16| {
+        let packet = Packet {
+            ipv6: false,
+            loopback: false,
+            dest,
+            protocol,
+            dest_port,
+            established: false,
+        };
+        decide(&rules, Verdict::Accept, &packet)
+    };
+    // The next job's machine, the Mac's services at the gateway, the broadcast address.
+    assert_eq!(to([203, 0, 113, 7], 6, 8000), Verdict::Drop);
+    assert_eq!(to(gateway, 6, 22), Verdict::Drop);
+    assert_eq!(to(gateway, 6, 445), Verdict::Drop);
+    assert_eq!(to(gateway, 1, 0), Verdict::Drop);
+    assert_eq!(to([203, 0, 113, 255], 17, 137), Verdict::Drop);
+    // Names are still resolved, and the world next door is the internet.
+    assert_eq!(to(gateway, 17, 53), Verdict::Accept);
+    assert_eq!(to(gateway, 6, 53), Verdict::Accept);
+    assert_eq!(to([203, 0, 114, 1], 6, 443), Verdict::Accept);
+    assert_eq!(to([203, 0, 112, 255], 6, 443), Verdict::Accept);
+
+    // A gateway outside the leased network is no way around it.
+    let rules = policy(
+        &[[1, 1, 1, 1]],
+        &[own_network(address, netmask), ([198, 51, 100, 1], 32)],
+    )
+    .output;
+    let packet = |dest| Packet {
+        ipv6: false,
+        loopback: false,
+        dest,
+        protocol: 6,
+        dest_port: 22,
+        established: false,
+    };
+    assert_eq!(
+        decide(&rules, Verdict::Accept, &packet([198, 51, 100, 1])),
+        Verdict::Drop
+    );
+    assert_eq!(
+        decide(&rules, Verdict::Accept, &packet([198, 51, 100, 2])),
+        Verdict::Accept
+    );
+
+    // The kernel is given the same rules.
+    let with = firewall::netlink(&policy(&[gateway], &own));
+    let without = firewall::netlink(&policy(&[gateway], &[]));
+    assert_eq!(with.acknowledged, without.acknowledged + 2);
+}
+
+#[test]
+fn the_network_of_a_lease_is_its_address_under_its_mask() {
+    for (address, netmask, network) in [
+        ([192, 168, 64, 7], [255, 255, 255, 0], ([192, 168, 64, 0], 24)),
+        ([10, 211, 55, 130], [255, 255, 255, 128], ([10, 211, 55, 128], 25)),
+        ([172, 20, 9, 9], [255, 255, 0, 0], ([172, 20, 0, 0], 16)),
+        ([8, 8, 8, 8], [255, 255, 255, 255], ([8, 8, 8, 8], 32)),
+        // A mask with a hole counts up to the hole: more is blocked, never less.
+        ([10, 1, 2, 3], [255, 0, 255, 0], ([10, 0, 0, 0], 8)),
+        // No mask at all blocks everything: a job without a network, not a job with the Mac's.
+        ([10, 1, 2, 3], [0, 0, 0, 0], ([0, 0, 0, 0], 0)),
+    ] {
+        assert_eq!(own_network(address, netmask), network, "{address:?} {netmask:?}");
+    }
+    let rules = policy(&[], &[own_network([10, 1, 2, 3], [0, 0, 0, 0])]).output;
+    let packet = Packet {
+        ipv6: false,
+        loopback: false,
+        dest: [140, 82, 121, 4],
+        protocol: 6,
+        dest_port: 443,
+        established: false,
+    };
+    assert_eq!(decide(&rules, Verdict::Accept, &packet), Verdict::Drop);
+}
+
+#[test]
+fn a_dhcp_question_is_asked_again_soon_at_first_and_every_700_ms_from_then_on() {
+    use std::time::Duration;
+    let waits: Vec<u64> = (0..6)
+        .map(|asked| dhcp::ask_again_after(asked).as_millis() as u64)
+        .collect();
+    assert_eq!(waits, [100, 200, 400, 700, 700, 700]);
+    assert_eq!(dhcp::ask_again_after(u32::MAX), Duration::from_millis(700));
+    // A first question lost while the device came up costs a tenth of a second, not most of one.
+    assert!(dhcp::ask_again_after(0) <= Duration::from_millis(100));
+}
+
+#[test]
+fn a_stop_the_kernel_counted_but_did_not_log_is_believed_at_the_second_look_or_at_the_last() {
+    // The log names every stop: nothing is left to guess.
+    let mut count = Count::default();
+    assert!(!count.look(0, 0, false));
+    assert!(!count.look(1, 1, false));
+    assert!(!count.look(2, 3, false), "the log may only be behind");
+    assert!(
+        !count.look(1, 4, false),
+        "the log caught up with one and fell behind by another"
+    );
+
+    // The log stays behind for two looks: the counter is believed, once.
+    let mut count = Count::default();
+    assert!(!count.look(0, 1, false));
+    assert!(count.look(0, 1, false));
+    assert!(!count.look(0, 1, false));
+    assert!(!count.look(0, 1, true));
+    // And again for the next stop.
+    assert!(!count.look(0, 2, false));
+    assert!(count.look(0, 2, false));
+
+    // The log catches up at the second look: its named stop is the report, no second one.
+    let mut count = Count::default();
+    assert!(!count.look(0, 1, false));
+    assert!(!count.look(1, 1, false));
+    assert!(!count.look(0, 1, false));
+
+    // The job's last look has no second one: a workload that died of the stop is out of memory all the same.
+    let mut count = Count::default();
+    assert!(count.look(0, 1, true));
+    assert!(!count.look(0, 1, true));
+    let mut count = Count::default();
+    assert!(!count.look(1, 1, true), "named by the log at the last look");
+    let mut count = Count::default();
+    assert!(!count.look(0, 0, true), "nothing was stopped");
+    // A counter that went backwards (a group made anew) reports nothing.
+    let mut count = Count::default();
+    assert!(!count.look(3, 3, false));
+    assert!(!count.look(0, 1, true));
 }

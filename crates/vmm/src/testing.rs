@@ -7,10 +7,10 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::{Channel, Vm, VmExit, VmSpec, Vmm, VmmError};
+use crate::{Channel, ExitCell, Vm, VmExit, VmSpec, Vmm, VmmError};
 
 /// What the guest of one scripted machine does with its end of the channel. When it returns, the machine has
 /// powered itself off.
@@ -44,7 +44,7 @@ impl Script {
 
 /// Lets a scripted guest end its machine in other ways than returning.
 #[derive(Clone)]
-pub struct PowerSwitch(Arc<Power>);
+pub struct PowerSwitch(Arc<ExitCell>);
 
 impl PowerSwitch {
     /// The monitor loses the machine, as when its process dies.
@@ -54,27 +54,7 @@ impl PowerSwitch {
 
     /// Blocks until the host has ended the machine (stop, kill or drop).
     pub fn wait_for_the_end(&self) {
-        let mut exit = self.0.exit.lock().unwrap();
-        while exit.is_none() {
-            exit = self.0.changed.wait(exit).unwrap();
-        }
-    }
-}
-
-#[derive(Default)]
-struct Power {
-    exit: Mutex<Option<VmExit>>,
-    changed: Condvar,
-}
-
-impl Power {
-    /// The first end wins: a machine ends once.
-    fn end(&self, exit: VmExit) {
-        let mut slot = self.exit.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(exit);
-            self.changed.notify_all();
-        }
+        self.0.wait(Duration::MAX);
     }
 }
 
@@ -134,7 +114,7 @@ impl Vmm for FakeVmm {
 }
 
 struct FakeVm {
-    power: Arc<Power>,
+    power: Arc<ExitCell>,
     guest: Mutex<Option<Guest>>,
     refuse_channel: Mutex<usize>,
     obeys_stop: bool,
@@ -147,7 +127,7 @@ impl Vm for FakeVm {
             port,
             reason: reason.into(),
         };
-        if self.power.exit.lock().unwrap().is_some() {
+        if self.power.wait(Duration::ZERO).is_some() {
             return Err(refuse("the machine has ended"));
         }
         let mut refusals = self.refuse_channel.lock().unwrap();
@@ -171,15 +151,7 @@ impl Vm for FakeVm {
     }
 
     fn wait(&self, timeout: Duration) -> Option<VmExit> {
-        let deadline = Instant::now() + timeout;
-        let mut exit = self.power.exit.lock().unwrap();
-        loop {
-            if exit.is_some() {
-                return exit.clone();
-            }
-            let left = deadline.checked_duration_since(Instant::now())?;
-            exit = self.power.changed.wait_timeout(exit, left).unwrap().0;
-        }
+        self.power.wait(timeout)
     }
 
     fn stop(&self) -> Result<(), VmmError> {

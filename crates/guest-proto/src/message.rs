@@ -42,7 +42,7 @@ pub enum Task {
 pub struct Job {
     /// The machine's host name inside the guest (letters, digits and `-`).
     pub name: String,
-    /// What the Mac is called in what the job is told ("This job runs on mini with ...").
+    /// What the Mac is called in what the job is told ("This job runs on mac-1 with ...").
     pub host: String,
     /// The process to run.
     pub workload: Workload,

@@ -1,18 +1,18 @@
 //! The protocol as its two ends meet it: what one writes the other reads, and nothing a peer sends breaks a reader.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use cf_guest_proto::{
-    Decoder, GuestEnd, GuestMessage, HostMessage, Job, Limits, MAX_FRAME, OomEvent, PROTOCOL, Process,
-    ProtoError, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload, encode, read_message,
-    write_message,
+    GuestEnd, GuestMessage, HostMessage, Job, Limits, MAX_FRAME, MAX_GUEST_FRAME, OomEvent, PROTOCOL,
+    Process, ProtoError, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload, encode,
+    read_message, read_message_within, write_message,
 };
 use proptest::prelude::*;
 
 fn job(secret: &str) -> Job {
     Job {
-        name: "cf-air-1".into(),
-        host: "air".into(),
+        name: "cf-mac-1".into(),
+        host: "mac-1".into(),
         workload: Workload::ActionsRunner {
             jit_config: Secret::new(secret),
         },
@@ -24,6 +24,23 @@ fn job(secret: &str) -> Job {
         },
         env: vec![("CI".into(), "true".into())],
         oom_grace_ms: 15_000,
+    }
+}
+
+/// A connection that hands over a few bytes at a time, as a socket may.
+struct Trickle<'a> {
+    left: &'a [u8],
+    cuts: std::iter::Cycle<std::slice::Iter<'a, usize>>,
+}
+
+impl Read for Trickle<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let take = (*self.cuts.next().unwrap_or(&1))
+            .min(self.left.len())
+            .min(buffer.len());
+        buffer[..take].copy_from_slice(&self.left[..take]);
+        self.left = &self.left[take..];
+        Ok(take)
     }
 }
 
@@ -147,51 +164,76 @@ proptest! {
         prop_assert_eq!(read_message::<HostMessage>(&mut reader).unwrap(), Some(message));
     }
 
-    /// However the bytes are cut on their way, the decoder gives the same messages in the same order.
+    /// However the bytes are cut on their way, the reader gives the same messages in the same order.
     #[test]
-    fn the_decoder_gives_the_same_messages_however_the_bytes_are_cut(
+    fn a_reader_gives_the_same_messages_however_the_bytes_are_cut(
         messages in prop::collection::vec(guest_message(), 1..6),
         cuts in prop::collection::vec(1usize..40, 1..40),
     ) {
         let wire: Vec<u8> = messages.iter().flat_map(|message| encode(message).unwrap()).collect();
-        let mut decoder = Decoder::new();
+        let mut reader = Trickle { left: &wire, cuts: cuts.iter().cycle() };
         let mut seen = Vec::new();
-        let mut rest = wire.as_slice();
-        let mut cuts = cuts.iter().cycle();
-        while !rest.is_empty() {
-            let take = (*cuts.next().unwrap()).min(rest.len());
-            decoder.push(&rest[..take]);
-            rest = &rest[take..];
-            while let Some(message) = decoder.take::<GuestMessage>().unwrap() {
-                seen.push(message);
-            }
+        while let Some(message) = read_message_within::<GuestMessage>(&mut reader, MAX_GUEST_FRAME).unwrap() {
+            seen.push(message);
         }
         prop_assert_eq!(seen, messages);
-        prop_assert!(!decoder.mid_frame());
     }
 
     /// A hostile guest's bytes end in a message or an error, never in a panic or an endless buffer.
     #[test]
     fn arbitrary_bytes_never_panic_a_reader(bytes in prop::collection::vec(any::<u8>(), 0..600)) {
-        let mut decoder = Decoder::new();
-        decoder.push(&bytes);
-        while let Ok(Some(_)) = decoder.take::<GuestMessage>() {}
+        let mut reader = Cursor::new(bytes.clone());
+        while let Ok(Some(_)) = read_message_within::<GuestMessage>(&mut reader, MAX_GUEST_FRAME) {}
         let mut reader = Cursor::new(bytes);
         while let Ok(Some(_)) = read_message::<HostMessage>(&mut reader) {}
     }
 }
 
+/// A reader that fails the test when more is asked of it than the four bytes of a length.
+struct OnlyThePrefix(Cursor<Vec<u8>>);
+
+impl Read for OnlyThePrefix {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        assert!(buffer.len() <= 4, "{} bytes were asked for", buffer.len());
+        self.0.read(buffer)
+    }
+}
+
 #[test]
-fn a_frame_that_claims_more_than_the_limit_is_refused_before_it_is_buffered() {
-    let prefix = ((MAX_FRAME + 1) as u32).to_be_bytes();
-    let mut decoder = Decoder::new();
-    decoder.push(&prefix);
-    assert!(
-        matches!(decoder.take::<GuestMessage>(), Err(ProtoError::TooLarge(size)) if size == MAX_FRAME + 1)
-    );
+fn a_frame_that_claims_more_than_the_limit_is_refused_before_a_byte_of_it_is_read() {
+    for (limit, claimed) in [
+        (MAX_FRAME, MAX_FRAME + 1),
+        (MAX_GUEST_FRAME, MAX_GUEST_FRAME + 1),
+        (MAX_GUEST_FRAME, u32::MAX as usize),
+        (0, 1),
+    ] {
+        let mut reader = OnlyThePrefix(Cursor::new((claimed as u32).to_be_bytes().to_vec()));
+        let result = read_message_within::<GuestMessage>(&mut reader, limit);
+        assert!(
+            matches!(result, Err(ProtoError::TooLarge { size, limit: named }) if size == claimed && named == limit),
+            "{claimed} within {limit}: {result:?}"
+        );
+    }
     assert!(matches!(
-        read_message::<GuestMessage>(&mut Cursor::new(prefix.to_vec())),
-        Err(ProtoError::TooLarge(_))
+        read_message::<GuestMessage>(&mut Cursor::new(((MAX_FRAME + 1) as u32).to_be_bytes().to_vec())),
+        Err(ProtoError::TooLarge { .. })
+    ));
+}
+
+/// What a guest may say at its longest still fits the host's limit, and the limit is the last byte that does.
+#[test]
+fn a_guests_frame_of_exactly_the_hosts_limit_is_read_and_one_byte_more_is_not() {
+    let fits = encode(&"x".repeat(MAX_GUEST_FRAME - 2)).unwrap();
+    assert_eq!(fits.len(), 4 + MAX_GUEST_FRAME);
+    assert!(
+        read_message_within::<String>(&mut Cursor::new(fits), MAX_GUEST_FRAME)
+            .unwrap()
+            .is_some()
+    );
+    let over = encode(&"x".repeat(MAX_GUEST_FRAME - 1)).unwrap();
+    assert!(matches!(
+        read_message_within::<String>(&mut Cursor::new(over), MAX_GUEST_FRAME),
+        Err(ProtoError::TooLarge { .. })
     ));
 }
 
@@ -210,7 +252,7 @@ fn a_frame_of_exactly_the_limit_is_read_and_one_byte_more_is_not_written() {
     );
     assert!(matches!(
         encode(&"x".repeat(MAX_FRAME - 1)),
-        Err(ProtoError::TooLarge(_))
+        Err(ProtoError::TooLarge { .. })
     ));
 }
 
@@ -223,10 +265,6 @@ fn a_connection_cut_inside_a_frame_is_an_error_and_between_frames_is_the_end() {
             matches!(result, Err(ProtoError::Truncated)),
             "cut at {cut}: {result:?}"
         );
-        let mut decoder = Decoder::new();
-        decoder.push(&frame[..cut]);
-        assert!(decoder.take::<GuestMessage>().unwrap().is_none());
-        assert!(decoder.mid_frame());
     }
     assert!(
         read_message::<GuestMessage>(&mut Cursor::new(Vec::new()))
@@ -243,16 +281,15 @@ fn a_frame_that_is_no_message_is_refused_and_the_next_frame_is_still_read() {
         wire.extend_from_slice(body);
     }
     wire.extend(encode(&GuestMessage::Ready { boot_ms: 1 }).unwrap());
-    let mut decoder = Decoder::new();
-    decoder.push(&wire);
+    let mut reader = Cursor::new(wire);
     for _ in 0..4 {
         assert!(matches!(
-            decoder.take::<GuestMessage>(),
+            read_message::<GuestMessage>(&mut reader),
             Err(ProtoError::Malformed(_))
         ));
     }
     assert_eq!(
-        decoder.take::<GuestMessage>().unwrap(),
+        read_message::<GuestMessage>(&mut reader).unwrap(),
         Some(GuestMessage::Ready { boot_ms: 1 })
     );
 }

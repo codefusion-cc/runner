@@ -3,11 +3,11 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use block2::RcBlock;
-use cf_vmm::{Channel, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
+use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
@@ -53,7 +53,7 @@ impl Vmm for VzVmm {
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError> {
         spec.validate()?;
         let queue = DispatchQueue::new("cc.codefusion.runner.vm", None);
-        let exit = Arc::new(Exit::default());
+        let exit = Arc::new(ExitCell::default());
 
         let mut built = None;
         queue.exec_sync(|| built = Some(build(spec, &queue, exit.clone()).map(OnQueue)));
@@ -99,7 +99,7 @@ struct VzVm {
     machine: Mutex<Option<Machine>>,
     /// The machine holds its delegate weakly.
     _delegate: OnQueue<Retained<Delegate>>,
-    exit: Arc<Exit>,
+    exit: Arc<ExitCell>,
 }
 
 impl VzVm {
@@ -174,7 +174,8 @@ impl Vm for VzVm {
             let _ = asked.send(unsafe { machine.state() });
         });
         match state.recv_timeout(CONNECT_TIMEOUT) {
-            Ok(VZVirtualMachineState::Stopped) => self.exit.end(VmExit::Guest),
+            // A stop the host asked for may be seen here before its own answer comes.
+            Ok(VZVirtualMachineState::Stopped) => self.exit.found_stopped(),
             Ok(VZVirtualMachineState::Error) => self
                 .exit
                 .end(VmExit::Error("the machine is in its error state".into())),
@@ -184,8 +185,11 @@ impl Vm for VzVm {
     }
 
     fn stop(&self) -> Result<(), VmmError> {
+        self.exit.stop_asked();
         let exit = self.exit.clone();
         self.on_queue(move |machine| {
+            // A machine that cannot be stopped now has ended, which `wait` finds out, or is in a state the
+            // framework takes no stop in: the caller's wait runs out and it lets go of the machine (`kill`).
             // SAFETY: on the machine's queue.
             if !unsafe { machine.canStop() } {
                 return;
@@ -215,37 +219,8 @@ impl Drop for VzVm {
     }
 }
 
-/// How the machine ended, set once by whoever hears of it first.
-#[derive(Default)]
-struct Exit {
-    slot: Mutex<Option<VmExit>>,
-    changed: Condvar,
-}
-
-impl Exit {
-    fn end(&self, exit: VmExit) {
-        let mut slot = self.slot.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(exit);
-            self.changed.notify_all();
-        }
-    }
-
-    fn wait(&self, timeout: Duration) -> Option<VmExit> {
-        let deadline = Instant::now() + timeout;
-        let mut slot = self.slot.lock().unwrap();
-        loop {
-            if slot.is_some() {
-                return slot.clone();
-            }
-            let left = deadline.checked_duration_since(Instant::now())?;
-            slot = self.changed.wait_timeout(slot, left).unwrap().0;
-        }
-    }
-}
-
 struct DelegateIvars {
-    exit: Arc<Exit>,
+    exit: Arc<ExitCell>,
 }
 
 define_class!(
@@ -273,7 +248,7 @@ define_class!(
 );
 
 impl Delegate {
-    fn new(exit: Arc<Exit>) -> Retained<Self> {
+    fn new(exit: Arc<ExitCell>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(DelegateIvars { exit });
         // SAFETY: NSObject's `init` on a freshly allocated object whose instance variables are set.
         unsafe { msg_send![super(this), init] }
@@ -284,7 +259,7 @@ impl Delegate {
 fn build(
     spec: &VmSpec,
     queue: &DispatchQueue,
-    exit: Arc<Exit>,
+    exit: Arc<ExitCell>,
 ) -> Result<(Retained<VZVirtualMachine>, Retained<Delegate>), VmmError> {
     let refuse = |what: &str, error: &NSError| VmmError::Spec(format!("{what}: {}", describe(error)));
     // SAFETY: every object below is made and used here, on the machine's queue, and every argument is a valid

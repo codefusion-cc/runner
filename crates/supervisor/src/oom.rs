@@ -35,6 +35,35 @@ pub fn kills_in_events(memory_events: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The stops the kernel counted for a job against those its log named. The log names the process and can fall
+/// behind or drop records; the counter (`oom_kill` in the group's `memory.events`) is exact and names nothing.
+#[derive(Debug, Default)]
+pub struct Count {
+    seen: u64,
+    /// Looks in a row at which the counter was ahead of the log.
+    behind: u32,
+}
+
+impl Count {
+    /// One look: the log named `named` stops since the last one, and the counter now says `counted`. Returns
+    /// whether a stop is to be reported that no log line named: when the counter was ahead for two looks in a row,
+    /// since one may only be the log being late, or at once at the job's `last` look, which has no second.
+    pub fn look(&mut self, named: u64, counted: u64, last: bool) -> bool {
+        self.seen = self.seen.saturating_add(named);
+        if counted <= self.seen {
+            self.behind = 0;
+            return false;
+        }
+        self.behind += 1;
+        if self.behind < 2 && !last {
+            return false;
+        }
+        self.seen = counted;
+        self.behind = 0;
+        true
+    }
+}
+
 /// Collects the kernel's report line by line.
 #[derive(Debug, Default)]
 pub struct Log {

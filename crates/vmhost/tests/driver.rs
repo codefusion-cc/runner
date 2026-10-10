@@ -9,11 +9,13 @@ use cf_vmhost::control::{self, Request};
 use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run};
 use cf_vmm::testing::{FakeVmm, PowerSwitch, Script};
 use cf_vmm::{Network, VmmError};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TOKEN: &str = "jit-registration-do-not-leak-7f3a";
 const GUEST: Guest<'static> = Guest {
@@ -24,7 +26,7 @@ const GUEST: Guest<'static> = Guest {
 fn request(job: &str) -> JobRequest {
     JobRequest {
         job: job.into(),
-        host: "mini".into(),
+        host: "mac-1".into(),
         memory_bytes: 4 << 30,
         cpus: 4,
         scratch_bytes: 1 << 30,
@@ -59,6 +61,7 @@ fn quick() -> Limits {
         kill: ms(200),
         boots: 2,
         publish: ms(0),
+        console_bytes: 1 << 20,
     }
 }
 
@@ -135,6 +138,30 @@ fn go(vmm: &FakeVmm, layout: &Layout, request: JobRequest, limits: Limits) -> Re
     run(vmm, layout, GUEST, request, limits, &AtomicBool::new(false))
 }
 
+/// Runs a job on a thread of its own and fails the test when it has no end within ten seconds: the waits these
+/// tests are about are there so that a job always has one.
+fn go_within(
+    vmm: &Arc<FakeVmm>,
+    layout: &Layout,
+    request: JobRequest,
+    limits: Limits,
+    cancel: bool,
+) -> Result<JobState, RunError> {
+    let (done, result) = mpsc::channel();
+    let (vmm, layout) = (vmm.clone(), layout.clone());
+    std::thread::spawn(move || {
+        let cancel = AtomicBool::new(cancel);
+        let _ = done.send(run(vmm.as_ref(), &layout, GUEST, request, limits, &cancel));
+    });
+    result
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the job had no end within ten seconds")
+}
+
+fn mode(path: impl AsRef<Path>) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 fn every_file(dir: &Path, found: &mut Vec<(String, Vec<u8>)>) {
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         if entry.path().is_dir() {
@@ -186,7 +213,7 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
     };
     assert_eq!(
         (task.name.as_str(), task.host.as_str(), task.oom_grace_ms),
-        ("job-1", "mini", 15_000)
+        ("job-1", "mac-1", 15_000)
     );
     assert_eq!(
         (
@@ -613,4 +640,353 @@ fn the_socket_answers_nonsense_with_an_error_and_goes_on() {
     );
     assert_eq!(after, Some(Stage::Running));
     assert_eq!(state.end.unwrap().end, End::Ok);
+}
+
+#[test]
+fn a_guest_that_never_stops_talking_still_meets_its_deadline() {
+    let (_dir, layout) = state_dir();
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(|stream, power, _| {
+            // Heartbeats as fast as the host takes them, and no ear for a stop.
+            let mut talker = stream.try_clone().unwrap();
+            let talk = std::thread::spawn(move || {
+                while write_message(&mut talker, &GuestMessage::Heartbeat(usage())).is_ok() {}
+            });
+            power.wait_for_the_end();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let _ = talk.join();
+        }),
+    ]));
+    let mut limits = quick();
+    (limits.deadline, limits.publish) = (Duration::from_millis(150), Duration::from_secs(1));
+    let started = Instant::now();
+    let state = go_within(&vmm, &layout, request("a"), limits, false).unwrap();
+    assert_eq!(state.end.unwrap().end, End::Timeout);
+    assert!(vmm.stops() >= 1, "the machine was not stopped by force");
+    // The deadline, its grace and the slack: 450 ms, and the boot before them.
+    assert!(
+        started.elapsed() >= limits.longest_run(),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_frame_larger_than_a_guest_of_ours_sends_is_a_lost_guest_and_not_read() {
+    let (_dir, layout) = state_dir();
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(|mut stream, power, _| {
+            // A well-formed message, well under the megabyte a frame may be, that says the job failed.
+            say(
+                &mut stream,
+                GuestMessage::Failed {
+                    stage: "job".into(),
+                    message: "x".repeat(100 << 10),
+                },
+            );
+            power.wait_for_the_end();
+        }),
+    ]));
+    let ended = go_within(&vmm, &layout, request("a"), quick(), false)
+        .unwrap()
+        .end
+        .unwrap();
+    assert_eq!(ended.end, End::GuestLost);
+    assert!(std::fs::metadata(layout.state("a")).unwrap().len() < 2048);
+}
+
+#[test]
+fn a_machine_that_fills_the_console_log_is_stopped() {
+    let (_dir, layout) = state_dir();
+    let console = layout.console("a");
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(move |mut stream, power, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            std::fs::write(&console, vec![b'!'; (1 << 20) + 1]).unwrap();
+            power.wait_for_the_end();
+        }),
+    ]));
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(60);
+    let state = go_within(&vmm, &layout, request("a"), limits, false).unwrap();
+    let ended = state.end.unwrap();
+    assert_eq!(ended.end, End::GuestLost);
+    assert!(ended.message.unwrap().contains("console"));
+    assert!(vmm.stops() >= 1);
+}
+
+#[test]
+fn a_console_log_of_exactly_the_limit_is_fine() {
+    let (_dir, layout) = state_dir();
+    let console = layout.console("a");
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(move |stream, _, _| {
+            std::fs::write(&console, vec![b'!'; 1 << 20]).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            finish(stream, summary(GuestEnd::Exited, Some(0)));
+        }),
+    ]));
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(60);
+    let state = go_within(&vmm, &layout, request("a"), limits, false).unwrap();
+    assert_eq!(state.end.unwrap().end, End::Ok);
+}
+
+#[test]
+fn a_socket_that_cannot_be_made_starts_no_job_and_leaves_the_name_free() {
+    let (_dir, layout) = state_dir();
+    // Something that is no socket and cannot be removed as a file sits where the socket goes.
+    std::fs::create_dir_all(layout.socket("a").join("in the way")).unwrap();
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0)))),
+    ]));
+    let error = go_within(&vmm, &layout, request("a"), quick(), false).unwrap_err();
+    assert!(matches!(error, RunError::Io(..)), "{error}");
+    assert!(vmm.started().is_empty());
+    assert!(!layout.state("a").exists() && !layout.job_dir("a").exists());
+
+    std::fs::remove_dir_all(layout.socket("a")).unwrap();
+    let state = go_within(&vmm, &layout, request("a"), quick(), false).unwrap();
+    assert_eq!(state.end.unwrap().end, End::Ok);
+}
+
+/// A machine that starts formatting a disk and never comes to an end.
+fn stuck_formatter() -> Script {
+    Script::boot(|mut stream, power| {
+        greet(&mut stream);
+        say(&mut stream, GuestMessage::Ready { boot_ms: 1 });
+        power.wait_for_the_end();
+    })
+}
+
+#[test]
+fn a_stop_while_the_disk_is_made_ends_the_job_without_waiting_for_the_disk() {
+    // A signal.
+    let (_dir, layout) = state_dir();
+    let vmm = Arc::new(FakeVmm::new([stuck_formatter()]));
+    let started = Instant::now();
+    let state = go_within(&vmm, &layout, request("a"), quick(), true).unwrap();
+    let ended = state.end.clone().unwrap();
+    assert_eq!(
+        (state.stage, ended.end, state.boots),
+        (Stage::Ended, End::Cancelled, 0)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        serde_json::from_slice::<JobState>(&std::fs::read(layout.state("a")).unwrap()).unwrap(),
+        state
+    );
+    assert!(vmm.stops() >= 1, "the formatting machine was left running");
+    assert!(!layout.job_dir("a").exists() && !layout.socket("a").exists());
+    let left: Vec<_> = std::fs::read_dir(layout.scratch_templates())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, ["image-1-1073741824.lock"]);
+
+    // A stop over the socket, with its own reason.
+    let (_dir, layout) = state_dir();
+    let vmm = Arc::new(FakeVmm::new([stuck_formatter()]));
+    let asker = {
+        let layout = layout.clone();
+        std::thread::spawn(move || {
+            let stop = Request::Stop {
+                reason: StopReason::EvictedDisk,
+                grace_ms: 60_000,
+            };
+            let asked = Instant::now();
+            while control::ask(&layout, "a", &stop, Duration::from_secs(1)).is_err() {
+                assert!(asked.elapsed() < Duration::from_secs(8), "no vm-host answered");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    let state = go_within(&vmm, &layout, request("a"), quick(), false).unwrap();
+    asker.join().unwrap();
+    assert_eq!((state.end.unwrap().end, state.boots), (End::EvictedDisk, 0));
+
+    // Another vm-host makes the same disk and takes its time: the wait for it ends with the stop too.
+    let (_dir, layout) = state_dir();
+    std::fs::create_dir_all(layout.scratch_templates()).unwrap();
+    let held = std::fs::File::create(layout.scratch_templates().join("image-1-1073741824.lock")).unwrap();
+    // SAFETY: flock takes no pointers; the descriptor is open for the call.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) },
+        0
+    );
+    let vmm = Arc::new(FakeVmm::new([]));
+    let state = go_within(&vmm, &layout, request("a"), quick(), true).unwrap();
+    assert_eq!(state.end.unwrap().end, End::Cancelled);
+    assert!(vmm.started().is_empty());
+}
+
+#[test]
+fn one_slow_client_does_not_keep_the_socket_from_the_next() {
+    use std::io::Write;
+    let (_dir, layout) = state_dir();
+    let (release, wait) = mpsc::channel::<()>();
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(move |mut stream, _, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            let _ = wait.recv_timeout(Duration::from_secs(8));
+            finish(stream, summary(GuestEnd::Exited, Some(0)));
+        }),
+    ]));
+    let prober = {
+        let layout = layout.clone();
+        std::thread::spawn(move || {
+            while control::ask(&layout, "a", &Request::State, Duration::from_secs(1))
+                .map(|state| state.stage)
+                .ok()
+                != Some(Stage::Running)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // A client that sends a byte every 300 ms: never silent for the second a read waits.
+            let mut slow = UnixStream::connect(layout.socket("a")).unwrap();
+            let trickle = std::thread::spawn(move || {
+                for byte in br#"{"cmd":"state"}"# {
+                    if slow.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            let asked = Instant::now();
+            let answer = control::ask(&layout, "a", &Request::State, Duration::from_millis(2500))
+                .map(|state| state.stage)
+                .ok();
+            let waited = asked.elapsed();
+            release.send(()).unwrap();
+            let _ = trickle.join();
+            (answer, waited)
+        })
+    };
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(60);
+    let state = go_within(&vmm, &layout, request("a"), limits, false).unwrap();
+    let (answer, waited) = prober.join().unwrap();
+    assert_eq!(answer, Some(Stage::Running), "after {waited:?}");
+    assert!(waited < Duration::from_millis(1500), "{waited:?}");
+    assert_eq!(state.end.unwrap().end, End::Ok);
+}
+
+#[test]
+fn what_a_job_leaves_is_this_users_alone_and_a_folder_others_can_write_to_boots_nothing() {
+    let (dir, layout) = state_dir();
+    let quiet = || job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0))));
+    let vmm = Arc::new(FakeVmm::new([formatter(), quiet()]));
+    go_within(&vmm, &layout, request("a"), quick(), false).unwrap();
+    assert_eq!(mode(layout.state("a")), 0o600);
+    assert_eq!(mode(layout.run()), 0o700);
+    assert_eq!(mode(layout.scratch_templates()), 0o700);
+    assert_eq!(mode(layout.console("a").parent().unwrap()), 0o700);
+
+    let rootfs = layout.rootfs("image-1");
+    let image = rootfs.parent().unwrap();
+    let images = image.parent().unwrap();
+    for (path, open, private) in [
+        (rootfs.as_path(), 0o666, 0o644),
+        (rootfs.as_path(), 0o664, 0o644),
+        (image, 0o777, 0o755),
+        (images, 0o775, 0o700),
+        (dir.path(), 0o757, 0o700),
+        (layout.run().as_path(), 0o770, 0o700),
+        (layout.scratch_templates().as_path(), 0o777, 0o700),
+    ] {
+        let set = |mode| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        set(open);
+        let vmm = Arc::new(FakeVmm::new([quiet()]));
+        let error = go_within(&vmm, &layout, request("b"), quick(), false).unwrap_err();
+        set(private);
+        assert!(
+            matches!(error, RunError::NotPrivate(_) | RunError::Scratch(_))
+                && error.to_string().contains("written by other users")
+                && error.to_string().contains(&path.display().to_string()),
+            "{}: {error}",
+            path.display()
+        );
+        assert!(vmm.started().is_empty(), "{} booted a machine", path.display());
+        assert!(!layout.state("b").exists() && !layout.job_dir("b").exists());
+    }
+    // And with everything private again the job runs.
+    let vmm = Arc::new(FakeVmm::new([quiet()]));
+    assert_eq!(
+        go_within(&vmm, &layout, request("b"), quick(), false)
+            .unwrap()
+            .end
+            .unwrap()
+            .end,
+        End::Ok
+    );
+}
+
+#[test]
+fn a_vm_host_answers_for_its_own_state_and_no_other() {
+    let (_dir, layout) = state_dir();
+    let (release, wait) = mpsc::channel::<()>();
+    let vmm = Arc::new(FakeVmm::new([
+        formatter(),
+        job(move |mut stream, _, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            let _ = wait.recv_timeout(Duration::from_secs(8));
+            finish(stream, summary(GuestEnd::Exited, Some(0)));
+        }),
+    ]));
+    let daemon = {
+        let layout = layout.clone();
+        std::thread::spawn(move || {
+            let read = || -> Option<JobState> {
+                serde_json::from_slice(&std::fs::read(layout.state("a")).ok()?).ok()
+            };
+            let state = loop {
+                match read() {
+                    Some(state) if state.stage == Stage::Running => break state,
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
+            };
+            let within = Duration::from_secs(1);
+            let own = control::answers(&layout, &state, within);
+            // The same file read by a daemon after the vm-host's number went to another process.
+            let reused = control::answers(
+                &layout,
+                &JobState {
+                    pid: state.pid + 1,
+                    ..state.clone()
+                },
+                within,
+            );
+            let other_job = control::answers(
+                &layout,
+                &JobState {
+                    job: "b".into(),
+                    ..state.clone()
+                },
+                within,
+            );
+            release.send(()).unwrap();
+            (state, own, reused, other_job)
+        })
+    };
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(60);
+    go_within(&vmm, &layout, request("a"), limits, false).unwrap();
+    let (state, own, reused, other_job) = daemon.join().unwrap();
+    assert_eq!((own, reused, other_job), (true, false, false));
+    assert!(
+        !control::answers(&layout, &state, Duration::from_millis(200)),
+        "a vm-host that is gone answered"
+    );
 }

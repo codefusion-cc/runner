@@ -1,11 +1,13 @@
 //! One of the guest's small tasks, run from the machine's start to its end: a probe, formatting a disk. A job
 //! goes through [`crate::run`], which survives more.
 
+use crate::machine::{MESSAGE_CHARS, STAGE_CHARS, clip};
 use cf_guest_proto::{
-    GuestMessage, HostMessage, PORT, PROTOCOL, Start, Summary, Task, read_message, write_message,
+    GuestMessage, HostMessage, MAX_GUEST_FRAME, PORT, PROTOCOL, Start, Summary, Task, read_message_within,
+    write_message,
 };
 use cf_vmm::{Channel, Vm, VmExit, VmSpec, Vmm};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What a task's machine did.
@@ -30,11 +32,19 @@ pub(crate) fn now_ns() -> u64 {
         .map_or(0, |since| since.as_nanos() as u64)
 }
 
-/// Opens the channel to a guest that may still be booting: tries until it listens, the machine ends or the time
-/// is over.
-pub fn connect(vm: &dyn Vm, within: Duration) -> Result<Box<dyn Channel>, String> {
+/// What a task given up says went wrong.
+const GIVEN_UP: &str = "given up before it was done";
+/// How long a wait goes on before `give_up` is asked again.
+const LOOK: Duration = Duration::from_millis(50);
+
+/// Opens the channel to a guest that may still be booting: tries until it listens, the machine ends, the time
+/// is over or `give_up` says so.
+fn connect(vm: &dyn Vm, within: Duration, give_up: &dyn Fn() -> bool) -> Result<Box<dyn Channel>, String> {
     let deadline = Instant::now() + within;
     loop {
+        if give_up() {
+            return Err(GIVEN_UP.into());
+        }
         match vm.channel(PORT) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() >= deadline => return Err(error.to_string()),
@@ -70,9 +80,16 @@ pub(crate) fn put_down(vm: &dyn Vm, within: Duration) -> bool {
     false
 }
 
-/// Boots a machine, gives its guest one task and waits for the end, all within `within`. An error says in words
-/// what went wrong; the machine is gone either way.
-pub fn run_task(vmm: &dyn Vmm, spec: &VmSpec, task: Task, within: Duration) -> Result<TaskReport, String> {
+/// Boots a machine, gives its guest one task and waits for the end, all within `within`, or until `give_up`
+/// answers yes, which is asked many times a second. An error says in words what went wrong; the machine is gone
+/// either way.
+pub fn run_task(
+    vmm: &dyn Vmm,
+    spec: &VmSpec,
+    task: Task,
+    within: Duration,
+    give_up: &dyn Fn() -> bool,
+) -> Result<TaskReport, String> {
     let started = Instant::now();
     let left = |what: &str| {
         within
@@ -81,22 +98,31 @@ pub fn run_task(vmm: &dyn Vmm, spec: &VmSpec, task: Task, within: Duration) -> R
     };
     let vm = vmm.start(spec).map_err(|error| error.to_string())?;
     let result = (|| {
-        let mut channel = connect(vm.as_ref(), left("the boot")?)?;
+        let mut channel = connect(vm.as_ref(), left("the boot")?, give_up)?;
         let mut reader = channel
             .try_clone()
             .map_err(|error| format!("the channel: {error}"))?;
-        let (sender, messages) = mpsc::channel();
+        let (sender, messages) = mpsc::sync_channel(64);
         std::thread::spawn(move || {
-            while let Ok(Some(message)) = read_message::<GuestMessage>(&mut reader) {
+            while let Ok(Some(message)) = read_message_within::<GuestMessage>(&mut reader, MAX_GUEST_FRAME) {
                 if sender.send(message).is_err() {
                     return;
                 }
             }
         });
         let next = |what: &str| {
-            messages
-                .recv_timeout(left(what)?)
-                .map_err(|_| format!("the guest went silent during {what}"))
+            let until = Instant::now() + left(what)?;
+            loop {
+                if give_up() {
+                    return Err(GIVEN_UP.to_string());
+                }
+                let wait = until.saturating_duration_since(Instant::now());
+                match messages.recv_timeout(wait.min(LOOK)) {
+                    Ok(message) => return Ok(message),
+                    Err(RecvTimeoutError::Timeout) if !wait.is_zero() => {}
+                    Err(_) => return Err(format!("the guest went silent during {what}")),
+                }
+            }
         };
         let kernel = match next("the boot")? {
             GuestMessage::Hello {
@@ -125,7 +151,11 @@ pub fn run_task(vmm: &dyn Vmm, spec: &VmSpec, task: Task, within: Duration) -> R
                 GuestMessage::Ready { .. } => ready_after = Some(started.elapsed()),
                 GuestMessage::Exited(summary) => break summary,
                 GuestMessage::Failed { stage, message } => {
-                    return Err(format!("the guest failed at {stage}: {message}"));
+                    return Err(format!(
+                        "the guest failed at {}: {}",
+                        clip(&stage, STAGE_CHARS),
+                        clip(&message, MESSAGE_CHARS)
+                    ));
                 }
                 _ => {}
             }

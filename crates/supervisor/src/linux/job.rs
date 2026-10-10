@@ -228,8 +228,9 @@ pub fn run(
         .map_err(|error| ("network", error))?;
     let [a, b, c, d] = network.address;
     say(&format!(
-        "network up in {} ms, address {a}.{b}.{c}.{d}",
-        network.took.as_millis()
+        "network up in {} ms after {} DHCP questions, address {a}.{b}.{c}.{d}",
+        network.took.as_millis(),
+        network.questions
     ));
 
     let container = |error| ("container", error);
@@ -329,8 +330,7 @@ pub fn run(
         log: oom::Log::new(page),
         previous: Table::new([]),
         oom: None,
-        kills_seen: 0,
-        unexplained: 0,
+        count: oom::Count::default(),
         step: None,
         stop: None,
         killed: false,
@@ -338,6 +338,9 @@ pub fn run(
         heartbeat: Instant::now(),
     };
     let ended = watch.until_the_end(events);
+    // A process the kernel stopped in the job's last half second, which a workload that died of it ends with, was
+    // not looked for yet.
+    watch.last_look();
     let summary_usage = usage();
     let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
 
@@ -444,9 +447,8 @@ struct Watch<'a> {
     /// The processes at the last look, where one the kernel has since stopped is still found.
     previous: Table,
     oom: Option<OomEvent>,
-    /// Stops the kernel counted for the job, and looks in a row at which its log explained fewer.
-    kills_seen: u64,
-    unexplained: u32,
+    /// The stops the kernel counted for the job against those its log named.
+    count: oom::Count,
     /// The step whose processes go when its time to fail by itself is over.
     step: Option<(Instant, Process)>,
     stop: Option<(StopReason, Instant)>,
@@ -498,9 +500,18 @@ impl Watch<'_> {
         }
     }
 
+    /// The look the job's end cuts short: what the kernel stopped since the last one, believing its counter at
+    /// once, since there is no later look to confirm it.
+    fn last_look(&mut self) {
+        let table = processes();
+        for kill in self.kernel_kills(true) {
+            self.out_of_memory(kill, &table);
+        }
+    }
+
     fn look(&mut self) {
         let table = processes();
-        for kill in self.kernel_kills() {
+        for kill in self.kernel_kills(false) {
             self.out_of_memory(kill, &table);
         }
         if self.step.as_ref().is_some_and(|(at, _)| Instant::now() >= *at)
@@ -529,8 +540,8 @@ impl Watch<'_> {
     }
 
     /// The stops the kernel made since the last look: from its log, which names the process, and when the log
-    /// fell behind for two looks, from the group's counter, which does not.
-    fn kernel_kills(&mut self) -> Vec<Kill> {
+    /// fell behind for two looks (or at the last look), from the group's counter, which does not name it.
+    fn kernel_kills(&mut self, last: bool) -> Vec<Kill> {
         let mut kills = Vec::new();
         if let Some(log) = &mut self.kernel_log {
             let mut record = [0u8; 8192];
@@ -549,25 +560,17 @@ impl Watch<'_> {
                 }
             }
         }
-        self.kills_seen += kills.len() as u64;
         let counted =
             oom::kills_in_events(&fs::read_to_string(format!("{CGROUP}/memory.events")).unwrap_or_default());
-        if counted > self.kills_seen {
-            self.unexplained += 1;
-            if self.unexplained >= 2 {
-                self.kills_seen = counted;
-                kills.push(Kill {
-                    process: Used {
-                        pid: 0,
-                        name: "a process".into(),
-                        memory_bytes: 0,
-                    },
-                    largest: Vec::new(),
-                });
-            }
-        } else {
-            self.unexplained = 0;
-            self.kills_seen = self.kills_seen.max(counted);
+        if self.count.look(kills.len() as u64, counted, last) {
+            kills.push(Kill {
+                process: Used {
+                    pid: 0,
+                    name: "a process".into(),
+                    memory_bytes: 0,
+                },
+                largest: Vec::new(),
+            });
         }
         kills
     }

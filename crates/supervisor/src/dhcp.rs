@@ -52,6 +52,18 @@ fn finish(mut packet: Vec<u8>, mac: [u8; 6]) -> Vec<u8> {
     packet
 }
 
+/// How long a question waits for its answer before it is asked again, by how often it was asked before. Soon at
+/// first: the first question often goes out before the host's side of the device takes packets, and the network
+/// is the host's own, with a handful of machines on it. Then every 700 ms.
+pub fn ask_again_after(asked_before: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(match asked_before {
+        0 => 100,
+        1 => 200,
+        2 => 400,
+        _ => 700,
+    })
+}
+
 /// The first packet: who offers an address?
 pub fn discover(xid: u32, mac: [u8; 6]) -> Vec<u8> {
     let mut packet = header(xid, mac);

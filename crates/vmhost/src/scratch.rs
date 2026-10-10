@@ -2,12 +2,13 @@
 //! seconds, so it happens once an image and size; every job's disk is a copy-on-write copy of that template,
 //! which costs no time and no space until the job writes.
 
-use crate::layout::Layout;
+use crate::layout::{Layout, private};
 use crate::task::run_task;
 use cf_guest_proto::Task;
 use cf_vmm::{Disk, Network, VmSpec, Vmm};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +16,9 @@ use std::time::Duration;
 pub const IMAGE_DISK: &str = "cf-image";
 /// See [`IMAGE_DISK`].
 pub const SCRATCH_DISK: &str = "cf-scratch";
+
+/// The longest formatting a disk may take, the machine's boot and end included.
+const FORMAT: Duration = Duration::from_secs(90);
 
 /// The files a guest boots from and runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +36,8 @@ fn say(what: &str, error: impl std::fmt::Display) -> String {
 }
 
 /// The template for this image and size, made first if it is not there. Vm-hosts that need the same one at the
-/// same time wait for the first to make it.
+/// same time wait for the first to make it. `give_up` is asked many times a second while this waits, for the
+/// other vm-host or for the formatting; once it says yes this is an error at once.
 pub fn template(
     vmm: &dyn Vmm,
     layout: &Layout,
@@ -40,9 +45,16 @@ pub fn template(
     image: &str,
     bytes: u64,
     console: &Path,
+    give_up: &dyn Fn() -> bool,
 ) -> Result<PathBuf, String> {
     let folder = layout.scratch_templates();
-    fs::create_dir_all(&folder).map_err(|error| say("the templates' folder", error))?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)
+        .map_err(|error| say("the templates' folder", error))?;
+    // Every job's disk starts as a copy of what is in here.
+    private(&folder)?;
     let path = folder.join(format!("{image}-{bytes}.img"));
     if path.exists() {
         return Ok(path);
@@ -50,8 +62,15 @@ pub fn template(
     let lock = File::create(folder.join(format!("{image}-{bytes}.lock")))
         .map_err(|error| say("the template's lock", error))?;
     // SAFETY: flock takes no pointers; the descriptor is open for the call. The lock goes with the file.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(say("the template's lock", std::io::Error::last_os_error()));
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(say("the template's lock", error));
+        }
+        if give_up() {
+            return Err("given up while another job made the same disk".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     if path.exists() {
         return Ok(path);
@@ -81,7 +100,7 @@ pub fn template(
         network: Network::None,
         console: console.to_path_buf(),
     };
-    let made = run_task(vmm, &spec, Task::FormatScratch, Duration::from_secs(90)).and_then(|report| {
+    let made = run_task(vmm, &spec, Task::FormatScratch, FORMAT, give_up).and_then(|report| {
         match report.summary.exit_code {
             Some(0) => Ok(()),
             code => Err(format!("formatting ended with {code:?}")),

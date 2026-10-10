@@ -6,10 +6,15 @@
 //! [`Layout`]:
 //!
 //! - `run/<job>.json`: the job's [`JobState`], replaced whole on every change. This is the truth a daemon that
-//!   starts again reads: a state without an `end` whose `pid` is alive is a running job to adopt, one whose `pid`
-//!   is gone is a job lost with its vm-host.
+//!   starts again reads: a state without an `end` whose vm-host still answers ([`control::answers`]) is a running
+//!   job to adopt, one whose vm-host does not is a job lost with it. The `pid` in the state is no proof of either:
+//!   once a vm-host is gone its number may be another process's, so nothing is signalled by it unchecked.
 //! - `run/<job>.sock`: a socket the vm-host answers on ([`control`]): one request a connection, the state back.
-//! - `run/<job>/`: the machine's own files, gone with the job. `logs/<job>.console.log` stays.
+//! - `run/<job>/`: the machine's own files, gone with the job. `logs/<job>.console.log` stays, 16 MiB at most:
+//!   a machine that writes more is stopped.
+//!
+//! The state folder, `images/` and each image in it must be this user's and writable by nobody else, or no job
+//! starts: an image is verified when it is installed, and that is worth what the folder's permissions are.
 //!
 //! A vm-host is its own session: it does not end with the daemon. It enforces the job's deadline and every wait
 //! on the guest by itself ([`Machine`]), so a job never depends on a daemon being there.
@@ -27,7 +32,7 @@ mod state;
 pub mod task;
 
 pub use driver::{Guest, RunError, run};
-pub use layout::Layout;
+pub use layout::{Layout, write_private};
 pub use machine::{Action, Event, Limits, Machine};
 pub use request::{JobRequest, RequestError, VM_OVERHEAD};
 pub use state::{End, Ended, JobState, OutOfMemory, Stage, out_of_memory};

@@ -11,8 +11,6 @@ use std::time::{Duration, Instant};
 const DEVICE: &str = "eth0";
 /// How long the host's DHCP may take in all.
 const DHCP_WAIT: Duration = Duration::from_secs(12);
-/// How long one question waits for its answer before it is asked again.
-const DHCP_RETRY: Duration = Duration::from_millis(700);
 
 /// The kernel's `struct ifreq`: a device's name and one value for it.
 #[repr(C)]
@@ -117,7 +115,8 @@ fn dhcp_payload(packet: &[u8]) -> Option<&[u8]> {
 
 /// Asks the host's DHCP for an address. Questions leave through an ordinary socket bound to the device; answers
 /// are read below IP, since a server may send them to the address the guest does not have yet.
-fn lease(mac: [u8; 6]) -> Result<Lease, String> {
+/// The lease, and how often the host was asked for it.
+fn lease(mac: [u8; 6]) -> Result<(Lease, u32), String> {
     let sender = context("DHCP socket", socket(libc::AF_INET, libc::SOCK_DGRAM, 0))?;
     let one: libc::c_int = 1;
     let device = sys::cstr(DEVICE);
@@ -161,7 +160,7 @@ fn lease(mac: [u8; 6]) -> Result<Lease, String> {
             (libc::ETH_P_IP as u16).to_be() as libc::c_int,
         ),
     )?;
-    timeout(&receiver, Duration::from_millis(100));
+    timeout(&receiver, Duration::from_millis(25));
 
     let send = |packet: &[u8]| {
         // SAFETY: sendto reads the packet and `length` bytes of the address, both ours.
@@ -180,15 +179,19 @@ fn lease(mac: [u8; 6]) -> Result<Lease, String> {
         (sys::uptime_ms() as u32).rotate_left(16) ^ u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
     let deadline = Instant::now() + DHCP_WAIT;
     let mut offer: Option<Lease> = None;
-    let mut asked = None;
+    // When the question in force was last asked and how often; none at the start and after each answer.
+    let mut asked: Option<(Instant, u32)> = None;
+    let mut questions = 0;
     let mut buffer = [0u8; 1500];
     while Instant::now() < deadline {
-        if asked.is_none_or(|at: Instant| at.elapsed() >= DHCP_RETRY) {
+        let times = asked.map_or(0, |(_, times)| times);
+        if asked.is_none_or(|(at, times)| at.elapsed() >= dhcp::ask_again_after(times - 1)) {
             match &offer {
                 Some(offer) => send(&dhcp::request(xid, mac, offer)),
                 None => send(&dhcp::discover(xid, mac)),
             }
-            asked = Some(Instant::now());
+            asked = Some((Instant::now(), times + 1));
+            questions += 1;
         }
         // SAFETY: recv fills at most the buffer's length.
         let read = unsafe { libc::recv(receiver.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
@@ -203,7 +206,7 @@ fn lease(mac: [u8; 6]) -> Result<Lease, String> {
                 offer = Some(lease);
                 asked = None;
             }
-            Some(Reply::Ack(lease)) if offer.is_some() => return Ok(lease),
+            Some(Reply::Ack(lease)) if offer.is_some() => return Ok((lease, questions)),
             Some(Reply::Nak) => {
                 offer = None;
                 asked = None;
@@ -222,6 +225,8 @@ pub struct Network {
     pub address: [u8; 4],
     /// How long the address took, for the console log.
     pub took: Duration,
+    /// How often the host's DHCP was asked: 2 when every question got its answer.
+    pub questions: u32,
 }
 
 /// Brings the network up and loads the firewall. An error leaves the job without a start: a job never runs
@@ -248,7 +253,7 @@ pub fn up() -> Result<Network, String> {
         *byte = u8::from_str_radix(text, 16).map_err(|_| "the network device has no address".to_string())?;
     }
 
-    let lease = lease(mac)?;
+    let (lease, questions) = lease(mac)?;
     context(
         "address",
         ioctl(
@@ -295,11 +300,16 @@ pub fn up() -> Result<Network, String> {
     } else {
         lease.dns.clone()
     };
-    load_firewall(&firewall::netlink(&firewall::policy(&name_servers)))?;
+    // What is next to this machine, whatever range the Mac gives its machines: the network and the gateway.
+    let own: Vec<_> = std::iter::once(firewall::own_network(lease.address, lease.netmask))
+        .chain(lease.gateway.map(|gateway| (gateway, 32)))
+        .collect();
+    load_firewall(&firewall::netlink(&firewall::policy(&name_servers, &own)))?;
     Ok(Network {
         name_servers,
         address: lease.address,
         took: started.elapsed(),
+        questions,
     })
 }
 

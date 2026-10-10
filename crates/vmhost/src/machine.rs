@@ -26,6 +26,8 @@ pub struct Limits {
     pub boots: u32,
     /// The least time between two state files that differ only in what the job uses.
     pub publish: Duration,
+    /// The most a job's machines write to the console log on the Mac; a machine that writes more is stopped.
+    pub console_bytes: u64,
 }
 
 impl Limits {
@@ -41,8 +43,47 @@ impl Limits {
             kill: Duration::from_secs(10),
             boots: 2,
             publish: Duration::from_secs(10),
+            console_bytes: 16 << 20,
         }
     }
+
+    /// The longest a job runs, from its workload's start: at the deadline it is told to end and has
+    /// `deadline_grace` to; a guest that has not said how it ended `stop_slack` later has its machine stopped by
+    /// force.
+    pub fn longest_run(&self) -> Duration {
+        self.deadline + self.deadline_grace + self.stop_slack
+    }
+
+    /// The longest a vm-host lives past its workload's start: [`Limits::longest_run`], then `done` for a machine
+    /// that stays up after its guest's account, then `kill` for one that ignores the forced stop.
+    pub fn longest_life(&self) -> Duration {
+        self.longest_run() + self.done + self.kill
+    }
+}
+
+/// The most of a guest's own words the state keeps, in characters: the stage it failed at, why, a process's name.
+pub(crate) const STAGE_CHARS: usize = 32;
+pub(crate) const MESSAGE_CHARS: usize = 1024;
+const NAME_CHARS: usize = 64;
+/// The most processes an out-of-memory report names, which is what a guest of ours sends.
+const LARGEST: usize = 5;
+
+/// A guest's words as the state keeps them: `most` characters, none of them a control character. The state goes
+/// into logs and onto screens, and the guest runs a stranger's code.
+pub(crate) fn clip(text: &str, most: usize) -> String {
+    text.chars()
+        .take(most)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn clip_oom(mut event: OomEvent) -> OomEvent {
+    event.process.name = clip(&event.process.name, NAME_CHARS);
+    event.largest.truncate(LARGEST);
+    for process in &mut event.largest {
+        process.name = clip(&process.name, NAME_CHARS);
+    }
+    event
 }
 
 /// What happened.
@@ -65,6 +106,8 @@ pub enum Event {
         /// What the job gets to end by itself.
         grace: Duration,
     },
+    /// The machines of this job wrote more to the console than [`Limits::console_bytes`].
+    ConsoleFull,
     /// Time went by.
     Tick,
 }
@@ -92,6 +135,8 @@ pub enum Action {
     /// The job is over: write the state, remove its files, exit.
     Finish,
 }
+
+const CONSOLE_FULL: &str = "the machine wrote more to its console than a job's log may hold";
 
 /// One job's state machine. Times are since the vm-host started.
 #[derive(Debug)]
@@ -214,7 +259,8 @@ impl Machine {
         vec![Action::SendStop { reason, grace }, Action::Publish]
     }
 
-    fn summary(&mut self, summary: Summary, now: Duration) -> Vec<Action> {
+    fn summary(&mut self, mut summary: Summary, now: Duration) -> Vec<Action> {
+        summary.oom = summary.oom.map(clip_oom);
         self.usage = Some(summary.usage);
         if self.oom.is_none() {
             self.oom = summary.oom.clone();
@@ -225,12 +271,26 @@ impl Machine {
         vec![Action::CloseChannel, Action::Publish]
     }
 
-    /// Takes one event at time `now` and says what to do.
+    /// Takes one event at time `now` and says what to do. Every event is also a look at the clock, so no wait
+    /// depends on a [`Event::Tick`] finding room between a guest's messages.
     pub fn handle(&mut self, event: Event, now: Duration) -> Vec<Action> {
+        let tick = event == Event::Tick;
+        let mut actions = self.take(event, now);
+        if !tick {
+            actions.extend(self.tick(now));
+        }
+        actions
+    }
+
+    fn take(&mut self, event: Event, now: Duration) -> Vec<Action> {
         match (self.stage, event) {
             (Stage::Ended, _) => Vec::new(),
             // A machine that is gone ends every stage but a boot, which may have another try.
-            (Stage::Booting, Event::VmExited(why)) => self.boot_failed(why, now),
+            (Stage::Booting, Event::VmExited(why)) if self.boots < self.limits.boots => {
+                self.boot_failed(why, now)
+            }
+            // At the last try the machine is already gone: nothing to stop and nothing to wait for.
+            (Stage::Booting, Event::VmExited(why)) => self.finish(End::BootFailed, why, now),
             // No machine came of it: at the last try there is nothing to stop and nothing to wait for.
             (Stage::Booting, Event::StartFailed(why)) if self.boots < self.limits.boots => {
                 self.boot_failed(why, now)
@@ -269,6 +329,19 @@ impl Machine {
             ),
             (Stage::Done | Stage::Killing, Event::ChannelClosed) => Vec::new(),
 
+            // Another boot would only write more.
+            (Stage::Booting, Event::ConsoleFull) => {
+                self.give_up(End::BootFailed, CONSOLE_FULL.to_string(), now)
+            }
+            (Stage::Running | Stage::Stopping, Event::ConsoleFull) => {
+                self.give_up(self.lost(), CONSOLE_FULL.to_string(), now)
+            }
+            (Stage::Done, Event::ConsoleFull) => {
+                self.enter(Stage::Killing, now);
+                vec![Action::StopVm, Action::Publish]
+            }
+            (Stage::Killing, Event::ConsoleFull) => Vec::new(),
+
             (_, Event::Tick) => self.tick(now),
         }
     }
@@ -305,7 +378,7 @@ impl Machine {
                 if self.oom.is_some() {
                     return Vec::new();
                 }
-                self.oom = Some(event);
+                self.oom = Some(clip_oom(event));
                 vec![Action::Publish]
             }
             GuestMessage::Exited(summary) => self.summary(summary, now),
@@ -315,6 +388,7 @@ impl Machine {
                 } else {
                     End::Failed
                 };
+                let (stage, message) = (clip(&stage, STAGE_CHARS), clip(&message, MESSAGE_CHARS));
                 self.give_up(end, format!("the guest failed at {stage}: {message}"), now)
             }
         }

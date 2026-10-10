@@ -6,7 +6,7 @@ use cf_vmhost::{Guest, JobRequest, Layout, Limits};
 use cf_vmm::{Network, VmSpec};
 use cf_vmm_vz::VzVmm;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -85,7 +85,7 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
         console: console.clone(),
     };
     let vmm = VzVmm::new().map_err(|error| error.to_string())?;
-    let report = run_task(&vmm, &spec, Task::Probe, timeout);
+    let report = run_task(&vmm, &spec, Task::Probe, timeout, &|| false);
     print!("{}", std::fs::read_to_string(&console).unwrap_or_default());
     let report = report?;
     println!(
@@ -124,13 +124,7 @@ impl Scratch {
     /// Writes a file that did not exist, readable by this user only.
     fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
         let path = self.0.join(name);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut file| file.write_all(bytes))
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        cf_vmhost::write_private(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
         Ok(path)
     }
 }

@@ -28,6 +28,32 @@ const LIMIT_OF_1024: &str = "805306368";
 const MACHINE_PROCESS: &str = "com.apple.Virtualization.VirtualMachine";
 const AGENT: &str = "cc.codefusion.runner.it";
 const WAITS: &str = "trap '' TERM; echo waiting; sleep 600; echo woke";
+/// Holds 700 MB for five seconds and prints what the guest has touched by then: all its memory but what is free.
+const HOLDS_700_MB: &str = r#"node -e 'const held = Buffer.alloc(700 << 20, 1); const text = require("fs").readFileSync("/proc/meminfo", "utf8"); const kb = (name) => Number(text.match(new RegExp(name + ":\\s+(\\d+)"))[1]); console.log("touched_kb=" + (kb("MemTotal") - kb("MemFree")) + " total_kb=" + kb("MemTotal")); setTimeout(() => console.log("held=" + held[5]), 5000)'"#;
+/// What a job's root tries against the machine's network with nothing but the kernel's own calls, so that the
+/// answer does not depend on which tools the image has: a packet socket and a raw socket (either would send what
+/// no firewall rule sees), and the firewall's table deleted over netlink, as `nft delete table` would.
+const NETWORK_PROBES: &str = r#"
+sudo -n perl -e 'print "packet=", (socket(S, 17, 3, 768) ? "0" : "refused"), "\n"'
+sudo -n perl -e 'print "rawip=", (socket(S, 2, 3, 1) ? "0" : "refused"), "\n"'
+sudo -n perl -e '
+  $SIG{ALRM} = sub { print "nfnetlink=silent\n"; exit };
+  alarm 5;
+  socket(S, 16, 3, 12) or do { print "nfnetlink=refused(socket)\n"; exit };
+  sub message { my ($kind, $flags, $family, $resource, $body) = @_; my $rest = pack("CCn", $family, 0, $resource) . $body; pack("LSSLL", 16 + length($rest), $kind, $flags, 0, 0) . $rest }
+  my $name = "codefusion\0";
+  my $table = pack("SS", 4 + length($name), 1) . $name;
+  $table .= "\0" x ((4 - length($table) % 4) % 4);
+  my $batch = message(0x10, 1, 0, 10, "") . message((10 << 8) | 2, 1 | 4, 1, 0, $table) . message(0x11, 1, 0, 10, "");
+  send(S, $batch, 0, pack("SSLL", 16, 0, 0, 0)) or do { print "nfnetlink=refused(send)\n"; exit };
+  recv(S, my $answer, 4096, 0);
+  my ($length, $kind, $flags, $sequence, $port, $error) = unpack("LSSLLl", $answer);
+  print "nfnetlink=", ($kind == 2 && $error == 0 ? "0" : "refused($error)"), "\n";
+'
+timeout 3 bash -c "</dev/tcp/2606:4700:4700::1111/443" 2>/dev/null; echo ipv6=$?
+sudo -n sh -c 'echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6' 2>/dev/null; echo ipv6-on=$?
+sudo -n mount -o remount,rw /proc/sys 2>/dev/null; echo remount=$?
+try 10.1.2.3 80 private-again; try $gw 22 gateway-again"#;
 
 struct Bench {
     binary: PathBuf,
@@ -603,6 +629,32 @@ echo step=$?"#;
         ),
     )?;
     tidy(bench, "it-oom")?;
+
+    // The workload is itself the process the kernel stops, and the job ends in the same moment: no later look
+    // at the kernel's log or counter is there to say why.
+    let alone = job(bench, "it-oom-alone", 512, 120, "exec tail /dev/zero")?;
+    ended(&alone, "oom")?;
+    expect(
+        alone.state["oom"].is_object(),
+        format!("the state names no kill: {}", alone.state),
+    )?;
+    tidy(bench, "it-oom-alone")?;
+
+    // What the machine's process holds beyond the memory its guest has touched: the hypervisor's own share.
+    let holds = job(bench, "it-memory", 1024, 120, HOLDS_700_MB)?;
+    ended(&holds, "ok")?;
+    tidy(bench, "it-memory")?;
+    let touched =
+        number_after(&holds.console, "touched_kb=").ok_or("the job printed no memory")? as u64 * 1024;
+    let total = number_after(&holds.console, "total_kb=").ok_or("the job printed no memory")? as u64 * 1024;
+    expect(
+        touched > 700 * MB && holds.machine_peak > 700 * MB,
+        format!(
+            "the guest touched {} and its machine held {}: the measure is wrong",
+            mb(touched),
+            mb(holds.machine_peak)
+        ),
+    )?;
     Ok(vec![
         finished
             .console
@@ -612,6 +664,18 @@ echo step=$?"#;
             .trim()
             .to_string(),
         format!("the kill as reported: {killed}"),
+        format!(
+            "a workload that is itself the process stopped (`exec tail /dev/zero`, 512 MB): ended `oom` after {:.1} s",
+            alone.took.as_secs_f32()
+        ),
+        format!(
+            "a 1024 MB machine whose job holds 700 MB: the guest had touched {} of the {} its kernel counts, the machine's process held {} at its most ({} beyond what was touched), its vm-host {}",
+            mb(touched),
+            mb(total),
+            mb(holds.machine_peak),
+            mb(holds.machine_peak.saturating_sub(touched)),
+            mb(holds.host_peak)
+        ),
         format!(
             "the machine's process at its most: {} for a 1024 MB machine ({} beyond its size), its vm-host {}",
             mb(finished.machine_peak),
@@ -632,14 +696,22 @@ fn timeout(bench: &Bench) -> Fallible<Vec<String>> {
     let finished = job(bench, "it-timeout", 512, 5, WAITS)?;
     ended(&finished, "timeout")?;
     expect(!finished.console.contains("woke"), "the job went on")?;
+    // The deadline (5 s) and its grace (20 s) count from the workload's start. The guest then ends the job
+    // itself and says so; only a guest that does not is stopped by the host, 10 s later (`Limits::longest_run`).
+    let boot = finished.state["boot_ms"].as_f64().unwrap_or(0.0) / 1000.0;
     let took = finished.took.as_secs_f32();
+    let ran = f64::from(took) - boot;
     expect(
-        (20.0..45.0).contains(&took),
-        format!("a 5 s deadline and 20 s of grace took {took:.1} s"),
+        (25.0..35.0).contains(&ran),
+        format!("a 5 s deadline and 20 s of grace: the job ended {ran:.1} s after its start"),
+    )?;
+    expect(
+        finished.state["end"]["summary"]["end"]["reason"] == "timeout",
+        format!("the guest gave no account of the stop: {}", finished.state["end"]),
     )?;
     tidy(bench, "it-timeout")?;
     Ok(vec![format!(
-        "a job that ignores SIGTERM, deadline 5 s: ended `timeout` after {took:.1} s (20 s of grace)"
+        "a job that ignores SIGTERM, deadline 5 s: ended `timeout` {ran:.1} s after its start ({took:.1} s after the vm-host's): 5 s, 20 s of grace, then the guest's kill, its account and the power-off"
     )])
 }
 
@@ -731,10 +803,12 @@ fn sigkill(bench: &Bench) -> Fallible<Vec<String>> {
     let gone = within(Duration::from_secs(15), || machine.iter().all(|pid| !alive(*pid)));
     let after = killed.elapsed().as_millis();
     let stage = state_of(bench, "it-kill")["stage"].clone();
+    let answered = ask(bench, "it-kill", &json!({ "cmd": "state" })).is_ok();
     forget(bench, "it-kill");
     expect(gone, "the machine's process outlived a killed vm-host by 15 s")?;
+    expect(!answered, "something answered on a killed vm-host's socket")?;
     Ok(vec![format!(
-        "SIGKILL to the vm-host: the machine's process was gone within {after} ms; the state file still said {stage}, for the daemon to notice by the pid"
+        "SIGKILL to the vm-host: the machine's process was gone within {after} ms; the state file still said {stage} and nothing answered on the socket, which is how the daemon tells"
     )])
 }
 
@@ -783,12 +857,11 @@ sudo -n iptables -P OUTPUT ACCEPT 2>/dev/null; echo iptables=$?
 sudo -n nft flush ruleset 2>/dev/null; echo nft=$?
 sudo -n hostname other 2>/dev/null; echo hostname=$?
 sudo -n date -s 2001-01-01 >/dev/null 2>&1; echo clock=$?
-sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?
-try 10.1.2.3 80 private-again"#,
+sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
         lan = lan.as_deref().unwrap_or("192.168.1.1"),
         tailnet = tailnet.as_deref().unwrap_or("100.100.100.100"),
         other = address.as_deref().unwrap_or("192.168.64.250"),
-    );
+    ) + NETWORK_PROBES;
     let first = start(bench, "it-firewall", 512, 120, &script, &[]).and_then(|running| {
         finish(bench, running, Duration::from_secs(120), &mut |_, machines| {
             // The other job's machine is not this one's.
@@ -813,7 +886,11 @@ try 10.1.2.3 80 private-again"#,
             "other-machine=124",
             "names=1",
             "github=200",
+            "packet=refused",
+            "rawip=refused",
+            "nfnetlink=refused",
             "private-again=124",
+            "gateway-again=124",
         ],
     )?;
     shows(&other.console, &["github=200"])?;
@@ -826,6 +903,9 @@ try 10.1.2.3 80 private-again"#,
             "hostname=0",
             "clock=0",
             "mknod=0",
+            "ipv6=0",
+            "ipv6-on=0",
+            "remount=0",
         ]
         .iter()
         .all(|done| !first.console.contains(done)),
@@ -873,6 +953,12 @@ try 10.1.2.3 80 private-again"#,
                     "hostname=",
                     "clock=",
                     "mknod=",
+                    "packet=",
+                    "rawip=",
+                    "nfnetlink=",
+                    "ipv6=",
+                    "ipv6-on=",
+                    "remount=",
                 ]
                 .iter()
                 .any(|name| line.starts_with(name))

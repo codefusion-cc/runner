@@ -172,6 +172,24 @@ fn the_second_boot_can_succeed_and_its_boot_time_is_its_own() {
 }
 
 #[test]
+fn a_machine_that_is_gone_at_the_last_try_ends_the_job_at_once() {
+    let (mut machine, _) = Machine::new(limits(), s(0));
+    assert_eq!(
+        machine.handle(Event::VmExited("crashed".into()), s(3)),
+        [Action::Boot, Action::Publish]
+    );
+    assert_eq!(
+        machine.handle(Event::VmExited("crashed again".into()), s(5)),
+        [Action::Finish]
+    );
+    let ended = machine.ended(0).unwrap();
+    assert_eq!(
+        (ended.end, ended.message.as_deref()),
+        (End::BootFailed, Some("crashed again"))
+    );
+}
+
+#[test]
 fn a_machine_that_cannot_start_twice_ends_at_once_with_nothing_to_stop() {
     let (mut machine, _) = Machine::new(limits(), s(0));
     assert_eq!(
@@ -409,6 +427,216 @@ fn only_the_first_out_of_memory_stop_is_the_jobs_and_usage_is_written_every_ten_
     assert_eq!(machine.handle(beat(), s(21)), [Action::Publish]);
 }
 
+#[test]
+fn a_guest_that_never_stops_talking_still_meets_every_wait() {
+    // No tick at all: whoever feeds the machine may have nothing but the guest's chatter to feed it.
+    let limits = Limits {
+        publish: s(3600),
+        ..Limits::for_deadline(s(5))
+    };
+    let beat = || Event::Guest(GuestMessage::Heartbeat(usage(1)));
+    let mut machine = running(limits);
+    assert_eq!(machine.handle(beat(), s(5)), []);
+    assert_eq!(
+        machine.handle(beat(), s(6)),
+        [
+            Action::SendStop {
+                reason: StopReason::Timeout,
+                grace: s(20)
+            },
+            Action::Publish
+        ]
+    );
+    assert_eq!(machine.handle(beat(), s(35)), []);
+    assert_eq!(machine.handle(beat(), s(36)), [Action::StopVm, Action::Publish]);
+    assert_eq!(
+        (machine.stage(), end_of(&machine)),
+        (Stage::Killing, Some(End::Timeout))
+    );
+    assert_eq!(machine.handle(beat(), s(45)), []);
+    assert_eq!(machine.handle(beat(), s(46)), [Action::Finish]);
+
+    // A boot is no different: a guest that says hello for ever is not ready.
+    let (mut machine, _) = Machine::new(limits, s(0));
+    assert_eq!(machine.handle(hello(), s(19)), []);
+    assert_eq!(machine.handle(hello(), s(20)), [Action::Boot, Action::Publish]);
+    assert_eq!(machine.handle(Event::Connected, s(39)), [Action::SendStart]);
+    assert_eq!(machine.handle(hello(), s(40)), [Action::StopVm, Action::Publish]);
+    assert_eq!(end_of(&machine), Some(End::BootFailed));
+
+    // And a stop asked of a job whose guest talks on: the grace, the slack, then by force.
+    let mut machine = running(Limits {
+        publish: s(3600),
+        ..Limits::for_deadline(s(3600))
+    });
+    machine.handle(
+        Event::StopAsked {
+            reason: StopReason::EvictedMemory,
+            grace: s(3),
+        },
+        s(10),
+    );
+    assert_eq!(machine.handle(beat(), s(22)), []);
+    assert_eq!(machine.handle(beat(), s(23)), [Action::StopVm, Action::Publish]);
+    assert_eq!(end_of(&machine), Some(End::EvictedMemory));
+}
+
+#[test]
+fn the_longest_a_job_runs_and_a_vm_host_lives_is_what_the_limits_say() {
+    let limits = Limits::for_deadline(s(5));
+    // Told at the deadline, 20 s to end by itself, 10 s for the guest to say how it went.
+    assert_eq!(limits.longest_run(), s(35));
+    // Then a machine that stays up after its guest's account (120 s) and one that ignores the forced stop (10 s).
+    assert_eq!(limits.longest_life(), s(165));
+
+    // A job that ignores everything, as does its machine: ready at second 1.
+    let ready_at = s(1);
+    let mut machine = running(limits);
+    let before = |wait: Duration| ready_at + wait - Duration::from_millis(1);
+    assert_eq!(machine.handle(Event::Tick, before(s(5))), []);
+    assert_eq!(machine.handle(Event::Tick, ready_at + s(5)).len(), 2);
+    assert_eq!(machine.stage(), Stage::Stopping);
+    assert_eq!(machine.handle(Event::Tick, before(limits.longest_run())), []);
+    assert_eq!(
+        machine.handle(Event::Tick, ready_at + limits.longest_run()),
+        [Action::StopVm, Action::Publish]
+    );
+    assert_eq!(
+        machine.handle(Event::Tick, before(limits.longest_run() + limits.kill)),
+        []
+    );
+    assert_eq!(
+        machine.handle(Event::Tick, ready_at + limits.longest_run() + limits.kill),
+        [Action::Finish]
+    );
+    assert_eq!(end_of(&machine), Some(End::Timeout));
+
+    // The slowest end there is: the guest gives its account at the last moment and its machine never goes.
+    let mut machine = running(limits);
+    machine.handle(Event::Tick, ready_at + s(5));
+    let last_moment = before(limits.longest_run());
+    assert_eq!(
+        machine.handle(
+            Event::Guest(GuestMessage::Exited(summary(
+                GuestEnd::Stopped(StopReason::Timeout),
+                None,
+                false
+            ))),
+            last_moment
+        ),
+        [Action::CloseChannel, Action::Publish]
+    );
+    let mut now = last_moment;
+    while machine.stage() != Stage::Ended {
+        now += Duration::from_millis(500);
+        machine.handle(Event::Tick, now);
+    }
+    assert!(
+        now <= ready_at + limits.longest_life(),
+        "ended {now:?} after the vm-host's start"
+    );
+    assert_eq!(end_of(&machine), Some(End::Timeout));
+}
+
+#[test]
+fn what_a_guest_writes_into_the_state_is_short_and_has_no_control_characters() {
+    let (mut machine, _) = Machine::new(limits(), s(0));
+    machine.handle(
+        Event::Guest(GuestMessage::Failed {
+            stage: "s".repeat(10_000),
+            message: format!(
+                "first line\n\u{1b}[2Jsecond\u{0}\u{7f}\u{85} {}",
+                "é".repeat(60_000)
+            ),
+        }),
+        s(1),
+    );
+    let message = machine.ended(0).unwrap().message.unwrap();
+    assert!(message.chars().all(|c| !c.is_control()), "{message:?}");
+    assert!(
+        message.starts_with(&format!(
+            "the guest failed at {}: first line  [2Jsecond    é",
+            "s".repeat(32)
+        )),
+        "{}",
+        &message[..120]
+    );
+    assert!(message.chars().count() <= 1200, "{}", message.chars().count());
+
+    let process = |name: &str| Process {
+        pid: 1,
+        name: name.into(),
+        memory_bytes: 1,
+    };
+    let loud = || OomEvent {
+        process: process(&format!("no\nde{}", "x".repeat(5000))),
+        limit_bytes: 2,
+        largest: (0..500)
+            .map(|i| process(&format!("{i}\t{}", "y".repeat(500))))
+            .collect(),
+    };
+    let mut machine = running(limits());
+    machine.handle(Event::Guest(GuestMessage::Oom(loud())), s(2));
+    let kept = machine.oom().unwrap();
+    assert_eq!(kept.process.name, format!("no de{}", "x".repeat(59)));
+    assert_eq!(kept.largest.len(), 5);
+    assert_eq!(kept.largest[4].name, format!("4 {}", "y".repeat(62)));
+
+    // The same in a summary, which is where a job's first out-of-memory stop may arrive.
+    let mut machine = running(limits());
+    let mut account = summary(GuestEnd::Exited, Some(137), true);
+    account.oom = Some(loud());
+    machine.handle(Event::Guest(GuestMessage::Exited(account)), s(2));
+    assert_eq!(machine.oom().unwrap().largest.len(), 5);
+    let ended = machine.ended(0).unwrap();
+    let in_summary = ended.summary.unwrap().oom.unwrap();
+    assert_eq!((in_summary.largest.len(), in_summary.process.name.len()), (5, 64));
+    assert!(serde_json::to_string(&machine.ended(0)).unwrap().len() < 4096);
+}
+
+#[test]
+fn a_machine_that_fills_its_console_is_stopped_and_never_booted_again() {
+    let full = Event::ConsoleFull;
+    let (mut machine, _) = Machine::new(limits(), s(0));
+    assert_eq!(
+        machine.handle(full.clone(), s(1)),
+        [Action::StopVm, Action::Publish]
+    );
+    assert_eq!((machine.boots(), end_of(&machine)), (1, Some(End::BootFailed)));
+    assert!(machine.ended(0).unwrap().message.unwrap().contains("console"));
+
+    let mut machine = running(limits());
+    assert_eq!(
+        machine.handle(full.clone(), s(2)),
+        [Action::StopVm, Action::Publish]
+    );
+    assert_eq!(
+        (machine.stage(), end_of(&machine)),
+        (Stage::Killing, Some(End::GuestLost))
+    );
+    assert_eq!(machine.handle(full.clone(), s(3)), []);
+
+    // Under a stop the end is the stop's; after the job's own end it stays, and the machine is not waited for.
+    let mut machine = running(limits());
+    machine.handle(
+        Event::StopAsked {
+            reason: StopReason::EvictedDisk,
+            grace: s(30),
+        },
+        s(2),
+    );
+    machine.handle(full.clone(), s(3));
+    assert_eq!(end_of(&machine), Some(End::EvictedDisk));
+
+    let mut machine = running(limits());
+    machine.handle(exited(0), s(2));
+    assert_eq!(machine.handle(full, s(3)), [Action::StopVm, Action::Publish]);
+    assert_eq!(
+        (machine.stage(), end_of(&machine)),
+        (Stage::Killing, Some(End::Ok))
+    );
+}
+
 fn any_event() -> impl Strategy<Value = Event> {
     let reason = prop_oneof![
         Just(StopReason::Cancelled),
@@ -423,6 +651,7 @@ fn any_event() -> impl Strategy<Value = Event> {
         Just(Event::ChannelClosed),
         Just(Event::VmExited("x".into())),
         Just(Event::Tick),
+        Just(Event::ConsoleFull),
         Just(hello()),
         Just(ready()),
         Just(Event::Guest(GuestMessage::Heartbeat(usage(1)))),

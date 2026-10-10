@@ -28,6 +28,10 @@ pub enum StoreError {
     /// The release is genuine but has no root file system (it is the bundle a binary embeds).
     #[error("the release has no root file system")]
     NoRootfs,
+    /// The store's record of the newest release it accepted is there but is no build time. Nothing is installed
+    /// until it is put right: read as "none yet", it would let every old release back in.
+    #[error("{0} does not hold the build time of the newest release accepted: {1}")]
+    Accepted(String, String),
     /// A file could not be read or written.
     #[error("{0}: {1}")]
     Io(String, io::Error),
@@ -58,12 +62,16 @@ impl Store {
         (plain(version) && path.is_file()).then_some(path)
     }
 
-    /// The build time of the newest release this store accepted; 0 before the first.
-    pub fn newest_accepted(&self) -> u64 {
-        fs::read_to_string(self.0.join(ACCEPTED_NAME))
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
-            .unwrap_or(0)
+    /// The build time of the newest release this store accepted; 0 before the first, when there is no record.
+    /// A record that cannot be read, or holds something else than one number, is an error.
+    pub fn newest_accepted(&self) -> Result<u64, StoreError> {
+        let path = self.0.join(ACCEPTED_NAME);
+        let refused = |why: String| StoreError::Accepted(path.display().to_string(), why);
+        match fs::read_to_string(&path) {
+            Ok(text) => text.trim().parse().map_err(|_| refused("not a number".into())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(refused(error.to_string())),
+        }
     }
 
     /// Installs the release in `source` as `version` and returns its manifest. Every file is copied first, then
@@ -74,7 +82,8 @@ impl Store {
         if !plain(version) {
             return Err(StoreError::Version(version.to_string()));
         }
-        let partial = self.0.join(format!("{version}.partial"));
+        // No version starts with a dot, so the store's own folders are never an installed image's.
+        let partial = self.0.join(format!(".{version}.partial"));
         let result = self.install_into(&partial, source, version, key);
         if result.is_err() {
             let _ = fs::remove_dir_all(&partial);
@@ -111,7 +120,8 @@ impl Store {
                 fs::copy(entry.path(), partial.join(entry.file_name())).map_err(io(&entry.path()))?;
             }
         }
-        let manifest = verify(&DirFiles::new(partial), key, version, self.newest_accepted())?.manifest;
+        let newest = self.newest_accepted()?;
+        let manifest = verify(&DirFiles::new(partial), key, version, newest)?.manifest;
         let rootfs = manifest.rootfs.as_ref().ok_or(StoreError::NoRootfs)?;
 
         // The parts are joined under the hash of the whole, so the file a machine boots from is the one signed.
@@ -137,16 +147,27 @@ impl Store {
             return Err(StoreError::Refused(ImageError::HashMismatch(ROOTFS_NAME.into())));
         }
 
-        let installed = self.0.join(version);
-        let _ = fs::remove_dir_all(&installed);
-        fs::rename(partial, &installed).map_err(io(&installed))?;
-        if manifest.built > self.newest_accepted() {
+        // The record moves first: a release in place without it could be followed by one older than itself.
+        if manifest.built > newest {
             let accepted = self.0.join(ACCEPTED_NAME);
             let new = self.0.join(format!("{ACCEPTED_NAME}.new"));
             fs::write(&new, manifest.built.to_string())
                 .and_then(|()| fs::rename(&new, &accepted))
                 .map_err(io(&accepted))?;
         }
+        let installed = self.0.join(version);
+        // A version installed again is put aside, not deleted first: when the new one cannot take its place the old
+        // one comes back.
+        let aside = self.0.join(format!(".{version}.old"));
+        let _ = fs::remove_dir_all(&aside);
+        let had_one = fs::rename(&installed, &aside).is_ok();
+        if let Err(error) = fs::rename(partial, &installed) {
+            if had_one {
+                let _ = fs::rename(&aside, &installed);
+            }
+            return Err(io(&installed)(error));
+        }
+        let _ = fs::remove_dir_all(&aside);
         Ok(manifest)
     }
 }

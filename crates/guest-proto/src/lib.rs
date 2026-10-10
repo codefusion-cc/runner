@@ -9,13 +9,15 @@
 //! [`PROTOCOL`] is checked all the same and a mismatch ends the boot.
 //!
 //! Everything a peer sends is input: a frame that is too large, cut short or not a message is a [`ProtoError`], never
-//! a panic.
+//! a panic. The host reads a guest with [`read_message_within`] and [`MAX_GUEST_FRAME`].
 
 mod frame;
 mod message;
 mod secret;
 
-pub use frame::{Decoder, MAX_FRAME, ProtoError, encode, read_message, write_message};
+pub use frame::{
+    MAX_FRAME, MAX_GUEST_FRAME, ProtoError, encode, read_message, read_message_within, write_message,
+};
 pub use message::{
     GuestEnd, GuestMessage, HostMessage, Job, Limits, OomEvent, Process, Start, Stop, StopReason, Summary,
     Task, Usage, Workload,

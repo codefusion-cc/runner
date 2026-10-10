@@ -79,8 +79,17 @@ pub struct Policy {
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 
-/// The firewall of a job's machine whose network named these name servers.
-pub fn policy(name_servers: &[Ip]) -> Policy {
+/// The network a lease puts a machine in: its address under its mask, as `(network, prefix length)`. A mask with
+/// a hole counts up to the hole, so the network is never smaller than the mask says.
+pub fn own_network(address: Ip, netmask: Ip) -> (Ip, u8) {
+    let prefix = u32::from_be_bytes(netmask).leading_ones() as u8;
+    ((u32::from_be_bytes(address) & mask(prefix)).to_be_bytes(), prefix)
+}
+
+/// The firewall of a job's machine whose network named these name servers. `own` is what the machine's lease
+/// says is next to it, the network it is in and its gateway: the Mac and the other jobs' machines, whatever range
+/// the Mac was set up to give them.
+pub fn policy(name_servers: &[Ip], own: &[(Ip, u8)]) -> Policy {
     let rule = |when: &[Match], then| Rule {
         when: when.to_vec(),
         then,
@@ -103,7 +112,7 @@ pub fn policy(name_servers: &[Ip]) -> Policy {
             Verdict::Accept,
         ));
     }
-    for (network, prefix) in BLOCKED {
+    for (network, prefix) in BLOCKED.iter().chain(own) {
         output.push(rule(
             &[Match::DestIn {
                 network: *network,
