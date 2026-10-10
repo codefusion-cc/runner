@@ -1,10 +1,28 @@
 [package]
 name = "cf-scaleset"
-description = "GitHub's scale set client: session, long poll, acquire, the JIT config of an Actions runner. Filled in M3."
+description = "GitHub's scale set client: sessions, the long poll, acquiring jobs, the one-job config of an Actions runner."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+cf-ghapp = { path = "../ghapp" }
+cf-secret = { path = "../secret" }
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time = { version = "0.3", features = ["parsing", "formatting"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+cf-fake-github = { path = "../fake-github" }
+proptest.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

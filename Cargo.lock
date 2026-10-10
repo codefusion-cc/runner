@@ -176,6 +176,21 @@ version = "0.1.0"
 [[package]]
 name = "cf-scaleset"
 version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "cf-fake-github",
+ "cf-ghapp",
+ "cf-secret",
+ "proptest",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cf-secret"
