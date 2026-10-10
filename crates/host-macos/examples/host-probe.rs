@@ -5,7 +5,7 @@
 
 #[cfg(target_os = "macos")]
 fn main() -> std::process::ExitCode {
-    use cf_budget::{Host, Mode, Settings};
+    use cf_budget::{Budget, Host, Mode, Settings};
     use cf_host_macos::{MacHost, reading};
 
     let disk = std::env::args().nth(1).unwrap_or_else(|| "/".into());
@@ -77,18 +77,20 @@ fn main() -> std::process::ExitCode {
     );
 
     for mode in [Mode::Dedicated, Mode::Workstation] {
-        let settings = Settings::for_host(facts, mode);
-        let limits = if mode == Mode::Workstation && reading.idle < settings.idle_after {
-            settings.in_use
-        } else {
-            settings.away
+        // The budget itself says which limits are in force, so this never disagrees with the Runner.
+        let Ok(mut budget) = Budget::new(Settings::for_host(facts, mode)) else {
+            eprintln!("{mode:?}: the default settings do not fit this Mac");
+            continue;
         };
+        budget.observe(now, Some(reading));
+        let status = budget.status(now);
         println!(
-            "{mode:?}: cap {:.2} GiB, floor {:.2} GiB, {} CPUs; above the floor now: {:.2} GiB",
-            gib(limits.cap_bytes),
-            gib(limits.floor_bytes),
-            limits.cpus,
-            gib(reading.available_bytes.saturating_sub(limits.floor_bytes)),
+            "{mode:?}: person there: {}, cap {:.2} GiB, floor {:.2} GiB, {} CPUs; above the floor now: {:.2} GiB",
+            status.person_there,
+            gib(status.limits.cap_bytes),
+            gib(status.limits.floor_bytes),
+            status.limits.cpus,
+            gib(reading.available_bytes.saturating_sub(status.limits.floor_bytes)),
         );
     }
     std::process::ExitCode::SUCCESS

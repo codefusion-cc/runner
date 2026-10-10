@@ -233,6 +233,10 @@ impl MacHost {
         // SAFETY: `key` was made above, is owned here and is not used again.
         unsafe { CFRelease(key) };
         if value.is_null() {
+            // The entry may be stale (the window server started again): look it up again at the next reading.
+            // SAFETY: `hid` is an entry this struct holds; it is set to 0 here and not used again.
+            unsafe { IOObjectRelease(self.hid) };
+            self.hid = 0;
             return None;
         }
         let mut nanos: i64 = 0;
