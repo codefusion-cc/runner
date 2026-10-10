@@ -3,7 +3,7 @@ use std::path::Path;
 use cf_image::store::Store;
 use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
-const USAGE: &str = "usage: codefusion-runner version | image verify <folder> --version <v> | image install <folder> --version <v> --state-dir <folder> | vm --state-dir <folder> | boot-proof [--memory-mb N] [--timeout-s N]";
+const USAGE: &str = "usage: codefusion-runner version | image verify <folder> --version <v> | image install <folder> --version <v> --state-dir <folder> | vm --state-dir <folder> | boot-proof [--memory-mb N] [--timeout-s N, at most 3600]";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -75,7 +75,8 @@ fn boot_proof(options: &[&str]) -> Result<(), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    if memory_mb == 0 || timeout == 0 {
+    // A proof is over in seconds; an hour is already no proof, and a time no clock can add is none either.
+    if memory_mb == 0 || timeout == 0 || timeout > 3600 {
         return Err(USAGE.into());
     }
     let memory_bytes = memory_mb

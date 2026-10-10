@@ -322,3 +322,67 @@ fn a_release_whose_build_time_cannot_be_recorded_is_not_installed() {
     assert_eq!(store.newest_accepted().unwrap(), 1000);
     assert_eq!(names(&images), ["accepted.json", "accepted.json.new", "v1"]);
 }
+
+#[test]
+fn what_the_signed_list_does_not_name_is_not_installed() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::new(state.path().join("images"));
+    let good = release("v1", 1000, true, &key(1));
+    // A genuine release with files next to it that nobody signed: one under the installed image's own name.
+    fs::write(good.path().join(ROOTFS_NAME), b"not the signed root file system").unwrap();
+    fs::write(good.path().join("run-me.sh"), b"#!/bin/sh\n").unwrap();
+    fs::write(good.path().join(".hidden"), b"x").unwrap();
+    store.install(good.path(), "v1", &key(1).verifying_key()).unwrap();
+
+    let installed = state.path().join("images/v1");
+    assert_eq!(fs::read(installed.join(ROOTFS_NAME)).unwrap(), rootfs());
+    assert_eq!(
+        names(&installed),
+        [
+            "Image",
+            "SHA256SUMS",
+            "SHA256SUMS.sig",
+            "image.json",
+            "initramfs",
+            ROOTFS_NAME
+        ]
+    );
+    assert_eq!(
+        fs::metadata(installed.join(ROOTFS_NAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn a_second_install_waits_for_the_one_under_way() {
+    let state = tempfile::tempdir().unwrap();
+    let images = state.path().join("images");
+    let store = Store::new(&images);
+    let good = release("v1", 1000, true, &key(1));
+    store.install(good.path(), "v1", &key(1).verifying_key()).unwrap();
+
+    // An install under way holds the store, as this test does now.
+    let held = fs::File::open(&images).unwrap();
+    held.lock().unwrap();
+    let (said, heard) = std::sync::mpsc::channel();
+    let source = good.path().to_path_buf();
+    let second = std::thread::spawn(move || {
+        let outcome = Store::new(&images).install(&source, "v1", &key(1).verifying_key());
+        said.send(()).unwrap();
+        outcome
+    });
+    assert!(
+        heard.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+        "the second install went on while the first held the store"
+    );
+    assert_eq!(names(&state.path().join("images")), ["accepted.json", "v1"]);
+    held.unlock().unwrap();
+    heard.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+    assert_eq!(second.join().unwrap().unwrap().version, "v1");
+    assert_eq!(names(&state.path().join("images")), ["accepted.json", "v1"]);
+}

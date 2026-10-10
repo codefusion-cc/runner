@@ -1,6 +1,6 @@
 //! One job: its disks, its limits, its container, and the watch over it until it ends.
 
-use super::container::{Outcome, STATUS_FD, Spec};
+use super::container::{STATUS_FD, Spec};
 use super::init::{Event, Failure, Host, SELF_COPY};
 use super::net::Network;
 use super::sys::{self, context, say};
@@ -9,6 +9,7 @@ use cf_guest_proto::{
 };
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::oom::{self, Kill};
+use cf_supervisor::outcome::{REPORT_BYTES, workload_end};
 use cf_supervisor::processes::{Process, Table, parse_stat};
 use cf_supervisor::tell::{self, JobFacts};
 use std::fs::{self, File};
@@ -217,11 +218,13 @@ pub fn run(
         )
         .map_err(disks)?;
     }
+    // No device files: the job's root has the user ids a device file trusts, so one in the image or one the job
+    // brought would be the machine's disks or memory. The container's own `/dev` is a mount of its own.
     sys::mount_at(
         "overlay",
         ROOT,
         "overlay",
-        0,
+        libc::MS_NODEV,
         &format!("lowerdir={IMAGE},upperdir={SCRATCH}/upper,workdir={SCRATCH}/work"),
     )
     .map_err(disks)?;
@@ -349,15 +352,9 @@ pub fn run(
     let summary_usage = usage();
     kill_job();
 
-    let mut outcome = String::new();
-    let _ = File::from(status).read_to_string(&mut outcome);
-    let (exit_code, signal) = match serde_json::from_str::<Outcome>(&outcome) {
-        Ok(Outcome::Error(error)) => return Err(container(error)),
-        Ok(Outcome::Status(status)) if libc::WIFEXITED(status) => (Some(libc::WEXITSTATUS(status)), None),
-        Ok(Outcome::Status(status)) => (None, Some(libc::WTERMSIG(status))),
-        // The container went before it could say: the launcher's own end is what there is.
-        Err(_) => (ended.code(), ended.signal()),
-    };
+    let mut report = String::new();
+    let _ = File::from(status).take(REPORT_BYTES).read_to_string(&mut report);
+    let (exit_code, signal) = workload_end(&report, (ended.code(), ended.signal())).map_err(container)?;
     Ok(Summary {
         end: watch
             .stop
@@ -549,21 +546,8 @@ impl Watch<'_> {
     fn kernel_kills(&mut self, last: bool) -> Vec<Kill> {
         let mut kills = Vec::new();
         if let Some(log) = &mut self.kernel_log {
-            let mut record = [0u8; 8192];
-            loop {
-                match log.read(&mut record) {
-                    Ok(read @ 1..) => {
-                        if let Some(kill) = oom::message_of(&String::from_utf8_lossy(&record[..read]))
-                            .and_then(|message| self.log.line(message))
-                        {
-                            kills.push(kill);
-                        }
-                    }
-                    // The log dropped records we were too slow for; the next read goes on after them.
-                    Err(error) if error.raw_os_error() == Some(libc::EPIPE) => {}
-                    _ => break,
-                }
-            }
+            let reader = &mut self.log;
+            oom::read_records(log, |message| kills.extend(reader.line(message)));
         }
         let counted =
             oom::kills_in_events(&fs::read_to_string(format!("{CGROUP}/memory.events")).unwrap_or_default());

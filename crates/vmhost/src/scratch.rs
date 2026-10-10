@@ -2,11 +2,11 @@
 //! seconds, so it happens once an image and size; every job's disk is a copy-on-write copy of that template,
 //! which costs no time and no space until the job writes.
 
-use crate::layout::{Layout, make_dir, private};
+use crate::layout::{Layout, make_dir, open_private, private};
 use crate::task::run_task;
 use cf_guest_proto::{IMAGE_DISK, SCRATCH_DISK, Task};
 use cf_vmm::{Disk, Network, VmSpec, Vmm};
-use std::fs::{self, File};
+use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -82,7 +82,7 @@ pub fn template(
     if path.exists() {
         return Ok(path);
     }
-    let lock = File::create(folder.join(format!("{image}-{bytes}.lock")))
+    let lock = open_private(&folder.join(format!("{image}-{bytes}.lock")))
         .map_err(|error| say("the template's lock", error))?;
     // SAFETY: flock takes no pointers; the descriptor is open for the call. The lock goes with the file.
     while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -100,7 +100,8 @@ pub fn template(
     }
     let partial = folder.join(format!("{image}-{bytes}.partial"));
     let _ = fs::remove_file(&partial);
-    File::create(&partial)
+    // A job's disk is a copy of this one, mode and all, and holds what the job had: nobody else reads it.
+    open_private(&partial)
         .and_then(|file| file.set_len(bytes))
         .map_err(|error| say("the template", error))?;
     let spec = files.machine(&partial, 1 << 30, 2, Network::None, console);

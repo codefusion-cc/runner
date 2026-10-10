@@ -225,6 +225,8 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
         ((4 << 30) - (256 << 20), 4096, 1 << 30, 4)
     );
     assert_eq!(task.env, [("CI".to_string(), "true".to_string())]);
+    // The guest is told the networks this machine is in, to keep the job from them.
+    assert_eq!(task.blocked, cf_vmhost::host_networks());
     assert!(matches!(&task.workload, Workload::ActionsRunner { jit_config } if jit_config.expose() == TOKEN));
 
     let specs = vmm.started();
@@ -266,7 +268,9 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
         !format!("{:?}", request("x")).contains(TOKEN),
         "a request printed for a log shows the registration"
     );
-    // What stays is the job's state and the empty disk the next job of this image and size starts from.
+    // What stays is the job's state, its console log (empty here: the scripted machine writes none) and the empty
+    // disk the next job of this image and size starts from.
+    assert_eq!(std::fs::read(layout.console("job-1")).unwrap(), b"");
     let template = layout.scratch_templates().join("image-1-1073741824.img");
     assert_eq!(std::fs::metadata(template).unwrap().len(), 1 << 30);
     let mut kept: Vec<_> = files
@@ -274,7 +278,15 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
         .map(|(name, _)| name.rsplit('/').next().unwrap())
         .collect();
     kept.sort_unstable();
-    assert_eq!(kept, ["image-1-1073741824.lock", "job-1.json", "rootfs.img"]);
+    assert_eq!(
+        kept,
+        [
+            "image-1-1073741824.lock",
+            "job-1.console.log",
+            "job-1.json",
+            "rootfs.img"
+        ]
+    );
 }
 
 #[test]
@@ -698,6 +710,41 @@ fn a_frame_larger_than_a_guest_of_ours_sends_is_a_lost_guest_and_not_read() {
 }
 
 #[test]
+fn a_jobs_console_log_starts_empty_is_its_users_alone_and_follows_no_link() {
+    let (dir, layout) = state_dir();
+    let logs = layout.console("a").parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // What an earlier job of the name left, readable by all; and for the next job a link to a file elsewhere.
+    std::fs::write(layout.console("a"), "an earlier job's lines\n").unwrap();
+    std::fs::set_permissions(layout.console("a"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::write(&elsewhere, "not a log").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, layout.console("b")).unwrap();
+
+    let vmm = FakeVmm::new([
+        formatter(),
+        job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0)))),
+        job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0)))),
+    ]);
+    for name in ["a", "b"] {
+        assert_eq!(
+            go(&vmm, &layout, request(name), quick())
+                .unwrap()
+                .end
+                .unwrap()
+                .end,
+            End::Ok
+        );
+        let console = layout.console(name);
+        assert_eq!(std::fs::read_to_string(&console).unwrap(), "", "{name}");
+        assert_eq!(mode(&console), 0o600, "{name}");
+        assert!(std::fs::symlink_metadata(&console).unwrap().is_file(), "{name}");
+    }
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "not a log");
+}
+
+#[test]
 fn a_machine_that_fills_the_console_log_is_stopped() {
     let (_dir, layout) = state_dir();
     let console = layout.console("a");
@@ -887,8 +934,38 @@ fn one_slow_client_does_not_keep_the_socket_from_the_next() {
 fn what_a_job_leaves_is_this_users_alone_and_a_folder_others_can_write_to_boots_nothing() {
     let (dir, layout) = state_dir();
     let quiet = || job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0))));
-    let vmm = Arc::new(FakeVmm::new([formatter(), quiet()]));
+    // What is there only while the job runs: its socket and its machine's files, the job's disk among them.
+    let (seen, while_running) = mpsc::channel();
+    let looks = {
+        let layout = layout.clone();
+        job(move |stream, _, _| {
+            let mut modes = vec![("the socket".to_string(), mode(layout.socket("a")))];
+            for entry in std::fs::read_dir(layout.job_dir("a")).unwrap() {
+                let entry = entry.unwrap();
+                modes.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    mode(entry.path()),
+                ));
+            }
+            modes.sort();
+            seen.send(modes).unwrap();
+            finish(stream, summary(GuestEnd::Exited, Some(0)));
+        })
+    };
+    let vmm = Arc::new(FakeVmm::new([formatter(), looks]));
     go_within(&vmm, &layout, request("a"), quick(), false).unwrap();
+    assert_eq!(
+        while_running.recv().unwrap(),
+        [
+            ("initramfs".to_string(), 0o600),
+            ("kernel".to_string(), 0o600),
+            ("scratch.img".to_string(), 0o600),
+            ("the socket".to_string(), 0o600),
+        ]
+    );
+    for kept in ["image-1-1073741824.img", "image-1-1073741824.lock"] {
+        assert_eq!(mode(layout.scratch_templates().join(kept)), 0o600, "{kept}");
+    }
     assert_eq!(mode(layout.state("a")), 0o600);
     assert_eq!(mode(layout.run()), 0o700);
     assert_eq!(mode(layout.scratch_templates()), 0o700);

@@ -14,14 +14,43 @@ pub struct Kill {
     pub largest: Vec<Process>,
 }
 
-/// The message of one record of `/dev/kmsg` (`<priority>,<sequence>,<time>,<flags>;<message>`). `None` for a
-/// continuation line, which carries no message.
+/// The message of one record of `/dev/kmsg` (`<priority>,<sequence>,<time>,<flags>;<message>`) that the kernel
+/// itself wrote. `None` for a continuation line, which carries no message, and for a record a process wrote into
+/// the log: the kernel marks those with a facility of their own (a priority of 8 or more), and what a process
+/// says about memory is not the kernel's word.
 pub fn message_of(record: &str) -> Option<&str> {
     if record.starts_with(' ') {
         return None;
     }
-    let (_, message) = record.split_once(';')?;
+    let (header, message) = record.split_once(';')?;
+    let priority: u32 = header.split(',').next()?.parse().ok()?;
+    if priority >> 3 != 0 {
+        return None;
+    }
     Some(message.lines().next().unwrap_or(""))
+}
+
+/// The most records of the kernel log one look reads. A log written faster than that is read on at the next
+/// look: a job that makes the kernel talk without end does not hold the supervisor at its log.
+pub const RECORDS_A_LOOK: usize = 4096;
+
+/// Reads what the kernel log (`/dev/kmsg`, opened so that a read never waits) has now, a record a read, and
+/// hands each of the kernel's own messages to `each`. It ends at the log's end, at an error, or after
+/// [`RECORDS_A_LOOK`] records.
+pub fn read_records(log: &mut impl std::io::Read, mut each: impl FnMut(&str)) {
+    let mut record = [0u8; 8192];
+    for _ in 0..RECORDS_A_LOOK {
+        match log.read(&mut record) {
+            Ok(read @ 1..) => {
+                if let Some(message) = message_of(&String::from_utf8_lossy(&record[..read])) {
+                    each(message);
+                }
+            }
+            // The log dropped records we were too slow for; the next read goes on after them.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            _ => break,
+        }
+    }
 }
 
 /// How often the kernel has stopped a process of a control group, from its `memory.events`.
@@ -125,12 +154,19 @@ impl Log {
     }
 }
 
-/// `... out of memory: Killed process 1234 (node) total-vm:...`: the id and the name. The name may hold brackets.
+/// How the kernel begins the line that names a process it stopped for memory: for a control group at its limit,
+/// for the whole machine, and for the machine when it is set to stop whoever asked for the memory.
+const KILLED: &[&str] = &[
+    "Memory cgroup out of memory: Killed process ",
+    "Out of memory: Killed process ",
+    "Out of memory (oom_kill_allocating_task): Killed process ",
+];
+
+/// `Memory cgroup out of memory: Killed process 1234 (node) total-vm:...`: the id and the name. The name may
+/// hold brackets. The line must begin as the kernel begins it: a job can get words of its own into the middle of
+/// a kernel message (a mount option the kernel refuses is quoted in the log), never to its start.
 fn parse_killed(message: &str) -> Option<(u32, String)> {
-    if !message.contains("ut of memory") {
-        return None;
-    }
-    let rest = &message[message.find("Killed process ")? + "Killed process ".len()..];
+    let rest = KILLED.iter().find_map(|start| message.strip_prefix(start))?;
     let (pid, rest) = rest.split_once(" (")?;
     let end = rest.find(") total-vm").or_else(|| rest.rfind(')'))?;
     Some((pid.parse().ok()?, rest[..end].to_string()))

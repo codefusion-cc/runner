@@ -16,6 +16,16 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .and_then(|mut file| file.write_all(bytes))
 }
 
+/// Opens a file for writing that this user alone reads and writes, making it when it is not there.
+pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Refuses a file or folder another user could change: one that is not this user's, or that its group or
 /// everybody may write to. The error says which and why.
 pub(crate) fn private(path: &Path) -> Result<(), String> {

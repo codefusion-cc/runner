@@ -172,7 +172,8 @@ fn perform(
             job::format_scratch().map_err(|error| ("format", error))
         }
         Task::Job(task) => {
-            let network = std::thread::spawn(net::up);
+            let told = task.blocked.clone();
+            let network = std::thread::spawn(move || net::up(told));
             job::run(task, network, host, sender, events)
         }
     }

@@ -24,6 +24,7 @@ fn job(secret: &str) -> Job {
         },
         env: vec![("CI".into(), "true".into())],
         oom_grace_ms: 15_000,
+        blocked: vec![([203, 0, 113, 0], 24)],
     }
 }
 
@@ -378,6 +379,18 @@ fn what_a_host_reads_from_a_guest_is_short_and_has_no_control_characters() {
     };
     assert_eq!(protocol, 7);
     assert_eq!(kernel, format!("6.12 ]0;owned   {}", "k".repeat(48)));
+
+    // What turns a line around or hides in it is taken out too; letters of any script stay.
+    let GuestMessage::Failed { message, .. } = read(&GuestMessage::Failed {
+        stage: "disk".into(),
+        message: "ok\u{202e}dekcah\u{202c} a\u{200b}b\u{2066}c\u{2069}\u{feff}\u{200f}\u{61c}\u{2028}\u{2029}\u{e0041} zażółć 文字 \u{5d0}".into(),
+    }) else {
+        panic!("another message came back");
+    };
+    assert_eq!(
+        message,
+        format!("ok dekcah  a b c{}zażółć 文字 \u{5d0}", " ".repeat(8))
+    );
 
     let process = |name: &str| Process {
         pid: 1,

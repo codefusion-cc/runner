@@ -290,6 +290,20 @@ fn an_offer_is_read_with_its_mask_gateway_and_name_servers() {
 }
 
 #[test]
+fn a_lease_gives_a_job_three_name_servers_at_most() {
+    // An answer with 63 servers, as many as one option holds: each would be an address the job may reach.
+    let mut options = vec![53, 1, 2, 54, 4, 192, 168, 64, 1, 1, 4, 255, 255, 255, 0, 6, 252];
+    options.extend((1..=63u8).flat_map(|n| [10, 0, 0, n]));
+    options.push(255);
+    let Some(Reply::Offer(lease)) = dhcp::parse(&server_packet(7, MAC, [192, 168, 64, 9], &options), 7, MAC)
+    else {
+        panic!("the offer was not read");
+    };
+    assert_eq!(lease.dns, [[10, 0, 0, 1], [10, 0, 0, 2], [10, 0, 0, 3]]);
+    assert_eq!(dhcp::NAME_SERVERS, 3);
+}
+
+#[test]
 fn an_answer_for_someone_else_or_a_broken_one_is_not_ours() {
     let good = server_packet(7, MAC, [192, 168, 64, 9], OFFER);
     assert!(dhcp::parse(&good, 8, MAC).is_none(), "another exchange");
@@ -454,7 +468,22 @@ fn a_second_stop_has_its_own_table_and_a_stop_without_one_still_names_the_proces
             .is_some(),
         "a stop for the whole machine counts"
     );
+    assert!(
+        log.line("Out of memory (oom_kill_allocating_task): Killed process 9 (init) total-vm:1kB")
+            .is_some()
+    );
     assert!(log.line("usb 1-1: Killed process 9 (x)").is_none());
+    // The kernel's words in the middle of a line are a job's: it quotes a mount option it refuses, a name a
+    // process gave itself.
+    for forged in [
+        "tmpfs: Unknown parameter 'Memory cgroup out of memory: Killed process 1 (init) total-vm:1kB'",
+        "x Memory cgroup out of memory: Killed process 1 (init)",
+        "Out of memory: [77]: segfault at 0 Killed process 1 (init)",
+        "out of memory: Killed process 1 (init)",
+        "Memory cgroup out of memory: killed process 1 (init)",
+    ] {
+        assert!(log.line(forged).is_none(), "{forged}");
+    }
     assert!(
         log.line("Memory cgroup out of memory: Killed process x (y)")
             .is_none()
@@ -470,6 +499,130 @@ fn a_kernel_log_record_is_its_message_and_continuations_are_none() {
     assert_eq!(message_of(" DEVICE=+pci:0000"), None);
     assert_eq!(message_of("no semicolon"), None);
     assert_eq!(message_of("6,1,2,-;"), Some(""));
+    // What a process wrote into the log has a facility the kernel's own lines never have, whatever it says.
+    assert_eq!(
+        message_of("12,813,5123999,-;Memory cgroup out of memory: Killed process 1 (a)\n"),
+        None
+    );
+    assert_eq!(message_of("8,1,2,-;x"), None);
+    assert_eq!(message_of("7,1,2,-;x"), Some("x"));
+    assert_eq!(message_of("x,1,2,-;x"), None);
+    assert_eq!(message_of(";x"), None);
+}
+
+#[test]
+fn how_a_workload_ended_is_the_launchers_report_and_never_a_success_without_one() {
+    use cf_supervisor::outcome::{Outcome, workload_end};
+    let report = |outcome: &Outcome| serde_json::to_string(outcome).unwrap();
+    let launcher_ok = (Some(0), None);
+    // A wait status: exit codes 0, 7 and 255, the signals 9 and 15, a core dump's flag.
+    assert_eq!(
+        workload_end(&report(&Outcome::Status(0)), launcher_ok),
+        Ok((Some(0), None))
+    );
+    assert_eq!(
+        workload_end(&report(&Outcome::Status(7 << 8)), launcher_ok),
+        Ok((Some(7), None))
+    );
+    assert_eq!(
+        workload_end(&report(&Outcome::Status(255 << 8)), launcher_ok),
+        Ok((Some(255), None))
+    );
+    assert_eq!(
+        workload_end(&report(&Outcome::Status(9)), launcher_ok),
+        Ok((None, Some(9)))
+    );
+    assert_eq!(
+        workload_end(&report(&Outcome::Status(15)), launcher_ok),
+        Ok((None, Some(15)))
+    );
+    assert_eq!(
+        workload_end(&report(&Outcome::Status(0x80 | 11)), launcher_ok),
+        Ok((None, Some(11)))
+    );
+    assert_eq!(
+        workload_end(&report(&Outcome::Error("no root".into())), launcher_ok),
+        Err("no root".to_string())
+    );
+
+    // No report: the container went before it could say. The launcher's own end is what there is.
+    assert_eq!(workload_end("", (Some(137), None)), Ok((Some(137), None)));
+    assert_eq!(workload_end("", (None, Some(9))), Ok((None, Some(9))));
+    // But a launcher that ended with 0 and left no report, or one something else wrote into, is no workload
+    // that ended well.
+    let real = report(&Outcome::Status(3 << 8));
+    for forged in [
+        String::new(),
+        "{".to_string(),
+        "null".to_string(),
+        format!("{}{real}", report(&Outcome::Status(0))),
+        format!("{real}{}", report(&Outcome::Status(0))),
+        format!("garbage{real}"),
+    ] {
+        assert_eq!(workload_end(&forged, launcher_ok), Ok((None, None)), "{forged:?}");
+    }
+}
+
+#[test]
+fn a_look_at_the_kernel_log_ends_at_its_end_and_never_reads_without_end() {
+    use cf_supervisor::oom::{RECORDS_A_LOOK, read_records};
+    use std::io::{Error, ErrorKind, Read};
+    /// A log as `/dev/kmsg` gives it: a record a read, then whatever `then` says.
+    struct Records(Vec<Result<&'static str, ErrorKind>>, usize, Option<&'static str>);
+    impl Read for Records {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.1 += 1;
+            assert!(
+                self.1 <= RECORDS_A_LOOK,
+                "the look goes on after {RECORDS_A_LOOK} records"
+            );
+            let next = if self.0.is_empty() {
+                self.2.ok_or(ErrorKind::WouldBlock)
+            } else {
+                self.0.remove(0)
+            };
+            let record = next.map_err(Error::from)?;
+            buffer[..record.len()].copy_from_slice(record.as_bytes());
+            Ok(record.len())
+        }
+    }
+    let read = |log: &mut Records| {
+        let mut messages = Vec::new();
+        read_records(log, |message| messages.push(message.to_string()));
+        messages
+    };
+
+    // To the log's end, past the records it dropped, without those a process wrote or a continuation.
+    let mut log = Records(
+        vec![
+            Ok("6,1,1,-;one\n"),
+            Err(ErrorKind::BrokenPipe),
+            Ok("12,2,2,-;a process wrote this\n"),
+            Ok(" SUBSYSTEM=x\n"),
+            Ok("4,3,3,-;two\n KEY=v\n"),
+        ],
+        0,
+        None,
+    );
+    assert_eq!(read(&mut log), ["one", "two"]);
+    assert_eq!(log.1, 6, "five reads and the one that found the end");
+
+    // Another error ends the look; what came before it counts.
+    let mut log = Records(
+        vec![
+            Ok("6,1,1,-;one\n"),
+            Err(ErrorKind::InvalidInput),
+            Ok("6,2,2,-;two\n"),
+        ],
+        0,
+        None,
+    );
+    assert_eq!(read(&mut log), ["one"]);
+
+    // A log that never ends: the look does.
+    let mut log = Records(Vec::new(), 0, Some("6,1,1,-;again\n"));
+    assert_eq!(read(&mut log).len(), RECORDS_A_LOOK);
+    assert_eq!(log.1, RECORDS_A_LOOK);
 }
 
 #[test]
@@ -837,6 +990,97 @@ fn a_job_does_not_reach_its_own_network_wherever_the_mac_put_it() {
     let with = firewall::netlink(&policy(&[gateway], &own));
     let without = firewall::netlink(&policy(&[gateway], &[]));
     assert_eq!(with.acknowledged, without.acknowledged + 2);
+}
+
+#[test]
+fn a_job_does_not_reach_the_networks_its_mac_is_in_whatever_their_range() {
+    use cf_supervisor::firewall::{MOST_TOLD, beside};
+    let (address, netmask, gateway) = ([192, 168, 64, 9], [255, 255, 255, 0], [192, 168, 64, 1]);
+    // The Mac sits in an office network with public addresses and has a VPN address of its own.
+    let told = [([145, 97, 20, 0], 22), ([25, 3, 2, 1], 32)];
+    let own = beside(address, netmask, Some(gateway), &told);
+    assert_eq!(
+        own,
+        [
+            ([192, 168, 64, 0], 24),
+            ([192, 168, 64, 1], 32),
+            ([145, 97, 20, 0], 22),
+            ([25, 3, 2, 1], 32)
+        ]
+    );
+    let rules = policy(&[gateway], &own).output;
+    let to = |dest: [u8; 4], protocol: u8, dest_port: u16| {
+        let packet = Packet {
+            ipv6: false,
+            loopback: false,
+            dest,
+            protocol,
+            dest_port,
+            established: false,
+        };
+        decide(&rules, Verdict::Accept, &packet)
+    };
+    // The Mac at its office address, a colleague's machine, the VPN address; all ports and protocols.
+    assert_eq!(to([145, 97, 20, 9], 6, 22), Verdict::Drop);
+    assert_eq!(to([145, 97, 23, 255], 6, 445), Verdict::Drop);
+    assert_eq!(to([145, 97, 21, 7], 17, 53), Verdict::Drop);
+    assert_eq!(to([25, 3, 2, 1], 6, 5900), Verdict::Drop);
+    // Next to them is the internet.
+    assert_eq!(to([145, 97, 24, 0], 6, 443), Verdict::Accept);
+    assert_eq!(to([145, 97, 19, 255], 6, 443), Verdict::Accept);
+    assert_eq!(to([25, 3, 2, 2], 6, 443), Verdict::Accept);
+    assert_eq!(to(gateway, 17, 53), Verdict::Accept);
+
+    // Without a gateway there is none to add; a host's network is cut to its prefix; one with a prefix no
+    // address has is left out, and so is what comes after the first 64.
+    assert_eq!(
+        beside(
+            address,
+            netmask,
+            None,
+            &[([145, 97, 21, 9], 22), ([8, 8, 8, 8], 33)]
+        ),
+        [([192, 168, 64, 0], 24), ([145, 97, 20, 0], 22)]
+    );
+    let many: Vec<_> = (0..200u8).map(|n| ([n.max(1), 1, 1, 1], 32)).collect();
+    assert_eq!(beside(address, netmask, None, &many).len(), 1 + MOST_TOLD);
+}
+
+#[test]
+fn a_job_does_not_reach_the_ranges_set_aside_for_inside_a_machine_or_site() {
+    let rules = policy(&[], &[]).output;
+    let to = |dest: [u8; 4]| {
+        let packet = Packet {
+            ipv6: false,
+            loopback: false,
+            dest,
+            protocol: 6,
+            dest_port: 443,
+            established: false,
+        };
+        decide(&rules, Verdict::Accept, &packet)
+    };
+    for inside in [
+        // A proxy's or VPN's made-up addresses on the Mac, the translated address of a Mac on an IPv6-only
+        // network, "this network".
+        [198, 18, 0, 1],
+        [198, 19, 255, 255],
+        [192, 0, 0, 2],
+        [192, 0, 0, 255],
+        [0, 0, 0, 0],
+        [0, 255, 255, 255],
+    ] {
+        assert_eq!(to(inside), Verdict::Drop, "{inside:?}");
+    }
+    for outside in [
+        [198, 17, 255, 255],
+        [198, 20, 0, 0],
+        [192, 0, 1, 0],
+        [191, 255, 255, 255],
+        [1, 0, 0, 0],
+    ] {
+        assert_eq!(to(outside), Verdict::Accept, "{outside:?}");
+    }
 }
 
 #[test]

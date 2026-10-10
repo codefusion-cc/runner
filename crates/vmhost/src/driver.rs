@@ -15,7 +15,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -152,6 +152,15 @@ fn run_in(
         layout.job_dir(&job),
         layout.console(&job),
     );
+    // The log is this job's alone: lines an earlier job of the name left are not added to, a link put in its
+    // place is not written through, and nobody else reads it.
+    let _ = fs::remove_file(&console);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&console)
+        .map_err(|error| RunError::Io(console.display().to_string(), error))?;
     let started = Instant::now();
     let files = GuestFiles {
         kernel: job_dir.join("kernel"),
@@ -174,6 +183,7 @@ fn run_in(
         limits: request.limits(),
         env: std::mem::take(&mut request.env),
         oom_grace_ms: 15_000,
+        blocked: crate::host_net::host_networks(),
     });
 
     let snapshot = |machine: Option<&Machine>, stage: Stage| JobState {
@@ -205,11 +215,17 @@ fn run_in(
     publish(&snapshot(None, Stage::Booting));
 
     let _ = fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path).map_err(|error| {
-        // A state with no vm-host behind it would read as a job lost, and keep the name taken.
-        let _ = fs::remove_file(&state_path);
-        RunError::Io(socket_path.display().to_string(), error)
-    })?;
+    // The socket is this user's alone, whatever the mask of the process: it stops the job for whoever asks.
+    let listener = UnixListener::bind(&socket_path)
+        .and_then(|listener| {
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).map(|()| listener)
+        })
+        .map_err(|error| {
+            // A state with no vm-host behind it would read as a job lost, and keep the name taken.
+            let _ = fs::remove_file(&state_path);
+            let _ = fs::remove_file(&socket_path);
+            RunError::Io(socket_path.display().to_string(), error)
+        })?;
     let (sender, messages) = mpsc::sync_channel::<Message>(QUEUE);
     let done = Arc::new(AtomicBool::new(false));
     let asked = sender.clone();

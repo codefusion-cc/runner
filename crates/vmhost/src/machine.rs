@@ -2,7 +2,7 @@
 //! forever. No clock, no thread and no file here: [`crate::run`] feeds it and does what it says.
 
 use crate::state::{End, Ended, Stage};
-use cf_guest_proto::{GuestMessage, OomEvent, PROTOCOL, StopReason, Summary, Usage};
+use cf_guest_proto::{GuestEnd, GuestMessage, OomEvent, PROTOCOL, StopReason, Summary, Usage};
 use std::time::Duration;
 
 /// How long a vm-host waits at each stage.
@@ -49,7 +49,7 @@ impl Limits {
 
     /// The longest a job runs, from its workload's start: at the deadline it is told to end and has
     /// `deadline_grace` to; a guest that has not said how it ended `stop_slack` later has its machine stopped by
-    /// force.
+    /// force. A stop from anybody else, whatever grace it asks for, ends the job no later than this.
     pub fn longest_run(&self) -> Duration {
         self.deadline + self.deadline_grace + self.stop_slack
     }
@@ -229,14 +229,24 @@ impl Machine {
     }
 
     fn stop(&mut self, reason: StopReason, grace: Duration, now: Duration) -> Vec<Action> {
-        let until = now + grace + self.limits.stop_slack;
-        // The first reason is the job's; a later stop can only make it sooner.
+        // No stop gives a job longer than its deadline would have: whoever asks, the longest run holds. (The
+        // deadline's own stop comes with the first look at the clock past it, and has its whole grace from there.)
+        let deadline = self.ready_at.unwrap_or(now) + self.limits.deadline;
+        let latest = now.max(deadline) + self.limits.deadline_grace + self.limits.stop_slack;
+        let until = (now + grace + self.limits.stop_slack).min(latest);
+        let grace = grace.min(until.saturating_sub(now + self.limits.stop_slack));
+        // The first reason is the job's; a later stop can only make it sooner, and one that does not is not sent.
+        let sooner = self.stop.is_none_or(|(_, existing)| until < existing);
         self.stop = Some(match self.stop {
             Some((first, existing)) => (first, existing.min(until)),
             None => (reason, until),
         });
         self.enter(Stage::Stopping, now);
-        vec![Action::SendStop { reason, grace }, Action::Publish]
+        if sooner {
+            vec![Action::SendStop { reason, grace }, Action::Publish]
+        } else {
+            Vec::new()
+        }
     }
 
     fn summary(&mut self, summary: Summary, now: Duration) -> Vec<Action> {
@@ -244,8 +254,17 @@ impl Machine {
         if self.oom.is_none() {
             self.oom = summary.oom.clone();
         }
-        self.end
-            .get_or_insert((End::of_summary(&summary), None, Some(summary)));
+        // Why a job was stopped is the host's to say: the guest only says that it was. One that names a stop
+        // nobody asked for is not believed.
+        let (end, message) = match (summary.end, self.stop) {
+            (GuestEnd::Stopped(_), Some((reason, _))) => (End::of_stop(reason), None),
+            (GuestEnd::Stopped(_), None) => (
+                End::GuestLost,
+                Some("the guest said the job was stopped, which nobody had asked for".to_string()),
+            ),
+            (GuestEnd::Exited, _) => (End::of_summary(&summary), None),
+        };
+        self.end.get_or_insert((end, message, Some(summary)));
         self.enter(Stage::Done, now);
         vec![Action::CloseChannel, Action::Publish]
     }
@@ -294,7 +313,9 @@ impl Machine {
             (Stage::Running | Stage::Stopping, Event::StopAsked { reason, grace }) => {
                 self.stop(reason, grace, now)
             }
-            (Stage::Done | Stage::Killing, Event::StopAsked { .. }) => Vec::new(),
+            // The job has its end; what a stop is still for is the machine and its memory, now.
+            (Stage::Done, Event::StopAsked { .. }) => self.kill(now),
+            (Stage::Killing, Event::StopAsked { .. }) => Vec::new(),
 
             (Stage::Booting | Stage::Running | Stage::Stopping, Event::Guest(message)) => {
                 self.guest(message, now)
@@ -325,6 +346,12 @@ impl Machine {
     fn guest(&mut self, message: GuestMessage, now: Duration) -> Vec<Action> {
         self.heard = now;
         match message {
+            // A supervisor greets once, before its task. Whatever greets a job under way is not ours any more.
+            GuestMessage::Hello { .. } if self.stage != Stage::Booting => self.give_up(
+                self.lost(),
+                "the guest greeted again in the middle of its job".to_string(),
+                now,
+            ),
             GuestMessage::Hello { protocol, .. } if protocol != PROTOCOL => {
                 // The guest is the one this binary carries; another try would meet the same guest.
                 self.give_up(

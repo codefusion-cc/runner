@@ -30,6 +30,8 @@ const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1";
 /// How long the framework gets to answer a start or a connect before the call gives up.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest a write to the guest waits for the guest to read.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The monitor on Virtualization.framework.
 #[derive(Debug, Clone, Copy)]
@@ -82,11 +84,13 @@ impl Vmm for VzVmm {
     }
 }
 
-/// Something that is only ever touched on its machine's queue, which is what makes it safe to hand to that queue
+/// Something that is only ever used on its machine's queue, which is what makes it safe to hand to that queue
 /// from another thread.
 struct OnQueue<T>(T);
-// SAFETY: the value is created, used and dropped only inside blocks that run on the machine's serial queue; other
-// threads hold it without ever looking inside.
+// SAFETY: the value is created and used only inside blocks that run on the machine's serial queue; other threads
+// hold it without ever looking inside. The machine is dropped on the queue too ([`VzVm::release`]). The delegate
+// is dropped with its `VzVm`, on whichever thread that is: all this does is release an Objective-C object, which
+// any thread may, and its one instance variable is an `Arc` of state that is `Send` and `Sync`.
 unsafe impl<T> Send for OnQueue<T> {}
 // SAFETY: as above; a shared reference gives no access outside the queue either.
 unsafe impl<T> Sync for OnQueue<T> {}
@@ -155,7 +159,10 @@ impl Vm for VzVm {
             unsafe { device.connectToPort_completionHandler(port, &handler) };
         });
         match result.recv_timeout(CONNECT_TIMEOUT) {
-            Ok(Ok(fd)) => Ok(Box::new(Stream(File::from(fd)))),
+            Ok(Ok(fd)) => {
+                patient_for(&fd, SEND_TIMEOUT);
+                Ok(Box::new(Stream(File::from(fd))))
+            }
             Ok(Err(reason)) => Err(refuse(reason)),
             Err(RecvTimeoutError::Timeout) => Err(refuse(format!("no answer within {CONNECT_TIMEOUT:?}"))),
             Err(RecvTimeoutError::Disconnected) => Err(refuse("the machine is gone".into())),
@@ -351,6 +358,26 @@ fn describe(error: &NSError) -> String {
     format!("{} (code {})", error.localizedDescription(), error.code())
 }
 
+/// Gives a write to this socket no longer than `most` to go on: a guest that reads nothing fails the write, and
+/// holds no thread of the host. Best effort: a descriptor that takes no such option stays as it was.
+fn patient_for(socket: &OwnedFd, most: Duration) {
+    let time = libc::timeval {
+        tv_sec: most.as_secs() as libc::time_t,
+        tv_usec: most.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: the descriptor is open for the call, and the option's value is a `timeval` of the size given that
+    // lives through it.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            (&raw const time).cast(),
+            size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+}
+
 /// One end of a connection to a port of the guest.
 struct Stream(File);
 
@@ -378,5 +405,34 @@ impl Channel for Stream {
     fn shutdown(&self) {
         // SAFETY: shutdown takes a descriptor this stream owns and no pointer.
         unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patient_for;
+    use std::io::{ErrorKind, Write};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_write_nobody_reads_fails_in_its_time_and_holds_no_thread() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let ours = OwnedFd::from(ours);
+        patient_for(&ours, Duration::from_millis(200));
+        let (said, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ours = std::fs::File::from(ours);
+            // More than any socket buffers, to a peer that reads none of it.
+            let outcome = ours.write_all(&vec![0u8; 16 << 20]);
+            let _ = said.send(outcome.map_err(|error| error.kind()));
+        });
+        let outcome = heard
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the write is still waiting");
+        assert_eq!(outcome, Err(ErrorKind::WouldBlock));
+        drop(theirs);
     }
 }

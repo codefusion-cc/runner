@@ -20,6 +20,12 @@ pub const BLOCKED: &[(Ip, u8)] = &[
     ([169, 254, 0, 0], 16),
     // Carrier-grade NAT, which is where Tailscale's addresses are.
     ([100, 64, 0, 0], 10),
+    // "This network", and the two ranges set aside for use inside one machine or site: protocol assignments
+    // (where a Mac on an IPv6-only network has its translated address) and benchmarking (where proxies and VPNs
+    // on a Mac put their made-up addresses).
+    ([0, 0, 0, 0], 8),
+    ([192, 0, 0, 0], 24),
+    ([198, 18, 0, 0], 15),
     // Multicast (mDNS on the Mac's network) and the reserved block with the broadcast address.
     ([224, 0, 0, 0], 4),
     ([240, 0, 0, 0], 4),
@@ -84,6 +90,29 @@ const UDP: u8 = 17;
 pub fn own_network(address: Ip, netmask: Ip) -> (Ip, u8) {
     let prefix = u32::from_be_bytes(netmask).leading_ones() as u8;
     ((u32::from_be_bytes(address) & mask(prefix)).to_be_bytes(), prefix)
+}
+
+/// The most networks a host names for a job to be kept from; what comes after is not taken.
+pub const MOST_TOLD: usize = 64;
+
+/// What is next to a job's machine and the Mac it runs on: the network of the machine's lease, its gateway, and
+/// the networks the host said the Mac is in (`told`, of which one with no prefix length an address can have is
+/// left out). This is what [`policy`] takes as `own`.
+pub fn beside(address: Ip, netmask: Ip, gateway: Option<Ip>, told: &[(Ip, u8)]) -> Vec<(Ip, u8)> {
+    std::iter::once(own_network(address, netmask))
+        .chain(gateway.map(|gateway| (gateway, 32)))
+        .chain(
+            told.iter()
+                .filter(|(_, prefix)| *prefix <= 32)
+                .take(MOST_TOLD)
+                .map(|(network, prefix)| {
+                    (
+                        (u32::from_be_bytes(*network) & mask(*prefix)).to_be_bytes(),
+                        *prefix,
+                    )
+                }),
+        )
+        .collect()
 }
 
 /// The firewall of a job's machine whose network named these name servers. `own` is what the machine's lease

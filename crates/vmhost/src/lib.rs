@@ -11,7 +11,10 @@
 //!   once a vm-host is gone its number may be another process's, so nothing is signalled by it unchecked.
 //! - `run/<job>.sock`: a socket the vm-host answers on ([`control`]): one request a connection, the state back.
 //! - `run/<job>/`: the machine's own files, gone with the job. `logs/<job>.console.log` stays, 16 MiB at most:
-//!   a machine that writes more is stopped.
+//!   a machine that writes more is stopped. It is made new for each job, so a job of a name used before starts
+//!   with an empty log.
+//!
+//! Each of these files and the socket is this user's alone (0600), whatever the mask of the process is.
 //!
 //! The state folder, `images/` and each image in it must be this user's and writable by nobody else, or no job
 //! starts: an image is verified when it is installed, and that is worth what the folder's permissions are.
@@ -24,6 +27,7 @@
 
 pub mod control;
 mod driver;
+mod host_net;
 mod layout;
 mod machine;
 mod request;
@@ -32,6 +36,7 @@ mod state;
 pub mod task;
 
 pub use driver::{Guest, RunError, run};
+pub use host_net::{Network as HostNetwork, host_networks, network_of};
 pub use layout::{Layout, write_private};
 pub use machine::{Action, Event, Limits, Machine};
 pub use request::{JobRequest, RequestError, VM_OVERHEAD};

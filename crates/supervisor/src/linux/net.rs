@@ -231,7 +231,7 @@ pub struct Network {
 
 /// Brings the network up and loads the firewall. An error leaves the job without a start: a job never runs
 /// without the firewall.
-pub fn up() -> Result<Network, String> {
+pub fn up(told: Vec<(firewall::Ip, u8)>) -> Result<Network, String> {
     let started = Instant::now();
     let control = context("control socket", socket(libc::AF_INET, libc::SOCK_DGRAM, 0))?;
     context("loopback", bring_up(&control, "lo"))?;
@@ -300,10 +300,8 @@ pub fn up() -> Result<Network, String> {
     } else {
         lease.dns.clone()
     };
-    // What is next to this machine, whatever range the Mac gives its machines: the network and the gateway.
-    let own: Vec<_> = std::iter::once(firewall::own_network(lease.address, lease.netmask))
-        .chain(lease.gateway.map(|gateway| (gateway, 32)))
-        .collect();
+    // What is next to this machine, whatever range the Mac gives its machines, and the networks the Mac is in.
+    let own = firewall::beside(lease.address, lease.netmask, lease.gateway, &told);
     load_firewall(&firewall::netlink(&firewall::policy(&name_servers, &own)))?;
     Ok(Network {
         name_servers,

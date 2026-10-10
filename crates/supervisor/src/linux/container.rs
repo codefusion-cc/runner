@@ -8,6 +8,7 @@
 //! its firewall belong to a namespace their root has no power over.
 
 use super::sys::{self, check, context};
+use cf_supervisor::outcome::Outcome;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -42,16 +43,6 @@ pub struct Spec {
     pub home: String,
     /// The size of `/dev/shm`.
     pub shm_bytes: u64,
-}
-
-/// How the container ended.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Outcome {
-    /// The workload's wait status, as `waitpid` gives it.
-    Status(i32),
-    /// The container could not be made.
-    Error(String),
 }
 
 fn report(outcome: &Outcome) {
@@ -101,8 +92,14 @@ fn launcher() -> Result<Infallible, String> {
         // SAFETY: dup2 on descriptors we own.
         unsafe { libc::dup2(null.as_raw_fd(), 0) };
     }
-    // The kernel's choice under memory pressure is a process of the job's, never what holds the job together.
-    let _ = fs::write("/proc/self/oom_score_adj", "-1000");
+    // The launcher and the container's first process keep to themselves: the job's root, which shares their
+    // user ids, can neither trace them nor open what they hold open (the pipe the job's end is reported on).
+    // The workload gets the usual back when it is started as its own program.
+    // SAFETY: prctl with this option takes numbers only.
+    context(
+        "keep to itself",
+        check(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }),
+    )?;
     let files = libc::rlimit {
         rlim_cur: 65536,
         rlim_max: 1 << 20,
@@ -127,6 +124,10 @@ fn launcher() -> Result<Infallible, String> {
         std::process::exit(0);
     }
     drop((ask_write, done_read));
+    // The kernel's choice under memory pressure is a process of the job's, never the launcher. This is set only
+    // now, after the first process was made: a value real root sets is also the lowest its children may set, and
+    // a job that could give itself -1000 would hang at its limit with nothing for the kernel to stop.
+    let _ = fs::write("/proc/self/oom_score_adj", "-1000");
     // The first process asks once it has its user namespace; only real root can give that namespace every id.
     let mut byte = [0u8; 1];
     let mut done = File::from(done_write);
@@ -283,7 +284,6 @@ fn contain(spec: &Spec, ask: OwnedFd, done: OwnedFd) -> Result<libc::c_int, Stri
 
 /// Becomes the workload. Returns only when that failed.
 fn start(spec: &Spec) -> String {
-    let _ = fs::write("/proc/self/oom_score_adj", "0");
     let Some(program) = spec.argv.first() else {
         return "it has no program".into();
     };

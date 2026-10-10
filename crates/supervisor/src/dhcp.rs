@@ -81,6 +81,9 @@ pub fn request(xid: u32, mac: [u8; 6], offer: &Lease) -> Vec<u8> {
     finish(packet, mac)
 }
 
+/// The most name servers taken from a lease, as a resolver uses; each one is an address the job may reach.
+pub const NAME_SERVERS: usize = 3;
+
 /// Reads a server's answer to the exchange `xid` of the device `mac`. `None` for anything else: another
 /// exchange, another device, a malformed packet.
 pub fn parse(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<Reply> {
@@ -112,7 +115,13 @@ pub fn parse(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<Reply> {
             53 => kind = value.first().copied(),
             1 => netmask = four(value),
             3 => gateway = four(value),
-            6 => dns = value.chunks_exact(4).filter_map(four).collect(),
+            6 => {
+                dns = value
+                    .chunks_exact(4)
+                    .filter_map(four)
+                    .take(NAME_SERVERS)
+                    .collect()
+            }
             54 => server = four(value),
             _ => {}
         }

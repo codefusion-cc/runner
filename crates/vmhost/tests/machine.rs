@@ -371,6 +371,171 @@ fn a_stop_keeps_its_first_reason_and_a_second_one_only_makes_it_sooner() {
 }
 
 #[test]
+fn the_guest_says_that_a_job_was_stopped_and_the_host_says_why() {
+    // The host's reason, whatever the guest names.
+    let mut machine = running(limits());
+    machine.handle(
+        Event::StopAsked {
+            reason: StopReason::EvictedDisk,
+            grace: s(20),
+        },
+        s(10),
+    );
+    let told = Event::Guest(GuestMessage::Exited(summary(
+        GuestEnd::Stopped(StopReason::Cancelled),
+        Some(143),
+        false,
+    )));
+    machine.handle(told, s(12));
+    assert_eq!(end_of(&machine), Some(End::EvictedDisk));
+
+    // Nobody asked for a stop: a guest that reports one chose its own end, and is not believed.
+    for reason in [
+        StopReason::Cancelled,
+        StopReason::Timeout,
+        StopReason::EvictedMemory,
+        StopReason::EvictedDisk,
+        StopReason::HostSlept,
+    ] {
+        let mut machine = running(limits());
+        let told = Event::Guest(GuestMessage::Exited(summary(
+            GuestEnd::Stopped(reason),
+            Some(0),
+            false,
+        )));
+        assert_eq!(
+            machine.handle(told, s(12)),
+            [Action::CloseChannel, Action::Publish]
+        );
+        let ended = machine.ended(0).unwrap();
+        assert_eq!(ended.end, End::GuestLost, "{reason:?}");
+        assert_eq!(
+            ended.message.as_deref(),
+            Some("the guest said the job was stopped, which nobody had asked for")
+        );
+        assert_eq!(ended.summary.unwrap().exit_code, Some(0));
+    }
+}
+
+#[test]
+fn a_guest_that_greets_in_the_middle_of_its_job_is_lost_and_not_a_failed_boot() {
+    for protocol in [PROTOCOL, PROTOCOL + 1] {
+        let again = || {
+            Event::Guest(GuestMessage::Hello {
+                protocol,
+                kernel: "6.18".into(),
+            })
+        };
+        let mut machine = running(limits());
+        assert_eq!(machine.handle(again(), s(5)), [Action::StopVm, Action::Publish]);
+        let ended = machine.ended(0).unwrap();
+        assert_eq!(ended.end, End::GuestLost);
+        assert_eq!(
+            ended.message.as_deref(),
+            Some("the guest greeted again in the middle of its job")
+        );
+
+        // While it is being stopped, the job's end is the stop's.
+        let mut machine = running(limits());
+        machine.handle(
+            Event::StopAsked {
+                reason: StopReason::EvictedMemory,
+                grace: s(20),
+            },
+            s(4),
+        );
+        assert_eq!(machine.handle(again(), s(5)), [Action::StopVm, Action::Publish]);
+        assert_eq!(end_of(&machine), Some(End::EvictedMemory));
+    }
+}
+
+#[test]
+fn a_stop_after_the_jobs_end_takes_the_machine_down_at_once_and_the_end_stays() {
+    let mut machine = running(limits());
+    machine.handle(exited(0), s(10));
+    assert_eq!(machine.stage(), Stage::Done);
+    assert_eq!(
+        machine.handle(
+            Event::StopAsked {
+                reason: StopReason::EvictedMemory,
+                grace: s(20)
+            },
+            s(12)
+        ),
+        [Action::StopVm, Action::Publish]
+    );
+    assert_eq!(
+        (machine.stage(), end_of(&machine)),
+        (Stage::Killing, Some(End::Ok))
+    );
+    // Once more changes nothing, and the machine that ignores the forced stop goes with the vm-host.
+    assert_eq!(
+        machine.handle(
+            Event::StopAsked {
+                reason: StopReason::Cancelled,
+                grace: s(0)
+            },
+            s(13)
+        ),
+        []
+    );
+    assert_eq!(machine.handle(Event::Tick, s(21)), []);
+    assert_eq!(machine.handle(Event::Tick, s(22)), [Action::Finish]);
+    assert_eq!(end_of(&machine), Some(End::Ok));
+}
+
+#[test]
+fn no_stop_gives_a_job_longer_than_its_deadline_would() {
+    // The workload started at second 1 with 100 s: at 131 its machine is stopped, whatever grace a stop names.
+    let mut machine = running(Limits::for_deadline(s(100)));
+    for at in [50, 90] {
+        machine.handle(Event::Guest(GuestMessage::Heartbeat(usage(1))), s(at));
+    }
+    assert_eq!(
+        machine.handle(
+            Event::StopAsked {
+                reason: StopReason::EvictedDisk,
+                grace: s(3600)
+            },
+            s(95)
+        ),
+        [
+            // What is left of the longest run, less the 10 s the guest has to say how it went.
+            Action::SendStop {
+                reason: StopReason::EvictedDisk,
+                grace: s(26)
+            },
+            Action::Publish
+        ]
+    );
+    machine.handle(Event::Guest(GuestMessage::Heartbeat(usage(1))), s(125));
+    assert_eq!(machine.handle(Event::Tick, s(130)), []);
+    assert_eq!(
+        machine.handle(Event::Tick, s(131)),
+        [Action::StopVm, Action::Publish]
+    );
+    assert_eq!(end_of(&machine), Some(End::EvictedDisk));
+}
+
+#[test]
+fn a_stop_that_brings_the_end_no_sooner_is_not_sent_to_the_guest_again() {
+    let mut machine = running(limits());
+    let stop = |grace| Event::StopAsked {
+        reason: StopReason::EvictedMemory,
+        grace: s(grace),
+    };
+    assert_eq!(machine.handle(stop(20), s(10)).len(), 2);
+    // The same again a second later would end at 41, not 40; a longer one later still.
+    assert_eq!(machine.handle(stop(20), s(11)), []);
+    assert_eq!(machine.handle(stop(600), s(12)), []);
+    assert_eq!(machine.handle(Event::Tick, s(39)), []);
+    assert_eq!(
+        machine.handle(Event::Tick, s(40)),
+        [Action::StopVm, Action::Publish]
+    );
+}
+
+#[test]
 fn a_stop_during_the_boot_ends_the_job_without_another_boot() {
     let (mut machine, _) = Machine::new(limits(), s(0));
     assert_eq!(

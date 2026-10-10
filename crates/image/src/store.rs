@@ -5,7 +5,7 @@
 //! so a machine cannot be talked back into a release with a known hole. Downloading a release is not here: this
 //! takes a folder that has the release's files.
 
-use crate::{DirFiles, ImageError, Manifest, verify};
+use crate::{DirFiles, ImageError, MANIFEST_NAME, Manifest, SIGNATURE_NAME, SUMS_NAME, verify};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -84,15 +84,27 @@ impl Store {
 
     /// Installs the release in `source` as `version` and returns its manifest. Every file is copied first, then
     /// checked where nobody else can change it: the signature against `key`, the version, each hash and size, and
-    /// that the release is not older than one accepted before. A release already installed is verified again all
-    /// the same; a refused one leaves nothing behind.
+    /// that the release is not older than one accepted before. What the folder holds beyond the files the signed
+    /// list names is not installed. A release already installed is verified again all the same; a refused one
+    /// leaves nothing behind. One install runs in a store at a time: a second one waits for the first.
     pub fn install(&self, source: &Path, version: &str, key: &VerifyingKey) -> Result<Manifest, StoreError> {
         if !is_version(version) {
             return Err(StoreError::Version(version.to_string()));
         }
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.0)
+            .map_err(|error| StoreError::Io(self.0.display().to_string(), error))?;
+        // Two installs would share the work folder, and one could put the other's unchecked files in place.
+        let lock = File::open(&self.0)
+            .and_then(|folder| folder.lock().map(|()| folder))
+            .map_err(|error| StoreError::Io(self.0.display().to_string(), error))?;
         // No version starts with a dot, so the store's own folders are never an installed image's.
         let partial = self.0.join(format!(".{version}.partial"));
         let result = self.install_into(&partial, source, version, key);
+        drop(lock);
         if result.is_err() {
             let _ = fs::remove_dir_all(&partial);
         }
@@ -106,16 +118,11 @@ impl Store {
         version: &str,
         key: &VerifyingKey,
     ) -> Result<Manifest, StoreError> {
-        use std::os::unix::fs::DirBuilderExt as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         let io = |path: &Path| {
             let path = path.display().to_string();
             move |error| StoreError::Io(path, error)
         };
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.0)
-            .map_err(io(&self.0))?;
         let _ = fs::remove_dir_all(partial);
         fs::DirBuilder::new()
             .mode(0o700)
@@ -132,9 +139,25 @@ impl Store {
         let manifest = verify(&DirFiles::new(partial), key, version, newest)?.manifest;
         let rootfs = manifest.rootfs.as_ref().ok_or(StoreError::NoRootfs)?;
 
+        // Only what was checked stays: a file the signed list does not name was read by nobody.
+        let mut checked = vec![MANIFEST_NAME, SUMS_NAME, SIGNATURE_NAME];
+        checked.extend(manifest.assets().into_iter().map(|asset| asset.name.as_str()));
+        for entry in fs::read_dir(partial).map_err(io(partial))? {
+            let entry = entry.map_err(io(partial))?;
+            if !checked.iter().any(|name| entry.file_name() == *name) {
+                fs::remove_file(entry.path()).map_err(io(&entry.path()))?;
+            }
+        }
+
         // The parts are joined under the hash of the whole, so the file a machine boots from is the one signed.
+        // It is new and its owner's alone, whatever this process's mask for new files is.
         let joined = partial.join(ROOTFS_NAME);
-        let mut out = File::create(&joined).map_err(io(&joined))?;
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&joined)
+            .map_err(io(&joined))?;
         let mut hash = Sha256::new();
         let mut buffer = vec![0u8; 1 << 20];
         for part in &rootfs.parts {

@@ -66,3 +66,14 @@ fn the_version_command_names_the_package_version() {
         format!("codefusion-runner {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_boot_proof_takes_no_time_that_no_clock_can_add() {
+    for timeout in ["18446744073709551615", "3601", "0"] {
+        let (ok, text) = runner(&["boot-proof", "--timeout-s", timeout]);
+        assert!(!ok);
+        assert!(text.contains("usage:"), "{timeout}: {text}");
+        assert!(!text.contains("panicked"), "{timeout}: {text}");
+    }
+}

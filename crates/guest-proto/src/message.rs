@@ -54,6 +54,10 @@ pub struct Job {
     /// How long a step gets to fail by itself after the kernel stopped one of its processes for memory, before the
     /// supervisor stops the rest of the step's processes.
     pub oom_grace_ms: u64,
+    /// Networks the job must not reach, beyond those the supervisor keeps it from by itself: the ones the Mac is
+    /// in (its local network, a VPN), whatever their range, as `(network, prefix length)`.
+    #[serde(default)]
+    pub blocked: Vec<([u8; 4], u8)>,
 }
 
 /// A job's limits, enforced by the guest kernel on the job's control group.
@@ -146,8 +150,9 @@ pub enum GuestMessage {
 
 impl GuestMessage {
     /// The message as a host keeps it: every text in it cut to its length ([`STAGE_CHARS`], [`MESSAGE_CHARS`],
-    /// [`NAME_CHARS`]) with no control character left, and at most [`LARGEST_PROCESSES`] processes in a report. What
-    /// a guest says goes into state files, logs and onto screens, and a guest runs a stranger's code.
+    /// [`NAME_CHARS`]) with no control character and none that steers the text around it left, and at most
+    /// [`LARGEST_PROCESSES`] processes in a report. What a guest says goes into state files, logs and onto
+    /// screens, and a guest runs a stranger's code.
     /// [`crate::read_guest_message`] applies it to everything it reads.
     #[must_use]
     pub fn clipped(self) -> Self {
@@ -182,8 +187,23 @@ pub const LARGEST_PROCESSES: usize = 5;
 fn clip(text: &str, most: usize) -> String {
     text.chars()
         .take(most)
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if c.is_control() || steers(c) { ' ' } else { c })
         .collect()
+}
+
+/// Whether a character shows nothing itself and changes how the text around it reads: a direction mark or
+/// override, a zero-width one, a line or paragraph separator, a tag. A log line with one can read as another.
+fn steers(c: char) -> bool {
+    matches!(
+        c,
+        '\u{61c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
 }
 
 /// What a job uses at one moment.
