@@ -6,7 +6,11 @@
 | `crates/vmm-vz` (`cf-vmm-vz`) | Virtualization.framework through `objc2-virtualization`. M0: `boot_to_ready`. M1 turns it into the `Vmm` implementation. |
 | `crates/supervisor` (`cf-supervisor`) | PID 1 of the guest, a static `aarch64-unknown-linux-musl` binary. M0: mounts, loads modules, says `ready`, powers off. |
 | `crates/runner` (`codefusion-runner`) | The binary. M0: `version`, `image verify`, `boot-proof`. `runner.entitlements` is signed into it. |
-| `crates/budget`, `lifecycle`, `scaleset`, `ghapp`, `workflows`, `vmm`, `guest-proto`, `host-macos`, `console-client` | Empty until their milestone (M1 to M4); each file says which. |
+| `crates/budget`, `lifecycle`, `scaleset`, `vmm`, `guest-proto`, `host-macos`, `console-client` | Empty until their milestone (M1 to M4); each file says which. |
+| `crates/ghapp` (`cf-ghapp`) | The GitHub App client: `AppCredentials::load` (`app.json` + `app.pem`, which must be 0600), the App JWT (iat now-60 s, exp now+9 min, clock skew learned from the `Date` header), installation tokens (cached, one request at a time), repositories, workflow files, repository variables, registration tokens; `Http` with retries (429 and 5xx with jitter, `Retry-After`). Tests in `tests/app.rs`, run against `cf-fake-github`. |
+| `crates/workflows` (`cf-workflows`) | `self_hosted` / `self_hosted_with`: the label sets a repository's workflows ask for (port of the Go `workflows` package, tests in `tests/labels.rs`), `size_gb` for the `cf-2g/4g/6g/8g` labels, `self-hosted` = 4 GB, and the `vars.*` expressions evaluated with the repository's variables. |
+| `crates/secret` (`cf-secret`) | `Secret<T>`: a value whose `Debug` prints `Secret(..)`. Every token and key is wrapped in it. |
+| `crates/fake-github` (`cf-fake-github`) | A stateful fake GitHub over real sockets, for tests only: App JWT checks, tokens, repositories, scale sets, sessions, long poll, acquire, JIT configs, with faults (`fail`, `before`, `lose_session`, `expire_session_token`, clock offset). |
 | `xtask` | `cargo xtask keygen | guest | release | build`. Kernel package pinned in `xtask/src/kernel.rs`. |
 | `image/Dockerfile` | The root filesystem a job runs in: GitHub's Actions runner image plus tools. Packed by `.github/workflows/image.yml`. |
 | `.github/workflows` | `ci.yml` (macos-14: fmt, guest, clippy, tests, release build; ubuntu: cargo deny), `image.yml` (the image: built and verified on every change to it, signed and published from main, weekly), `automerge.yml`. |
