@@ -335,6 +335,19 @@ fn a_reading_handed_over_late_or_from_the_future_is_no_reading() {
 }
 
 #[test]
+fn a_readings_age_counts_from_when_it_was_taken_not_from_when_it_was_handed_over() {
+    // Taken at second 57, handed over at 61: at 62 it is five seconds old and the last word; at 62.001 it is too
+    // old to grant on, though it came only a second ago.
+    let mut budget = open(dedicated());
+    budget.observe(secs(61), Some(calm(secs(57))));
+    assert_eq!(budget.fits(secs(62), Size::G2), Ok(()));
+    assert_eq!(budget.fits(ms(62_001), Size::G2), Err(Refusal::Blind));
+    assert_eq!(budget.claim(ms(62_001), Size::G2), Err(Refusal::Blind));
+    assert_eq!(budget.status(ms(62_001)).reading, None);
+    assert_eq!(budget.level(ms(62_001)), Level::Hold);
+}
+
+#[test]
 fn readings_too_far_apart_start_the_wait_again() {
     let mut budget = open(dedicated());
     watch(&mut budget, 65, 65, |_| {});
@@ -549,6 +562,7 @@ fn no_job_is_stopped_when_ci_holds_next_to_nothing() {
     budget.confirm(job).unwrap();
     budget
         .usage(
+            secs(60),
             job,
             Usage {
                 resident_bytes: GIB - 1,
@@ -569,6 +583,7 @@ fn no_job_is_stopped_when_ci_holds_next_to_nothing() {
     }
     budget
         .usage(
+            secs(119),
             job,
             Usage {
                 resident_bytes: GIB,
@@ -689,6 +704,7 @@ fn a_nearly_full_disk_stops_the_job_with_the_largest_scratch() {
     assert_eq!(budget.level(secs(61)), Level::Evict);
     budget
         .usage(
+            secs(61),
             older,
             Usage {
                 resident_bytes: 0,
@@ -698,6 +714,7 @@ fn a_nearly_full_disk_stops_the_job_with_the_largest_scratch() {
         .unwrap();
     budget
         .usage(
+            secs(61),
             newer,
             Usage {
                 resident_bytes: 0,

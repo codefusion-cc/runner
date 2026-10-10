@@ -25,6 +25,33 @@ pub struct Grant {
     /// When the reservation is given back unless [`Budget::confirm`] came first. `None` for an adopted slot and
     /// for a job that was assigned ([`Budget::assign`]): those never run out.
     pub expires: Option<Millis>,
+    /// How the slot came to be counted: say it where the job's start is logged and reported.
+    pub origin: Origin,
+}
+
+/// How a slot came to be counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Origin {
+    /// The Runner asked for it ([`Budget::claim`]) and the Mac was open.
+    Claimed,
+    /// GitHub assigned the job without asking ([`Budget::assign`]) and the Mac had room for it.
+    Assigned,
+    /// The same, while the person was at the Mac, when no claim is granted: the job runs at low priority.
+    AssignedInUse,
+    /// A VM found running after a restart ([`Budget::adopt`]).
+    Adopted,
+}
+
+impl Origin {
+    /// A short fixed name for reports and logs.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Origin::Claimed => "claimed",
+            Origin::Assigned => "assigned",
+            Origin::AssignedInUse => "assigned-in-use",
+            Origin::Adopted => "adopted",
+        }
+    }
 }
 
 /// Why a slot was not granted.
@@ -46,7 +73,7 @@ pub enum Refusal {
     Cpus { cap: u32, committed: u32 },
     /// The Mac could not keep its floor if every VM grew to its full size.
     Memory { short_bytes: u64 },
-    /// Jobs that GitHub assigned without asking wait for room, and they go first.
+    /// Jobs that GitHub assigned without asking wait for room, and they go first: so many of them.
     AssignedFirst { waiting: usize },
 }
 
@@ -108,7 +135,9 @@ pub struct Released {
 /// What a running VM uses, as its vm-host measures it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
-    /// The host memory the VM holds now (the footprint of its process).
+    /// The physical memory the VM's process holds now: its resident size. Not its footprint, which also counts
+    /// pages macOS compressed or swapped out: those left the Mac's memory, show as available again, and come back
+    /// when the guest touches them, so they are still to come.
     pub resident_bytes: u64,
     /// The size of the job's scratch disk on the host.
     pub scratch_bytes: u64,
@@ -175,12 +204,42 @@ pub struct Status {
     pub cpus_committed: u32,
     /// Whether the person counts as being at the Mac: running jobs go on at low priority.
     pub person_there: bool,
-    /// How many assigned jobs wait for room.
-    pub waiting: usize,
+    /// Every slot that counts, in the order of their ids, with how it came to be: an assigned job that started while the
+    /// person was there is why memory is committed under a cap of zero.
+    pub slots: Vec<Held>,
+    /// The assigned jobs that wait for room, first in line first, each with what keeps it waiting.
+    pub waiting: Vec<Waiting>,
     /// The newest reading, if there is one new enough.
     pub reading: Option<HostReading>,
     /// What would fit now.
     pub free: Free,
+}
+
+/// One slot the budget counts, as [`Status`] shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The slot.
+    pub slot: SlotId,
+    /// Its size.
+    pub size: Size,
+    /// How it came to be counted.
+    pub origin: Origin,
+}
+
+/// One assigned job that waits, as [`Status`] shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    /// The name it waits under.
+    pub slot: SlotId,
+    /// Its size.
+    pub size: Size,
+    /// What keeps it waiting now: what is wrong with the Mac, what it is short of, or
+    /// [`Refusal::AssignedFirst`] with the number of jobs before it. `None` when nothing does any more and the
+    /// next reading starts it.
+    pub why: Option<Refusal>,
+    /// Whether the settings in force rule its size out altogether (`why` says which limit). It keeps its place
+    /// and holds nobody up, but it starts only if the settings change: withdraw it or change them.
+    pub never: bool,
 }
 
 /// One VM's share of the host, as admission counts it.
@@ -190,7 +249,7 @@ pub struct Charge {
     pub vm_bytes: u64,
     /// The size plus the host's overhead for the VM: the most it can take from the host.
     pub host_bytes: u64,
-    /// What it holds now. Unknown counts as nothing, so all of it is still to come.
+    /// What it held when the Mac was last read. Unknown counts as nothing, so all of it is still to come.
     pub resident_bytes: u64,
     /// Its vCPUs.
     pub cpus: u32,
@@ -246,8 +305,15 @@ struct Slot {
     host_bytes: u64,
     /// When the reservation runs out; `None` once a VM is to be started for it.
     expires: Option<Millis>,
-    usage: Option<Usage>,
+    origin: Origin,
+    /// The newest measurement, and when it came.
+    usage: Option<(Millis, Usage)>,
+    /// What of the VM's size admission takes as gone from the host already: its resident size as far as the
+    /// reading in hand can show it. A measurement newer than that reading does not raise it.
+    settled_bytes: u64,
     evicting: bool,
+    /// Its place among the slots by when it began to hold memory. A job that waited has an older id than that.
+    order: u64,
 }
 
 impl Slot {
@@ -255,10 +321,18 @@ impl Slot {
         Charge {
             vm_bytes: self.size.vm_bytes(),
             host_bytes: self.host_bytes,
-            resident_bytes: self
-                .usage
-                .map_or(0, |usage| usage.resident_bytes.min(self.host_bytes)),
+            resident_bytes: self.settled_bytes.min(self.host_bytes),
             cpus: self.cpus,
+        }
+    }
+
+    /// Takes a measurement as settled once a reading taken no earlier is in hand: that reading's available
+    /// memory is already without what the VM held then.
+    fn settle(&mut self, reading: &HostReading) {
+        if let Some((at, usage)) = self.usage
+            && at <= reading.at.elapsed
+        {
+            self.settled_bytes = usage.resident_bytes;
         }
     }
 
@@ -267,8 +341,9 @@ impl Slot {
         if self.expires.is_some() {
             return 0;
         }
-        self.usage
-            .map_or(self.host_bytes, |usage| usage.resident_bytes.min(self.host_bytes))
+        self.usage.map_or(self.host_bytes, |(_, usage)| {
+            usage.resident_bytes.min(self.host_bytes)
+        })
     }
 }
 
@@ -285,6 +360,8 @@ pub struct Budget {
     /// Assigned jobs that have no room yet, oldest first. They hold nothing.
     waiting: VecDeque<(SlotId, Size)>,
     next_slot: u64,
+    /// How many slots ever held memory here.
+    inserted: u64,
     holds: BTreeSet<Hold>,
     last_eviction: Option<Millis>,
 }
@@ -299,6 +376,7 @@ impl Budget {
             slots: BTreeMap::new(),
             waiting: VecDeque::new(),
             next_slot: 0,
+            inserted: 0,
             holds: BTreeSet::new(),
             last_eviction: None,
         })
@@ -336,12 +414,19 @@ impl Budget {
         let slept = self.watch.observe(&self.settings, now, reading);
         if went_back {
             // Deadlines set on a clock that then went back would come early or never. Neither may free memory a
-            // job was promised or let jobs be stopped in a burst: start both again from now.
+            // job was promised or let jobs be stopped in a burst: start both again from now. A measurement from
+            // before would look newer than every reading until the clock caught up: it counts as made now.
             let deadline = now.elapsed.plus(self.settings.reservation_ttl);
             for slot in self.slots.values_mut() {
                 slot.expires = slot.expires.map(|_| deadline);
+                slot.usage = slot.usage.map(|(_, usage)| (now.elapsed, usage));
             }
             self.last_eviction = self.last_eviction.map(|_| now.elapsed);
+        }
+        if let Some(reading) = self.watch.fresh(&self.settings, now) {
+            for slot in self.slots.values_mut() {
+                slot.settle(reading);
+            }
         }
         let expired: Vec<SlotId> = self
             .slots
@@ -359,7 +444,7 @@ impl Budget {
                 break;
             }
             self.waiting.remove(index);
-            started.push(self.insert(slot, size, None));
+            started.push(self.insert(slot, size, None, self.assigned_origin(now)));
         }
         Observed {
             level: self.level(now),
@@ -376,7 +461,7 @@ impl Budget {
         self.fits(now, size)?;
         let expires = now.elapsed.plus(self.settings.reservation_ttl);
         let slot = self.next_id();
-        Ok(self.insert(slot, size, Some(expires)))
+        Ok(self.insert(slot, size, Some(expires), Origin::Claimed))
     }
 
     /// Takes a job that GitHub assigned without asking: a poll with spare capacity can get one while the Mac is
@@ -385,7 +470,8 @@ impl Budget {
     ///
     /// The job is already this Mac's, so it is treated like one that was running when the person came back: the
     /// person being there does not keep it waiting (it runs at low priority, [`Status::person_there`]), and it
-    /// counts against the cap and the CPUs the Mac has while its person is away. Everything that protects the Mac
+    /// counts against the cap and the CPUs the Mac has while its person is away. Its grant and [`Status::slots`]
+    /// say so ([`Origin::AssignedInUse`]). Everything that protects the Mac
     /// still holds for it: the floor in force (the higher one while the person is there), pressure, swapping, the
     /// calm time, heat, battery, disk, a missing reading, and every hold. Those it waits for.
     ///
@@ -402,7 +488,7 @@ impl Budget {
             None => match self.assigned_fits(now, size) {
                 Ok(()) => {
                     let slot = self.next_id();
-                    return Assigned::Start(self.insert(slot, size, None));
+                    return Assigned::Start(self.insert(slot, size, None, self.assigned_origin(now)));
                 }
                 Err(why) => why,
             },
@@ -431,12 +517,11 @@ impl Budget {
     /// time it is read: only [`Budget::claim`] decides.
     pub fn fits(&self, now: Now, size: Size) -> Result<(), Refusal> {
         let reading = self.gate(now)?;
-        let charges: Vec<Charge> = self.slots.values().map(Slot::charge).collect();
         admit(
             &self.settings,
             profile_for(&self.settings, Some(reading)),
             reading.available_bytes,
-            &charges,
+            &self.charges(),
             size,
         )
     }
@@ -455,13 +540,17 @@ impl Budget {
     /// the first to be stopped when memory runs short.
     pub fn adopt(&mut self, size: Size) -> Grant {
         let slot = self.next_id();
-        self.insert(slot, size, None)
+        self.insert(slot, size, None, Origin::Adopted)
     }
 
-    /// Records what a slot's VM uses now. What it has already taken from the host is no longer counted as still
-    /// to come.
-    pub fn usage(&mut self, slot: SlotId, usage: Usage) -> Result<(), UnknownSlot> {
-        self.slots.get_mut(&slot).ok_or(UnknownSlot(slot))?.usage = Some(usage);
+    /// Records what a slot's VM uses, measured no later than `now`. What the VM has taken from the host stops
+    /// counting as still to come with the first reading of the Mac taken at `now` or later: the reading in hand
+    /// may be older than the measurement and still show that memory as available, and taking it off twice would
+    /// promise memory the Mac no longer has. A VM that holds less than before counts with less at once.
+    pub fn usage(&mut self, now: Now, slot: SlotId, usage: Usage) -> Result<(), UnknownSlot> {
+        let held = self.slots.get_mut(&slot).ok_or(UnknownSlot(slot))?;
+        held.usage = Some((now.elapsed, usage));
+        held.settled_bytes = held.settled_bytes.min(usage.resident_bytes);
         Ok(())
     }
 
@@ -510,8 +599,9 @@ impl Budget {
         let mut free = Free::default();
         let Ok(reading) = self.gate(now) else { return free };
         let limits = profile_for(&self.settings, Some(reading));
+        let held = self.charges();
         for size in Size::ALL {
-            let mut charges: Vec<Charge> = self.slots.values().map(Slot::charge).collect();
+            let mut charges = held.clone();
             let one_more = Charge {
                 vm_bytes: size.vm_bytes(),
                 host_bytes: self.settings.host_bytes(size),
@@ -538,11 +628,20 @@ impl Budget {
             limits: *profile_for(&self.settings, reading.as_ref()),
             committed_bytes: self.committed_bytes(),
             resident_bytes: self.slots.values().fold(0, |sum, slot| {
-                sum.saturating_add(slot.usage.map_or(0, |usage| usage.resident_bytes))
+                sum.saturating_add(slot.usage.map_or(0, |(_, usage)| usage.resident_bytes))
             }),
             cpus_committed: self.cpus_committed(),
             person_there: person_there(&self.settings, reading.as_ref()),
-            waiting: self.waiting.len(),
+            slots: self
+                .slots
+                .iter()
+                .map(|(id, slot)| Held {
+                    slot: *id,
+                    size: slot.size,
+                    origin: slot.origin,
+                })
+                .collect(),
+            waiting: self.waiting_now(now),
             reading,
             free: self.free(now),
         }
@@ -589,8 +688,13 @@ impl Budget {
             floor_bytes: profile_for(&self.settings, Some(reading)).floor_bytes,
             ..self.settings.away
         };
-        let charges: Vec<Charge> = self.slots.values().map(Slot::charge).collect();
-        admit(&self.settings, &limits, reading.available_bytes, &charges, size)
+        admit(
+            &self.settings,
+            &limits,
+            reading.available_bytes,
+            &self.charges(),
+            size,
+        )
     }
 
     /// The oldest waiting job this Mac can run at all, with its place in the line. A job that the settings have
@@ -601,6 +705,43 @@ impl Budget {
             .enumerate()
             .find(|(_, (_, size))| self.settings.can_run(*size).is_ok())
             .map(|(index, (slot, size))| (index, *slot, *size))
+    }
+
+    /// Every slot as admission counts it.
+    fn charges(&self) -> Vec<Charge> {
+        self.slots.values().map(Slot::charge).collect()
+    }
+
+    /// Every waiting job with what keeps it waiting at `now`.
+    fn waiting_now(&self, now: Now) -> Vec<Waiting> {
+        let mut ahead = 0;
+        self.waiting
+            .iter()
+            .map(|&(slot, size)| {
+                let ruled_out = self.settings.can_run(size).err();
+                let why = match ruled_out {
+                    Some(limit) => Some(limit),
+                    None if ahead == 0 => self.assigned_fits(now, size).err(),
+                    None => Some(Refusal::AssignedFirst { waiting: ahead }),
+                };
+                ahead += usize::from(ruled_out.is_none());
+                Waiting {
+                    slot,
+                    size,
+                    why,
+                    never: ruled_out.is_some(),
+                }
+            })
+            .collect()
+    }
+
+    /// How an assigned job that starts at `now` is marked: with the person there or not.
+    fn assigned_origin(&self, now: Now) -> Origin {
+        if person_there(&self.settings, self.watch.fresh(&self.settings, now)) {
+            Origin::AssignedInUse
+        } else {
+            Origin::Assigned
+        }
     }
 
     fn next_id(&mut self) -> SlotId {
@@ -644,10 +785,10 @@ impl Budget {
                 if held < self.settings.evict_min_held_bytes {
                     return None;
                 }
-                running.map(|(id, _)| *id).max()?
+                running.map(|(id, slot)| (slot.order, *id)).max()?.1
             }
             EvictionCause::Disk => running
-                .map(|(id, slot)| (slot.usage.map_or(0, |usage| usage.scratch_bytes), *id))
+                .map(|(id, slot)| (slot.usage.map_or(0, |(_, usage)| usage.scratch_bytes), *id))
                 .filter(|(scratch, _)| *scratch > 0)
                 .max()
                 .map(|(_, id)| id)?,
@@ -657,9 +798,10 @@ impl Budget {
         Some(Eviction { slot, cause })
     }
 
-    fn insert(&mut self, slot: SlotId, size: Size, expires: Option<Millis>) -> Grant {
+    fn insert(&mut self, slot: SlotId, size: Size, expires: Option<Millis>, origin: Origin) -> Grant {
         let cpus = self.settings.vcpus_of(size);
         let host_bytes = self.settings.host_bytes(size);
+        self.inserted += 1;
         self.slots.insert(
             slot,
             Slot {
@@ -667,8 +809,11 @@ impl Budget {
                 cpus,
                 host_bytes,
                 expires,
+                origin,
                 usage: None,
+                settled_bytes: 0,
                 evicting: false,
+                order: self.inserted,
             },
         );
         Grant {
@@ -678,6 +823,7 @@ impl Budget {
             job_limit_bytes: self.settings.job_limit_bytes(size),
             cpus,
             expires,
+            origin,
         }
     }
 }

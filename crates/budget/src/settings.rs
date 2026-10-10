@@ -129,7 +129,9 @@ impl Settings {
     /// - Cap: all memory but a reserve of 25% (at least 3 GB) on a dedicated Mac, 40% (at least 4 GB) on a
     ///   workstation whose person is away, and nothing while the person is there. A 16 GB Mac: 12 GB and 9.6 GB.
     /// - Floor: 2 GB, 3 GB and 4 GB on a 16 GB Mac (dedicated, away, in use).
-    /// - CPUs: all cores but two; half the cores while the person is there. 2 vCPUs for `cf-2g`, 4 for the rest.
+    /// - CPUs: all cores but two; half the cores while the person is there. 2 vCPUs for `cf-2g` and 4 for
+    ///   `cf-6g` and `cf-8g`. `cf-4g` gets half of the CPUs CI may use, at most 4 and at least 2, so that two of
+    ///   them run side by side: 4 on a Mac with 10 cores, 3 on one with 8 (what the Go manager gave a job there).
     /// - 15 minutes without the person, a 2 minute reservation, 60 s of calm, 30 s after a swap-out, and a job
     ///   stopped after 10 s of critical pressure on a workstation, 30 s on a dedicated Mac.
     pub fn for_host(facts: HostFacts, mode: Mode) -> Settings {
@@ -165,7 +167,7 @@ impl Settings {
             idle_after: Millis::mins(15),
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD_ESTIMATE,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
-            vcpus: [2, 4, 4, 4],
+            vcpus: [2, (all_but_two / 2).clamp(2, 4), 4, 4],
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),

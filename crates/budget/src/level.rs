@@ -11,7 +11,8 @@ pub enum Level {
     Tight,
     /// No new slot for a reason that is not memory: no reading, heat, battery, disk, or a hold someone set.
     Hold,
-    /// A job has to stop for the Mac's sake.
+    /// The Mac is out of memory or disk: a job of ours stops if stopping one gives the Mac something back
+    /// ([`Observed::evict`](crate::Observed::evict) names it).
     Evict,
 }
 
@@ -85,7 +86,7 @@ impl Hold {
 /// What the readings so far say: the part of the budget that remembers.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watch {
-    /// The newest reading that could be used, with the time it was handed over.
+    /// The newest reading that could be used.
     reading: Option<HostReading>,
     /// When `observe` last ran.
     observed: Option<Now>,
@@ -222,12 +223,12 @@ impl Watch {
         self.observed
     }
 
-    /// The newest reading, if `now` is still close enough to it to act on.
+    /// The newest reading, if it was taken no longer than [`Settings::stale_after`] before `now`.
     pub(crate) fn fresh(&self, settings: &Settings, now: Now) -> Option<&HostReading> {
         let observed = self.observed?;
+        let reading = self.reading.as_ref()?;
         let in_order = now.elapsed >= observed.elapsed && now.awake >= observed.awake;
-        (in_order && now.elapsed.since(observed.elapsed) <= settings.stale_after)
-            .then_some(self.reading.as_ref()?)
+        (in_order && now.elapsed.since(reading.at.elapsed) <= settings.stale_after).then_some(reading)
     }
 
     /// What is wrong now, worst first.

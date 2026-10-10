@@ -73,6 +73,8 @@ fn the_default_cpus_and_times() {
     assert_eq!(d.critical_for, Millis::secs(30));
     let w = workstation();
     assert_eq!((w.away.cpus, w.in_use.cpus), (6, 4));
+    // cf-4g has half the CPUs CI may use: 3 on a Mac with 8 cores, where 4 would leave no second one any.
+    assert_eq!(w.vcpus, [2, 3, 4, 4]);
     assert_eq!(w.critical_for, Millis::secs(10));
     assert_eq!(
         (w.idle_after, w.reservation_ttl, w.calm_for),
@@ -307,6 +309,72 @@ fn vcpus_are_never_overcommitted() {
 }
 
 #[test]
+fn what_fits_each_of_the_two_macs() {
+    // Both have 16 GB. All of it available is more than either ever has: the caps and the CPUs decide here.
+    let fits = |settings: Settings, sizes: &[Size]| {
+        let mut budget = open(settings);
+        sizes
+            .iter()
+            .map(|size| budget.claim(secs(60), *size).map(|grant| grant.cpus))
+            .collect::<Vec<_>>()
+    };
+    use Size::{G2, G4, G6, G8};
+    // The dedicated one, 10 cores: 12 GB and 8 CPUs.
+    assert_eq!(fits(dedicated(), &[G4, G4]), [Ok(4), Ok(4)]);
+    assert_eq!(fits(dedicated(), &[G8, G4]), [Ok(4), Ok(4)]);
+    assert_eq!(fits(dedicated(), &[G6, G6]), [Ok(4), Ok(4)]);
+    assert_eq!(
+        fits(dedicated(), &[G4, G4, G4])[2],
+        Err(Refusal::Cpus { cap: 8, committed: 8 })
+    );
+    // The workstation, 8 cores, its person away: 9.6 GB and 6 CPUs. Two cf-4g run side by side with 3 vCPUs
+    // each; with 4 the second would never start.
+    let cap = workstation().away.cap_bytes;
+    assert_eq!(fits(workstation(), &[G4, G4]), [Ok(3), Ok(3)]);
+    assert_eq!(fits(workstation(), &[G6, G2]), [Ok(4), Ok(2)]);
+    assert_eq!(fits(workstation(), &[G8]), [Ok(4)]);
+    assert_eq!(
+        fits(workstation(), &[G4, G4, G2])[2],
+        Err(Refusal::Full {
+            cap_bytes: cap,
+            committed_bytes: 8 * GIB
+        })
+    );
+    assert_eq!(
+        fits(workstation(), &[G6, G4])[1],
+        Err(Refusal::Full {
+            cap_bytes: cap,
+            committed_bytes: 6 * GIB
+        })
+    );
+    // Half of the CPUs for CI, between 2 and 4, whatever the Mac.
+    let g4_vcpus = |cores: u32| {
+        let facts = HostFacts {
+            total_bytes: 16 * GIB,
+            cores,
+        };
+        Settings::for_host(facts, Mode::Workstation).vcpus_of(G4)
+    };
+    assert_eq!(
+        [1, 4, 6, 7, 8, 9, 10, 12, 24].map(g4_vcpus),
+        [2, 2, 2, 2, 3, 3, 4, 4, 4]
+    );
+
+    // By memory, two cf-4g need 2 x (4 GB + 64 MB) and the floor available before either starts: 11.125 GB on
+    // the workstation, 10.125 GB on the dedicated Mac. A byte less and the second waits.
+    for (settings, floor) in [(workstation(), 3 * GIB), (dedicated(), 2 * GIB)] {
+        for (short, second) in [(0, Ok(())), (1, Err(Refusal::Memory { short_bytes: 1 }))] {
+            let mut budget = Budget::new(settings.clone()).unwrap();
+            watch(&mut budget, 0, 60, |r| {
+                r.available_bytes = 2 * HOST_4G + floor - short
+            });
+            budget.claim(secs(60), G4).unwrap();
+            assert_eq!(budget.claim(secs(60), G4).map(|_| ()), second);
+        }
+    }
+}
+
+#[test]
 fn the_floor_holds_to_the_byte() {
     // Three VMs of 4 GB with their overhead and the 2 GB floor: exactly that much available fits the third,
     // one byte less does not.
@@ -350,6 +418,7 @@ fn a_vm_that_grew_is_not_counted_twice() {
     );
     budget
         .usage(
+            secs(61),
             first,
             Usage {
                 resident_bytes: 3 * GIB,
@@ -364,6 +433,7 @@ fn a_vm_that_grew_is_not_counted_twice() {
     // A VM cannot have taken more than its size and overhead: a larger report frees nothing.
     budget
         .usage(
+            secs(62),
             first,
             Usage {
                 resident_bytes: 64 * GIB,
@@ -394,6 +464,7 @@ fn a_vm_nobody_measured_yet_is_all_still_to_come() {
     );
     budget
         .usage(
+            secs(61),
             first,
             Usage {
                 resident_bytes: 1,
@@ -401,7 +472,114 @@ fn a_vm_nobody_measured_yet_is_all_still_to_come() {
             },
         )
         .unwrap();
-    assert_eq!(budget.fits(secs(61), Size::G2), Ok(()));
+    reading.at = secs(62);
+    budget.observe(secs(62), Some(reading));
+    assert_eq!(budget.fits(secs(62), Size::G2), Ok(()));
+}
+
+#[test]
+fn what_a_vm_took_after_the_reading_is_still_to_come_until_the_mac_is_read_again() {
+    // The reading of second 61 shows 8 GB available and was taken before the VM touched its memory. Half a
+    // second later its vm-host reports 3 GB: those are gone from the 8 GB the budget still has in hand. Taking
+    // them off what the VM may still grow by as well would grant a second VM on memory that is no longer there
+    // (5 GB available in truth, 5.1 GB still to come for the two, and the 2 GB floor).
+    let mut budget = open(one_vcpu(dedicated()));
+    let first = budget.claim(secs(60), Size::G4).unwrap().slot;
+    budget.confirm(first).unwrap();
+    let look = |budget: &mut Budget, at: cf_budget::Now, available: u64| {
+        let mut reading = calm(at);
+        reading.available_bytes = available;
+        budget.observe(at, Some(reading));
+    };
+    let grown = Usage {
+        resident_bytes: 3 * GIB,
+        scratch_bytes: 0,
+    };
+    let short = Err(Refusal::Memory {
+        short_bytes: 2 * HOST_4G + 2 * GIB - 8 * GIB,
+    });
+    look(&mut budget, secs(61), 8 * GIB);
+    assert_eq!(budget.fits(secs(61), Size::G4), short);
+    budget.usage(ms(61_500), first, grown).unwrap();
+    assert_eq!(
+        budget.fits(ms(61_500), Size::G4),
+        short,
+        "the reading is older than the report"
+    );
+    assert_eq!(
+        budget.status(ms(61_500)).resident_bytes,
+        3 * GIB,
+        "the report itself is shown at once"
+    );
+
+    // A reading that was taken before the report, handed over after it, proves nothing either.
+    let mut late = calm(ms(61_400));
+    late.available_bytes = 8 * GIB;
+    budget.observe(ms(61_600), Some(late));
+    assert_eq!(budget.fits(ms(61_600), Size::G4), short);
+
+    // The next reading is newer than the report and shows the Mac without the 3 GB: now they count as taken.
+    look(&mut budget, secs(62), 5 * GIB);
+    assert_eq!(
+        budget.fits(secs(62), Size::G4),
+        Err(Refusal::Memory {
+            short_bytes: 2 * HOST_4G - 3 * GIB + 2 * GIB - 5 * GIB
+        })
+    );
+    look(&mut budget, secs(63), 2 * HOST_4G - 3 * GIB + 2 * GIB);
+    assert_eq!(budget.fits(secs(63), Size::G4), Ok(()));
+}
+
+#[test]
+fn a_measurement_from_before_the_clock_went_back_counts_from_the_next_reading() {
+    // Reported at second 5000 on a clock that then shows 10: it would look newer than every reading for the
+    // next 83 minutes, and the 3 GB the VM holds would be kept back twice for as long.
+    let mut budget = Budget::new(one_vcpu(dedicated())).unwrap();
+    watch(&mut budget, 4940, 5000, |_| {});
+    let first = budget.claim(secs(5000), Size::G4).unwrap().slot;
+    budget.confirm(first).unwrap();
+    let grown = Usage {
+        resident_bytes: 3 * GIB,
+        scratch_bytes: 0,
+    };
+    budget.usage(secs(5000), first, grown).unwrap();
+    let enough = 2 * HOST_4G - 3 * GIB + 2 * GIB;
+    watch(&mut budget, 10, 70, |r| r.available_bytes = enough);
+    assert_eq!(budget.fits(secs(70), Size::G4), Ok(()));
+    watch(&mut budget, 71, 71, |r| r.available_bytes = enough - 1);
+    assert_eq!(
+        budget.fits(secs(71), Size::G4),
+        Err(Refusal::Memory { short_bytes: 1 })
+    );
+}
+
+#[test]
+fn a_vm_that_holds_less_than_before_counts_with_less_at_once() {
+    // macOS compressed or swapped out 2 GB of a VM's memory: they are available again and will come back.
+    let mut budget = open(one_vcpu(dedicated()));
+    let first = budget.claim(secs(60), Size::G4).unwrap().slot;
+    budget.confirm(first).unwrap();
+    let resident = |bytes: u64| Usage {
+        resident_bytes: bytes,
+        scratch_bytes: 0,
+    };
+    budget.usage(secs(60), first, resident(4 * GIB)).unwrap();
+    let mut reading = calm(secs(61));
+    reading.available_bytes = HOST_4G - 4 * GIB + HOST_4G + 2 * GIB;
+    budget.observe(secs(61), Some(reading));
+    assert_eq!(budget.fits(secs(61), Size::G4), Ok(()));
+    budget.usage(ms(61_200), first, resident(2 * GIB)).unwrap();
+    assert_eq!(
+        budget.fits(ms(61_200), Size::G4),
+        Err(Refusal::Memory { short_bytes: 2 * GIB }),
+        "no reading is waited for when a VM shrank"
+    );
+    // And a report of more, right after, does not undo that before the Mac was read again.
+    budget.usage(ms(61_300), first, resident(4 * GIB)).unwrap();
+    assert_eq!(
+        budget.fits(ms(61_300), Size::G4),
+        Err(Refusal::Memory { short_bytes: 2 * GIB })
+    );
 }
 
 #[test]
@@ -433,12 +611,12 @@ fn the_workstation_waits_fifteen_minutes_for_its_person() {
     assert!(budget.status(secs(60)).person_there);
     watch(&mut budget, 61, 61, |r| r.idle = Millis::mins(15));
     assert!(!budget.status(secs(61)).person_there);
-    // 9.6 GB and 6 CPUs: a cf-4g and a cf-2g, then the CPUs are used up.
+    // 9.6 GB and 6 CPUs: a cf-4g and a cf-2g have 3 and 2 of them, and a second cf-2g would be one too many.
     budget.claim(secs(61), Size::G4).unwrap();
     budget.claim(secs(61), Size::G2).unwrap();
     assert_eq!(
         budget.claim(secs(61), Size::G2),
-        Err(Refusal::Cpus { cap: 6, committed: 6 })
+        Err(Refusal::Cpus { cap: 6, committed: 5 })
     );
 }
 
@@ -510,7 +688,7 @@ fn also_while_i_work_opens_a_smaller_budget() {
     );
     assert_eq!(
         budget.claim(now, Size::G2),
-        Err(Refusal::Cpus { cap: 4, committed: 4 })
+        Err(Refusal::Cpus { cap: 4, committed: 3 })
     );
     let mut budget = open(workstation());
     let mut settings = budget.settings().clone();
@@ -550,7 +728,10 @@ fn a_reservation_runs_out_after_two_minutes_unless_confirmed() {
         "told once"
     );
     assert_eq!(budget.confirm(lost), Err(UnknownSlot(lost)));
-    assert_eq!(budget.usage(lost, Usage::default()), Err(UnknownSlot(lost)));
+    assert_eq!(
+        budget.usage(secs(181), lost, Usage::default()),
+        Err(UnknownSlot(lost))
+    );
     assert_eq!(budget.release(lost), Err(UnknownSlot(lost)));
     watch(&mut budget, 182, 4000, |_| {});
     assert_eq!(budget.slots(), 1, "a confirmed slot never runs out");
@@ -726,6 +907,7 @@ fn free_slots_and_status_say_what_a_claim_would() {
     assert_eq!(budget.free(now).of(Size::G2), 3);
     budget
         .usage(
+            now,
             job,
             Usage {
                 resident_bytes: GIB,

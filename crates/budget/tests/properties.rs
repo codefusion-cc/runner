@@ -188,8 +188,30 @@ struct Held {
     size: Size,
     cpus: u32,
     deadline: Option<Millis>,
-    usage: Option<Usage>,
+    /// Every measurement of its VM, with the time it was reported at.
+    reports: Vec<(Millis, Usage)>,
     told_to_stop: bool,
+}
+
+impl Held {
+    fn usage(&self) -> Option<Usage> {
+        self.reports.last().map(|(_, usage)| *usage)
+    }
+
+    /// The most of the VM's size that may count as gone from the host in a reading taken at `read_at`: what
+    /// the VM was known to hold by then, and never more than any report since. What it took after the reading
+    /// is still in the reading's available memory.
+    fn taken_by(&self, read_at: Millis) -> u64 {
+        let known = self
+            .reports
+            .iter()
+            .rfind(|(at, _)| *at <= read_at)
+            .map_or(0, |(_, usage)| usage.resident_bytes);
+        self.reports
+            .iter()
+            .filter(|(at, _)| *at > read_at)
+            .fold(known, |least, (_, usage)| least.min(usage.resident_bytes))
+    }
 }
 
 struct World {
@@ -235,7 +257,8 @@ impl World {
         let (last_at, last) = self.seen.last()?;
         let last = (*last)?;
         let in_order = self.now.elapsed >= last_at.elapsed && self.now.awake >= last_at.awake;
-        if !in_order || self.now.elapsed.0 - last_at.elapsed.0 > self.settings.stale_after.0 {
+        // A reading's age counts from when it was taken, not from when it was handed over.
+        if !in_order || self.now.elapsed.0.saturating_sub(last.at.elapsed.0) > self.settings.stale_after.0 {
             return None;
         }
         let mut newer = *last_at;
@@ -255,7 +278,8 @@ impl World {
         None
     }
 
-    fn charges(&self) -> Vec<Charge> {
+    /// Every slot as admission may count it against a reading taken at `read_at`.
+    fn charges(&self, read_at: Millis) -> Vec<Charge> {
         self.held
             .iter()
             .map(|slot| {
@@ -263,7 +287,7 @@ impl World {
                 Charge {
                     vm_bytes: slot.size.vm_bytes(),
                     host_bytes,
-                    resident_bytes: slot.usage.map_or(0, |usage| usage.resident_bytes.min(host_bytes)),
+                    resident_bytes: slot.taken_by(read_at).min(host_bytes),
                     cpus: slot.cpus,
                 }
             })
@@ -322,7 +346,7 @@ impl World {
             "CPUs overcommitted"
         );
         let to_come: u64 = self
-            .charges()
+            .charges(reading.at.elapsed)
             .iter()
             .map(|c| c.host_bytes - c.resident_bytes)
             .sum();
@@ -389,7 +413,7 @@ impl World {
                             size: *size,
                             cpus: grant.cpus,
                             deadline: Some(deadline),
-                            usage: None,
+                            reports: Vec::new(),
                             told_to_stop: false,
                         });
                     }
@@ -413,7 +437,7 @@ impl World {
                             size: *size,
                             cpus: grant.cpus,
                             deadline: None,
-                            usage: None,
+                            reports: Vec::new(),
                             told_to_stop: false,
                         });
                     }
@@ -469,8 +493,8 @@ impl World {
                         resident_bytes: resident_mib * MIB,
                         scratch_bytes: scratch_mib * MIB,
                     };
-                    prop_assert_eq!(self.budget.usage(slot.id, usage), Ok(()));
-                    slot.usage = Some(usage);
+                    prop_assert_eq!(self.budget.usage(self.now, slot.id, usage), Ok(()));
+                    slot.reports.push((self.now.elapsed, usage));
                 }
             }
             Op::Hold(on) => {
@@ -499,18 +523,22 @@ impl World {
                 slot.deadline = slot.deadline.map(|_| deadline);
             }
             self.last_stop = self.last_stop.map(|_| self.now.elapsed);
+            // What was measured on the clock before it went back cannot be placed before or after a reading on
+            // the clock since: it is as if it had been reported now.
+            for slot in &mut self.held {
+                for (at, _) in &mut slot.reports {
+                    *at = self.now.elapsed;
+                }
+            }
         }
         let held_bytes: u64 = self
-            .charges()
+            .held
             .iter()
-            .zip(&self.held)
-            .filter(|(_, slot)| slot.deadline.is_none())
-            .map(|(charge, slot)| {
-                if slot.usage.is_some() {
-                    charge.resident_bytes
-                } else {
-                    charge.host_bytes
-                }
+            .filter(|slot| slot.deadline.is_none())
+            .map(|slot| {
+                let host_bytes = slot.size.vm_bytes() + self.settings.vm_host_overhead_bytes;
+                slot.usage()
+                    .map_or(host_bytes, |usage| usage.resident_bytes.min(host_bytes))
             })
             .sum();
         let observed = self.budget.observe(self.now, reading);
@@ -575,7 +603,7 @@ impl World {
                 }
                 EvictionCause::Disk => {
                     prop_assert!(reading.disk_free_bytes < self.settings.disk_evict_bytes);
-                    let scratch = |slot: &Held| slot.usage.map_or(0, |usage| usage.scratch_bytes);
+                    let scratch = |slot: &Held| slot.usage().map_or(0, |usage| usage.scratch_bytes);
                     prop_assert!(scratch(victim) > 0);
                     prop_assert_eq!(
                         Some(scratch(victim)),
@@ -606,7 +634,7 @@ impl World {
                 size,
                 cpus: grant.cpus,
                 deadline: None,
-                usage: None,
+                reports: Vec::new(),
                 told_to_stop: false,
             });
         }

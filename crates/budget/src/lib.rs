@@ -10,14 +10,17 @@
 //! - No claim is granted that takes the sum of VM sizes over the cap in force, or the sum of vCPUs over the CPU
 //!   cap. Nothing is overcommitted.
 //! - No claim is granted unless the Mac would keep its floor available even if every VM, the new one included,
-//!   grew to its full size: `available - (promised - resident) - new >= floor`.
+//!   grew to its full size: `available - (promised - resident) - new >= floor`. What a VM holds counts as held
+//!   only once a reading taken after that measurement shows it gone from `available`; less than before counts
+//!   at once.
 //! - No claim is granted unless the level is open: a fresh reading, no memory pressure, no swap-out for 30 s, the
 //!   Mac not under its floor, cool, on mains, with disk, and all of that for 60 s without a break.
-//! - A reading that fails, is old, or follows a gap in time (sleep, a stalled caller, a clock that went back)
-//!   closes the Mac. Not knowing is never a reason to open.
+//! - A reading that fails, is old (by the time it was taken, not handed over), or follows a gap in time (sleep,
+//!   a stalled caller, a clock that went back) closes the Mac. Not knowing is never a reason to open.
 //! - A slot's memory is given back once: a second [`Budget::release`] is an error and changes nothing.
 //! - A job GitHub assigned without asking ([`Budget::assign`]) is never dropped and never started against the
 //!   rules above, the person being there excepted: it waits for the Mac to have room, first in line.
+//!   [`Status`] names every slot with how it came to be ([`Origin`]) and every waiting job with what keeps it.
 //!
 //! The numbers are [`Settings`]; [`Settings::for_host`] has the defaults and where each comes from.
 
@@ -28,8 +31,8 @@ mod settings;
 mod size;
 
 pub use budget::{
-    Assigned, Budget, Charge, Eviction, EvictionCause, Free, Grant, Observed, Refusal, Released, SlotId,
-    Status, UnknownSlot, Usage, admit,
+    Assigned, Budget, Charge, Eviction, EvictionCause, Free, Grant, Held, Observed, Origin, Refusal,
+    Released, SlotId, Status, UnknownSlot, Usage, Waiting, admit,
 };
 pub use host::{Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};
