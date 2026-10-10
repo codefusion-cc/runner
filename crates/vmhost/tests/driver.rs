@@ -7,7 +7,7 @@ use cf_guest_proto::{
 };
 use cf_vmhost::control::{self, Request};
 use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run};
-use cf_vmm::testing::{FakeVmm, PowerSwitch, Script};
+use cf_vmm::testing::{FakeVmm, PowerSwitch, Script, Stop};
 use cf_vmm::{Network, VmmError};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -32,7 +32,7 @@ fn request(job: &str) -> JobRequest {
         scratch_bytes: 1 << 30,
         image: "image-1".into(),
         workload: Workload::ActionsRunner {
-            jit_config: Secret::new(TOKEN),
+            jit_config: Secret::new(TOKEN.to_string()),
         },
         env: vec![("CI".into(), "true".into())],
         deadline_s: 3600,
@@ -325,7 +325,7 @@ fn a_guest_that_never_answers_is_booted_twice_and_the_job_fails_to_boot() {
     let mute = || Script::Boot {
         refuse_channel: usize::MAX,
         guest: Box::new(|_, _| {}),
-        obeys_stop: true,
+        stop: Stop::Obeys,
     };
     let vmm = FakeVmm::new([formatter(), mute(), mute()]);
     let state = go(&vmm, &layout, request("a"), quick()).unwrap();
@@ -458,7 +458,7 @@ fn a_guest_that_ignores_a_stop_is_stopped_by_force_also_when_its_machine_hangs()
             drop(stream);
             let _ = beats.join();
         }),
-        obeys_stop: false,
+        stop: Stop::Hangs,
     };
     let vmm = FakeVmm::new([formatter(), stubborn]);
     let cancel = AtomicBool::new(true);
@@ -989,4 +989,89 @@ fn a_vm_host_answers_for_its_own_state_and_no_other() {
         !control::answers(&layout, &state, Duration::from_millis(200)),
         "a vm-host that is gone answered"
     );
+}
+
+#[test]
+fn a_machine_that_takes_no_stop_is_let_go_of_at_once() {
+    let (_dir, layout) = state_dir();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let deaf = Script::Boot {
+        refuse_channel: 0,
+        guest: Box::new({
+            let cancel = cancel.clone();
+            move |mut stream, power| {
+                greet(&mut stream);
+                say(&mut stream, GuestMessage::Ready { boot_ms: 1 });
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                power.wait_for_the_end();
+            }
+        }),
+        stop: Stop::Refuses,
+    };
+    let vmm = FakeVmm::new([formatter(), deaf]);
+    // A machine that only hangs in its stop is waited for this long; one that refuses it is not.
+    let mut limits = quick();
+    limits.kill = Duration::from_secs(8);
+    let started = std::time::Instant::now();
+    let state = run(&vmm, &layout, GUEST, request("a"), limits, &cancel).unwrap();
+    assert_eq!(state.end.unwrap().end, End::Cancelled);
+    assert_eq!(state.boots, 1);
+    assert_eq!(vmm.stops(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn what_a_guest_says_of_its_failure_reaches_the_state_short_and_clean() {
+    let (_dir, layout) = state_dir();
+    let vmm = FakeVmm::new([
+        formatter(),
+        job(|mut stream, power, _| {
+            say(
+                &mut stream,
+                GuestMessage::Failed {
+                    stage: "s".repeat(1000),
+                    message: format!("gone\n\u{1b}[2J{}", "é".repeat(20_000)),
+                },
+            );
+            power.wait_for_the_end();
+        }),
+    ]);
+    let ended = go(&vmm, &layout, request("a"), quick()).unwrap().end.unwrap();
+    assert_eq!(ended.end, End::Failed);
+    let message = ended.message.unwrap();
+    assert!(
+        message.starts_with(&format!("the guest failed at {}: gone  [2Jé", "s".repeat(32))),
+        "{}",
+        &message[..80]
+    );
+    assert!(message.chars().count() < 1100 && message.chars().all(|c| !c.is_control()));
+    let on_disk = std::fs::read_to_string(layout.state("a")).unwrap();
+    assert!(on_disk.len() < 4096, "{}", on_disk.len());
+}
+
+#[test]
+fn a_request_names_an_image_by_any_version_the_store_takes() {
+    for (version, fine) in [
+        ("2026.10.10-1", true),
+        ("2026.10.10-RC1", true),
+        ("A", true),
+        (&*"v".repeat(64), true),
+        (&*"v".repeat(65), false),
+        ("", false),
+        (".hidden", false),
+        ("..", false),
+        ("a/b", false),
+        ("a b", false),
+        ("a\n", false),
+        ("é", false),
+    ] {
+        let mut asked = request("a");
+        asked.image = version.into();
+        assert_eq!(asked.check().is_ok(), fine, "{version:?}");
+        assert_eq!(cf_image::store::is_version(version), fine, "{version:?}");
+    }
 }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::secret::Secret;
+use cf_secret::Secret;
 
 /// What the host sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +76,8 @@ pub enum Workload {
     /// GitHub's Actions runner with a one-job configuration: `run.sh --jitconfig <configuration>`.
     ActionsRunner {
         /// The encoded one-job configuration GitHub issued.
-        jit_config: Secret,
+        #[serde(with = "on_the_wire")]
+        jit_config: Secret<String>,
     },
     /// A command in the image, with the same container and limits. The integration suite's stand-in for the
     /// Actions runner.
@@ -143,6 +144,48 @@ pub enum GuestMessage {
     },
 }
 
+impl GuestMessage {
+    /// The message as a host keeps it: every text in it cut to its length ([`STAGE_CHARS`], [`MESSAGE_CHARS`],
+    /// [`NAME_CHARS`]) with no control character left, and at most [`LARGEST_PROCESSES`] processes in a report. What
+    /// a guest says goes into state files, logs and onto screens, and a guest runs a stranger's code.
+    /// [`crate::read_guest_message`] applies it to everything it reads.
+    #[must_use]
+    pub fn clipped(self) -> Self {
+        match self {
+            Self::Hello { protocol, kernel } => Self::Hello {
+                protocol,
+                kernel: clip(&kernel, NAME_CHARS),
+            },
+            Self::Oom(event) => Self::Oom(event.clipped()),
+            Self::Exited(mut summary) => {
+                summary.oom = summary.oom.map(OomEvent::clipped);
+                Self::Exited(summary)
+            }
+            Self::Failed { stage, message } => Self::Failed {
+                stage: clip(&stage, STAGE_CHARS),
+                message: clip(&message, MESSAGE_CHARS),
+            },
+            Self::Ready { .. } | Self::Heartbeat(_) => self,
+        }
+    }
+}
+
+/// The most characters a host keeps of the stage a guest says it failed at.
+pub const STAGE_CHARS: usize = 32;
+/// The most characters a host keeps of why a guest says it failed.
+pub const MESSAGE_CHARS: usize = 1024;
+/// The most characters a host keeps of a name a guest sends: a process, the kernel's release.
+pub const NAME_CHARS: usize = 64;
+/// The most processes an out-of-memory report names.
+pub const LARGEST_PROCESSES: usize = 5;
+
+fn clip(text: &str, most: usize) -> String {
+    text.chars()
+        .take(most)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// What a job uses at one moment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -165,8 +208,19 @@ pub struct OomEvent {
     pub process: Process,
     /// The limit the job ran into.
     pub limit_bytes: u64,
-    /// The job's processes with the most memory at that moment, largest first, five at most.
+    /// The job's processes with the most memory at that moment, largest first, [`LARGEST_PROCESSES`] at most.
     pub largest: Vec<Process>,
+}
+
+impl OomEvent {
+    fn clipped(mut self) -> Self {
+        self.process.name = clip(&self.process.name, NAME_CHARS);
+        self.largest.truncate(LARGEST_PROCESSES);
+        for process in &mut self.largest {
+            process.name = clip(&process.name, NAME_CHARS);
+        }
+        self
+    }
 }
 
 /// A process of the job.
@@ -207,4 +261,18 @@ pub enum GuestEnd {
     Exited,
     /// The host asked for the end.
     Stopped(StopReason),
+}
+
+/// A secret as a plain string in a message: the one place a [`Secret`] is written out, to the end that needs it.
+mod on_the_wire {
+    use cf_secret::Secret;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(secret: &Secret<String>, to: S) -> Result<S::Ok, S::Error> {
+        to.serialize_str(secret.expose())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<Secret<String>, D::Error> {
+        String::deserialize(from).map(Secret::new)
+    }
 }

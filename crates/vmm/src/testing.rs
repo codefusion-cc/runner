@@ -26,9 +26,20 @@ pub enum Script {
         refuse_channel: usize,
         /// The guest.
         guest: Guest,
-        /// Whether [`Vm::stop`] ends the machine (`false`: a machine that hangs in its stop).
-        obeys_stop: bool,
+        /// What [`Vm::stop`] does to the machine.
+        stop: Stop,
     },
+}
+
+/// What a scripted machine does when the host stops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// It ends.
+    Obeys,
+    /// It takes the stop and goes on running, as a machine that hangs in its stop.
+    Hangs,
+    /// It takes no stop: [`Vm::stop`] is an error, and the machine goes on running.
+    Refuses,
 }
 
 impl Script {
@@ -37,7 +48,7 @@ impl Script {
         Script::Boot {
             refuse_channel: 0,
             guest: Box::new(guest),
-            obeys_stop: true,
+            stop: Stop::Obeys,
         }
     }
 }
@@ -101,12 +112,12 @@ impl Vmm for FakeVmm {
             Script::Boot {
                 refuse_channel,
                 guest,
-                obeys_stop,
+                stop,
             } => Ok(Box::new(FakeVm {
                 power: Arc::default(),
                 guest: Mutex::new(Some(guest)),
                 refuse_channel: Mutex::new(refuse_channel),
-                obeys_stop,
+                stop,
                 stops: self.stops.clone(),
             })),
         }
@@ -117,7 +128,7 @@ struct FakeVm {
     power: Arc<ExitCell>,
     guest: Mutex<Option<Guest>>,
     refuse_channel: Mutex<usize>,
-    obeys_stop: bool,
+    stop: Stop,
     stops: Arc<Mutex<usize>>,
 }
 
@@ -156,8 +167,10 @@ impl Vm for FakeVm {
 
     fn stop(&self) -> Result<(), VmmError> {
         *self.stops.lock().unwrap() += 1;
-        if self.obeys_stop {
-            self.power.end(VmExit::Stopped);
+        match self.stop {
+            Stop::Obeys => self.power.end(VmExit::Stopped),
+            Stop::Hangs => {}
+            Stop::Refuses => return Err(VmmError::Stop("the machine takes no stop now".into())),
         }
         Ok(())
     }

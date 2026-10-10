@@ -61,31 +61,6 @@ impl Limits {
     }
 }
 
-/// The most of a guest's own words the state keeps, in characters: the stage it failed at, why, a process's name.
-pub(crate) const STAGE_CHARS: usize = 32;
-pub(crate) const MESSAGE_CHARS: usize = 1024;
-const NAME_CHARS: usize = 64;
-/// The most processes an out-of-memory report names, which is what a guest of ours sends.
-const LARGEST: usize = 5;
-
-/// A guest's words as the state keeps them: `most` characters, none of them a control character. The state goes
-/// into logs and onto screens, and the guest runs a stranger's code.
-pub(crate) fn clip(text: &str, most: usize) -> String {
-    text.chars()
-        .take(most)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
-}
-
-fn clip_oom(mut event: OomEvent) -> OomEvent {
-    event.process.name = clip(&event.process.name, NAME_CHARS);
-    event.largest.truncate(LARGEST);
-    for process in &mut event.largest {
-        process.name = clip(&process.name, NAME_CHARS);
-    }
-    event
-}
-
 /// What happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -220,6 +195,11 @@ impl Machine {
     /// Ends the job for this reason, unless it has an end already, and stops the machine by force.
     fn give_up(&mut self, end: End, message: impl Into<Option<String>>, now: Duration) -> Vec<Action> {
         self.end.get_or_insert((end, message.into(), None));
+        self.kill(now)
+    }
+
+    /// Stops the machine by force and waits for it to be gone.
+    fn kill(&mut self, now: Duration) -> Vec<Action> {
         self.enter(Stage::Killing, now);
         vec![Action::StopVm, Action::Publish]
     }
@@ -259,8 +239,7 @@ impl Machine {
         vec![Action::SendStop { reason, grace }, Action::Publish]
     }
 
-    fn summary(&mut self, mut summary: Summary, now: Duration) -> Vec<Action> {
-        summary.oom = summary.oom.map(clip_oom);
+    fn summary(&mut self, summary: Summary, now: Duration) -> Vec<Action> {
         self.usage = Some(summary.usage);
         if self.oom.is_none() {
             self.oom = summary.oom.clone();
@@ -336,10 +315,7 @@ impl Machine {
             (Stage::Running | Stage::Stopping, Event::ConsoleFull) => {
                 self.give_up(self.lost(), CONSOLE_FULL.to_string(), now)
             }
-            (Stage::Done, Event::ConsoleFull) => {
-                self.enter(Stage::Killing, now);
-                vec![Action::StopVm, Action::Publish]
-            }
+            (Stage::Done, Event::ConsoleFull) => self.kill(now),
             (Stage::Killing, Event::ConsoleFull) => Vec::new(),
 
             (_, Event::Tick) => self.tick(now),
@@ -378,7 +354,7 @@ impl Machine {
                 if self.oom.is_some() {
                     return Vec::new();
                 }
-                self.oom = Some(clip_oom(event));
+                self.oom = Some(event);
                 vec![Action::Publish]
             }
             GuestMessage::Exited(summary) => self.summary(summary, now),
@@ -388,7 +364,6 @@ impl Machine {
                 } else {
                     End::Failed
                 };
-                let (stage, message) = (clip(&stage, STAGE_CHARS), clip(&message, MESSAGE_CHARS));
                 self.give_up(end, format!("the guest failed at {stage}: {message}"), now)
             }
         }
@@ -420,10 +395,7 @@ impl Machine {
             {
                 self.stop(StopReason::Timeout, self.limits.deadline_grace, now)
             }
-            Stage::Done if waited >= self.limits.done => {
-                self.enter(Stage::Killing, now);
-                vec![Action::StopVm, Action::Publish]
-            }
+            Stage::Done if waited >= self.limits.done => self.kill(now),
             // A machine that does not obey a forced stop goes with this process.
             Stage::Killing if waited >= self.limits.kill => {
                 self.enter(Stage::Ended, now);

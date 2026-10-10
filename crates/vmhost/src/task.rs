@@ -1,10 +1,8 @@
 //! One of the guest's small tasks, run from the machine's start to its end: a probe, formatting a disk. A job
 //! goes through [`crate::run`], which survives more.
 
-use crate::machine::{MESSAGE_CHARS, STAGE_CHARS, clip};
 use cf_guest_proto::{
-    GuestMessage, HostMessage, MAX_GUEST_FRAME, PORT, PROTOCOL, Start, Summary, Task, read_message_within,
-    write_message,
+    GuestMessage, HostMessage, PORT, PROTOCOL, Start, Summary, Task, read_guest_message, write_message,
 };
 use cf_vmm::{Channel, Vm, VmExit, VmSpec, Vmm};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -30,6 +28,11 @@ pub(crate) fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos() as u64)
+}
+
+/// The time a state is stamped with, in seconds since 1970.
+pub(crate) fn now_s() -> u64 {
+    now_ns() / 1_000_000_000
 }
 
 /// What a task given up says went wrong.
@@ -104,7 +107,7 @@ pub fn run_task(
             .map_err(|error| format!("the channel: {error}"))?;
         let (sender, messages) = mpsc::sync_channel(64);
         std::thread::spawn(move || {
-            while let Ok(Some(message)) = read_message_within::<GuestMessage>(&mut reader, MAX_GUEST_FRAME) {
+            while let Ok(Some(message)) = read_guest_message(&mut reader) {
                 if sender.send(message).is_err() {
                     return;
                 }
@@ -151,11 +154,7 @@ pub fn run_task(
                 GuestMessage::Ready { .. } => ready_after = Some(started.elapsed()),
                 GuestMessage::Exited(summary) => break summary,
                 GuestMessage::Failed { stage, message } => {
-                    return Err(format!(
-                        "the guest failed at {}: {}",
-                        clip(&stage, STAGE_CHARS),
-                        clip(&message, MESSAGE_CHARS)
-                    ));
+                    return Err(format!("the guest failed at {stage}: {message}"));
                 }
                 _ => {}
             }

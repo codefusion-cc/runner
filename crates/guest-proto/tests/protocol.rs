@@ -5,7 +5,7 @@ use std::io::{Cursor, Read};
 use cf_guest_proto::{
     GuestEnd, GuestMessage, HostMessage, Job, Limits, MAX_FRAME, MAX_GUEST_FRAME, OomEvent, PROTOCOL,
     Process, ProtoError, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload, encode,
-    read_message, read_message_within, write_message,
+    read_guest_message, read_message, read_message_within, write_message,
 };
 use proptest::prelude::*;
 
@@ -14,7 +14,7 @@ fn job(secret: &str) -> Job {
         name: "cf-mac-1".into(),
         host: "mac-1".into(),
         workload: Workload::ActionsRunner {
-            jit_config: Secret::new(secret),
+            jit_config: Secret::new(secret.to_string()),
         },
         limits: Limits {
             memory_bytes: 4_026_531_840,
@@ -342,4 +342,108 @@ fn the_wire_names_are_the_documented_ones() {
         serde_json::to_string(&Task::FormatScratch).unwrap(),
         r#"{"kind":"format-scratch"}"#
     );
+}
+
+#[test]
+fn what_a_host_reads_from_a_guest_is_short_and_has_no_control_characters() {
+    let read = |message: &GuestMessage| {
+        read_guest_message(&mut Cursor::new(encode(message).unwrap()))
+            .unwrap()
+            .unwrap()
+    };
+
+    let GuestMessage::Failed { stage, message } = read(&GuestMessage::Failed {
+        stage: "s".repeat(10_000),
+        message: format!(
+            "first line\n\u{1b}[2Jsecond\u{0}\u{7f}\u{85} {}",
+            "é".repeat(20_000)
+        ),
+    }) else {
+        panic!("another message came back");
+    };
+    assert_eq!(stage, "s".repeat(32));
+    assert!(
+        message.starts_with("first line  [2Jsecond    é"),
+        "{}",
+        &message[..60]
+    );
+    assert_eq!(message.chars().count(), 1024);
+    assert!(message.chars().all(|c| !c.is_control()));
+
+    let GuestMessage::Hello { protocol, kernel } = read(&GuestMessage::Hello {
+        protocol: 7,
+        kernel: format!("6.12\u{1b}]0;owned\u{7}\r\n{}", "k".repeat(5000)),
+    }) else {
+        panic!("another message came back");
+    };
+    assert_eq!(protocol, 7);
+    assert_eq!(kernel, format!("6.12 ]0;owned   {}", "k".repeat(48)));
+
+    let process = |name: &str| Process {
+        pid: 1,
+        name: name.into(),
+        memory_bytes: 1,
+    };
+    let loud = OomEvent {
+        process: process(&format!("no\nde{}", "x".repeat(500))),
+        limit_bytes: 2,
+        largest: (0..300)
+            .map(|i| process(&format!("{i}\t{}", "y".repeat(100))))
+            .collect(),
+    };
+    let GuestMessage::Oom(kept) = read(&GuestMessage::Oom(loud.clone())) else {
+        panic!("another message came back");
+    };
+    assert_eq!(kept.process.name, format!("no de{}", "x".repeat(59)));
+    assert_eq!(kept.limit_bytes, 2);
+    assert_eq!(kept.largest.len(), 5);
+    assert_eq!(kept.largest[4].name, format!("4 {}", "y".repeat(62)));
+
+    // The same in a summary, which is where a job's first out-of-memory stop may arrive.
+    let account = Summary {
+        end: GuestEnd::Exited,
+        exit_code: Some(137),
+        signal: None,
+        usage: Usage::default(),
+        disk_peak_bytes: 0,
+        oom: Some(loud),
+        wall_ms: 1,
+    };
+    let GuestMessage::Exited(kept) = read(&GuestMessage::Exited(account)) else {
+        panic!("another message came back");
+    };
+    let in_summary = kept.oom.unwrap();
+    assert_eq!(
+        (
+            in_summary.largest.len(),
+            in_summary.process.name.len(),
+            kept.exit_code
+        ),
+        (5, 64, Some(137))
+    );
+}
+
+#[test]
+fn a_host_reads_no_frame_of_a_guest_beyond_its_limit_and_what_is_short_arrives_as_it_was_sent() {
+    let plain = GuestMessage::Failed {
+        stage: "network".into(),
+        message: "no lease within 10 s".into(),
+    };
+    assert_eq!(
+        read_guest_message(&mut Cursor::new(encode(&plain).unwrap())).unwrap(),
+        Some(plain)
+    );
+    let large = encode(&GuestMessage::Failed {
+        stage: "network".into(),
+        message: "x".repeat(MAX_GUEST_FRAME),
+    })
+    .unwrap();
+    assert!(matches!(
+        read_guest_message(&mut Cursor::new(large)),
+        Err(ProtoError::TooLarge {
+            limit: MAX_GUEST_FRAME,
+            ..
+        })
+    ));
+    assert_eq!(read_guest_message(&mut Cursor::new(Vec::new())).unwrap(), None);
 }

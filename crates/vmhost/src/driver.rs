@@ -1,17 +1,16 @@
 //! Runs one job against a monitor: does what [`Machine`] says and tells it what happens.
 
 use crate::control;
-use crate::layout::{Layout, private, write_private};
+use crate::layout::{Layout, make_dir, private, write_private};
 use crate::machine::{Action, Event, Limits, Machine};
 use crate::request::{JobRequest, RequestError};
-use crate::scratch::{self, GuestFiles, IMAGE_DISK, SCRATCH_DISK};
+use crate::scratch::{self, GuestFiles};
 use crate::state::{End, Ended, JobState, Stage};
-use crate::task::{describe, now_ns, put_down};
+use crate::task::{describe, now_ns, now_s, put_down};
 use cf_guest_proto::{
-    GuestMessage, HostMessage, Job, MAX_GUEST_FRAME, PORT, PROTOCOL, Start, Stop, StopReason, Task,
-    read_message_within, write_message,
+    HostMessage, Job, PORT, PROTOCOL, Start, Stop, StopReason, Task, read_guest_message, write_message,
 };
-use cf_vmm::{Channel, Disk, Network, Vm, VmSpec, Vmm};
+use cf_vmm::{Channel, Network, Vm, Vmm};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
@@ -108,26 +107,12 @@ pub fn run(
     if !rootfs.is_file() {
         return Err(RunError::Image(request.image));
     }
-    // The image was verified when it was installed. That holds for as long as nobody else can write to the file,
-    // its folder, the images' folder or the state folder: the root file system, its two folders and their parent.
-    for trusted in rootfs.ancestors().take(4) {
-        private(trusted).map_err(RunError::NotPrivate)?;
+    for trusted in layout.trusted_for(&request.image) {
+        private(&trusted).map_err(RunError::NotPrivate)?;
     }
-    let (state_path, socket_path, job_dir, console) = (
-        layout.state(&job),
-        layout.socket(&job),
-        layout.job_dir(&job),
-        layout.console(&job),
-    );
-    for folder in [
-        layout.run(),
-        console.parent().unwrap_or(Path::new("")).to_path_buf(),
-    ] {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&folder)
-            .map_err(io(&folder))?;
+    let (state_path, socket_path, job_dir) = (layout.state(&job), layout.socket(&job), layout.job_dir(&job));
+    for folder in [layout.run(), layout.logs()] {
+        make_dir(&folder).map_err(io(&folder))?;
         private(&folder).map_err(RunError::NotPrivate)?;
     }
     if socket_path.as_os_str().len() > SOCKET_PATH_MAX {
@@ -194,7 +179,7 @@ fn run_in(
     let snapshot = |machine: Option<&Machine>, stage: Stage| JobState {
         job: job.clone(),
         pid: std::process::id(),
-        started_at: now_ns() / 1_000_000_000 - started.elapsed().as_secs(),
+        started_at: now_s() - started.elapsed().as_secs(),
         stage,
         vm_bytes: request.memory_bytes,
         limit_bytes: request.limits().memory_bytes,
@@ -206,7 +191,7 @@ fn run_in(
         oom: machine.and_then(Machine::oom).cloned(),
         end: machine
             .filter(|_| stage == Stage::Ended)
-            .and_then(|machine| machine.ended(now_ns() / 1_000_000_000)),
+            .and_then(|machine| machine.ended(now_s())),
     };
     let published = Arc::new(Mutex::new(String::new()));
     let publish = |state: &JobState| {
@@ -267,7 +252,7 @@ fn run_in(
             end: End::of_stop(reason),
             message: Some("stopped before its machine started".into()),
             summary: None,
-            at: now_ns() / 1_000_000_000,
+            at: now_s(),
         });
         publish(&state);
         return Ok(state);
@@ -277,26 +262,13 @@ fn run_in(
         let _ = fs::remove_file(&state_path);
         return Err(RunError::Scratch(error));
     }
-    let spec = VmSpec {
-        kernel: files.kernel.clone(),
-        initramfs: files.initramfs.clone(),
-        memory_bytes: request.memory_bytes,
-        cpus: request.cpus as usize,
-        disks: vec![
-            Disk {
-                path: files.rootfs.clone(),
-                id: IMAGE_DISK.into(),
-                read_only: true,
-            },
-            Disk {
-                path: scratch_disk,
-                id: SCRATCH_DISK.into(),
-                read_only: false,
-            },
-        ],
-        network: Network::Nat,
-        console,
-    };
+    let spec = files.machine(
+        &scratch_disk,
+        request.memory_bytes,
+        request.cpus as usize,
+        Network::Nat,
+        &console,
+    );
     // The job's clock starts here: the wait for a guest's `ready` is for the boot, not for a disk made before it.
     let (mut machine, first) = Machine::new(limits, started.elapsed());
     let generation = Arc::new(AtomicU32::new(0));
@@ -360,8 +332,10 @@ fn run_in(
                     }
                 }
                 Action::StopVm => {
+                    // A machine that takes no stop has ended by itself, which a look finds out, or never will.
                     if let Some(vm) = &vm
                         && vm.stop().is_err()
+                        && vm.wait(Duration::ZERO).is_none()
                     {
                         vm.kill();
                     }
@@ -419,8 +393,8 @@ fn run_in(
                 Event::Connected
             }
             Ok(Message::Asked(event)) => event,
-            // What a machine that was let go of still says.
-            Ok(Message::Machine(..) | Message::Channel(..)) => continue,
+            // What a machine that was let go of still says: nothing to the job, and no reason to miss a wait.
+            Ok(Message::Machine(..) | Message::Channel(..)) => Event::Tick,
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Event::Tick,
         };
         actions.extend(machine.handle(event, started.elapsed()));
@@ -438,11 +412,8 @@ fn watch(vm: Arc<dyn Vm>, of: u32, generation: Arc<AtomicU32>, sender: SyncSende
                     return;
                 }
             }
-            let nap = if connected {
-                Duration::from_millis(250)
-            } else {
-                Duration::from_millis(25)
-            };
+            // Until the guest listens every nap is time the job starts later.
+            let nap = Duration::from_millis(if connected { 250 } else { 5 });
             if let Some(exit) = vm.wait(nap) {
                 let _ = sender.send(Message::Machine(of, Event::VmExited(describe(&exit))));
                 return;
@@ -451,12 +422,12 @@ fn watch(vm: Arc<dyn Vm>, of: u32, generation: Arc<AtomicU32>, sender: SyncSende
     });
 }
 
-/// Reads what the guest says until the channel ends, or says what no guest of ours would: a frame larger than
-/// [`MAX_GUEST_FRAME`], or one that is no message.
+/// Reads what the guest says until the channel ends, or says what no guest of ours would: a frame larger than a
+/// host takes, or one that is no message.
 fn read(mut channel: Box<dyn Channel>, of: u32, sender: SyncSender<Message>) {
     std::thread::spawn(move || {
         loop {
-            let event = match read_message_within::<GuestMessage>(&mut channel, MAX_GUEST_FRAME) {
+            let event = match read_guest_message(&mut channel) {
                 Ok(Some(message)) => Event::Guest(message),
                 _ => Event::ChannelClosed,
             };

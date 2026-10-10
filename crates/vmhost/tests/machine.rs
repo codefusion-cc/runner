@@ -539,62 +539,6 @@ fn the_longest_a_job_runs_and_a_vm_host_lives_is_what_the_limits_say() {
 }
 
 #[test]
-fn what_a_guest_writes_into_the_state_is_short_and_has_no_control_characters() {
-    let (mut machine, _) = Machine::new(limits(), s(0));
-    machine.handle(
-        Event::Guest(GuestMessage::Failed {
-            stage: "s".repeat(10_000),
-            message: format!(
-                "first line\n\u{1b}[2Jsecond\u{0}\u{7f}\u{85} {}",
-                "é".repeat(60_000)
-            ),
-        }),
-        s(1),
-    );
-    let message = machine.ended(0).unwrap().message.unwrap();
-    assert!(message.chars().all(|c| !c.is_control()), "{message:?}");
-    assert!(
-        message.starts_with(&format!(
-            "the guest failed at {}: first line  [2Jsecond    é",
-            "s".repeat(32)
-        )),
-        "{}",
-        &message[..120]
-    );
-    assert!(message.chars().count() <= 1200, "{}", message.chars().count());
-
-    let process = |name: &str| Process {
-        pid: 1,
-        name: name.into(),
-        memory_bytes: 1,
-    };
-    let loud = || OomEvent {
-        process: process(&format!("no\nde{}", "x".repeat(5000))),
-        limit_bytes: 2,
-        largest: (0..500)
-            .map(|i| process(&format!("{i}\t{}", "y".repeat(500))))
-            .collect(),
-    };
-    let mut machine = running(limits());
-    machine.handle(Event::Guest(GuestMessage::Oom(loud())), s(2));
-    let kept = machine.oom().unwrap();
-    assert_eq!(kept.process.name, format!("no de{}", "x".repeat(59)));
-    assert_eq!(kept.largest.len(), 5);
-    assert_eq!(kept.largest[4].name, format!("4 {}", "y".repeat(62)));
-
-    // The same in a summary, which is where a job's first out-of-memory stop may arrive.
-    let mut machine = running(limits());
-    let mut account = summary(GuestEnd::Exited, Some(137), true);
-    account.oom = Some(loud());
-    machine.handle(Event::Guest(GuestMessage::Exited(account)), s(2));
-    assert_eq!(machine.oom().unwrap().largest.len(), 5);
-    let ended = machine.ended(0).unwrap();
-    let in_summary = ended.summary.unwrap().oom.unwrap();
-    assert_eq!((in_summary.largest.len(), in_summary.process.name.len()), (5, 64));
-    assert!(serde_json::to_string(&machine.ended(0)).unwrap().len() < 4096);
-}
-
-#[test]
 fn a_machine_that_fills_its_console_is_stopped_and_never_booted_again() {
     let full = Event::ConsoleFull;
     let (mut machine, _) = Machine::new(limits(), s(0));

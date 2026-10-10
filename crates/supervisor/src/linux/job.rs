@@ -63,7 +63,7 @@ fn disk(id: &str) -> Result<String, String> {
 
 fn mount_image() -> Result<(), String> {
     sys::mount_at(
-        &disk("cf-image")?,
+        &disk(cf_guest_proto::IMAGE_DISK)?,
         IMAGE,
         "erofs",
         libc::MS_RDONLY | libc::MS_NODEV,
@@ -75,7 +75,7 @@ fn mount_image() -> Result<(), String> {
 /// job a copy.
 pub fn format_scratch() -> Result<Summary, String> {
     mount_image()?;
-    let device = disk("cf-scratch")?;
+    let device = disk(cf_guest_proto::SCRATCH_DISK)?;
     sys::mount_at("devtmpfs", &format!("{IMAGE}/dev"), "devtmpfs", 0, "")?;
     let mut command = Command::new("/usr/sbin/mke2fs");
     command
@@ -179,6 +179,11 @@ fn write_root(path: &str, text: &str) -> Result<(), String> {
     context(&path, fs::write(&path, text))
 }
 
+/// Stops every process of the job at once, whatever it ignores: the kernel kills the whole control group.
+fn kill_job() {
+    let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
+}
+
 fn share(name: &str, text: &str, mode: u32) -> Result<(), String> {
     let path = format!("{SHARED}/{name}");
     let temporary = format!("{path}.new");
@@ -201,7 +206,7 @@ pub fn run(
     let disks = |error| ("disks", error);
     let began = sys::uptime_ms();
     mount_image().map_err(disks)?;
-    let scratch = disk("cf-scratch").map_err(disks)?;
+    let scratch = disk(cf_guest_proto::SCRATCH_DISK).map_err(disks)?;
     // The disk's size as the job asked for it; the file system on it holds a little less.
     let disk_bytes = sys::number(format!("/sys/block/{}/size", scratch.trim_start_matches("/dev/"))) * 512;
     sys::mount_at(&scratch, SCRATCH, "ext4", libc::MS_NOATIME, "noinit_itable").map_err(disks)?;
@@ -342,7 +347,7 @@ pub fn run(
     // not looked for yet.
     watch.last_look();
     let summary_usage = usage();
-    let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
+    kill_job();
 
     let mut outcome = String::new();
     let _ = File::from(status).read_to_string(&mut outcome);
@@ -470,7 +475,7 @@ impl Watch<'_> {
                 Ok(Event::HostGone) | Err(RecvTimeoutError::Disconnected) => {
                     // Nobody is left to tell how the job ends, and nothing of it may outlive its host.
                     say("the host is gone");
-                    let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
+                    kill_job();
                     sys::power_off();
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -528,7 +533,7 @@ impl Watch<'_> {
         }
         if !self.killed && self.stop.is_some_and(|(_, deadline)| Instant::now() >= deadline) {
             self.killed = true;
-            let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
+            kill_job();
         }
         if self.heartbeat.elapsed() >= HEARTBEAT {
             self.heartbeat = Instant::now();

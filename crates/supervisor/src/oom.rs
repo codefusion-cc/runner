@@ -3,17 +3,14 @@
 //! The kernel log has, for each such stop, a table of the job's processes with their memory, then the line that
 //! names the one it stopped. [`Log`] is fed the log's lines and gives one [`Kill`] per stop.
 
-use cf_guest_proto::Process;
-
-/// How many of the largest processes a report names.
-pub const LARGEST: usize = 5;
+use cf_guest_proto::{LARGEST_PROCESSES, Process};
 
 /// One process stopped by the kernel, with the largest processes at that moment (largest first).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kill {
     /// The process that was stopped.
     pub process: Process,
-    /// The processes that held the most memory, [`LARGEST`] at most.
+    /// The processes that held the most memory, [`LARGEST_PROCESSES`] at most.
     pub largest: Vec<Process>,
 }
 
@@ -116,7 +113,7 @@ impl Log {
             .iter()
             .find(|process| process.pid == pid)
             .map_or(0, |process| process.memory_bytes);
-        table.truncate(LARGEST);
+        table.truncate(LARGEST_PROCESSES);
         Some(Kill {
             process: Process {
                 pid,

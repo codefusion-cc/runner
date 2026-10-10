@@ -386,6 +386,18 @@ fn start(
     })
 }
 
+/// A job that was not over when its scenario stopped waiting; its vm-host was killed.
+#[derive(Debug)]
+struct StillRunning(String);
+
+impl std::fmt::Display for StillRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for StillRunning {}
+
 /// Watches a job to its end, measuring its machine meanwhile. `during` sees the console so far and the job's
 /// machine processes on every look.
 fn finish(
@@ -418,11 +430,11 @@ fn finish(
     if !exited {
         let _ = running.child.kill();
         let _ = running.child.wait();
-        return Err(format!(
+        return Err(StillRunning(format!(
             "{} was still running after {limit:?}; its console's end: {}",
             running.job,
             tail(&console_of(bench, &running.job))
-        )
+        ))
         .into());
     }
     let took = running.began.elapsed();
@@ -495,6 +507,37 @@ fn number_after(text: &str, before: &str) -> Option<f64> {
     digits.parse().ok()
 }
 
+/// The milliseconds of a duration printed by Rust's `{:?}` (`271.00ms`, `1.52s`) after `before`.
+fn ms_after(text: &str, before: &str) -> Option<f64> {
+    let number = number_after(text, before)?;
+    let unit: String = text
+        .split(before)
+        .nth(1)?
+        .chars()
+        .skip_while(|c| c.is_ascii_digit() || *c == '.')
+        .take_while(|c| c.is_alphabetic())
+        .collect();
+    match unit.as_str() {
+        "s" => Some(number * 1000.0),
+        "ms" => Some(number),
+        "µs" => Some(number / 1000.0),
+        "ns" => Some(number / 1_000_000.0),
+        _ => None,
+    }
+}
+
+/// The Mac's load average over the last minute, and how many CPUs it has.
+fn load() -> (f64, usize) {
+    let printed = Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let average = number_after(&printed, "{ ").unwrap_or(0.0);
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    (average, cpus)
+}
+
 fn boot(bench: &Bench) -> Fallible<Vec<String>> {
     let mut ready = Vec::new();
     for _ in 0..5 {
@@ -504,7 +547,7 @@ fn boot(bench: &Bench) -> Fallible<Vec<String>> {
         let text =
             String::from_utf8_lossy(&printed.stdout).into_owned() + &String::from_utf8_lossy(&printed.stderr);
         expect(printed.status.success(), format!("boot-proof failed: {text}"))?;
-        ready.push(number_after(&text, "ready after ").ok_or(format!("no time in `{text}`"))?);
+        ready.push(ms_after(&text, "ready after ").ok_or(format!("no time in `{text}`"))?);
     }
     ready.sort_by(f64::total_cmp);
     Ok(vec![format!(
@@ -1079,7 +1122,21 @@ step();'"#;
         ),
     ] {
         let running = start(bench, "it-timers", 1024, 120, script, wrap)?;
-        let finished = finish(bench, running, Duration::from_secs(150), &mut |_, _| Ok(()))?;
+        let finished = match finish(bench, running, Duration::from_secs(150), &mut |_, _| Ok(())) {
+            Ok(finished) => finished,
+            // A clamped tier gets what the Mac's other work leaves. With more work than CPUs that can be nothing,
+            // which is what this scenario is here to show, so it is a number and no failure. Any other end is one.
+            Err(error) => {
+                let (average, cpus) = load();
+                if wrap.is_empty() || !error.is::<StillRunning>() || average <= cpus as f64 {
+                    return Err(error);
+                }
+                lines.push(format!(
+                    "{name}: not done on a Mac with a load average of {average:.0} on {cpus} CPUs: {error}"
+                ));
+                continue;
+            }
+        };
         ended(&finished, "ok")?;
         let line = finished
             .console
@@ -1093,4 +1150,19 @@ step();'"#;
         ));
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ms_after;
+
+    #[test]
+    fn a_boot_time_is_read_in_its_own_unit() {
+        let line = |time: &str| format!("kernel 6.12: ready after {time}, ended after 2.10s (power-off)");
+        assert_eq!(ms_after(&line("271.00ms"), "ready after "), Some(271.0));
+        assert_eq!(ms_after(&line("1.52s"), "ready after "), Some(1520.0));
+        assert_eq!(ms_after(&line("900.00µs"), "ready after "), Some(0.9));
+        assert_eq!(ms_after(&line("soon"), "ready after "), None);
+        assert_eq!(ms_after("nothing", "ready after "), None);
+    }
 }

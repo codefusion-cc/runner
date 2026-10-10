@@ -41,7 +41,9 @@ pub enum StoreError {
 #[derive(Debug, Clone)]
 pub struct Store(PathBuf);
 
-fn plain(version: &str) -> bool {
+/// Whether this can be an installed image's version: 1 to 64 letters, digits, dots and dashes, not starting with a
+/// dot. It names a folder, and whoever asks for an image by version checks the name with this first.
+pub fn is_version(version: &str) -> bool {
     !version.is_empty()
         && version.len() <= 64
         && version
@@ -58,8 +60,14 @@ impl Store {
 
     /// The root file system of an installed image, if that version is installed.
     pub fn rootfs(&self, version: &str) -> Option<PathBuf> {
-        let path = self.0.join(version).join(ROOTFS_NAME);
-        (plain(version) && path.is_file()).then_some(path)
+        let path = self.rootfs_path(version);
+        (is_version(version) && path.is_file()).then_some(path)
+    }
+
+    /// Where the root file system of this version is once it is installed. The version is a name
+    /// [`is_version`] takes.
+    pub fn rootfs_path(&self, version: &str) -> PathBuf {
+        self.0.join(version).join(ROOTFS_NAME)
     }
 
     /// The build time of the newest release this store accepted; 0 before the first, when there is no record.
@@ -79,7 +87,7 @@ impl Store {
     /// that the release is not older than one accepted before. A release already installed is verified again all
     /// the same; a refused one leaves nothing behind.
     pub fn install(&self, source: &Path, version: &str, key: &VerifyingKey) -> Result<Manifest, StoreError> {
-        if !plain(version) {
+        if !is_version(version) {
             return Err(StoreError::Version(version.to_string()));
         }
         // No version starts with a dot, so the store's own folders are never an installed image's.
@@ -151,7 +159,13 @@ impl Store {
         if manifest.built > newest {
             let accepted = self.0.join(ACCEPTED_NAME);
             let new = self.0.join(format!("{ACCEPTED_NAME}.new"));
-            fs::write(&new, manifest.built.to_string())
+            // On the disk before it takes the old record's place: a record cut short by a power loss would
+            // refuse every release from then on.
+            File::create(&new)
+                .and_then(|mut file| {
+                    file.write_all(manifest.built.to_string().as_bytes())?;
+                    file.sync_all()
+                })
                 .and_then(|()| fs::rename(&new, &accepted))
                 .map_err(io(&accepted))?;
         }

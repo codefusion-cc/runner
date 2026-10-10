@@ -187,11 +187,12 @@ impl Vm for VzVm {
     fn stop(&self) -> Result<(), VmmError> {
         self.exit.stop_asked();
         let exit = self.exit.clone();
+        let (answer, taken) = mpsc::channel();
         self.on_queue(move |machine| {
-            // A machine that cannot be stopped now has ended, which `wait` finds out, or is in a state the
-            // framework takes no stop in: the caller's wait runs out and it lets go of the machine (`kill`).
             // SAFETY: on the machine's queue.
-            if !unsafe { machine.canStop() } {
+            let can = unsafe { machine.canStop() };
+            let _ = answer.send(can);
+            if !can {
                 return;
             }
             let handler = RcBlock::new(move |error: *mut NSError| {
@@ -204,7 +205,12 @@ impl Vm for VzVm {
             // SAFETY: on the machine's queue, with a block that is copied before the call returns.
             unsafe { machine.stopWithCompletionHandler(&handler) };
         });
-        Ok(())
+        match taken.recv_timeout(CONNECT_TIMEOUT) {
+            Ok(true) => Ok(()),
+            // It has ended, which `wait` finds out, or is in a state the framework takes no stop in.
+            Ok(false) => Err(VmmError::Stop("the machine takes no stop now".into())),
+            Err(_) => Err(VmmError::Stop(format!("no answer within {CONNECT_TIMEOUT:?}"))),
+        }
     }
 
     fn kill(&self) {

@@ -175,19 +175,41 @@ impl JobState {
     }
 }
 
+/// Why a job's state file gave no state.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    /// The file could not be read: no job of this name wrote one, or it is gone.
+    #[error("could not be read: {0}")]
+    Unreadable(std::io::Error),
+    /// The file holds something else than a job's state.
+    #[error("is not a job's state: {0}")]
+    Malformed(String),
+    /// The state in the file is of a job with another name.
+    #[error("is of another job, {0:?}")]
+    AnotherJob(String),
+}
+
+impl JobState {
+    /// The state the vm-host of this job wrote last. What the file holds is taken for a state only when it names
+    /// this job.
+    pub fn read(layout: &Layout, job: &str) -> Result<Self, StateError> {
+        let text = fs::read_to_string(layout.state(job)).map_err(StateError::Unreadable)?;
+        let state: Self =
+            serde_json::from_str(&text).map_err(|error| StateError::Malformed(error.to_string()))?;
+        if state.job != job {
+            return Err(StateError::AnotherJob(state.job));
+        }
+        Ok(state)
+    }
+}
+
 /// Whether the job of this name ran out of memory, from its state file. This never fails and never guesses: a file
 /// that is missing, unreadable or not a job's state is `Unknown` with that as the reason.
 pub fn out_of_memory(layout: &Layout, job: &str) -> OutOfMemory {
-    let path = layout.state(job);
-    let unknown = |what: String| OutOfMemory::Unknown {
-        reason: format!("the job's state ({}) {what}", path.display()),
-    };
-    match fs::read_to_string(&path) {
-        Err(error) => unknown(format!("could not be read: {error}")),
-        Ok(text) => match serde_json::from_str::<JobState>(&text) {
-            Err(error) => unknown(format!("is not a job's state: {error}")),
-            Ok(state) if state.job != job => unknown(format!("is of another job, {:?}", state.job)),
-            Ok(state) => state.out_of_memory(),
+    match JobState::read(layout, job) {
+        Ok(state) => state.out_of_memory(),
+        Err(error) => OutOfMemory::Unknown {
+            reason: format!("the job's state ({}) {error}", layout.state(job).display()),
         },
     }
 }

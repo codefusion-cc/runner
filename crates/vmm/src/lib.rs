@@ -76,7 +76,8 @@ pub trait Vm: Send + Sync {
     fn wait(&self, timeout: Duration) -> Option<VmExit>;
 
     /// Stops the machine as pulling its plug would: the guest gets no say. Returns once the stop is asked for;
-    /// [`Vm::wait`] tells when it happened. Stopping a machine that has ended is fine.
+    /// [`Vm::wait`] tells when it happened. An error means the machine takes no stop: it has ended, which
+    /// [`Vm::wait`] tells, or it never will, and [`Vm::kill`] is what is left.
     fn stop(&self) -> Result<(), VmmError>;
 
     /// Lets go of the machine without waiting for anything: the last resort when [`Vm::stop`] does not end it.

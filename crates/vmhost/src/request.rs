@@ -68,7 +68,7 @@ impl JobRequest {
         if !plain(&self.job, 32) || self.job.contains('.') {
             return refuse("the job's name is not 1 to 32 lowercase letters, digits and dashes");
         }
-        if !plain(&self.image, 64) {
+        if !cf_image::store::is_version(&self.image) {
             return refuse("the image's version is not a plain name");
         }
         if self.host.is_empty() || self.host.len() > 64 || self.host.chars().any(char::is_control) {

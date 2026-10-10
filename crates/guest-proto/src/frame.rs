@@ -3,6 +3,8 @@ use std::io::{ErrorKind, Read, Write};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::message::GuestMessage;
+
 /// The largest frame either side sends, and the largest a guest accepts. A message is a few hundred bytes; a one-job
 /// configuration of the Actions runner is a few kilobytes.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -92,6 +94,12 @@ pub fn read_message_within<T: DeserializeOwned>(
         _ => ProtoError::Io(error),
     })?;
     parse(&body).map(Some)
+}
+
+/// Reads a guest's next message as a host takes it: a frame of at most [`MAX_GUEST_FRAME`] bytes, its texts cut
+/// short and cleaned ([`GuestMessage::clipped`]). Every read of a guest on the host goes through here.
+pub fn read_guest_message(from: &mut impl Read) -> Result<Option<GuestMessage>, ProtoError> {
+    Ok(read_message_within::<GuestMessage>(from, MAX_GUEST_FRAME)?.map(GuestMessage::clipped))
 }
 
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, ProtoError> {

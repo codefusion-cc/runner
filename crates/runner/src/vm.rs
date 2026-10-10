@@ -19,15 +19,19 @@ extern "C" fn cancel(_signal: libc::c_int) {
 }
 
 /// The guest this binary carries, verified before a byte of it reaches the hypervisor.
-fn guest() -> Result<(cf_image::Bundle, String, String), String> {
+fn guest() -> Result<Guest<'static>, String> {
     let verified = cf_image::verify_embedded()
         .map_err(|error| format!("the embedded guest image is refused: {error}"))?;
     let bundle = cf_image::embedded_bundle().ok_or("no embedded guest image")?;
-    Ok((
-        bundle,
-        verified.manifest.kernel.name,
-        verified.manifest.initramfs.name,
-    ))
+    let file = |name: &str, what: &str| {
+        bundle
+            .file(name)
+            .ok_or(format!("the embedded image has no {what}"))
+    };
+    Ok(Guest {
+        kernel: file(&verified.manifest.kernel.name, "kernel")?,
+        initramfs: file(&verified.manifest.initramfs.name, "initramfs")?,
+    })
 }
 
 /// The vm-host of one job. The job's request comes on standard input, since it holds the job's registration with
@@ -43,13 +47,7 @@ pub fn host(state_dir: &str) -> Result<(), String> {
         .map_err(|error| format!("the request: {error}"))?;
     let request = JobRequest::parse(&json).map_err(|error| error.to_string())?;
     drop(json);
-    let (bundle, kernel, initramfs) = guest()?;
-    let guest = Guest {
-        kernel: bundle.file(&kernel).ok_or("the embedded image has no kernel")?,
-        initramfs: bundle
-            .file(&initramfs)
-            .ok_or("the embedded image has no initramfs")?,
-    };
+    let guest = guest()?;
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: the handler only stores into an atomic, which a signal handler may do.
         unsafe { libc::signal(signal, cancel as extern "C" fn(libc::c_int) as libc::sighandler_t) };
@@ -69,15 +67,12 @@ pub fn host(state_dir: &str) -> Result<(), String> {
 
 /// Boots the embedded guest with no disk and no network, has it answer and power off, and prints what happened.
 pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
-    let (bundle, kernel, initramfs) = guest()?;
+    let guest = guest()?;
     let scratch = Scratch::new()?;
-    let write = |name: &str| -> Result<PathBuf, String> {
-        scratch.write(name, bundle.file(name).ok_or(name.to_string())?)
-    };
     let console = scratch.0.join("console.log");
     let spec = VmSpec {
-        kernel: write(&kernel)?,
-        initramfs: write(&initramfs)?,
+        kernel: scratch.write("kernel", guest.kernel)?,
+        initramfs: scratch.write("initramfs", guest.initramfs)?,
         memory_bytes,
         cpus: 1,
         disks: Vec::new(),

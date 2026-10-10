@@ -2,20 +2,14 @@
 //! seconds, so it happens once an image and size; every job's disk is a copy-on-write copy of that template,
 //! which costs no time and no space until the job writes.
 
-use crate::layout::{Layout, private};
+use crate::layout::{Layout, make_dir, private};
 use crate::task::run_task;
-use cf_guest_proto::Task;
+use cf_guest_proto::{IMAGE_DISK, SCRATCH_DISK, Task};
 use cf_vmm::{Disk, Network, VmSpec, Vmm};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// The disk names the guest finds its disks by.
-pub const IMAGE_DISK: &str = "cf-image";
-/// See [`IMAGE_DISK`].
-pub const SCRATCH_DISK: &str = "cf-scratch";
 
 /// The longest formatting a disk may take, the machine's boot and end included.
 const FORMAT: Duration = Duration::from_secs(90);
@@ -29,6 +23,39 @@ pub struct GuestFiles {
     pub initramfs: PathBuf,
     /// The image's root file system.
     pub rootfs: PathBuf,
+}
+
+impl GuestFiles {
+    /// The machine every guest of ours runs in: the image read-only, `scratch` as the one disk it may write.
+    pub(crate) fn machine(
+        &self,
+        scratch: &Path,
+        memory_bytes: u64,
+        cpus: usize,
+        network: Network,
+        console: &Path,
+    ) -> VmSpec {
+        VmSpec {
+            kernel: self.kernel.clone(),
+            initramfs: self.initramfs.clone(),
+            memory_bytes,
+            cpus,
+            disks: vec![
+                Disk {
+                    path: self.rootfs.clone(),
+                    id: IMAGE_DISK.into(),
+                    read_only: true,
+                },
+                Disk {
+                    path: scratch.to_path_buf(),
+                    id: SCRATCH_DISK.into(),
+                    read_only: false,
+                },
+            ],
+            network,
+            console: console.to_path_buf(),
+        }
+    }
 }
 
 fn say(what: &str, error: impl std::fmt::Display) -> String {
@@ -48,12 +75,8 @@ pub fn template(
     give_up: &dyn Fn() -> bool,
 ) -> Result<PathBuf, String> {
     let folder = layout.scratch_templates();
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&folder)
-        .map_err(|error| say("the templates' folder", error))?;
     // Every job's disk starts as a copy of what is in here.
+    make_dir(&folder).map_err(|error| say("the templates' folder", error))?;
     private(&folder)?;
     let path = folder.join(format!("{image}-{bytes}.img"));
     if path.exists() {
@@ -80,26 +103,7 @@ pub fn template(
     File::create(&partial)
         .and_then(|file| file.set_len(bytes))
         .map_err(|error| say("the template", error))?;
-    let spec = VmSpec {
-        kernel: files.kernel.clone(),
-        initramfs: files.initramfs.clone(),
-        memory_bytes: 1 << 30,
-        cpus: 2,
-        disks: vec![
-            Disk {
-                path: files.rootfs.clone(),
-                id: IMAGE_DISK.into(),
-                read_only: true,
-            },
-            Disk {
-                path: partial.clone(),
-                id: SCRATCH_DISK.into(),
-                read_only: false,
-            },
-        ],
-        network: Network::None,
-        console: console.to_path_buf(),
-    };
+    let spec = files.machine(&partial, 1 << 30, 2, Network::None, console);
     let made = run_task(vmm, &spec, Task::FormatScratch, FORMAT, give_up).and_then(|report| {
         match report.summary.exit_code {
             Some(0) => Ok(()),

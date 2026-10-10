@@ -170,6 +170,7 @@ dependencies = [
 name = "cf-guest-proto"
 version = "0.1.0"
 dependencies = [
+ "cf-secret",
  "proptest",
  "serde",
  "serde_json",
@@ -246,6 +247,7 @@ name = "cf-vmhost"
 version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
+ "cf-image",
  "cf-vmm",
  "libc",
  "proptest",

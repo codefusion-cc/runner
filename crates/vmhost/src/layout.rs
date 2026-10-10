@@ -1,8 +1,9 @@
 //! Where a vm-host's files are in the state folder.
 
+use cf_image::store::Store;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// Writes a file that did not exist, readable and writable by this user only.
@@ -38,6 +39,12 @@ pub(crate) fn private(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Makes a folder for this user alone, with the folders above it. One that is there already stays as it is:
+/// [`private`] says whether it can be trusted.
+pub(crate) fn make_dir(path: &Path) -> std::io::Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+}
+
 /// The state folder's layout. Every name that goes into a path was checked to be plain by [`crate::JobRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout(PathBuf);
@@ -70,12 +77,30 @@ impl Layout {
 
     /// The job's console log, which outlives it.
     pub fn console(&self, job: &str) -> PathBuf {
-        self.0.join("logs").join(format!("{job}.console.log"))
+        self.logs().join(format!("{job}.console.log"))
+    }
+
+    /// `images/`: the installed images, a [`cf_image::store::Store`].
+    pub fn images(&self) -> PathBuf {
+        self.0.join("images")
     }
 
     /// The root file system of an installed image.
     pub fn rootfs(&self, image: &str) -> PathBuf {
-        self.0.join("images").join(image).join("rootfs.img")
+        Store::new(self.images()).rootfs_path(image)
+    }
+
+    /// What a job trusts when it boots from an installed image: the root file system, its folder, the images'
+    /// folder and the state folder. The image was verified when it was installed, which holds for as long as
+    /// nobody else can write to any of these.
+    pub(crate) fn trusted_for(&self, image: &str) -> [PathBuf; 4] {
+        let images = self.images();
+        [self.rootfs(image), images.join(image), images, self.0.clone()]
+    }
+
+    /// `logs/`: the console logs.
+    pub fn logs(&self) -> PathBuf {
+        self.0.join("logs")
     }
 
     /// `scratch/`: one formatted, empty disk an image and size, which every job's disk is a copy of.

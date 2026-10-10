@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cf_vmm::testing::{FakeVmm, Script};
+use cf_vmm::testing::{FakeVmm, Script, Stop};
 use cf_vmm::{Disk, MIN_MEMORY, Network, SpecError, VmExit, VmSpec, Vmm, VmmError};
 
 fn spec() -> VmSpec {
@@ -114,7 +114,7 @@ fn a_scripted_guest_talks_over_the_channel_and_its_return_is_a_power_off() {
             channel.read_exact(&mut byte).unwrap();
             channel.write_all(&[byte[0] + 1]).unwrap();
         }),
-        obeys_stop: true,
+        stop: Stop::Obeys,
     }]);
     let vm = vmm.start(&spec()).unwrap();
     assert!(vm.channel(6000).is_err());
@@ -136,7 +136,7 @@ fn a_machine_that_ignores_its_stop_keeps_running_until_it_is_killed() {
     let vmm = FakeVmm::new([Script::Boot {
         refuse_channel: 0,
         guest: Box::new(|_, power| power.wait_for_the_end()),
-        obeys_stop: false,
+        stop: Stop::Hangs,
     }]);
     let vm = vmm.start(&spec()).unwrap();
     let _channel = vm.channel(6000).unwrap();
@@ -156,4 +156,20 @@ fn a_monitor_with_no_script_left_fails_the_start() {
     );
     assert!(matches!(vmm.start(&spec()), Err(VmmError::Start(_))));
     assert_eq!(vmm.started().len(), 2);
+}
+
+#[test]
+fn a_machine_that_takes_no_stop_says_so_and_runs_until_it_is_let_go() {
+    let vmm = FakeVmm::new([Script::Boot {
+        refuse_channel: 0,
+        guest: Box::new(|_, power| power.wait_for_the_end()),
+        stop: Stop::Refuses,
+    }]);
+    let vm = vmm.start(&spec()).unwrap();
+    let _channel = vm.channel(6000).unwrap();
+    assert!(matches!(vm.stop(), Err(VmmError::Stop(_))));
+    assert_eq!(vm.wait(Duration::from_millis(50)), None);
+    assert_eq!(vmm.stops(), 1);
+    vm.kill();
+    assert_eq!(vm.wait(Duration::from_secs(5)), Some(VmExit::Stopped));
 }
