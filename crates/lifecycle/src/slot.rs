@@ -224,6 +224,9 @@ pub struct Slot {
     ran_job: bool,
     /// Whether the budget still counts this slot.
     memory: bool,
+    /// Whether this slot came back from disk: what a second VM needs to register (the Actions runner's
+    /// configuration) was never saved, so a restored slot never starts one.
+    restored: bool,
     /// The watchdog of the phase.
     deadline: Option<Millis>,
     heartbeat: Option<Millis>,
@@ -241,6 +244,7 @@ impl Slot {
             oom: false,
             ran_job: false,
             memory: true,
+            restored: false,
             deadline: None,
             heartbeat: None,
             job: None,
@@ -260,6 +264,7 @@ impl Slot {
         slot.oom = saved.oom;
         slot.ran_job = saved.ran_job;
         slot.memory = vm_alive;
+        slot.restored = true;
         let mut effects = Vec::new();
         if saved.phase == Phase::Released {
             slot.memory = false;
@@ -386,7 +391,7 @@ impl Slot {
             // The VM's process is gone, wherever the slot was.
             (Phase::Starting, Event::VmExited) => {
                 out.push(Effect::StartFailed);
-                if self.starts < self.limits.starts {
+                if self.may_start_again() {
                     self.start(now, out);
                 } else {
                     self.release(End::StartFailed, out);
@@ -410,7 +415,7 @@ impl Slot {
             (Phase::Starting, Event::Tick) if due(self.deadline) => {
                 out.push(Effect::StartFailed);
                 out.push(Effect::KillVm);
-                if self.starts < self.limits.starts {
+                if self.may_start_again() {
                     self.phase = Phase::Retrying;
                 } else {
                     self.phase = Phase::Killing;
@@ -480,6 +485,10 @@ impl Slot {
             _ => {}
         }
         effects
+    }
+
+    fn may_start_again(&self) -> bool {
+        !self.restored && self.starts < self.limits.starts
     }
 
     fn start(&mut self, now: Millis, out: &mut Vec<Effect>) {

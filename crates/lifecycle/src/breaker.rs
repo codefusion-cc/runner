@@ -24,9 +24,17 @@ impl Default for BreakerLimits {
 
 /// Counts VM starts that fail in a row and, past the limit, lets only one start through per wait.
 ///
-/// Ask [`StartBreaker::admit`] before every claim of a slot. Report every [`crate::Effect::StartFailed`] and
-/// [`crate::Effect::StartSucceeded`]. While [`StartBreaker::closed`] is true, set `Hold::StartFailures` on the
-/// budget, so the reason shows in the console.
+/// How the daemon drives it:
+///
+/// - Before every reading, claim and assigned job, `budget.hold(Hold::StartFailures, breaker.holds(now))`. The
+///   hold keeps every job out, one that GitHub assigned without asking too, and the console shows the reason. It
+///   is off for the moment of the one try, or the try could never be granted.
+/// - Ask [`StartBreaker::admit`] before every claim, and call it for every grant the budget hands out by itself
+///   (`Observed::started`, `Assigned::Start`): it notes that the try is out, and the hold comes back.
+/// - Report every [`crate::Effect::StartFailed`] and [`crate::Effect::StartSucceeded`].
+///
+/// A try that never reports back (its slot was stopped while the VM booted, or its job went elsewhere) does not
+/// close the Mac for good: after one more wait it counts as not made. [`StartBreaker::unused`] says so sooner.
 #[derive(Clone, Debug)]
 pub struct StartBreaker {
     limits: BreakerLimits,
@@ -34,8 +42,8 @@ pub struct StartBreaker {
     wait: Millis,
     /// When the next single start may be tried; `None` while healthy.
     retry_at: Option<Millis>,
-    /// A single start was let through and has not reported back.
-    trying: bool,
+    /// Since when a single start is out that has not reported back.
+    trying: Option<Millis>,
 }
 
 impl StartBreaker {
@@ -46,27 +54,34 @@ impl StartBreaker {
             failed_in_a_row: 0,
             wait: limits.first_wait,
             retry_at: None,
-            trying: false,
+            trying: None,
         }
     }
 
     /// Whether a slot may be claimed now. Healthy: always. Closed: once per wait, and not again until that start
-    /// has reported back or [`StartBreaker::unused`] says it never happened.
+    /// has reported back, [`StartBreaker::unused`] says it never happened, or a whole wait passed without a word
+    /// of it.
     pub fn admit(&mut self, now: Millis) -> bool {
-        match self.retry_at {
-            None => true,
-            Some(at) if now >= at && !self.trying => {
-                self.trying = true;
-                true
-            }
-            Some(_) => false,
+        if self.holds(now) {
+            return false;
         }
+        if self.retry_at.is_some() {
+            self.trying = Some(now);
+        }
+        true
+    }
+
+    /// Whether `Hold::StartFailures` belongs on the budget at `now`: starts failed too often, and it is not the
+    /// moment of the one try. Exactly then [`StartBreaker::admit`] refuses.
+    pub fn holds(&self, now: Millis) -> bool {
+        let try_is_out = self.trying.is_some_and(|since| now.since(since) < self.wait);
+        self.retry_at.is_some_and(|at| now < at || try_is_out)
     }
 
     /// The start that [`StartBreaker::admit`] let through did not happen (the claim was refused, or another Mac
     /// got the job): the next one may be tried.
     pub fn unused(&mut self) {
-        self.trying = false;
+        self.trying = None;
     }
 
     /// A VM did not reach `ready`.
@@ -75,10 +90,10 @@ impl StartBreaker {
         if self.failed_in_a_row < self.limits.failures.max(1) {
             return;
         }
-        if self.retry_at.is_some() && self.trying {
+        if self.retry_at.is_some() && self.trying.is_some() {
             self.wait = Millis(self.wait.0.saturating_mul(2)).min(self.limits.longest_wait);
         }
-        self.trying = false;
+        self.trying = None;
         self.retry_at = Some(now.plus(self.wait));
     }
 
@@ -87,7 +102,7 @@ impl StartBreaker {
         self.failed_in_a_row = 0;
         self.wait = self.limits.first_wait;
         self.retry_at = None;
-        self.trying = false;
+        self.trying = None;
     }
 
     /// Whether starts failed so often that the Mac takes no jobs but the single tries.

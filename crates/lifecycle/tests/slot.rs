@@ -720,3 +720,34 @@ fn the_ends_have_the_consoles_names() {
     );
     assert_eq!((limits.kill_again, limits.long_sleep), (s(10), s(300)));
 }
+
+#[test]
+fn a_restored_slot_never_starts_a_second_vm() {
+    // What a second VM needs to register was never on disk, so a restored VM that does not get ready ends the
+    // slot, whether its process dies or its watchdog runs out.
+    let limits = Limits::default();
+    let (mut restored, _) = Slot::restore(limits, s(900), starting().saved(), true);
+    assert_eq!(
+        restored.on(s(901), Event::VmExited),
+        [
+            Effect::StartFailed,
+            Effect::Unregister,
+            Effect::Release,
+            ended(End::StartFailed, false)
+        ]
+    );
+    let (mut restored, _) = Slot::restore(limits, s(900), starting().saved(), true);
+    assert_eq!(
+        restored.on(s(921), Event::Tick),
+        [Effect::StartFailed, Effect::KillVm]
+    );
+    assert_eq!(restored.phase(), Phase::Killing);
+    assert_eq!(
+        restored.on(s(922), Event::VmExited),
+        [
+            Effect::Unregister,
+            Effect::Release,
+            ended(End::StartFailed, false)
+        ]
+    );
+}

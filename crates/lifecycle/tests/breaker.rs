@@ -1,6 +1,9 @@
 //! VM starts that keep failing must not be tried again and again.
 
-use cf_budget::Millis;
+use cf_budget::{
+    Assigned, Budget, GIB, Hold, HostFacts, HostReading, Millis, Mode, Now, Pressure, Refusal, Settings,
+    Size, Thermal,
+};
 use cf_lifecycle::{BreakerLimits, StartBreaker};
 use proptest::prelude::*;
 
@@ -47,7 +50,7 @@ fn one_start_per_wait_and_the_wait_doubles_to_fifteen_minutes() {
         assert!(!breaker.admit(Millis(at.0 - 1)));
         assert!(breaker.admit(at), "one start is let through");
         assert!(
-            !breaker.admit(at) && !breaker.admit(at.plus(s(10_000))),
+            !breaker.admit(at) && !breaker.admit(at.plus(s(20))),
             "and only one until it reports back"
         );
         now = at.0 / 1000 + 20;
@@ -93,6 +96,129 @@ fn a_start_that_never_happened_does_not_use_up_the_try() {
         "the claim was refused, so nothing was started"
     );
     assert!(breaker.closed());
+}
+
+#[test]
+fn a_try_that_never_reports_back_does_not_close_the_mac_for_good() {
+    // The slot of the one try was stopped while its VM booted, or its job went to another Mac: neither a failure
+    // nor a success is ever reported. One more wait, and the next try may go.
+    let mut breaker = StartBreaker::new(BreakerLimits::default());
+    for _ in 0..3 {
+        breaker.failed(s(0));
+    }
+    assert!(breaker.admit(s(30)));
+    assert!(!breaker.admit(Millis(59_999)) && breaker.holds(Millis(59_999)));
+    assert!(!breaker.holds(s(60)));
+    assert!(breaker.admit(s(60)), "thirty seconds without a word of the try");
+    assert!(!breaker.admit(s(61)) && breaker.closed());
+    // The wait in force is what a try gets: after a failed try it is sixty seconds.
+    breaker.failed(s(70));
+    assert_eq!(breaker.retry_at(), Some(s(130)));
+    assert!(breaker.admit(s(130)));
+    assert!(!breaker.admit(Millis(189_999)));
+    assert!(breaker.admit(s(190)));
+    // A late word of a try that was given up on changes nothing about the next one.
+    breaker.succeeded();
+    assert!(!breaker.closed() && !breaker.holds(s(190)));
+}
+
+#[test]
+fn the_hold_is_on_exactly_while_no_start_is_let_through() {
+    let mut breaker = StartBreaker::new(BreakerLimits::default());
+    assert!(!breaker.holds(s(0)));
+    breaker.failed(s(0));
+    breaker.failed(s(0));
+    assert!(!breaker.holds(s(0)), "two failures do not close");
+    breaker.failed(s(0));
+    for (at, held) in [(0, true), (29_999, true), (30_000, false), (500_000, false)] {
+        assert_eq!(breaker.holds(Millis(at)), held, "at {at} ms");
+        assert_eq!(breaker.clone().admit(Millis(at)), !held, "at {at} ms");
+    }
+    // Asking changes nothing; the try going out does.
+    assert!(breaker.admit(s(30)));
+    assert!(breaker.holds(s(30)) && breaker.holds(s(45)));
+    breaker.unused();
+    assert!(!breaker.holds(s(45)));
+}
+
+fn calm(second: u64) -> (Now, HostReading) {
+    let at = Now {
+        awake: s(second),
+        elapsed: s(second),
+    };
+    let reading = HostReading {
+        at,
+        available_bytes: 16 * GIB,
+        pressure: Pressure::Normal,
+        swap_used_bytes: 0,
+        swapouts: 0,
+        idle: Millis::mins(60),
+        thermal: Thermal::Nominal,
+        on_battery: false,
+        disk_free_bytes: 500 * GIB,
+    };
+    (at, reading)
+}
+
+#[test]
+fn with_the_budget_a_closed_mac_tries_one_job_per_wait_and_says_why_it_takes_no_other() {
+    // The daemon's loop as the breaker asks for it: the hold follows `holds`, every grant is told to `admit`.
+    let facts = HostFacts {
+        total_bytes: 16 * GIB,
+        cores: 10,
+    };
+    let mut budget = Budget::new(Settings::for_host(facts, Mode::Dedicated)).unwrap();
+    let mut breaker = StartBreaker::new(BreakerLimits::default());
+    let mut granted = Vec::new();
+    let mut waiting = None;
+    for second in 0..=400 {
+        let (now, reading) = calm(second);
+        budget.hold(Hold::StartFailures, breaker.holds(now.elapsed));
+        let observed = budget.observe(now, Some(reading));
+        for grant in &observed.started {
+            assert!(breaker.admit(now.elapsed), "a job started under the hold");
+            granted.push((second, grant.slot));
+        }
+        match second {
+            // Three VMs fail to start: the Mac closes.
+            100 => (0..3).for_each(|_| breaker.failed(now.elapsed)),
+            // GitHub assigns a job without asking while it is closed: it waits, and the status says for what.
+            105 => {
+                let Assigned::Waits { slot, why } = budget.assign(now, Size::G2) else {
+                    panic!("started on a Mac whose VMs do not start")
+                };
+                assert_eq!(why, Refusal::Held(Hold::StartFailures));
+                assert_eq!(budget.status(now).waiting[0].why, Some(why));
+                waiting = Some(slot);
+            }
+            // The try fails after its twenty seconds, and its slot is given back.
+            150 => {
+                budget.release(granted[0].1).unwrap();
+                breaker.failed(now.elapsed);
+            }
+            _ => {}
+        }
+        // The Runner asks for more work whenever it may; under the hold it is refused by name.
+        budget.hold(Hold::StartFailures, breaker.holds(now.elapsed));
+        if second >= 100 && breaker.admit(now.elapsed) {
+            match budget.claim(now, Size::G2) {
+                Ok(grant) => granted.push((second, grant.slot)),
+                Err(_) => breaker.unused(),
+            }
+        } else if second >= 100 {
+            assert_eq!(
+                budget.claim(now, Size::G2),
+                Err(Refusal::Held(Hold::StartFailures))
+            );
+        }
+    }
+    // Closed at 100. The first try at 130 is the job that waited, and nothing else until it has failed; the
+    // next one sixty seconds after that failure, at 210, and it never reports back: sixty more, 270, 330, 390.
+    assert_eq!(granted[0], (130, waiting.unwrap()));
+    assert_eq!(
+        granted.iter().map(|(second, _)| *second).collect::<Vec<_>>(),
+        [130, 210, 270, 330, 390]
+    );
 }
 
 #[test]
