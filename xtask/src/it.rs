@@ -55,11 +55,44 @@ sudo -n sh -c 'echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6' 2>/dev/null; e
 sudo -n mount -o remount,rw /proc/sys 2>/dev/null; echo remount=$?
 try 10.1.2.3 80 private-again; try $gw 22 gateway-again"#;
 
+/// What a job's root tries against its own machine from inside the container: the pipe its end is reported on
+/// and the process that holds it, the kernel's settings and what is mounted read-only over them, a lower score
+/// for the kernel's choice under memory pressure, swap, and the socket the supervisor talks to the Mac on.
+/// `control` is the same kind of try on something a job may do, so a refusal is not just a `sudo` that is missing.
+const INSIDE_PROBES: &str = r#"
+sudo -n sh -c 'echo x > /tmp/control' 2>/dev/null; echo control=$?
+sudo -n sh -c 'echo x > /proc/1/fd/100' 2>/dev/null; echo status-pipe=$?
+sudo -n sh -c 'cat /proc/1/environ > /dev/null' 2>/dev/null; echo first-environ=$?
+sudo -n sh -c 'echo -1000 > /proc/self/oom_score_adj' 2>/dev/null; echo oom-floor=$?
+sudo -n sh -c 'echo "|/tmp/x" > /proc/sys/kernel/core_pattern' 2>/dev/null; echo core-pattern=$?
+sudo -n sh -c 'echo x > /run/codefusion/probe' 2>/dev/null; echo write-shared=$?
+sudo -n mount -o remount,rw /sys 2>/dev/null; echo remount-sys=$?
+sudo -n mount -o remount,rw /run/codefusion 2>/dev/null; echo remount-shared=$?
+sudo -n umount -l /proc/sys 2>/dev/null; echo umount-settings=$?
+sudo -n umount -l /proc/kcore 2>/dev/null; echo umount-memory=$?
+sudo -n umount -l /run/codefusion 2>/dev/null; echo umount-shared=$?
+mkdir -p /tmp/at
+sudo -n unshare -m -p -f sh -c 'mount -t proc proc /tmp/at' 2>/dev/null; echo fresh-proc=$?
+sudo -n unshare -m -n sh -c 'mount -t sysfs sysfs /tmp/at 2>/dev/null && grep -q " /tmp/at sysfs rw" /proc/mounts'; echo fresh-sys=$?
+sudo -n sh -c 'dd if=/dev/zero of=/tmp/swap bs=1M count=8 2>/dev/null && chmod 600 /tmp/swap && mkswap /tmp/swap >/dev/null 2>&1 && swapon /tmp/swap' 2>/dev/null; echo swap=$?
+echo swaps=$(tail -n +2 /proc/swaps | wc -l)
+grep -Eq '^overlay / overlay [^ ]*nodev' /proc/mounts; echo root-nodev=$?
+sudo -n perl -e '
+  $SIG{ALRM} = sub { print "vsock-host=silent\n"; exit };
+  alarm 5;
+  socket(S, 40, 1, 0) or do { print "vsock-host=refused(socket)\n"; exit };
+  print "vsock-host=", (connect(S, pack("SSLLx4", 40, 0, 6000, 2)) ? "0" : "refused"), "\n"'
+sudo -n perl -e '
+  socket(S, 40, 1, 0) or do { print "vsock-port=refused(socket)\n"; exit };
+  print "vsock-port=", (bind(S, pack("SSLLx4", 40, 0, 6000, 0xFFFFFFFF)) ? "0" : "refused"), "\n"'
+exit 7"#;
+
 struct Bench {
     binary: PathBuf,
     state: PathBuf,
     work: PathBuf,
     image: String,
+    release: PathBuf,
 }
 
 struct Running {
@@ -95,7 +128,7 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         }
     }
     let bench = prepare(root, &release)?;
-    let scenarios: [(&str, Scenario); 11] = [
+    let scenarios: [(&str, Scenario); 12] = [
         ("boot", boot),
         ("lifecycle", lifecycle),
         ("exit-code", exit_code),
@@ -105,6 +138,7 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         ("sigterm", sigterm),
         ("sigkill", sigkill),
         ("firewall", firewall),
+        ("inside", inside),
         ("launchd", launchd),
         ("timers", timers),
     ];
@@ -173,23 +207,32 @@ fn prepare(root: &Path, release: &Path) -> Fallible<Bench> {
     let state = root.join("target/it/state");
     let work = root.join("target/it/work");
     fs::create_dir_all(&work)?;
-    if !state.join("images").join(&image).join("rootfs.img").exists() {
-        let installed = Command::new(&binary)
-            .args(["image", "install"])
-            .arg(release)
-            .args(["--version", &image, "--state-dir"])
-            .arg(&state)
-            .status()?;
-        if !installed.success() {
-            return Err("the image release was refused".into());
-        }
-    }
+    install(&binary, release, &image, &state)?;
     Ok(Bench {
         binary,
         state,
         work,
         image,
+        release: release.to_path_buf(),
     })
+}
+
+/// Installs the release into this state folder through the verifying store, unless it is there already.
+fn install(binary: &Path, release: &Path, image: &str, state: &Path) -> Fallible<()> {
+    if state.join("images").join(image).join("rootfs.img").exists() {
+        return Ok(());
+    }
+    let installed = Command::new(binary)
+        .args(["image", "install"])
+        .arg(release)
+        .args(["--version", image, "--state-dir"])
+        .arg(state)
+        .status()?;
+    if installed.success() {
+        Ok(())
+    } else {
+        Err("the image release was refused".into())
+    }
 }
 
 fn indent(lines: &[String]) -> String {
@@ -741,12 +784,18 @@ fn timeout(bench: &Bench) -> Fallible<Vec<String>> {
     expect(!finished.console.contains("woke"), "the job went on")?;
     // The deadline (5 s) and its grace (20 s) count from the workload's start. The guest then ends the job
     // itself and says so; only a guest that does not is stopped by the host, 10 s later (`Limits::longest_run`).
-    let boot = finished.state["boot_ms"].as_f64().unwrap_or(0.0) / 1000.0;
+    // The job's time is the guest's own count: the vm-host's also holds what the Mac took to start the machine,
+    // which is seconds when the scenario before left it short of memory.
+    let ran = finished.state["end"]["summary"]["wall_ms"]
+        .as_f64()
+        .unwrap_or(0.0)
+        / 1000.0;
     let took = finished.took.as_secs_f32();
-    let ran = f64::from(took) - boot;
     expect(
-        (25.0..35.0).contains(&ran),
-        format!("a 5 s deadline and 20 s of grace: the job ended {ran:.1} s after its start"),
+        (25.0..35.0).contains(&ran) && f64::from(took) >= ran,
+        format!(
+            "a 5 s deadline and 20 s of grace: the job ended {ran:.1} s after its start, its vm-host after {took:.1} s"
+        ),
     )?;
     expect(
         finished.state["end"]["summary"]["end"]["reason"] == "timeout",
@@ -754,7 +803,7 @@ fn timeout(bench: &Bench) -> Fallible<Vec<String>> {
     )?;
     tidy(bench, "it-timeout")?;
     Ok(vec![format!(
-        "a job that ignores SIGTERM, deadline 5 s: ended `timeout` {ran:.1} s after its start ({took:.1} s after the vm-host's): 5 s, 20 s of grace, then the guest's kill, its account and the power-off"
+        "a job that ignores SIGTERM, deadline 5 s: ended `timeout` {ran:.1} s after its start by the guest's count, its vm-host {took:.1} s after its own: 5 s, 20 s of grace, then the guest's kill, its account and the power-off"
     )])
 }
 
@@ -1011,15 +1060,94 @@ sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
     ])
 }
 
+/// The last value a job printed as `name=value`.
+fn printed<'a>(console: &'a str, name: &str) -> Option<&'a str> {
+    console
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix('='))
+}
+
+fn inside(bench: &Bench) -> Fallible<Vec<String>> {
+    const REFUSED: [&str; 16] = [
+        "status-pipe",
+        "first-environ",
+        "oom-floor",
+        "core-pattern",
+        "write-shared",
+        "remount-sys",
+        "remount-shared",
+        "umount-settings",
+        "umount-memory",
+        "umount-shared",
+        "fresh-proc",
+        "fresh-sys",
+        "swap",
+        "vsock-host",
+        "vsock-port",
+        "root-nodev",
+    ];
+    let finished = job(bench, "it-inside", 512, 120, INSIDE_PROBES)?;
+    let value = |name: &str| printed(&finished.console, name).unwrap_or("not tried");
+    let line = REFUSED
+        .iter()
+        .chain(&["control", "swaps"])
+        .map(|name| format!("{name}={}", value(name)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    expect(
+        value("control") == "0",
+        format!("the job's root could not even write a file of its own: {line}"),
+    )?;
+    // `root-nodev` is a question, the others are tries: the root has no device files when the answer is 0.
+    let open: Vec<&str> = REFUSED
+        .iter()
+        .copied()
+        .filter(|name| match (*name, value(name)) {
+            (_, "not tried") => true,
+            ("root-nodev", answer) => answer != "0",
+            (_, answer) => answer == "0",
+        })
+        .collect();
+    expect(
+        open.is_empty() && value("swaps") == "0",
+        format!(
+            "the job's root got at its own machine ({}): {line}",
+            open.join(", ")
+        ),
+    )?;
+    // What the job wrote at the pipe its end is reported on changed nothing: its end is its own exit code.
+    ended(&finished, "failed")?;
+    expect(
+        finished.state["end"]["summary"]["exit_code"] == 7,
+        format!("the job's end is not its own: {}", finished.state["end"]),
+    )?;
+    tidy(bench, "it-inside")?;
+    Ok(vec![
+        "refused to the job's root, whose job then ended with its own exit code 7:".to_string(),
+        line,
+    ])
+}
+
 fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
     let job = "it-launchd";
-    forget(bench, job);
     let uid = output("id", &["-u"]).trim().to_string();
-    // An agent reads no other volume without the owner's consent, so its own files are in the temporary folder.
+    // An agent touches no other volume without the owner's consent, and waits for it for good. So all it touches
+    // is in the temporary folder: the binary, its own files and a state folder with the image.
     let folder = std::env::temp_dir().join(AGENT);
+    let _ = fs::remove_dir_all(&folder);
     fs::create_dir_all(&folder)?;
     let path = |name: &str| folder.join(name).display().to_string();
-    fs::copy(&bench.binary, folder.join("codefusion-runner"))?;
+    let binary = folder.join("codefusion-runner");
+    fs::copy(&bench.binary, &binary)?;
+    let bench = &Bench {
+        binary: binary.clone(),
+        state: folder.join("state"),
+        work: folder.clone(),
+        image: bench.image.clone(),
+        release: bench.release.clone(),
+    };
+    install(&binary, &bench.release, &bench.image, &bench.state)?;
     fs::write(
         path("launchd.json"),
         request(bench, job, 512, 120, "echo waiting; sleep 15; echo survived").to_string(),
@@ -1056,7 +1184,8 @@ fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
         .status()?;
     expect(loaded.success(), "launchctl bootstrap refused the test's agent")?;
     let outcome = (|| {
-        let started = within(Duration::from_secs(40), || {
+        // The first job in a state folder makes its disk's template first.
+        let started = within(Duration::from_secs(90), || {
             console_of(bench, job).contains("waiting")
         });
         let said =
@@ -1097,6 +1226,12 @@ fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
         .args(["bootout", &format!("{domain}/{AGENT}")])
         .stderr(Stdio::null())
         .status();
+    // A vm-host that is still there has failed the scenario: it is not left to run on.
+    let hosts = || output("pgrep", &["-f", &path("codefusion-runner")]);
+    for host in hosts().lines().filter_map(|line| line.trim().parse().ok()) {
+        signal(host, "KILL");
+    }
+    within(Duration::from_secs(20), || hosts().trim().is_empty());
     let _ = fs::remove_dir_all(&folder);
     outcome?;
     Ok(vec![
