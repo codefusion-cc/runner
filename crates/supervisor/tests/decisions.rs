@@ -743,3 +743,39 @@ fn an_annotation_cannot_be_ended_or_forged_by_a_process_name() {
         "::error title=a%2Cb%3A%3Ac::50%25 done%0A::error::forged%0D"
     );
 }
+
+#[test]
+fn a_process_nobody_saw_is_of_the_one_step_that_runs() {
+    let job = |steps: &[(u32, u32, &str)]| {
+        let mut all = vec![
+            process(10, 1, "supervisor"),
+            process(11, 10, "supervisor"),
+            process(12, 11, "run.sh"),
+            process(13, 12, "Runner.Listener"),
+            process(14, 13, "Runner.Worker"),
+            process(40, 1, "other"),
+        ];
+        all.extend(
+            steps
+                .iter()
+                .map(|(pid, parent, name)| process(*pid, *parent, name)),
+        );
+        Table::new(all)
+    };
+    let only = |table: Table| table.only_step(10).map(|step| step.pid);
+    // One step with what it started: a process that came and went was its.
+    assert_eq!(
+        only(job(&[(20, 14, "bash"), (21, 20, "sleep"), (22, 21, "node")])),
+        Some(20)
+    );
+    // Between two steps, and with two at once, nobody can say whose it was.
+    assert_eq!(only(job(&[])), None);
+    assert_eq!(
+        only(job(&[(20, 14, "bash"), (30, 14, "bash"), (31, 30, "sleep")])),
+        None
+    );
+    assert_eq!(only(actions_runner_job()), None);
+    // What an earlier step left behind hangs below the container's first process and is nobody's step.
+    assert_eq!(only(job(&[(50, 11, "leftover")])), None);
+    assert_eq!(only(job(&[(50, 11, "leftover"), (20, 14, "bash")])), Some(20));
+}

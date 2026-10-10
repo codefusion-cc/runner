@@ -10,6 +10,7 @@
 
 mod cpio;
 mod guest;
+mod it;
 mod kernel;
 mod keys;
 
@@ -36,7 +37,8 @@ fn run(args: &[String]) -> Result<()> {
         Some("guest") => no_options(&args[1..]).and_then(|()| guest::build(&root)),
         Some("release") => guest::release(&root, &args[1..]),
         Some("build") => no_options(&args[1..]).and_then(|()| build(&root)),
-        _ => Err("tasks: keygen, guest, release, build".into()),
+        Some("it") => it::run(&root, &args[1..]),
+        _ => Err("tasks: keygen, guest, release, build, it".into()),
     }
 }
 

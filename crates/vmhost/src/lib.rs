@@ -30,4 +30,4 @@ pub use driver::{Guest, RunError, run};
 pub use layout::Layout;
 pub use machine::{Action, Event, Limits, Machine};
 pub use request::{JobRequest, RequestError, VM_OVERHEAD};
-pub use state::{End, Ended, JobState, Stage};
+pub use state::{End, Ended, JobState, OutOfMemory, Stage, out_of_memory};

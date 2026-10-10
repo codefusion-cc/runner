@@ -2100,6 +2100,7 @@ dependencies = [
  "cf-image",
  "ed25519-dalek",
  "flate2",
+ "serde_json",
  "sha2",
  "tempfile",
 ]

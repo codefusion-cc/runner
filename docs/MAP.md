@@ -19,7 +19,7 @@
 | `crates/secret` (`cf-secret`) | `Secret<T>`: a value whose `Debug` prints `Secret(..)`. Every token and key is wrapped in it. |
 | `crates/fake-github` (`cf-fake-github`) | A stateful fake GitHub over real sockets, for tests only: App JWT checks, tokens, repositories, scale sets, sessions, long poll, acquire, JIT configs, with `Options::auto_assign` (the real service hands a queued job to a poll that has room), with faults (`fail`, `before`, `lose_answer`, `lose_session`, `expire_session_token`, `revoke_admin_tokens`, `send_the_service_to`, `send_the_queue_to`, clock offset). `harness` is what every crate's tests start from: the fake with the real App and scale set clients in front of it, `TestClock`, `fast` retries, `until`, and `elsewhere` (a host no token may reach). |
 | `crates/console-client` | Empty until its milestone (M4); the file says which. |
-| `xtask` | `cargo xtask keygen | guest | release | build`. Kernel package pinned in `xtask/src/kernel.rs`. |
+| `xtask` | `cargo xtask keygen | guest | release | build | it`. `it` (`xtask/src/it.rs`) runs the vm-host against real machines on this Mac, one small machine at a time, and writes its numbers to `target/it/report.txt`. Kernel package pinned in `xtask/src/kernel.rs`. |
 | `image/Dockerfile` | The root filesystem a job runs in: GitHub's Actions runner image plus tools. Packed by `.github/workflows/image.yml`. |
 | `.github/workflows` | `ci.yml` (macos-14: fmt, guest, clippy, tests, release build; ubuntu: cargo deny), `image.yml` (the image: built and verified on every change to it, signed and published from main, weekly), `automerge.yml`. |
 
@@ -31,6 +31,9 @@
 - What the budget sees on a Mac: `cargo run -p cf-host-macos --example host-probe`. It only reads and prints; compare
   with `vm_stat` and `sysctl kern.memorystatus_vm_pressure_level vm.swapusage`.
 - GitHub's hosted Macs cannot boot VMs (no nested virtualization), so CI never runs `boot-proof`; it runs on a Mac.
+- Real machines: `gh release download <image tag> -R codefusion-cc/runner -D target/it/release`, then
+  `cargo xtask build && cargo xtask it` (`--only oom,firewall` for some). It installs the release through the store,
+  which verifies it, and needs a network for the firewall and GitHub checks.
 
 ## Image signing
 

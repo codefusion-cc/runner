@@ -581,7 +581,12 @@ impl Watch<'_> {
             let step = self
                 .previous
                 .step_of(kill.process.pid, self.launcher)
-                .or_else(|| table.step_of(kill.process.pid, self.launcher));
+                .or_else(|| table.step_of(kill.process.pid, self.launcher))
+                // A process that lived and died between two looks is in neither table.
+                .or_else(|| table.only_step(self.launcher));
+            if step.is_none() {
+                say("no step to stop for it: its process is gone and no single step runs");
+            }
             self.step = step.map(|step| {
                 (
                     Instant::now() + Duration::from_millis(self.job.oom_grace_ms),

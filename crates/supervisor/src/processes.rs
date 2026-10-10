@@ -111,4 +111,22 @@ impl Table {
             .skip(3)
             .find(|process| !ACTIONS_RUNNER.contains(&process.name.as_str()))
     }
+
+    /// The one step running now, when exactly one is. The Actions runner runs a job's steps one after another, so a
+    /// process that came and went between two looks at the table was that step's. `None` when no step runs or
+    /// several do: then nobody can say whose it was.
+    pub fn only_step(&self, launcher: u32) -> Option<&Process> {
+        let mut steps: Vec<u32> = self
+            .0
+            .keys()
+            .filter_map(|pid| self.step_of(*pid, launcher))
+            .map(|step| step.pid)
+            .collect();
+        steps.sort_unstable();
+        steps.dedup();
+        match steps[..] {
+            [only] => self.get(only),
+            _ => None,
+        }
+    }
 }
