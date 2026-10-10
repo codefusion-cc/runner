@@ -40,8 +40,14 @@ pub struct StartBreaker {
     limits: BreakerLimits,
     failed_in_a_row: u32,
     wait: Millis,
-    /// When the next single start may be tried; `None` while healthy.
-    retry_at: Option<Millis>,
+    /// `None` while healthy.
+    closed: Option<Closed>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Closed {
+    /// When the next single start may be tried.
+    retry_at: Millis,
     /// Since when a single start is out that has not reported back.
     trying: Option<Millis>,
 }
@@ -53,8 +59,7 @@ impl StartBreaker {
             limits,
             failed_in_a_row: 0,
             wait: limits.first_wait,
-            retry_at: None,
-            trying: None,
+            closed: None,
         }
     }
 
@@ -65,8 +70,8 @@ impl StartBreaker {
         if self.holds(now) {
             return false;
         }
-        if self.retry_at.is_some() {
-            self.trying = Some(now);
+        if let Some(closed) = &mut self.closed {
+            closed.trying = Some(now);
         }
         true
     }
@@ -74,14 +79,18 @@ impl StartBreaker {
     /// Whether `Hold::StartFailures` belongs on the budget at `now`: starts failed too often, and it is not the
     /// moment of the one try. Exactly then [`StartBreaker::admit`] refuses.
     pub fn holds(&self, now: Millis) -> bool {
-        let try_is_out = self.trying.is_some_and(|since| now.since(since) < self.wait);
-        self.retry_at.is_some_and(|at| now < at || try_is_out)
+        self.closed.is_some_and(|closed| {
+            let try_is_out = closed.trying.is_some_and(|since| now.since(since) < self.wait);
+            now < closed.retry_at || try_is_out
+        })
     }
 
     /// The start that [`StartBreaker::admit`] let through did not happen (the claim was refused, or another Mac
     /// got the job): the next one may be tried.
     pub fn unused(&mut self) {
-        self.trying = None;
+        if let Some(closed) = &mut self.closed {
+            closed.trying = None;
+        }
     }
 
     /// A VM did not reach `ready`.
@@ -90,28 +99,27 @@ impl StartBreaker {
         if self.failed_in_a_row < self.limits.failures.max(1) {
             return;
         }
-        if self.retry_at.is_some() && self.trying.is_some() {
-            self.wait = Millis(self.wait.0.saturating_mul(2)).min(self.limits.longest_wait);
+        if self.closed.is_some_and(|closed| closed.trying.is_some()) {
+            self.wait = self.wait.plus(self.wait).min(self.limits.longest_wait);
         }
-        self.trying = None;
-        self.retry_at = Some(now.plus(self.wait));
+        self.closed = Some(Closed {
+            retry_at: now.plus(self.wait),
+            trying: None,
+        });
     }
 
     /// A VM reached `ready`: whatever was wrong is over.
     pub fn succeeded(&mut self) {
-        self.failed_in_a_row = 0;
-        self.wait = self.limits.first_wait;
-        self.retry_at = None;
-        self.trying = None;
+        *self = StartBreaker::new(self.limits);
     }
 
     /// Whether starts failed so often that the Mac takes no jobs but the single tries.
     pub fn closed(&self) -> bool {
-        self.retry_at.is_some()
+        self.closed.is_some()
     }
 
     /// When the next single start may be tried; `None` while healthy.
     pub fn retry_at(&self) -> Option<Millis> {
-        self.retry_at
+        self.closed.map(|closed| closed.retry_at)
     }
 }

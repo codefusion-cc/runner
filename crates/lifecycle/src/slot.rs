@@ -263,14 +263,15 @@ impl Slot {
         slot.end = saved.end;
         slot.oom = saved.oom;
         slot.ran_job = saved.ran_job;
-        slot.memory = vm_alive;
+        slot.memory = vm_alive && saved.phase != Phase::Released;
         slot.restored = true;
         let mut effects = Vec::new();
         if saved.phase == Phase::Released {
-            slot.memory = false;
             slot.phase = Phase::Released;
             return (slot, effects);
         }
+        // How a slot ends whose VM is not to go on, unless its phase says more.
+        let recorded = saved.end.unwrap_or(End::GuestLost);
         if !vm_alive {
             // The budget is a new one and never counted this slot.
             let end = match saved.phase {
@@ -280,7 +281,7 @@ impl Slot {
                     End::StartFailed
                 }
                 Phase::Retrying => End::StartFailed,
-                _ => saved.end.unwrap_or(End::GuestLost),
+                _ => recorded,
             };
             slot.starts = slot.starts.max(u32::from(saved.phase != Phase::Reserved));
             slot.release(end, &mut effects);
@@ -302,9 +303,10 @@ impl Slot {
             Phase::Stopping => slot.stop(now, saved.end.unwrap_or(End::Stopped), Millis::ZERO, &mut effects),
             // A VM where there cannot be one (a reservation), one that was to be replaced, or one being killed.
             Phase::Reserved | Phase::Retrying | Phase::Killing | Phase::Released => {
-                let end = match saved.phase {
-                    Phase::Retrying => End::StartFailed,
-                    _ => saved.end.unwrap_or(End::GuestLost),
+                let end = if saved.phase == Phase::Retrying {
+                    End::StartFailed
+                } else {
+                    recorded
                 };
                 slot.kill(now, end, &mut effects);
             }
