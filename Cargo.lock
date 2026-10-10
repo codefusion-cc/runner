@@ -192,6 +192,10 @@ dependencies = [
 [[package]]
 name = "cf-lifecycle"
 version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "proptest",
+]
 
 [[package]]
 name = "cf-scaleset"

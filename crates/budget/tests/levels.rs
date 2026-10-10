@@ -8,6 +8,9 @@ use cf_budget::{
 };
 use common::*;
 
+/// A change to a calm reading.
+type Change = fn(&mut HostReading);
+
 fn refusal(budget: &Budget, second: u64) -> Option<Refusal> {
     budget.fits(secs(second), Size::G2).err()
 }
@@ -205,7 +208,7 @@ fn a_signal_that_flips_every_second_keeps_the_mac_closed() {
 
 #[test]
 fn heat_battery_and_a_full_disk_hold() {
-    let cases: [(fn(&mut HostReading), Trouble); 4] = [
+    let cases: [(Change, Trouble); 4] = [
         (|r| r.thermal = Thermal::Serious, Trouble::Hot),
         (|r| r.thermal = Thermal::Critical, Trouble::Hot),
         (|r| r.on_battery = true, Trouble::Battery),
