@@ -14,7 +14,9 @@
 //!   only once a reading taken after that measurement shows it gone from `available`; less than before counts
 //!   at once.
 //! - No claim is granted unless the level is open: a fresh reading, no memory pressure, no swap-out for 30 s, the
-//!   Mac not under its floor, cool, on mains, with disk, and all of that for 60 s without a break.
+//!   Mac not under its floor, cool, on mains, with disk, and all of that for 60 s without a break. The 60 s are
+//!   counted from the first reading with nothing wrong to the newest one: the time since the newest reading is
+//!   time nobody watched.
 //! - A reading that fails, is old (by the time it was taken, not handed over), or follows a gap in time (sleep,
 //!   a stalled caller, a clock that went back) closes the Mac. Not knowing is never a reason to open.
 //! - A slot's memory is given back once: a second [`Budget::release`] is an error and changes nothing.

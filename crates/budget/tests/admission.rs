@@ -227,12 +227,14 @@ fn a_new_budget_is_closed_until_sixty_calm_seconds() {
             left: Millis::secs(1)
         })
     );
-    assert_eq!(
-        budget.claim(ms(59_999), Size::G2),
-        Err(Refusal::Calming { left: Millis(1) })
-    );
-    assert_eq!(budget.level(ms(59_999)), Level::Tight);
-    assert_eq!(budget.free(ms(59_999)), Free::default());
+    // The minute is over by the clock, but only 59 s of it were watched: the reading of second 60 opens the Mac.
+    let one_more = Refusal::Calming {
+        left: Millis::secs(1),
+    };
+    assert_eq!(budget.claim(secs(60), Size::G2), Err(one_more));
+    assert_eq!(budget.level(secs(60)), Level::Tight);
+    assert_eq!(budget.free(secs(60)), Free::default());
+    watch(&mut budget, 60, 60, |_| {});
     assert_eq!(budget.level(secs(60)), Level::Open);
     let grant = budget.claim(secs(60), Size::G2).unwrap();
     assert_eq!(

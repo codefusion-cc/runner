@@ -238,9 +238,13 @@ impl Watch {
 
     /// How much longer nothing may go wrong before slots open; zero when the calm time is over. `None` while
     /// something is wrong.
-    pub(crate) fn calm_left(&self, settings: &Settings, now: Now) -> Option<Millis> {
+    ///
+    /// The calm time is counted to the last look at the Mac, not to the moment of asking: what came after that
+    /// look is time nobody watched, and it proves nothing.
+    pub(crate) fn calm_left(&self, settings: &Settings) -> Option<Millis> {
         let since = self.calm_since?;
-        Some(settings.calm_for.since(now.elapsed.since(since)))
+        let watched_to = self.observed?.elapsed;
+        Some(settings.calm_for.since(watched_to.since(since)))
     }
 
     /// Whether memory is so short that a job has to stop: critical pressure that lasted, or pressure with swap

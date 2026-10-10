@@ -3,8 +3,8 @@
 mod common;
 
 use cf_budget::{
-    Budget, Eviction, EvictionCause, GIB, HostReading, Level, MIB, Millis, Now, Pressure, Refusal, Size,
-    Thermal, Trouble, Usage,
+    Assigned, Budget, Eviction, EvictionCause, GIB, HostReading, Level, MIB, Millis, Now, Pressure, Refusal,
+    Size, Thermal, Trouble, Usage,
 };
 use common::*;
 
@@ -45,6 +45,47 @@ fn pressure_closes_at_once_and_opens_sixty_seconds_after_it_ends() {
         );
         assert_eq!(after(&mut budget, 122, |_| {}), None);
     }
+}
+
+/// The input `nothing_is_promised_that_the_rules_do_not_allow` found: readings a few seconds apart, the last one
+/// 57 s after the first, and a job that asks 3 s later, 60 s after the first by the clock. The three seconds
+/// since the last reading are time nobody watched: they are no part of the calm minute.
+#[test]
+fn the_calm_minute_is_counted_to_the_last_reading_not_to_the_moment_of_asking() {
+    const GAPS: [u64; 20] = [
+        500, 2154, 4936, 2152, 3418, 4241, 4316, 4618, 2425, 3055, 2739, 2282, 1919, 1736, 3128, 2430, 3138,
+        3663, 1606, 3051,
+    ];
+    let mut budget = Budget::new(dedicated()).unwrap();
+    let mut at = 0;
+    for gap in GAPS {
+        at += gap;
+        budget.observe(ms(at), Some(calm(ms(at))));
+    }
+    let asked = ms(at + 2993);
+    assert_eq!((at - 500, asked.elapsed.0 - 500), (57_007, 60_000));
+
+    let calming = Refusal::Calming { left: Millis(2993) };
+    assert_eq!(budget.fits(asked, Size::G2), Err(calming));
+    assert_eq!(budget.level(asked), Level::Tight);
+    assert_eq!(budget.free(asked), Default::default());
+    assert_eq!(budget.claim(asked, Size::G2), Err(calming));
+    // A job GitHub assigned waits for the reading too, and that reading starts it.
+    let Assigned::Waits { slot, why } = budget.assign(asked, Size::G2) else {
+        panic!("an assigned job started on 57 watched seconds");
+    };
+    assert_eq!(why, calming);
+    assert_eq!(budget.slots(), 0);
+    let observed = budget.observe(asked, Some(calm(asked)));
+    assert_eq!(
+        observed
+            .started
+            .iter()
+            .map(|grant| grant.slot)
+            .collect::<Vec<_>>(),
+        [slot]
+    );
+    assert_eq!(budget.fits(asked, Size::G2), Ok(()));
 }
 
 #[test]

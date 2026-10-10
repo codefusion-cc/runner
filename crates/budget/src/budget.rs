@@ -63,7 +63,7 @@ pub enum Refusal {
     Blind,
     /// A reading shows something wrong.
     Trouble(Trouble),
-    /// Nothing is wrong any more, but not for long enough yet.
+    /// Nothing is wrong any more, but not for long enough yet: `left` as of the newest reading.
     Calming { left: Millis },
     /// The person is at this Mac and it takes no job while they are.
     PersonThere,
@@ -663,7 +663,7 @@ impl Budget {
         if let Some(trouble) = self.watch.troubles().next() {
             return Err(Refusal::Trouble(trouble));
         }
-        match self.watch.calm_left(&self.settings, now) {
+        match self.watch.calm_left(&self.settings) {
             Some(Millis::ZERO) => {}
             Some(left) => return Err(Refusal::Calming { left }),
             None => return Err(Refusal::Blind),
