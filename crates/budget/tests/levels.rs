@@ -394,7 +394,12 @@ fn two_looks_in_the_same_moment_are_not_a_clock_gone_back() {
         budget.observe(secs(60), Some(calm(secs(60))));
         assert_eq!(budget.level(secs(60)), Level::Open);
     }
-    assert!(budget.claim(secs(60), Size::G4).is_ok());
+    let slot = budget.claim(secs(60), Size::G4).unwrap().slot;
+    // Nor does a second look give a reservation its two minutes again.
+    for second in [100, 100, 179, 179] {
+        assert_eq!(budget.observe(secs(second), Some(calm(secs(second)))).expired, []);
+    }
+    assert_eq!(budget.observe(secs(180), Some(calm(secs(180)))).expired, [slot]);
 }
 
 #[test]

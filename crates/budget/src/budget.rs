@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use thiserror::Error;
 
@@ -22,7 +22,8 @@ pub struct Grant {
     pub job_limit_bytes: u64,
     /// The VM's vCPUs.
     pub cpus: u32,
-    /// When the reservation is given back unless [`Budget::confirm`] came first. `None` for an adopted slot.
+    /// When the reservation is given back unless [`Budget::confirm`] came first. `None` for an adopted slot and
+    /// for a job that was assigned ([`Budget::assign`]): those never run out.
     pub expires: Option<Millis>,
 }
 
@@ -45,6 +46,8 @@ pub enum Refusal {
     Cpus { cap: u32, committed: u32 },
     /// The Mac could not keep its floor if every VM grew to its full size.
     Memory { short_bytes: u64 },
+    /// Jobs that GitHub assigned without asking wait for room, and they go first.
+    AssignedFirst { waiting: usize },
 }
 
 impl Refusal {
@@ -59,6 +62,7 @@ impl Refusal {
             Refusal::Full { .. } => "full",
             Refusal::Cpus { .. } => "cpus",
             Refusal::Memory { .. } => "memory",
+            Refusal::AssignedFirst { .. } => "assigned-first",
         }
     }
 
@@ -69,6 +73,20 @@ impl Refusal {
             _ => Level::Tight,
         }
     }
+}
+
+/// What became of a job that GitHub assigned without asking ([`Budget::assign`]). The job is never dropped: it
+/// starts, or it waits until it can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Assigned {
+    /// It starts now. The slot is the job's until it is released.
+    Start(Grant),
+    /// It waits under this name, for this reason. [`Budget::observe`] hands out its grant
+    /// ([`Observed::started`]) when the Mac has room; until then no other slot is granted.
+    Waits { slot: SlotId, why: Refusal },
+    /// This Mac can never run a VM of this size with its settings, so nothing waits. Hand the job back, and do
+    /// not offer this size here ([`Settings::can_run`]).
+    Never(Refusal),
 }
 
 /// A slot the budget does not hold: never granted, expired, or given back already.
@@ -125,6 +143,8 @@ pub struct Observed {
     pub expired: Vec<SlotId>,
     /// A job to stop now. At most one per [`Settings::evict_every`].
     pub evict: Option<Eviction>,
+    /// Assigned jobs that waited and start now, oldest first. Each grant's slot is the name the job waited under.
+    pub started: Vec<Grant>,
 }
 
 /// How many more slots of each size would fit now, each size counted alone.
@@ -155,6 +175,8 @@ pub struct Status {
     pub cpus_committed: u32,
     /// Whether the person counts as being at the Mac: running jobs go on at low priority.
     pub person_there: bool,
+    /// How many assigned jobs wait for room.
+    pub waiting: usize,
     /// The newest reading, if there is one new enough.
     pub reading: Option<HostReading>,
     /// What would fit now.
@@ -260,6 +282,8 @@ pub struct Budget {
     settings: Settings,
     watch: Watch,
     slots: BTreeMap<SlotId, Slot>,
+    /// Assigned jobs that have no room yet, oldest first. They hold nothing.
+    waiting: VecDeque<(SlotId, Size)>,
     next_slot: u64,
     holds: BTreeSet<Hold>,
     last_eviction: Option<Millis>,
@@ -273,6 +297,7 @@ impl Budget {
             settings,
             watch: Watch::default(),
             slots: BTreeMap::new(),
+            waiting: VecDeque::new(),
             next_slot: 0,
             holds: BTreeSet::new(),
             last_eviction: None,
@@ -328,11 +353,20 @@ impl Budget {
             self.slots.remove(id);
         }
         let evict = self.pick_eviction(now);
+        let mut started = Vec::new();
+        while let Some((index, slot, size)) = self.next_waiting() {
+            if self.assigned_fits(now, size).is_err() {
+                break;
+            }
+            self.waiting.remove(index);
+            started.push(self.insert(slot, size, None));
+        }
         Observed {
             level: self.level(now),
             slept,
             expired,
             evict,
+            started,
         }
     }
 
@@ -341,7 +375,56 @@ impl Budget {
     pub fn claim(&mut self, now: Now, size: Size) -> Result<Grant, Refusal> {
         self.fits(now, size)?;
         let expires = now.elapsed.plus(self.settings.reservation_ttl);
-        Ok(self.insert(size, Some(expires)))
+        let slot = self.next_id();
+        Ok(self.insert(slot, size, Some(expires)))
+    }
+
+    /// Takes a job that GitHub assigned without asking: a poll with spare capacity can get one while the Mac is
+    /// closed. The job is never dropped. It starts now if the Mac can carry it, else it waits and
+    /// [`Budget::observe`] starts it ([`Observed::started`]); nothing runs out in either case.
+    ///
+    /// The job is already this Mac's, so it is treated like one that was running when the person came back: the
+    /// person being there does not keep it waiting (it runs at low priority, [`Status::person_there`]), and it
+    /// counts against the cap and the CPUs the Mac has while its person is away. Everything that protects the Mac
+    /// still holds for it: the floor in force (the higher one while the person is there), pressure, swapping, the
+    /// calm time, heat, battery, disk, a missing reading, and every hold. Those it waits for.
+    ///
+    /// Jobs that wait start in the order they came, and while one waits no other slot is granted
+    /// ([`Refusal::AssignedFirst`], and [`Budget::free`] is zero, so the Runner offers GitHub nothing).
+    pub fn assign(&mut self, now: Now, size: Size) -> Assigned {
+        if let Err(never) = self.settings.can_run(size) {
+            return Assigned::Never(never);
+        }
+        let why = match self.next_waiting() {
+            Some(_) => Refusal::AssignedFirst {
+                waiting: self.waiting.len(),
+            },
+            None => match self.assigned_fits(now, size) {
+                Ok(()) => {
+                    let slot = self.next_id();
+                    return Assigned::Start(self.insert(slot, size, None));
+                }
+                Err(why) => why,
+            },
+        };
+        let slot = self.next_id();
+        self.waiting.push_back((slot, size));
+        Assigned::Waits { slot, why }
+    }
+
+    /// Forgets an assigned job that still waits: GitHub took it back or it was cancelled. It held nothing. An
+    /// error means it does not wait: it started (then [`Budget::release`] is the call), or it was never there.
+    pub fn withdraw(&mut self, slot: SlotId) -> Result<Size, UnknownSlot> {
+        let index = self.waiting.iter().position(|(id, _)| *id == slot);
+        let (_, size) = index
+            .and_then(|index| self.waiting.remove(index))
+            .ok_or(UnknownSlot(slot))?;
+        Ok(size)
+    }
+
+    /// How many assigned jobs wait for room.
+    pub fn waiting(&self) -> usize {
+        self.waiting.len()
     }
 
     /// Whether a slot of `size` would be granted now, without reserving it. The answer may be out of date by the
@@ -371,7 +454,8 @@ impl Budget {
     /// memory is taken whether the budget likes it or not. Adopt the oldest VM first, since the newest slot is
     /// the first to be stopped when memory runs short.
     pub fn adopt(&mut self, size: Size) -> Grant {
-        self.insert(size, None)
+        let slot = self.next_id();
+        self.insert(slot, size, None)
     }
 
     /// Records what a slot's VM uses now. What it has already taken from the host is no longer counted as still
@@ -458,6 +542,7 @@ impl Budget {
             }),
             cpus_committed: self.cpus_committed(),
             person_there: person_there(&self.settings, reading.as_ref()),
+            waiting: self.waiting.len(),
             reading,
             free: self.free(now),
         }
@@ -465,6 +550,20 @@ impl Budget {
 
     /// Everything that must hold before the arithmetic is even tried. `Ok` carries the reading to decide with.
     fn gate(&self, now: Now) -> Result<&HostReading, Refusal> {
+        let reading = self.health(now)?;
+        if person_there(&self.settings, Some(reading)) && self.settings.in_use.cap_bytes == 0 {
+            return Err(Refusal::PersonThere);
+        }
+        if self.next_waiting().is_some() {
+            return Err(Refusal::AssignedFirst {
+                waiting: self.waiting.len(),
+            });
+        }
+        Ok(reading)
+    }
+
+    /// What protects the Mac whoever asks: no hold, a reading to act on, nothing wrong, and not for the calm time.
+    fn health(&self, now: Now) -> Result<&HostReading, Refusal> {
         if let Some(hold) = self.holds.first() {
             return Err(Refusal::Held(*hold));
         }
@@ -479,10 +578,35 @@ impl Budget {
             Some(left) => return Err(Refusal::Calming { left }),
             None => return Err(Refusal::Blind),
         }
-        if person_there(&self.settings, Some(reading)) && self.settings.in_use.cap_bytes == 0 {
-            return Err(Refusal::PersonThere);
-        }
         Ok(reading)
+    }
+
+    /// Whether an assigned job of `size` may start now: the Mac's health, the widest cap and CPUs it has, and the
+    /// floor in force.
+    fn assigned_fits(&self, now: Now, size: Size) -> Result<(), Refusal> {
+        let reading = self.health(now)?;
+        let limits = Profile {
+            floor_bytes: profile_for(&self.settings, Some(reading)).floor_bytes,
+            ..self.settings.away
+        };
+        let charges: Vec<Charge> = self.slots.values().map(Slot::charge).collect();
+        admit(&self.settings, &limits, reading.available_bytes, &charges, size)
+    }
+
+    /// The oldest waiting job this Mac can run at all, with its place in the line. A job that the settings have
+    /// since made impossible keeps its place and holds nobody up.
+    fn next_waiting(&self) -> Option<(usize, SlotId, Size)> {
+        self.waiting
+            .iter()
+            .enumerate()
+            .find(|(_, (_, size))| self.settings.can_run(*size).is_ok())
+            .map(|(index, (slot, size))| (index, *slot, *size))
+    }
+
+    fn next_id(&mut self) -> SlotId {
+        let slot = SlotId(self.next_slot);
+        self.next_slot += 1;
+        slot
     }
 
     /// Why a job would have to stop now, if anything says so. Only a fresh reading can say so.
@@ -533,9 +657,7 @@ impl Budget {
         Some(Eviction { slot, cause })
     }
 
-    fn insert(&mut self, size: Size, expires: Option<Millis>) -> Grant {
-        let slot = SlotId(self.next_slot);
-        self.next_slot += 1;
+    fn insert(&mut self, slot: SlotId, size: Size, expires: Option<Millis>) -> Grant {
         let cpus = self.settings.vcpus_of(size);
         let host_bytes = self.settings.host_bytes(size);
         self.slots.insert(

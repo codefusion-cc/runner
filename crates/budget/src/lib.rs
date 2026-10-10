@@ -16,6 +16,8 @@
 //! - A reading that fails, is old, or follows a gap in time (sleep, a stalled caller, a clock that went back)
 //!   closes the Mac. Not knowing is never a reason to open.
 //! - A slot's memory is given back once: a second [`Budget::release`] is an error and changes nothing.
+//! - A job GitHub assigned without asking ([`Budget::assign`]) is never dropped and never started against the
+//!   rules above, the person being there excepted: it waits for the Mac to have room, first in line.
 //!
 //! The numbers are [`Settings`]; [`Settings::for_host`] has the defaults and where each comes from.
 
@@ -26,8 +28,8 @@ mod settings;
 mod size;
 
 pub use budget::{
-    Budget, Charge, Eviction, EvictionCause, Free, Grant, Observed, Refusal, Released, SlotId, Status,
-    UnknownSlot, Usage, admit,
+    Assigned, Budget, Charge, Eviction, EvictionCause, Free, Grant, Observed, Refusal, Released, SlotId,
+    Status, UnknownSlot, Usage, admit,
 };
 pub use host::{Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};

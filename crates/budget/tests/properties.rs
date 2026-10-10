@@ -6,8 +6,8 @@
 mod common;
 
 use cf_budget::{
-    Budget, Charge, EvictionCause, GIB, Hold, HostFacts, HostReading, Level, MIB, Millis, Mode, Now,
-    Pressure, Profile, Settings, Size, SlotId, Thermal, Usage, admit,
+    Assigned, Budget, Charge, EvictionCause, GIB, Hold, HostFacts, HostReading, Level, MIB, Millis, Mode,
+    Now, Pressure, Profile, Settings, Size, SlotId, Thermal, Usage, admit,
 };
 use common::*;
 use proptest::prelude::*;
@@ -37,6 +37,8 @@ enum Op {
         both: bool,
     },
     Claim(Size),
+    Assign(Size),
+    Withdraw(usize),
     Confirm(usize),
     Release(usize),
     ReleaseGone(usize),
@@ -143,6 +145,8 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0..900_000u64).prop_map(|ms| Op::Sleep { ms }),
         1 => (1..100_000u64, any::<bool>()).prop_map(|(ms, both)| Op::Back { ms, both }),
         16 => size().prop_map(Op::Claim),
+        5 => size().prop_map(Op::Assign),
+        1 => (0..4usize).prop_map(Op::Withdraw),
         5 => (0..8usize).prop_map(Op::Confirm),
         5 => (0..8usize).prop_map(Op::Release),
         1 => (0..8usize).prop_map(Op::ReleaseGone),
@@ -195,6 +199,8 @@ struct World {
     /// Every call of `observe`: when, and the reading if there was one.
     seen: Vec<(Now, Option<HostReading>)>,
     held: Vec<Held>,
+    /// Assigned jobs that wait, oldest first.
+    waiting: Vec<(SlotId, Size)>,
     gone: Vec<SlotId>,
     swapouts: u64,
     swap_used: u64,
@@ -268,8 +274,31 @@ impl World {
         self.held.iter().map(|slot| slot.size.vm_bytes()).sum()
     }
 
-    /// Everything that must be true the moment a slot is granted.
-    fn check_grant(&self, size: Size) -> Result<(), TestCaseError> {
+    /// Whether the Mac could run a VM of this size at all: alone, with all its memory, its person away.
+    fn can_run(&self, size: Size) -> bool {
+        let limits = &self.settings.away;
+        size.vm_bytes() <= limits.cap_bytes
+            && self.settings.vcpus_of(size) <= limits.cpus
+            && size.vm_bytes() + self.settings.vm_host_overhead_bytes + limits.floor_bytes
+                <= self.settings.total_bytes
+    }
+
+    /// Whether an assigned job waits that everything else has to let go first.
+    fn someone_waits(&self) -> bool {
+        self.waiting.iter().any(|(_, size)| self.can_run(*size))
+    }
+
+    fn name_is_new(&self, id: SlotId) -> Result<(), TestCaseError> {
+        prop_assert!(self.held.iter().all(|slot| slot.id != id));
+        prop_assert!(self.waiting.iter().all(|(waiting, _)| *waiting != id));
+        prop_assert!(!self.gone.contains(&id), "a slot's name came back");
+        Ok(())
+    }
+
+    /// Everything that must be true the moment a slot is granted. A job that was assigned without asking does
+    /// not wait for its person to leave and counts against the cap and CPUs of a Mac without its person; nothing
+    /// else is different for it.
+    fn check_grant(&self, size: Size, assigned: bool) -> Result<(), TestCaseError> {
         prop_assert!(!self.hold, "granted under a hold");
         let reading = self.watched_calm();
         prop_assert!(
@@ -277,7 +306,13 @@ impl World {
             "granted without sixty calm, watched seconds behind a fresh reading"
         );
         let reading = reading.unwrap();
-        let limits = self.limits(&reading);
+        let mut limits = self.limits(&reading);
+        if assigned {
+            limits = Profile {
+                floor_bytes: limits.floor_bytes,
+                ..self.settings.away
+            };
+        }
         let vm = size.vm_bytes();
         prop_assert!(self.committed() + vm <= limits.cap_bytes, "over the cap in force");
         prop_assert!(self.committed() + vm <= self.settings.away.cap_bytes);
@@ -339,12 +374,12 @@ impl World {
                 let free = self.budget.free(self.now);
                 match self.budget.claim(self.now, *size) {
                     Ok(grant) => {
-                        self.check_grant(*size)?;
+                        self.check_grant(*size, false)?;
+                        prop_assert!(!self.someone_waits(), "a claim went past a job that waits");
                         prop_assert_eq!(fits, Ok(()));
                         prop_assert!(free.of(*size) >= 1);
                         prop_assert_eq!(self.budget.level(self.now), Level::Open);
-                        prop_assert!(self.held.iter().all(|slot| slot.id != grant.slot));
-                        prop_assert!(!self.gone.contains(&grant.slot), "a slot's name came back");
+                        self.name_is_new(grant.slot)?;
                         prop_assert_eq!(grant.vm_bytes, size.vm_bytes());
                         prop_assert_eq!(grant.cpus, self.settings.vcpus_of(*size));
                         let deadline = Millis(self.now.elapsed.0 + self.settings.reservation_ttl.0);
@@ -362,6 +397,43 @@ impl World {
                         prop_assert_eq!(fits, Err(refusal));
                         prop_assert_eq!(free.of(*size), 0, "said free, then refused: {:?}", refusal);
                     }
+                }
+            }
+            Op::Assign(size) => {
+                let ahead = self.someone_waits();
+                match self.budget.assign(self.now, *size) {
+                    Assigned::Start(grant) => {
+                        prop_assert!(!ahead, "started past a job that waits");
+                        prop_assert!(self.can_run(*size));
+                        self.check_grant(*size, true)?;
+                        self.name_is_new(grant.slot)?;
+                        prop_assert_eq!((grant.vm_bytes, grant.expires), (size.vm_bytes(), None));
+                        self.held.push(Held {
+                            id: grant.slot,
+                            size: *size,
+                            cpus: grant.cpus,
+                            deadline: None,
+                            usage: None,
+                            told_to_stop: false,
+                        });
+                    }
+                    Assigned::Waits { slot, .. } => {
+                        prop_assert!(self.can_run(*size), "waits for what can never be");
+                        self.name_is_new(slot)?;
+                        self.waiting.push((slot, *size));
+                    }
+                    Assigned::Never(_) => {
+                        prop_assert!(!self.can_run(*size), "refused for good what could run")
+                    }
+                }
+            }
+            Op::Withdraw(index) => {
+                if *index < self.waiting.len() {
+                    let (id, size) = self.waiting.remove(*index);
+                    prop_assert!(self.budget.release(id).is_err(), "a job that waits holds nothing");
+                    prop_assert_eq!(self.budget.withdraw(id), Ok(size));
+                    prop_assert!(self.budget.withdraw(id).is_err());
+                    self.gone.push(id);
                 }
             }
             Op::Confirm(index) => {
@@ -519,6 +591,25 @@ impl World {
                 .unwrap()
                 .told_to_stop = true;
         }
+        for grant in &observed.started {
+            let next = self.waiting.iter().position(|(_, size)| self.can_run(*size));
+            prop_assert!(next.is_some(), "a job started that did not wait");
+            let (id, size) = self.waiting.remove(next.unwrap());
+            prop_assert_eq!(
+                (grant.slot, grant.size, grant.expires),
+                (id, size, None),
+                "not the job that waited longest"
+            );
+            self.check_grant(size, true)?;
+            self.held.push(Held {
+                id,
+                size,
+                cpus: grant.cpus,
+                deadline: None,
+                usage: None,
+                told_to_stop: false,
+            });
+        }
         Ok(())
     }
 
@@ -538,6 +629,11 @@ impl World {
             self.held.iter().map(|slot| slot.cpus).sum::<u32>()
         );
         prop_assert_eq!(self.budget.slots(), self.held.len());
+        prop_assert_eq!(
+            self.budget.waiting(),
+            self.waiting.len(),
+            "a job that waits was lost or made up"
+        );
         prop_assert!(
             self.committed() <= self.settings.away.cap_bytes,
             "more promised than the cap"
@@ -554,6 +650,13 @@ impl World {
         if self.budget.level(self.now) != Level::Open {
             prop_assert_eq!(free, Default::default(), "slots offered while not open");
         }
+        if self.someone_waits() {
+            prop_assert_eq!(
+                free,
+                Default::default(),
+                "slots offered while an assigned job waits"
+            );
+        }
         Ok(())
     }
 }
@@ -569,6 +672,7 @@ proptest! {
             now: ms(1_000_000),
             seen: Vec::new(),
             held: Vec::new(),
+            waiting: Vec::new(),
             gone: Vec::new(),
             swapouts: 0,
             swap_used: 0,
@@ -586,7 +690,11 @@ proptest! {
             prop_assert!(world.budget.release(slot.id).is_ok());
             prop_assert!(world.budget.release(slot.id).is_err());
         }
+        for (id, size) in std::mem::take(&mut world.waiting) {
+            prop_assert_eq!(world.budget.withdraw(id), Ok(size));
+        }
         prop_assert_eq!((world.budget.committed_bytes(), world.budget.cpus_committed(), world.budget.slots()), (0, 0, 0));
+        prop_assert_eq!(world.budget.waiting(), 0);
         // Not a rule, but a guard for this test: it must not pass because nothing was ever granted.
         prop_assume!(granted > 0 || ops.len() < 150);
     }

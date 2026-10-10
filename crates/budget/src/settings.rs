@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{GIB, HostFacts, MIB, Millis, Size};
+use crate::{GIB, HostFacts, MIB, Millis, Refusal, Size, admit};
 
 /// Whether a person works on this Mac.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -253,6 +253,12 @@ impl Settings {
             return Err(SettingsError::DiskLimitsCrossed);
         }
         Ok(())
+    }
+
+    /// Whether this Mac could run a VM of this size at all: alone, with all its memory available and its person
+    /// away. Sizes that fail are not worth offering to GitHub from this Mac.
+    pub fn can_run(&self, size: Size) -> Result<(), Refusal> {
+        admit(self, &self.away, self.total_bytes, &[], size)
     }
 
     /// vCPUs of a VM of this size.
