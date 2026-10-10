@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use cf_fake_github::Options;
 use cf_fake_github::httpd::Reply;
 use cf_ghapp::RetryPolicy;
-use cf_scaleset::{Backoff, Error, ScaleSet, listen, shutdown, supervise};
+use cf_scaleset::{Backoff, Error, ScaleSet, listen, listen_nudged, shutdown, supervise};
 use serde_json::json;
 use support::recorder::{Recorder, Seen};
 use support::*;
@@ -36,6 +36,46 @@ fn job_message(id: i64, request: i64) -> Reply {
         &json!({"messageId": id, "messageType": "RunnerScaleSetJobMessages", "body": json!([item]).to_string(),
         "statistics": {"totalAvailableJobs": 1}}),
     )
+}
+
+// What changes on the machine while GitHub is silent (a slot opened, a waiting job's turn came) must not wait for
+// the long poll to run out: a nudge ends the wait, the scaler is asked, and a message queued meanwhile still comes.
+#[tokio::test]
+async fn a_nudge_ends_the_wait_asks_the_scaler_and_loses_no_message() {
+    let h = harness().await;
+    let (_, session) = with_session(&h).await;
+    h.fake.set_poll_timeout(Duration::from_secs(30));
+    let nudge = Arc::new(Notify::new());
+    let mut scaler = Recorder::new(1);
+    let seen = scaler.clone();
+    let (trigger, stop) = shutdown();
+    let task = tokio::spawn({
+        let (session, nudge) = (session.clone(), nudge.clone());
+        async move { listen_nudged(&session, &mut scaler, stop, &nudge).await }
+    });
+    until("the first wait", || polls(&h) == 1).await;
+    let quiet = |seen: &Recorder| {
+        seen.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| matches!(s, Seen::Quiet))
+            .count()
+    };
+    assert_eq!(quiet(&seen), 0, "the scaler was asked before anything happened");
+    let asked = Instant::now();
+    nudge.notify_one();
+    until("the scaler to be asked again", || quiet(&seen) == 1).await;
+    until("the next wait", || polls(&h) == 2).await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "the nudge waited for the poll to run out"
+    );
+    // A job queued now arrives on the wait that followed the nudge.
+    h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    until("the job's message", || seen.messages().len() == 1).await;
+    trigger.trigger();
+    task.await.unwrap().unwrap();
 }
 
 // A message is handled first and acknowledged after: while the scaler is busy with it, the service still has it.

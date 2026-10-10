@@ -1,39 +1,66 @@
+use cf_budget::{Size, SlotId};
 use cf_scaleset::{Error, JitConfig};
 use cf_secret::Secret;
+use cf_vmhost::OutOfMemory;
 use std::future::Future;
 use time::OffsetDateTime;
 
-/// A slot that was promised to a job or given to an Actions runner. The budget's `SlotId` in the real daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Ticket(pub u64);
+/// A slot that was promised to a job or given to an Actions runner: the budget's slot.
+pub type Ticket = SlotId;
 
 /// Why no slot was given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal(pub String);
 
+/// What a job that is already this machine's gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// A slot: start the Actions runner now.
+    Start(Ticket),
+    /// A place in line. The job starts when [`Slots::ready`] says so; a job that went away gives its place back
+    /// with [`Slots::withdraw`].
+    Waits {
+        /// The place in line.
+        ticket: Ticket,
+        /// What it waits for, in the budget's word.
+        why: String,
+    },
+    /// No change of memory, of who is at the Mac or of what else runs makes this size fit: the settings do not allow
+    /// it. Nothing is held.
+    Never(String),
+}
+
 /// The machine's slots, which every scale set together share: the budget, from the scaler's side.
 ///
-/// A slot is promised before a job is acquired ([`Slots::reserve`]), made an Actions runner's when the service says the
-/// job is assigned ([`Slots::claim`]), and given back once, when its virtual machine is gone ([`Slots::release`]);
-/// never while the machine may still run. The scaler gives back the promises nobody claims (the job went elsewhere, the
-/// acquire failed, no assignment came within [`crate::PROMISE_TTL`], the scaler went away), so the budget needs no
-/// clock of its own; one that lets promises run out as well loses nothing, since a claim then takes a free slot.
+/// A slot is promised before a job is acquired ([`Slots::reserve`]), made an Actions runner's when the service says
+/// the job is assigned ([`Slots::claim`]), and given back once: by the scaler while no machine was started for it
+/// ([`Slots::release`], [`Slots::withdraw`]), by whoever watches the machines afterwards, when the machine is gone
+/// and never while it may still run. The scaler gives back the promises nobody claims (the job went elsewhere, the
+/// acquire failed, no assignment came within [`crate::PROMISE_TTL`], the scaler went away); the budget lets them run
+/// out as well and loses nothing, since a claim then asks anew.
 pub trait Slots: Send + Sync {
     /// Promises a slot of this size to a job about to be acquired. A refusal says why: the machine takes no new
     /// jobs now (someone works on it, memory is short), or it is full.
-    fn reserve(&self, size_gb: u32) -> Result<Ticket, Refusal>;
+    fn reserve(&self, size: Size) -> Result<Ticket, Refusal>;
 
-    /// Gives a promise back, or a claimed slot whose Actions runner did not start or whose machine is gone. A ticket
-    /// the budget no longer knows (given back already, run out) is not an error.
+    /// Gives back a promise, or a slot whose Actions runner was not started. A ticket the budget no longer knows
+    /// (given back already, run out) is not an error.
     fn release(&self, ticket: Ticket);
 
-    /// A slot for the Actions runner of a job already assigned: the promised one, or, when the promise ran out or there
-    /// was none, a free one even while the machine is closed to new jobs, since the job is already this machine's.
-    /// `None` when the machine has no room. The promise is used up either way.
-    fn claim(&self, size_gb: u32, promised: Option<Ticket>) -> Option<Ticket>;
+    /// A slot for the Actions runner of a job already assigned: the promised one, or, when the promise ran out or
+    /// there was none, what the budget gives a job that is already this machine's. Such a job is never turned
+    /// away for who is at the Mac: it starts, or it waits in line. The promise is used up either way.
+    fn claim(&self, size: Size, promised: Option<Ticket>) -> Claim;
+
+    /// Whether the job that waits with this ticket may start now. From then on the ticket is a slot like any other.
+    fn ready(&self, ticket: Ticket) -> bool;
+
+    /// Gives a place in line back: the job that waited went away. Also fine for a ticket that became ready and
+    /// whose Actions runner was never started.
+    fn withdraw(&self, ticket: Ticket);
 
     /// How many more slots of this size would open now; 0 while the machine takes no new jobs.
-    fn open_slots(&self, size_gb: u32) -> usize;
+    fn open_slots(&self, size: Size) -> usize;
 
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
@@ -50,8 +77,8 @@ pub struct RunnerSpec {
     pub scale_set_id: i64,
     /// The service's ID for the registered Actions runner.
     pub runner_id: i64,
-    /// The memory size class in GB.
-    pub size_gb: u32,
+    /// The machine's size.
+    pub size: Size,
     /// The slot it runs in.
     pub ticket: Ticket,
     /// What the Actions runner starts with. A credential.
@@ -63,20 +90,59 @@ pub struct RunnerSpec {
 #[error("{0}")]
 pub struct HostError(pub String);
 
-/// Starts and stops the virtual machines of Actions runners: the VM monitor and the lifecycle, from the scaler's side.
+/// Starts and stops the virtual machines of Actions runners: the vm-hosts and the lifecycle, from the scaler's side.
 pub trait Hosts: Send + Sync {
-    /// Starts a machine for the Actions runner and returns its handle. After an error no machine stands: the host
-    /// removes what it had begun before it answers, since the scaler then gives the slot to another job.
+    /// An Actions runner of this name is about to be registered for a scale set. Written down before GitHub is
+    /// asked, so that a Runner that dies between the registration and the machine's start finds the name again and
+    /// removes the registration.
+    fn registering(&self, name: &str, repo: &str, scale_set_id: i64);
+
+    /// The registration of that name was refused or is removed again: nothing of it is left at GitHub.
+    fn not_registered(&self, name: &str);
+
+    /// GitHub gave no clear answer to the registration of that name (the connection broke, a 5xx): it may exist.
+    /// Whoever removes left-over registrations looks for it by name.
+    fn registration_unsure(&self, name: &str);
+
+    /// Starts a machine for the Actions runner and returns its handle. After an error no machine stands and the
+    /// slot is still the caller's: the host removed what it had begun before it answers. After a success the slot
+    /// is the machine's, and goes back when the machine is gone.
     fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send;
 
-    /// Stops a machine and removes it; one that is gone already is stopped. After an error the machine may still
-    /// stand, so the scaler leaves it its slot.
+    /// Asks a machine to stop; one that is gone already is stopped. The machine goes away, and its slot with it,
+    /// in its own time. After an error the machine stands as before.
     fn stop(&self, handle: &str) -> impl Future<Output = Result<(), HostError>> + Send;
 
-    /// Whether the machine lost a process because it had used up its memory. An error when that is not known (the
-    /// monitor does not answer, the machine is gone), never `false`: the scaler then asks whoever watched the
+    /// Whether the machine lost a process because it had used up its memory. `Unknown` when nobody can say (the
+    /// vm-host does not answer, the machine's state is gone), never `No`: the scaler then asks whoever watched the
     /// machine go.
-    fn out_of_memory(&self, handle: &str) -> impl Future<Output = Result<bool, HostError>> + Send;
+    fn out_of_memory(&self, handle: &str) -> impl Future<Output = OutOfMemory> + Send;
+}
+
+impl<T: Hosts> Hosts for std::sync::Arc<T> {
+    fn registering(&self, name: &str, repo: &str, scale_set_id: i64) {
+        (**self).registering(name, repo, scale_set_id);
+    }
+
+    fn not_registered(&self, name: &str) {
+        (**self).not_registered(name);
+    }
+
+    fn registration_unsure(&self, name: &str) {
+        (**self).registration_unsure(name);
+    }
+
+    fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send {
+        (**self).start(spec)
+    }
+
+    fn stop(&self, handle: &str) -> impl Future<Output = Result<(), HostError>> + Send {
+        (**self).stop(handle)
+    }
+
+    fn out_of_memory(&self, handle: &str) -> impl Future<Output = OutOfMemory> + Send {
+        (**self).out_of_memory(handle)
+    }
 }
 
 /// Acquires jobs for the scale set (the message session).

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::error::Error;
 use crate::session::MessageSession;
@@ -60,10 +60,19 @@ impl Shutdown {
 /// back. A message with an ID at or below one already handled in this session (delivered twice) is acknowledged
 /// without being handled again. `stop` interrupts only the wait for a message: one received is handled and
 /// acknowledged first, so nothing the scaler was given is dropped.
-pub async fn listen(
+pub async fn listen(session: &MessageSession, scaler: &mut impl Scaler, stop: Shutdown) -> Result<(), Error> {
+    listen_nudged(session, scaler, stop, &Notify::new()).await
+}
+
+/// [`listen`], with a wait for a message that a nudge ends too: the scaler is asked again at once, as after a
+/// quiet poll, and the next wait carries the capacity it then gives. For what changes on the machine while nobody
+/// writes: a slot that opened, a waiting job whose turn came. A nudge during the handling of a message is kept
+/// for the next wait; several are one.
+pub async fn listen_nudged(
     session: &MessageSession,
     scaler: &mut impl Scaler,
     mut stop: Shutdown,
+    nudge: &Notify,
 ) -> Result<(), Error> {
     let mut capacity = scaler
         .scale(Some(&Message::initial(session.initial_statistics())))
@@ -76,6 +85,9 @@ pub async fn listen(
         let polled = tokio::select! {
             biased;
             () = stop.wait() => return Ok(()),
+            // The wait is given up; a message it was about to bring stays in the session's queue and comes with
+            // the next one.
+            () = nudge.notified() => None,
             polled = session.poll(handled, capacity) => polled?,
         };
         match polled {

@@ -115,13 +115,21 @@ version = "0.1.0"
 name = "cf-daemon"
 version = "0.1.0"
 dependencies = [
+ "cf-budget",
  "cf-fake-github",
  "cf-ghapp",
+ "cf-guest-proto",
+ "cf-host-macos",
+ "cf-lifecycle",
  "cf-scaleset",
  "cf-secret",
+ "cf-vmhost",
  "cf-workflows",
+ "libc",
  "proptest",
  "rand 0.9.5",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "time",

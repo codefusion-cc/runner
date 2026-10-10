@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use crate::traits::{Slots, Ticket};
+use crate::traits::Ticket;
 
 /// What an Actions runner works on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,14 +120,5 @@ impl Roster {
             .values()
             .filter(|r| r.scale_set_id == scale_set_id && r.done.is_none())
             .count()
-    }
-
-    /// An Actions runner's machine is gone: forgets the Actions runner and gives its slot back, once.
-    pub fn exited(&self, name: &str, slots: &dyn Slots) -> Option<Runner> {
-        let runner = self.remove(name)?;
-        if let Some(ticket) = runner.ticket {
-            slots.release(ticket);
-        }
-        Some(runner)
     }
 }

@@ -20,8 +20,8 @@ async fn a_job_the_closed_machine_refused_waits_at_github_and_is_taken_once_the_
     )
     .await;
     h.fake.set_poll_timeout(Duration::from_millis(150));
-    h.slots.set_open(false, "in use");
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "build");
+    h.slots.set_open(false);
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
 
     let (trigger, stop) = shutdown();
     let (session, mut scaler) = (h.session.clone(), h.scaler);
@@ -43,7 +43,7 @@ async fn a_job_the_closed_machine_refused_waits_at_github_and_is_taken_once_the_
     assert!(h.hosts.started().is_empty());
     assert_eq!(h.fake.count("acquirejobs"), 0);
 
-    h.slots.set_open(true, "");
+    h.slots.set_open(true);
     until("a runner for the job", || h.hosts.started().len() == 1).await;
     assert_eq!(h.fake.runners().len(), 1);
     assert!(
@@ -62,7 +62,7 @@ async fn a_job_the_closed_machine_refused_waits_at_github_and_is_taken_once_the_
 #[tokio::test]
 async fn a_stop_before_the_assignment_gives_the_promise_back_and_the_next_listener_starts_the_job() {
     let h = harness(2).await;
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "build");
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     let (trigger, stop) = shutdown();
     // Asked to stop just before the service handles the acknowledgement, so the listener sees it at its next
     // look, before any other message.
@@ -81,7 +81,7 @@ async fn a_stop_before_the_assignment_gives_the_promise_back_and_the_next_listen
         1,
         "the promise went back with the scaler"
     );
-    assert_eq!(h.slots.used_gb(), 0);
+    assert_eq!(h.slots.used(), 0);
 
     let mut scaler = scaler_of(&Parts {
         client: &h.client,
@@ -100,7 +100,7 @@ async fn a_stop_before_the_assignment_gives_the_promise_back_and_the_next_listen
         h.hosts.started().len() == 1
     })
     .await;
-    assert_eq!((h.slots.claimed(), h.slots.used_gb()), (1, 1));
+    assert_eq!((h.slots.claimed(), h.slots.used()), (1, 1));
     trigger.trigger();
     task.await.unwrap().expect("a clean stop");
 }
@@ -110,7 +110,7 @@ async fn a_stop_before_the_assignment_gives_the_promise_back_and_the_next_listen
 #[tokio::test]
 async fn a_stop_after_the_assignment_leaves_the_actions_runner_its_slot() {
     let h = harness(2).await;
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "build");
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     let (trigger, stop) = shutdown();
     let (session, mut scaler) = (h.session.clone(), h.scaler);
     let task = tokio::spawn(async move { listen(&session, &mut scaler, stop).await });
@@ -123,7 +123,7 @@ async fn a_stop_after_the_assignment_leaves_the_actions_runner_its_slot() {
     trigger.trigger();
     task.await.unwrap().expect("a clean stop");
     assert_eq!(h.fake.job_state(id), Some(JobState::Acquired(h.set.id)));
-    assert_eq!((h.slots.claimed(), h.slots.used_gb()), (1, 1));
+    assert_eq!((h.slots.claimed(), h.slots.used()), (1, 1));
     assert!(
         h.slots.released().is_empty(),
         "the slot of a standing machine is not given back"

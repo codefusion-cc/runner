@@ -37,6 +37,12 @@ pub fn runner_name(machine: &str, random: u32) -> String {
     format!("{machine}-j{:07x}", random & 0x0fff_ffff)
 }
 
+/// The name an Actions runner's machine has on this Mac: the random part of the Actions runner's name, which is
+/// what a vm-host allows (32 plain characters at most) whatever the Mac is called.
+pub fn job_name(runner: &str) -> &str {
+    runner.rsplit('-').next().unwrap_or(runner)
+}
+
 /// Names a machine's scale set for one label set: the machine, a double dash (which machine names never contain,
 /// so `mac-a` never claims the sets of `mac-a-2`), the labels that tell repositories' sets apart, and a hash of the
 /// whole set so that two sets never share a name.

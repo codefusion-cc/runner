@@ -6,16 +6,27 @@
 //! [`cf_scaleset`] client.
 
 mod adapters;
+mod ends;
+mod machines;
 pub mod names;
+mod records;
 mod roster;
 mod scaler;
 #[doc(hidden)]
 pub mod testing;
 mod traits;
+mod vms;
 
 pub use adapters::SetRegistry;
+pub use ends::{EndKind, machine_end};
+pub use machines::{
+    JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT, Registration,
+    Reports, Snapshot,
+};
+pub use records::{DiskStore, Ending, GithubJob, MemoryStore, Record, SavedSlot, Store, replace_private};
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory};
 pub use traits::{
-    EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
+    Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
 };
+pub use vms::{Seen, VmError, VmHosts, Vms};
