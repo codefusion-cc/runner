@@ -9,14 +9,8 @@ fn main() -> std::process::ExitCode {
     use cf_host_macos::{MacHost, reading};
 
     let disk = std::env::args().nth(1).unwrap_or_else(|| "/".into());
-    let mut host = match MacHost::new(std::path::Path::new(&disk)) {
-        Ok(host) => host,
-        Err(error) => {
-            eprintln!("cannot read this Mac: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
     let result = (|| {
+        let host = MacHost::new(std::path::Path::new(&disk))?;
         let facts = host.facts()?;
         let now = host.now();
         let raw = host.raw()?;

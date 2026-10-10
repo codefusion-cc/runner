@@ -43,7 +43,7 @@ fn the_facts_are_what_sysctl_prints() {
 
 #[test]
 fn the_page_counts_are_what_vm_stat_prints() {
-    let mut host = MacHost::new(Path::new("/")).unwrap();
+    let host = MacHost::new(Path::new("/")).unwrap();
     let before = host.raw().unwrap();
     let total_pages = host.facts().unwrap().total_bytes / before.page_bytes;
     // Memory moves between two looks at it, but a field read from the wrong place is off by far more than this.
@@ -93,7 +93,7 @@ fn the_page_counts_are_what_vm_stat_prints() {
 
 #[test]
 fn pressure_and_swap_are_what_sysctl_prints() {
-    let mut host = MacHost::new(Path::new("/")).unwrap();
+    let host = MacHost::new(Path::new("/")).unwrap();
     let before = host.raw().unwrap();
     let level: i32 = sysctl("kern.memorystatus_vm_pressure_level").parse().unwrap();
     let after = host.raw().unwrap();
@@ -147,8 +147,82 @@ fn a_reading_is_made_of_the_raw_answers_and_fits_this_mac() {
 }
 
 #[test]
+fn both_clocks_count_milliseconds() {
+    let host = MacHost::new(Path::new("/")).unwrap();
+    let before = host.now();
+    // Longer than a second, so that both the seconds and the fraction of the clock's answer move.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let after = host.now();
+    for (name, passed) in [
+        ("elapsed", after.elapsed.0.checked_sub(before.elapsed.0)),
+        ("awake", after.awake.0.checked_sub(before.awake.0)),
+    ] {
+        let passed = passed.unwrap_or_else(|| panic!("the {name} clock went back"));
+        assert!(
+            (1200..5000).contains(&passed),
+            "{name}: {passed} ms for a sleep of 1200 ms"
+        );
+    }
+}
+
+#[test]
+fn the_idle_time_is_what_the_hid_system_says() {
+    let host = MacHost::new(Path::new("/")).unwrap();
+    // `    | |     "HIDIdleTime" = 891834416`, in nanoseconds.
+    let printed = || -> Option<u64> {
+        output("/usr/sbin/ioreg", &["-c", "IOHIDSystem", "-d", "4"])
+            .lines()
+            .find(|line| line.contains("\"HIDIdleTime\""))
+            .and_then(|line| line.rsplit('=').next()?.trim().parse().ok())
+    };
+    // A key pressed between two looks starts the time again, so ours before and after must enclose ioreg's in
+    // one of a few tries.
+    let enclosed = (0..20).any(|_| {
+        let before = host.raw().unwrap().idle_nanos;
+        let between = printed();
+        let after = host.raw().unwrap().idle_nanos;
+        match (before, between, after) {
+            // A Mac with no HID system to ask: then we say so too.
+            (None, None, None) => true,
+            (Some(before), Some(between), Some(after)) => before <= between && between <= after,
+            _ => false,
+        }
+    });
+    assert!(
+        enclosed,
+        "ioreg says {:?}, we read {:?}",
+        printed(),
+        host.raw().unwrap().idle_nanos
+    );
+}
+
+#[test]
+fn the_thermal_level_is_the_notification_state() {
+    let host = MacHost::new(Path::new("/")).unwrap();
+    // "com.apple.system.thermalpressurelevel 0"
+    let printed = || -> u64 {
+        output(
+            "/usr/bin/notifyutil",
+            &["-g", "com.apple.system.thermalpressurelevel"],
+        )
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap()
+    };
+    let before = host.raw().unwrap().thermal_level;
+    let level = printed();
+    let after = host.raw().unwrap().thermal_level;
+    assert!(
+        level == before || level == after,
+        "{level}, read {before} and {after}"
+    );
+}
+
+#[test]
 fn the_disk_is_the_one_the_path_names() {
-    let mut host = MacHost::new(Path::new("/")).unwrap();
+    let host = MacHost::new(Path::new("/")).unwrap();
     // `df -k /`: the fourth column of the last line is what is available, in kilobytes.
     let printed = output("/bin/df", &["-k", "/"]);
     let available: u64 = printed

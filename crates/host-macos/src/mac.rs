@@ -62,7 +62,8 @@ fn errno() -> i64 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0).into()
 }
 
-fn sysctl<T: Plain>(name: &'static CStr, what: &'static str) -> Result<T, HostError> {
+fn sysctl<T: Plain>(name: &'static CStr) -> Result<T, HostError> {
+    let what = name.to_str().unwrap_or("sysctl");
     let mut value = MaybeUninit::<T>::zeroed();
     let mut len = size_of::<T>();
     // SAFETY: the name ends with a NUL; `value` is `len` writable bytes, and the kernel writes at most `len` and
@@ -101,17 +102,56 @@ fn clock(id: libc::clockid_t) -> Option<Millis> {
     (status == 0).then(|| Millis(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000)))
 }
 
-fn hid_system() -> u32 {
+/// The HID system's idle time in nanoseconds; `None` when macOS has no HID system (no window server yet) or it
+/// gives no such number. The entry is looked up for every reading, so a window server that started again is
+/// found again.
+fn idle_nanos() -> Option<u64> {
     // SAFETY: the name ends with a NUL. The dictionary `IOServiceMatching` makes is consumed by
     // `IOServiceGetMatchingService`, which is not called with a null one. Port 0 is the default main port.
-    unsafe {
+    let hid = unsafe {
         let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
         if matching.is_null() {
-            0
-        } else {
-            IOServiceGetMatchingService(0, matching)
+            return None;
         }
+        IOServiceGetMatchingService(0, matching)
+    };
+    if hid == 0 {
+        return None;
     }
+    // SAFETY: the text ends with a NUL; a null allocator is the default one. `hid` is the entry found above and
+    // `key`, when there is one, a string made here: both are used only up to their release below, once each.
+    let value = unsafe {
+        let key = CFStringCreateWithCString(ptr::null(), c"HIDIdleTime".as_ptr(), CF_UTF8);
+        let value = if key.is_null() {
+            ptr::null()
+        } else {
+            let value = IORegistryEntryCreateCFProperty(hid, key, ptr::null(), 0);
+            CFRelease(key);
+            value
+        };
+        IOObjectRelease(hid);
+        value
+    };
+    if value.is_null() {
+        return None;
+    }
+    let mut nanos: i64 = 0;
+    // SAFETY: `value` is an object this call owns (it was created for it). It is read as a number only after
+    // its type was checked, into an i64, which is what the SInt64 type writes. It is released once.
+    let read = unsafe {
+        let read = CFGetTypeID(value) == CFNumberGetTypeID()
+            && CFNumberGetValue(value, CF_NUMBER_SINT64, (&raw mut nanos).cast()) != 0;
+        CFRelease(value);
+        read
+    };
+    if read { u64::try_from(nanos).ok() } else { None }
+}
+
+/// Whether an answer of `words` 32-bit words reaches past the last field read here. An older macOS knows fewer
+/// fields and writes fewer.
+fn has_every_field_read(words: u32) -> bool {
+    let needed = offset_of!(libc::vm_statistics64, internal_page_count) + size_of::<libc::natural_t>();
+    (words as usize) * size_of::<libc::integer_t>() >= needed
 }
 
 /// This Mac. It only reads: nothing it calls changes a setting, a file or another process.
@@ -120,8 +160,6 @@ pub struct MacHost {
     host_port: u32,
     disk: CString,
     thermal_token: c_int,
-    /// The HID system's registry entry, 0 when macOS has none (no window server yet).
-    hid: u32,
 }
 
 impl MacHost {
@@ -145,18 +183,14 @@ impl MacHost {
             host_port: mach_host_self(),
             disk,
             thermal_token,
-            hid: hid_system(),
         })
     }
 
     /// What macOS answers now, before anything is made of it.
-    pub fn raw(&mut self) -> Result<Raw, HostError> {
+    pub fn raw(&self) -> Result<Raw, HostError> {
         let memory = self.memory()?;
-        let swap: libc::xsw_usage = sysctl(c"vm.swapusage", "vm.swapusage")?;
-        let pressure_level: i32 = sysctl(
-            c"kern.memorystatus_vm_pressure_level",
-            "kern.memorystatus_vm_pressure_level",
-        )?;
+        let swap: libc::xsw_usage = sysctl(c"vm.swapusage")?;
+        let pressure_level: i32 = sysctl(c"kern.memorystatus_vm_pressure_level")?;
         // SAFETY: no arguments; it answers with the page size or -1.
         let page_bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_bytes = u64::try_from(page_bytes).map_err(|_| HostError::Call {
@@ -178,7 +212,7 @@ impl MacHost {
             pressure_level,
             swap_used_bytes: swap.xsu_used,
             swap_total_bytes: swap.xsu_total,
-            idle_nanos: self.idle_nanos(),
+            idle_nanos: idle_nanos(),
             thermal_level: self.thermal_level()?,
             power_remaining_secs: IOPSGetTimeRemainingEstimate(),
             disk_free_bytes: self.disk_free_bytes()?,
@@ -204,9 +238,7 @@ impl MacHost {
                 code: status.into(),
             });
         }
-        // An older macOS knows fewer fields and writes fewer; the last one read here must be among them.
-        let needed = offset_of!(libc::vm_statistics64, internal_page_count) + size_of::<libc::natural_t>();
-        if (words as usize) * size_of::<libc::integer_t>() < needed {
+        if !has_every_field_read(words) {
             return Err(HostError::Implausible {
                 what: "host_statistics64",
                 value: format!("{words} words"),
@@ -214,41 +246,6 @@ impl MacHost {
         }
         // SAFETY: the struct is integers only and was zeroed before the kernel wrote into it.
         Ok(unsafe { stats.assume_init() })
-    }
-
-    fn idle_nanos(&mut self) -> Option<u64> {
-        if self.hid == 0 {
-            self.hid = hid_system();
-        }
-        if self.hid == 0 {
-            return None;
-        }
-        // SAFETY: the text ends with a NUL; a null allocator is the default one.
-        let key = unsafe { CFStringCreateWithCString(ptr::null(), c"HIDIdleTime".as_ptr(), CF_UTF8) };
-        if key.is_null() {
-            return None;
-        }
-        // SAFETY: `hid` is a registry entry this struct holds, `key` a string that lives until the release below.
-        let value = unsafe { IORegistryEntryCreateCFProperty(self.hid, key, ptr::null(), 0) };
-        // SAFETY: `key` was made above, is owned here and is not used again.
-        unsafe { CFRelease(key) };
-        if value.is_null() {
-            // The entry may be stale (the window server started again): look it up again at the next reading.
-            // SAFETY: `hid` is an entry this struct holds; it is set to 0 here and not used again.
-            unsafe { IOObjectRelease(self.hid) };
-            self.hid = 0;
-            return None;
-        }
-        let mut nanos: i64 = 0;
-        // SAFETY: `value` is an object this call owns (it was created for it). It is read as a number only after
-        // its type was checked, into an i64, which is what the SInt64 type writes. It is released once.
-        let read = unsafe {
-            let read = CFGetTypeID(value) == CFNumberGetTypeID()
-                && CFNumberGetValue(value, CF_NUMBER_SINT64, (&raw mut nanos).cast()) != 0;
-            CFRelease(value);
-            read
-        };
-        if read { u64::try_from(nanos).ok() } else { None }
     }
 
     fn thermal_level(&self) -> Result<u64, HostError> {
@@ -283,14 +280,13 @@ impl MacHost {
 
 impl Host for MacHost {
     fn facts(&self) -> Result<HostFacts, HostError> {
-        let total_bytes: u64 = sysctl(c"hw.memsize", "hw.memsize")?;
-        let cores: i32 = sysctl(c"hw.ncpu", "hw.ncpu")?;
-        let cores = u32::try_from(cores).ok().filter(|cores| *cores > 0);
-        match (total_bytes, cores) {
-            (1.., Some(cores)) => Ok(HostFacts { total_bytes, cores }),
+        let total_bytes: u64 = sysctl(c"hw.memsize")?;
+        let cores: i32 = sysctl(c"hw.ncpu")?;
+        match (total_bytes, u32::try_from(cores)) {
+            (1.., Ok(cores @ 1..)) => Ok(HostFacts { total_bytes, cores }),
             _ => Err(HostError::Implausible {
                 what: "the Mac's memory and cores",
-                value: format!("{total_bytes} bytes, {cores:?} cores"),
+                value: format!("{total_bytes} bytes, {cores} cores"),
             }),
         }
     }
@@ -314,13 +310,24 @@ impl Host for MacHost {
 
 impl Drop for MacHost {
     fn drop(&mut self) {
-        // SAFETY: the token and the registry entry were opened in `new` (or on a later read) and are not used
-        // after this.
+        // SAFETY: the token was opened in `new` and is not used after this.
         unsafe {
             notify_cancel(self.thermal_token);
-            if self.hid != 0 {
-                IOObjectRelease(self.hid);
-            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_every_field_read;
+
+    #[test]
+    fn an_answer_that_ends_before_the_last_field_read_is_told_apart() {
+        // <mach/vm_statistics.h>: `internal_page_count` is the 36th 32-bit word of `vm_statistics64`, and macOS
+        // writes 38 today.
+        assert!(!has_every_field_read(0));
+        assert!(!has_every_field_read(35));
+        assert!(has_every_field_read(36));
+        assert!(has_every_field_read(libc::HOST_VM_INFO64_COUNT));
     }
 }
