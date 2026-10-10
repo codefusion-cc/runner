@@ -110,6 +110,20 @@ dependencies = [
 [[package]]
 name = "cf-console-client"
 version = "0.1.0"
+dependencies = [
+ "cf-fake-console",
+ "cf-fake-github",
+ "cf-ghapp",
+ "cf-secret",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cf-daemon"
@@ -135,6 +149,16 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cf-fake-console"
+version = "0.1.0"
+dependencies = [
+ "cf-fake-github",
+ "rand 0.9.5",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -238,6 +262,9 @@ dependencies = [
 [[package]]
 name = "cf-secret"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "cf-supervisor"

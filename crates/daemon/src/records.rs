@@ -232,21 +232,7 @@ impl DiskStore {
     }
 }
 
-/// Writes a file for this user alone and puts it in place in one step, so that a reader never sees half of it.
-pub fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let partial = path.with_extension("partial");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&partial)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&partial, path)
-}
+pub use cf_secret::replace_private;
 
 impl Store for DiskStore {
     fn save(&self, record: &Record) {

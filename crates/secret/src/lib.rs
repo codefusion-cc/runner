@@ -5,7 +5,11 @@
 //! types that do not already allow it. The value comes out only through [`Secret::expose`], so every use of it can be
 //! found with a search.
 
+mod file;
+
 use std::fmt;
+
+pub use file::replace_private;
 
 /// A value that must not be printed. See the [crate documentation](crate).
 #[derive(Clone, PartialEq, Eq)]
