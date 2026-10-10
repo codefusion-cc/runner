@@ -1,7 +1,7 @@
 //! Two Macs to test with, and readings of a Mac where nothing is wrong.
 #![allow(dead_code)]
 
-use cf_budget::{Budget, GIB, HostFacts, HostReading, Millis, Mode, Now, Pressure, Settings, Thermal};
+use cf_budget::{Budget, GIB, Grant, HostFacts, HostReading, Millis, Mode, Now, Pressure, Settings, Thermal};
 
 /// A 16 GB Mac with 10 cores that nobody works on.
 pub const DEDICATED: HostFacts = HostFacts {
@@ -54,13 +54,22 @@ pub fn calm(at: Now) -> HostReading {
     }
 }
 
-/// One reading a second from `from` to `to` seconds, both included, each changed by `change`.
-pub fn watch(budget: &mut Budget, from: u64, to: u64, change: impl Fn(&mut HostReading)) {
+/// One reading a second from `from` to `to` seconds, both included, each changed by `change`; the assigned jobs
+/// that started, with the second.
+pub fn watch(
+    budget: &mut Budget,
+    from: u64,
+    to: u64,
+    change: impl Fn(&mut HostReading),
+) -> Vec<(u64, Grant)> {
+    let mut started = Vec::new();
     for second in from..=to {
         let mut reading = calm(secs(second));
         change(&mut reading);
-        budget.observe(secs(second), Some(reading));
+        let observed = budget.observe(secs(second), Some(reading));
+        started.extend(observed.started.into_iter().map(|grant| (second, grant)));
     }
+    started
 }
 
 /// A budget that has seen 60 s of calm readings: it is open at second 60.

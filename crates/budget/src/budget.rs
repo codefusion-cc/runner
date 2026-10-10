@@ -481,21 +481,18 @@ impl Budget {
         if let Err(never) = self.settings.can_run(size) {
             return Assigned::Never(never);
         }
-        let why = match self.next_waiting() {
-            Some(_) => Refusal::AssignedFirst {
-                waiting: self.waiting.len(),
-            },
-            None => match self.assigned_fits(now, size) {
-                Ok(()) => {
-                    let slot = self.next_id();
-                    return Assigned::Start(self.insert(slot, size, None, self.assigned_origin(now)));
-                }
-                Err(why) => why,
-            },
-        };
         let slot = self.next_id();
-        self.waiting.push_back((slot, size));
-        Assigned::Waits { slot, why }
+        let fits = match self.assigned_first() {
+            Some(first) => Err(first),
+            None => self.assigned_fits(now, size),
+        };
+        match fits {
+            Ok(()) => Assigned::Start(self.insert(slot, size, None, self.assigned_origin(now))),
+            Err(why) => {
+                self.waiting.push_back((slot, size));
+                Assigned::Waits { slot, why }
+            }
+        }
     }
 
     /// Forgets an assigned job that still waits: GitHub took it back or it was cancelled. It held nothing. An
@@ -517,13 +514,7 @@ impl Budget {
     /// time it is read: only [`Budget::claim`] decides.
     pub fn fits(&self, now: Now, size: Size) -> Result<(), Refusal> {
         let reading = self.gate(now)?;
-        admit(
-            &self.settings,
-            profile_for(&self.settings, Some(reading)),
-            reading.available_bytes,
-            &self.charges(),
-            size,
-        )
+        self.admits(reading, profile_for(&self.settings, Some(reading)), size)
     }
 
     /// The job for a reserved slot arrived: the reservation no longer runs out. Confirming twice is fine (GitHub
@@ -596,11 +587,12 @@ impl Budget {
     /// How many more slots of each size would fit now, each size counted alone. This is what the Runner tells
     /// GitHub it has; a slot still needs [`Budget::claim`].
     pub fn free(&self, now: Now) -> Free {
-        let mut free = Free::default();
-        let Ok(reading) = self.gate(now) else { return free };
+        let Ok(reading) = self.gate(now) else {
+            return Free::default();
+        };
         let limits = profile_for(&self.settings, Some(reading));
         let held = self.charges();
-        for size in Size::ALL {
+        Free(Size::ALL.map(|size| {
             let mut charges = held.clone();
             let one_more = Charge {
                 vm_bytes: size.vm_bytes(),
@@ -608,15 +600,16 @@ impl Budget {
                 resident_bytes: 0,
                 cpus: self.settings.vcpus_of(size),
             };
+            let mut more = 0;
             // The cap is at most the Mac's memory, so this ends; the bound is for a setting that slipped through.
-            while free.0[size.index()] < 1024
+            while more < 1024
                 && admit(&self.settings, limits, reading.available_bytes, &charges, size).is_ok()
             {
                 charges.push(one_more);
-                free.0[size.index()] += 1;
+                more += 1;
             }
-        }
-        free
+            more
+        }))
     }
 
     /// Everything the tray, the console and `status` show.
@@ -653,12 +646,10 @@ impl Budget {
         if person_there(&self.settings, Some(reading)) && self.settings.in_use.cap_bytes == 0 {
             return Err(Refusal::PersonThere);
         }
-        if self.next_waiting().is_some() {
-            return Err(Refusal::AssignedFirst {
-                waiting: self.waiting.len(),
-            });
+        match self.assigned_first() {
+            Some(first) => Err(first),
+            None => Ok(reading),
         }
-        Ok(reading)
     }
 
     /// What protects the Mac whoever asks: no hold, a reading to act on, nothing wrong, and not for the calm time.
@@ -688,13 +679,29 @@ impl Budget {
             floor_bytes: profile_for(&self.settings, Some(reading)).floor_bytes,
             ..self.settings.away
         };
+        self.admits(reading, &limits, size)
+    }
+
+    /// The arithmetic for one more slot of `size` under `limits`, on what `reading` shows.
+    fn admits(&self, reading: &HostReading, limits: &Profile, size: Size) -> Result<(), Refusal> {
         admit(
             &self.settings,
-            &limits,
+            limits,
             reading.available_bytes,
             &self.charges(),
             size,
         )
+    }
+
+    /// What whoever comes after the waiting jobs is told: how many of them go first. A job the settings have
+    /// since made impossible goes before nobody, so it does not count.
+    fn assigned_first(&self) -> Option<Refusal> {
+        let waiting = self
+            .waiting
+            .iter()
+            .filter(|(_, size)| self.settings.can_run(*size).is_ok())
+            .count();
+        (waiting > 0).then_some(Refusal::AssignedFirst { waiting })
     }
 
     /// The oldest waiting job this Mac can run at all, with its place in the line. A job that the settings have
@@ -785,7 +792,7 @@ impl Budget {
                 if held < self.settings.evict_min_held_bytes {
                     return None;
                 }
-                running.map(|(id, slot)| (slot.order, *id)).max()?.1
+                running.max_by_key(|(_, slot)| slot.order).map(|(id, _)| *id)?
             }
             EvictionCause::Disk => running
                 .map(|(id, slot)| (slot.usage.map_or(0, |(_, usage)| usage.scratch_bytes), *id))

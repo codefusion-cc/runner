@@ -14,18 +14,6 @@ use common::*;
 
 const OVERHEAD: u64 = 64 * MIB;
 
-/// One reading a second from `from` to `to`, each changed by `change`; the jobs that started, with the second.
-fn run(budget: &mut Budget, from: u64, to: u64, change: impl Fn(&mut HostReading)) -> Vec<(u64, Grant)> {
-    let mut started = Vec::new();
-    for second in from..=to {
-        let mut reading = calm(secs(second));
-        change(&mut reading);
-        let observed = budget.observe(secs(second), Some(reading));
-        started.extend(observed.started.into_iter().map(|grant| (second, grant)));
-    }
-    started
-}
-
 fn waits(assigned: Assigned) -> (SlotId, Refusal) {
     match assigned {
         Assigned::Waits { slot, why } => (slot, why),
@@ -80,7 +68,7 @@ fn on_an_open_mac_an_assigned_job_starts_at_once_and_its_slot_never_runs_out() {
 #[test]
 fn under_pressure_it_waits_holds_nothing_and_starts_sixty_seconds_after_the_pressure() {
     let mut budget = open(dedicated());
-    assert_eq!(run(&mut budget, 61, 61, |r| r.pressure = Pressure::Warning), []);
+    assert_eq!(watch(&mut budget, 61, 61, |r| r.pressure = Pressure::Warning), []);
     let (slot, why) = waits(budget.assign(secs(61), Size::G4));
     assert_eq!(why, Refusal::Trouble(Trouble::Pressure));
     assert_eq!(
@@ -94,10 +82,13 @@ fn under_pressure_it_waits_holds_nothing_and_starts_sixty_seconds_after_the_pres
     );
 
     // As long as the pressure lasts, and for the calm time after it, nothing starts.
-    assert_eq!(run(&mut budget, 62, 300, |r| r.pressure = Pressure::Warning), []);
-    assert_eq!(run(&mut budget, 301, 360, |_| {}), []);
+    assert_eq!(
+        watch(&mut budget, 62, 300, |r| r.pressure = Pressure::Warning),
+        []
+    );
+    assert_eq!(watch(&mut budget, 301, 360, |_| {}), []);
     assert_eq!(budget.waiting(), 1);
-    let started = run(&mut budget, 361, 361, |_| {});
+    let started = watch(&mut budget, 361, 361, |_| {});
     assert_eq!(started.len(), 1);
     let (second, grant) = started[0];
     assert_eq!(
@@ -109,13 +100,13 @@ fn under_pressure_it_waits_holds_nothing_and_starts_sixty_seconds_after_the_pres
         (4 * GIB, 1, 0)
     );
     // It starts once.
-    assert_eq!(run(&mut budget, 362, 500, |_| {}), []);
+    assert_eq!(watch(&mut budget, 362, 500, |_| {}), []);
 }
 
 #[test]
 fn the_person_being_there_does_not_keep_it_waiting() {
     let mut budget = open(workstation());
-    run(&mut budget, 61, 61, |r| r.idle = Millis::ZERO);
+    watch(&mut budget, 61, 61, |r| r.idle = Millis::ZERO);
     assert_eq!(budget.claim(secs(61), Size::G4), Err(Refusal::PersonThere));
     let grant = starts(budget.assign(secs(61), Size::G4));
     assert_eq!((grant.size, grant.expires), (Size::G4, None));
@@ -134,7 +125,7 @@ fn a_job_that_started_while_the_person_was_there_says_so() {
     let mut budget = open(workstation());
     let claimed = budget.claim(secs(60), Size::G2).unwrap();
     let away = starts(budget.assign(secs(60), Size::G2));
-    run(&mut budget, 61, 61, |r| r.idle = Millis::ZERO);
+    watch(&mut budget, 61, 61, |r| r.idle = Millis::ZERO);
     let in_use = starts(budget.assign(secs(61), Size::G2));
     assert_eq!(
         (claimed.origin, away.origin, in_use.origin),
@@ -167,9 +158,9 @@ fn a_job_that_started_while_the_person_was_there_says_so() {
         (Millis::mins(15), Origin::Assigned),
     ] {
         let mut budget = open(workstation());
-        run(&mut budget, 61, 61, person(5 * GIB));
+        watch(&mut budget, 61, 61, person(5 * GIB));
         let (slot, _) = waits(budget.assign(secs(61), Size::G4));
-        let started = run(&mut budget, 62, 62, |r| r.idle = idle);
+        let started = watch(&mut budget, 62, 62, |r| r.idle = idle);
         assert_eq!((started[0].1.slot, started[0].1.origin), (slot, origin));
         assert_eq!(budget.status(secs(62)).slots[0].origin, origin);
     }
@@ -183,11 +174,11 @@ fn while_the_person_is_there_it_needs_the_higher_floor() {
     let person =
         |available: u64| move |r: &mut HostReading| (r.idle, r.available_bytes) = (Millis::ZERO, available);
 
-    run(&mut budget, 61, 61, person(with_person - 1));
+    watch(&mut budget, 61, 61, person(with_person - 1));
     let (slot, why) = waits(budget.assign(secs(61), Size::G4));
     assert_eq!(why, Refusal::Memory { short_bytes: 1 });
-    assert_eq!(run(&mut budget, 62, 70, person(with_person - 1)), []);
-    let started = run(&mut budget, 71, 71, person(with_person));
+    assert_eq!(watch(&mut budget, 62, 70, person(with_person - 1)), []);
+    let started = watch(&mut budget, 71, 71, person(with_person));
     assert_eq!(
         started
             .iter()
@@ -198,19 +189,19 @@ fn while_the_person_is_there_it_needs_the_higher_floor() {
 
     // The same shortage ends when the person leaves: a gigabyte less is enough then.
     let mut budget = open(workstation());
-    run(&mut budget, 61, 61, person(with_person - GIB));
+    watch(&mut budget, 61, 61, person(with_person - GIB));
     let (slot, why) = waits(budget.assign(secs(61), Size::G4));
     assert_eq!(why, Refusal::Memory { short_bytes: GIB });
-    assert_eq!(run(&mut budget, 62, 70, person(with_person - GIB)), []);
+    assert_eq!(watch(&mut budget, 62, 70, person(with_person - GIB)), []);
     let away = |r: &mut HostReading| (r.idle, r.available_bytes) = (Millis::mins(15), with_person - GIB);
-    let started = run(&mut budget, 71, 71, away);
+    let started = watch(&mut budget, 71, 71, away);
     assert_eq!(
         started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
         [slot]
     );
     // One byte less than that and it would still wait.
     let mut budget = open(workstation());
-    run(&mut budget, 61, 61, |r| {
+    watch(&mut budget, 61, 61, |r| {
         (r.idle, r.available_bytes) = (Millis::mins(15), with_person - GIB - 1)
     });
     assert_eq!(
@@ -226,7 +217,7 @@ fn it_counts_against_the_cap_and_the_cpus_the_mac_has_without_its_person() {
     let cap = settings.away.cap_bytes;
     let person = |r: &mut HostReading| r.idle = Millis::ZERO;
     let mut budget = open(settings.clone());
-    run(&mut budget, 61, 61, person);
+    watch(&mut budget, 61, 61, person);
     let big = starts(budget.assign(secs(61), Size::G8));
     let (small, why) = waits(budget.assign(secs(61), Size::G2));
     assert_eq!(
@@ -236,9 +227,9 @@ fn it_counts_against_the_cap_and_the_cpus_the_mac_has_without_its_person() {
             committed_bytes: 8 * GIB
         }
     );
-    assert_eq!(run(&mut budget, 62, 200, person), []);
+    assert_eq!(watch(&mut budget, 62, 200, person), []);
     budget.release(big.slot).unwrap();
-    let started = run(&mut budget, 201, 201, person);
+    let started = watch(&mut budget, 201, 201, person);
     assert_eq!(
         started
             .iter()
@@ -249,21 +240,21 @@ fn it_counts_against_the_cap_and_the_cpus_the_mac_has_without_its_person() {
 
     // Three, two and two vCPUs are more than six.
     let mut budget = open(settings);
-    run(&mut budget, 61, 61, person);
+    watch(&mut budget, 61, 61, person);
     let first = starts(budget.assign(secs(61), Size::G4));
     starts(budget.assign(secs(61), Size::G2));
     let (third, why) = waits(budget.assign(secs(61), Size::G2));
     assert_eq!(why, Refusal::Cpus { cap: 6, committed: 5 });
-    assert_eq!(run(&mut budget, 62, 100, person), []);
+    assert_eq!(watch(&mut budget, 62, 100, person), []);
     budget.release(first.slot).unwrap();
-    assert_eq!(run(&mut budget, 101, 101, person)[0].1.slot, third);
+    assert_eq!(watch(&mut budget, 101, 101, person)[0].1.slot, third);
 }
 
 #[test]
 fn jobs_that_wait_start_in_the_order_they_came() {
     let mut budget = open(dedicated());
     // 5 GB available: a VM of 2 GB would fit (2 + 2 GB floor), one of 8 GB not.
-    run(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
     let (big, why) = waits(budget.assign(secs(61), Size::G8));
     assert_eq!(
         why,
@@ -278,22 +269,22 @@ fn jobs_that_wait_start_in_the_order_they_came() {
     assert!(big < small && small < third);
 
     // Room for the small ones is not room for the one in front of them.
-    assert_eq!(run(&mut budget, 62, 100, |r| r.available_bytes = 9 * GIB), []);
+    assert_eq!(watch(&mut budget, 62, 100, |r| r.available_bytes = 9 * GIB), []);
     assert_eq!(budget.waiting(), 3);
     // Room for the big one and one small one: 8 + 2 GB of VMs, their overheads and the floor.
     let enough = 10 * GIB + 2 * OVERHEAD + 2 * GIB;
-    let started = run(&mut budget, 101, 101, |r| r.available_bytes = enough);
+    let started = watch(&mut budget, 101, 101, |r| r.available_bytes = enough);
     assert_eq!(
         started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
         [big, small]
     );
     // The third one waits for memory of its own, and gets it a second later.
     assert_eq!((budget.waiting(), budget.committed_bytes()), (1, 10 * GIB));
-    let started = run(&mut budget, 102, 102, |r| {
+    let started = watch(&mut budget, 102, 102, |r| {
         r.available_bytes = enough + 2 * GIB + OVERHEAD - 1
     });
     assert_eq!(started, []);
-    let started = run(&mut budget, 103, 103, |r| {
+    let started = watch(&mut budget, 103, 103, |r| {
         r.available_bytes = enough + 2 * GIB + OVERHEAD
     });
     assert_eq!(
@@ -306,7 +297,7 @@ fn jobs_that_wait_start_in_the_order_they_came() {
 #[test]
 fn while_a_job_waits_nothing_else_is_granted_or_offered() {
     let mut budget = open(dedicated());
-    run(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
     assert!(budget.fits(secs(61), Size::G2).is_ok());
     let (slot, _) = waits(budget.assign(secs(61), Size::G8));
 
@@ -357,10 +348,10 @@ fn while_a_job_waits_nothing_else_is_granted_or_offered() {
     );
     full.release(running.slot).unwrap();
     assert_eq!(full.status(secs(60)).waiting, [waiting(next, Size::G8, None)]);
-    assert_eq!(run(&mut full, 61, 61, |_| {})[0].1.slot, next);
+    assert_eq!(watch(&mut full, 61, 61, |_| {})[0].1.slot, next);
 
     // Once it runs, the Mac takes jobs again.
-    let started = run(&mut budget, 62, 62, |_| {});
+    let started = watch(&mut budget, 62, 62, |_| {});
     assert_eq!(started[0].1.slot, slot);
     assert_eq!(budget.level(secs(62)), Level::Open);
     assert!(budget.claim(secs(62), Size::G2).is_ok());
@@ -379,10 +370,10 @@ fn a_hold_keeps_it_waiting_and_lifting_the_hold_starts_it() {
         budget.hold(hold, true);
         let (slot, why) = waits(budget.assign(secs(60), Size::G4));
         assert_eq!(why, Refusal::Held(hold));
-        assert_eq!(run(&mut budget, 61, 400, |_| {}), [], "{hold:?}");
+        assert_eq!(watch(&mut budget, 61, 400, |_| {}), [], "{hold:?}");
         budget.hold(hold, false);
         // A hold is no reading: there is no calm time after it.
-        let started = run(&mut budget, 401, 401, |_| {});
+        let started = watch(&mut budget, 401, 401, |_| {});
         assert_eq!(
             started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
             [slot],
@@ -403,11 +394,11 @@ fn everything_else_that_closes_the_mac_keeps_it_waiting() {
     ];
     for (change, trouble) in cases {
         let mut budget = open(dedicated());
-        run(&mut budget, 61, 61, change);
+        watch(&mut budget, 61, 61, change);
         let (slot, why) = waits(budget.assign(secs(61), Size::G2));
         assert_eq!(why, Refusal::Trouble(trouble));
-        assert_eq!(run(&mut budget, 62, 90, change), [], "{trouble:?}");
-        let started = run(&mut budget, 91, 151, |_| {});
+        assert_eq!(watch(&mut budget, 62, 90, change), [], "{trouble:?}");
+        let started = watch(&mut budget, 91, 151, |_| {});
         assert_eq!(
             started
                 .iter()
@@ -428,24 +419,24 @@ fn without_a_reading_it_waits_and_a_sleep_does_not_lose_it() {
     for second in 1..=100 {
         assert_eq!(budget.observe(secs(second), None).started, []);
     }
-    assert_eq!(run(&mut budget, 101, 160, |_| {}), []);
-    let started = run(&mut budget, 161, 161, |_| {});
+    assert_eq!(watch(&mut budget, 101, 160, |_| {}), []);
+    let started = watch(&mut budget, 161, 161, |_| {});
     assert_eq!(started[0].1.slot, first);
 
     // The Mac sleeps for 40 minutes with a job waiting: it is still there, and starts after the calm time.
-    run(&mut budget, 162, 162, |r| r.on_battery = true);
+    watch(&mut budget, 162, 162, |r| r.on_battery = true);
     let (second, _) = waits(budget.assign(secs(162), Size::G2));
     let woke = 162 + 40 * 60;
-    assert_eq!(run(&mut budget, woke, woke + 59, |_| {}), []);
+    assert_eq!(watch(&mut budget, woke, woke + 59, |_| {}), []);
     assert_eq!(budget.waiting(), 1);
-    assert_eq!(run(&mut budget, woke + 60, woke + 60, |_| {})[0].1.slot, second);
+    assert_eq!(watch(&mut budget, woke + 60, woke + 60, |_| {})[0].1.slot, second);
     // A clock that went back does not lose it either.
-    run(&mut budget, woke + 61, woke + 61, |r| {
+    watch(&mut budget, woke + 61, woke + 61, |r| {
         r.pressure = Pressure::Warning
     });
     let (third, _) = waits(budget.assign(secs(woke + 61), Size::G2));
-    assert_eq!(run(&mut budget, 10, 69, |_| {}), []);
-    assert_eq!(run(&mut budget, 70, 70, |_| {})[0].1.slot, third);
+    assert_eq!(watch(&mut budget, 10, 69, |_| {}), []);
+    assert_eq!(watch(&mut budget, 70, 70, |_| {})[0].1.slot, third);
 }
 
 #[test]
@@ -505,7 +496,7 @@ fn a_size_the_mac_can_never_run_does_not_wait() {
 #[test]
 fn a_waiting_job_the_settings_made_impossible_keeps_its_place_and_holds_nobody_up() {
     let mut budget = open(dedicated());
-    run(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
     let (big, _) = waits(budget.assign(secs(61), Size::G8));
     let (small, _) = waits(budget.assign(secs(61), Size::G2));
 
@@ -520,7 +511,12 @@ fn a_waiting_job_the_settings_made_impossible_keeps_its_place_and_holds_nobody_u
         (small_now.slot, small_now.why, small_now.never),
         (small, None, false)
     );
-    let started = run(&mut budget, 62, 62, |_| {});
+    // And whoever comes after is told of the one job that goes first, not of the one that cannot run.
+    assert_eq!(
+        budget.fits(secs(61), Size::G2),
+        Err(Refusal::AssignedFirst { waiting: 1 })
+    );
+    let started = watch(&mut budget, 62, 62, |_| {});
     assert_eq!(
         started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
         [small]
@@ -555,14 +551,14 @@ fn a_waiting_job_the_settings_made_impossible_keeps_its_place_and_holds_nobody_u
         budget.claim(secs(62), Size::G2),
         Err(Refusal::AssignedFirst { waiting: 1 })
     );
-    assert_eq!(run(&mut budget, 63, 63, |_| {})[0].1.slot, big);
+    assert_eq!(watch(&mut budget, 63, 63, |_| {})[0].1.slot, big);
     assert_eq!((budget.waiting(), budget.committed_bytes()), (0, 12 * GIB));
 }
 
 #[test]
 fn a_job_github_took_back_stops_waiting_and_the_next_one_moves_up() {
     let mut budget = open(dedicated());
-    run(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
     let (big, _) = waits(budget.assign(secs(61), Size::G8));
     let (small, _) = waits(budget.assign(secs(61), Size::G2));
 
@@ -575,7 +571,7 @@ fn a_job_github_took_back_stops_waiting_and_the_next_one_moves_up() {
     assert_eq!(budget.withdraw(SlotId(999)), Err(UnknownSlot(SlotId(999))));
     assert_eq!(budget.waiting(), 1);
 
-    let started = run(&mut budget, 62, 62, |r| r.available_bytes = 5 * GIB);
+    let started = watch(&mut budget, 62, 62, |r| r.available_bytes = 5 * GIB);
     assert_eq!(
         started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
         [small]
@@ -613,7 +609,7 @@ fn an_assigned_job_is_stopped_for_the_mac_like_any_other() {
 #[test]
 fn the_job_that_started_last_is_the_one_stopped_however_long_it_waited() {
     let mut budget = open(dedicated());
-    run(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
     let (waited, _) = waits(budget.assign(secs(61), Size::G8));
     // The owner's cap rules it out for a while, so a job that came later runs before it.
     let mut lower = dedicated();
@@ -623,7 +619,7 @@ fn the_job_that_started_last_is_the_one_stopped_however_long_it_waited() {
     let earlier = budget.claim(secs(61), Size::G2).unwrap().slot;
     budget.confirm(earlier).unwrap();
     budget.set_settings(dedicated()).unwrap();
-    assert_eq!(run(&mut budget, 62, 62, |_| {})[0].1.slot, waited);
+    assert_eq!(watch(&mut budget, 62, 62, |_| {})[0].1.slot, waited);
     assert!(waited < earlier, "the name is older than the job");
 
     // Critical for 30 s: the job that has done the least work goes, and that is the one that just started.

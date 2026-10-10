@@ -137,26 +137,27 @@ impl Settings {
     pub fn for_host(facts: HostFacts, mode: Mode) -> Settings {
         let total = facts.total_bytes;
         let all_but_two = facts.cores.saturating_sub(2).max(1).min(facts.cores);
-        let dedicated = Profile {
-            cap_bytes: total.saturating_sub((total / 4).max(3 * GIB)),
-            floor_bytes: GIB + total / 16,
-            cpus: all_but_two,
-        };
-        let away = match mode {
-            Mode::Dedicated => dedicated,
-            Mode::Workstation => Profile {
-                cap_bytes: total.saturating_sub((total / 5 * 2).max(4 * GIB)),
-                floor_bytes: (total / 16 * 3).min(2 * GIB + total / 16),
-                cpus: all_but_two,
-            },
-        };
-        let in_use = match mode {
-            Mode::Dedicated => dedicated,
-            Mode::Workstation => Profile {
-                cap_bytes: 0,
-                floor_bytes: (total / 4).min(2 * GIB + total / 8),
-                cpus: facts.cores / 2,
-            },
+        let (away, in_use) = match mode {
+            Mode::Dedicated => {
+                let always = Profile {
+                    cap_bytes: total.saturating_sub((total / 4).max(3 * GIB)),
+                    floor_bytes: GIB + total / 16,
+                    cpus: all_but_two,
+                };
+                (always, always)
+            }
+            Mode::Workstation => (
+                Profile {
+                    cap_bytes: total.saturating_sub((total / 5 * 2).max(4 * GIB)),
+                    floor_bytes: (total / 16 * 3).min(2 * GIB + total / 16),
+                    cpus: all_but_two,
+                },
+                Profile {
+                    cap_bytes: 0,
+                    floor_bytes: (total / 4).min(2 * GIB + total / 8),
+                    cpus: facts.cores / 2,
+                },
+            ),
         };
         Settings {
             total_bytes: total,
