@@ -1,10 +1,17 @@
 [package]
 name = "cf-workflows"
-description = "Ports of the Go manager's workflow handling, with its tests as the specification. Filled in M3."
+description = "Which self-hosted runner label sets a repository's workflows ask for, and the cf-<n>g sizes."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+serde_yaml_ng = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
