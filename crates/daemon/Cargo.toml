@@ -1,0 +1,10 @@
+[package]
+name = "cf-daemon"
+description = "The daemon's GitHub half: scale sets per repository and size, and the scaler that ties a claimed job to a slot."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

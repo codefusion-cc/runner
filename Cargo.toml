@@ -34,3 +34,7 @@ panic = "abort"
 # A debug build hashes a gigabyte in minutes otherwise, and the image workflow signs and verifies with debug builds.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Generating the fake GitHub's test key takes seconds in a debug build otherwise.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

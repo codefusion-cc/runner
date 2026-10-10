@@ -1,0 +1,77 @@
+use std::fmt;
+use std::time::Duration;
+
+/// A response GitHub answered with a status the call did not expect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusError {
+    /// `GET`, `POST` and so on.
+    pub method: String,
+    /// The request path (never the query: it may carry a cursor, never a secret, but is of no use here).
+    pub path: String,
+    /// The HTTP status.
+    pub status: u16,
+    /// The start of the body, at most 512 bytes, to say why.
+    pub body: String,
+    /// What the `Retry-After` header asked for, if it did.
+    pub retry_after: Option<Duration>,
+    /// GitHub's clock when it answered, from the `Date` header, in seconds since the epoch.
+    pub server_time: Option<i64>,
+}
+
+impl fmt::Display for StatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}: {} {}", self.method, self.path, self.status, self.body)
+    }
+}
+
+/// What a call to GitHub can meet.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    /// GitHub answered with an unexpected status.
+    #[error("{0}")]
+    Status(StatusError),
+    /// The request did not complete: no connection, a timeout, a body that ended early.
+    #[error("network: {0}")]
+    Transport(String),
+    /// GitHub answered with a body that is not what the call needs.
+    #[error("{what}: {why}")]
+    Decode {
+        /// The call.
+        what: String,
+        /// What was wrong.
+        why: String,
+    },
+    /// The App's key could not be used to sign.
+    #[error("GitHub App key: {0}")]
+    Key(String),
+}
+
+impl Error {
+    /// The HTTP status, when GitHub answered with one.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Error::Status(s) => Some(s.status),
+            _ => None,
+        }
+    }
+
+    /// What `Retry-After` asked for, when it did.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::Status(s) => s.retry_after,
+            _ => None,
+        }
+    }
+
+    /// Whether trying the same call again later can work: network trouble, rate limits and server errors do; a
+    /// refusal (401, 403, 404, 409) and a malformed body do not by themselves.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Transport(_) => true,
+            Error::Status(s) => {
+                s.status == 429 || s.status >= 500 || (s.status == 403 && s.retry_after.is_some())
+            }
+            Error::Decode { .. } | Error::Key(_) => false,
+        }
+    }
+}
