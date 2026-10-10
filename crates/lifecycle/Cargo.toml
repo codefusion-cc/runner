@@ -1,10 +1,16 @@
 [package]
 name = "cf-lifecycle"
-description = "The job state machines, from queued to released (pure, no I/O). Filled in M2."
+description = "The state machine of a job slot, from its reservation to its release, and the breaker for VM starts that fail (pure, no I/O)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+cf-budget = { path = "../budget" }
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

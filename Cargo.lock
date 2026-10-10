@@ -102,6 +102,10 @@ dependencies = [
 [[package]]
 name = "cf-budget"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "cf-console-client"
@@ -169,6 +173,10 @@ version = "0.1.0"
 [[package]]
 name = "cf-host-macos"
 version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "libc",
+]
 
 [[package]]
 name = "cf-image"
@@ -188,6 +196,10 @@ dependencies = [
 [[package]]
 name = "cf-lifecycle"
 version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "proptest",
+]
 
 [[package]]
 name = "cf-scaleset"
