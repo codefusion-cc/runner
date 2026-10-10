@@ -34,6 +34,9 @@ jobs:
       - name: Guest image
         run: cargo xtask guest
       - run: cargo clippy --locked --workspace --all-targets -j3 -- -D warnings
+      # The supervisor's Linux half is compiled for the guest only, so the line above never sees it.
+      - name: Lint the guest supervisor for its own target
+        run: cargo clippy --locked -p cf-supervisor --target aarch64-unknown-linux-musl --bins -j3 -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace -j3
         env:

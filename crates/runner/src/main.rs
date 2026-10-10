@@ -1,6 +1,9 @@
-//! The CodeFusion Runner. M0 knows three commands: `version`, `image verify` and `boot-proof`.
+//! The CodeFusion Runner: `version`, `image verify` and `image install`, `vm` (the vm-host of one job) and
+//! `boot-proof`.
 
 mod commands;
+#[cfg(target_os = "macos")]
+mod vm;
 
 use std::process::ExitCode;
 

@@ -1,10 +1,19 @@
 [package]
 name = "cf-guest-proto"
-description = "The wire protocol between a vm-host and the supervisor in the guest. Filled in M1."
+description = "The wire protocol between a vm-host and the supervisor in the guest."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+cf-secret = { path = "../secret" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

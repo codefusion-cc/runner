@@ -16,6 +16,8 @@ mod error;
 mod files;
 mod manifest;
 mod release;
+#[cfg(unix)]
+pub mod store;
 mod verify;
 
 pub use embedded::{Bundle, embedded_bundle, verify_embedded};

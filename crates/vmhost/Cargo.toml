@@ -1,0 +1,23 @@
+[package]
+name = "cf-vmhost"
+description = "The vm-host: one job's machine from its request to its end, and what the daemon reads and tells it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cf-guest-proto = { path = "../guest-proto" }
+cf-image = { path = "../image" }
+cf-vmm = { path = "../vmm" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
