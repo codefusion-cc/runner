@@ -173,6 +173,10 @@ version = "0.1.0"
 [[package]]
 name = "cf-host-macos"
 version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "libc",
+]
 
 [[package]]
 name = "cf-image"
