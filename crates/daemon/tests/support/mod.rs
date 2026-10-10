@@ -49,24 +49,16 @@ pub async fn harness_with(gb: u32, options: Options) -> Harness {
     let hosts = FakeHosts::default();
     let roster = Arc::new(Roster::new());
     let events = Arc::new(EventLog::default());
-    let scaler = Scaler::new(
-        ScalerConfig {
-            scale_set_id: set.id,
-            repo: REPO.into(),
-            machine: MACHINE.into(),
-            size_gb: 1,
-        },
-        session.clone(),
-        SetRegistry {
-            client: client.clone(),
-            scale_set_id: set.id,
-        },
-        hosts.clone(),
-        slots.clone(),
-        roster.clone(),
-        clock.clone(),
-    )
-    .with_events(events.clone());
+    let scaler = scaler_of(&Parts {
+        client: &client,
+        set: &set,
+        session: &session,
+        slots: &slots,
+        hosts: &hosts,
+        roster: &roster,
+        clock: &clock,
+        events: &events,
+    });
     Harness {
         fake,
         client,
@@ -79,6 +71,40 @@ pub async fn harness_with(gb: u32, options: Options) -> Harness {
         events,
         scaler,
     }
+}
+
+/// What a scaler is made of. A test that needs a second scaler for the same scale set, as the daemon has after it
+/// started again, names the harness's own parts here.
+pub struct Parts<'a> {
+    pub client: &'a ScaleSetClient,
+    pub set: &'a ScaleSet,
+    pub session: &'a MessageSession,
+    pub slots: &'a Arc<FakeSlots>,
+    pub hosts: &'a FakeHosts,
+    pub roster: &'a Arc<Roster>,
+    pub clock: &'a Arc<TestClock>,
+    pub events: &'a Arc<EventLog>,
+}
+
+pub fn scaler_of(parts: &Parts<'_>) -> TestScaler {
+    Scaler::new(
+        ScalerConfig {
+            scale_set_id: parts.set.id,
+            repo: REPO.into(),
+            machine: MACHINE.into(),
+            size_gb: 1,
+        },
+        parts.session.clone(),
+        SetRegistry {
+            client: parts.client.clone(),
+            scale_set_id: parts.set.id,
+        },
+        parts.hosts.clone(),
+        parts.slots.clone(),
+        parts.roster.clone(),
+        parts.clock.clone(),
+    )
+    .with_events(parts.events.clone())
 }
 
 impl Harness {
