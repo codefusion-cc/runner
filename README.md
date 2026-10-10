@@ -14,16 +14,28 @@ not yet to be reused.
 
 ## State
 
-Milestone M0, the scaffold. What works:
+The parts exist and are tested, each on its own. The daemon that joins them into a service comes next, so nothing
+here takes a job from GitHub by itself yet. What works:
 
-- the Cargo workspace with its crates (most are empty until their milestone),
-- the guest image: Alpine's `linux-virt` kernel and an initramfs with a small PID 1, built reproducibly by
+- a job in its own virtual machine (`codefusion-runner vm`): one Linux machine per job with a fixed amount of memory
+  and CPU, no swap and nothing that gives memory back while it runs. The job runs in a container in that machine as
+  the image's user; its `sudo` makes it root of the container, not of the machine. When the job ends the machine and
+  its disk are gone, and the end is named: `ok`, `failed`, `oom`, `timeout`, `cancelled`, an eviction, a lost guest
+  or a boot that failed,
+- the limits a job cannot move: its memory (a job that runs out is stopped inside its machine and ends `oom`, the
+  Mac's memory stays where it was), and its time (a deadline, 20 s for the job to end by itself, then by force),
+- what a job reaches: the internet, and names through the Mac's gateway. Not the Mac, the networks the Mac is in,
+  other jobs' machines, private, tailnet and metadata addresses, or anything over IPv6,
+- the guest: Alpine's `linux-virt` kernel and an initramfs whose PID 1 is the supervisor, built reproducibly by
   `cargo xtask guest` and embedded in the binary,
-- the signed manifest and its verification: an Ed25519 signature over `SHA256SUMS`, every hash and size checked on
-  load, and the root filesystem in parts below GitHub's 2 GB asset limit,
-- `codefusion-runner boot-proof`, which boots the embedded guest in a 1 GB virtual machine and waits for `ready`.
+- images: an Ed25519 signature over `SHA256SUMS`, every hash and size checked, the root filesystem in parts below
+  GitHub's 2 GB asset limit. `image install` verifies a release in a folder of its own before a machine boots from
+  it, and refuses one older than the newest it has accepted,
+- admission by memory (`cf-budget`), the life of a slot (`cf-lifecycle`), GitHub's scale set protocol and the scaler
+  (`cf-scaleset`, `cf-daemon`), the GitHub App client (`cf-ghapp`),
+- `codefusion-runner boot-proof`, which boots the embedded guest in a 1 GB machine and waits for `ready`.
 
-It does not yet run a job. The plan has the milestones after this one; `docs/MAP.md` says where things are.
+`docs/MAP.md` says where things are and how a job's machine is put together.
 
 ## Build and try it
 
@@ -44,6 +56,14 @@ Checks, as CI runs them:
 cargo fmt --all --check
 cargo xtask guest
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p cf-supervisor --target aarch64-unknown-linux-musl --bins -- -D warnings
 CF_REQUIRE_EMBEDDED=1 cargo test --workspace
 cargo deny check
+```
+
+CI's Macs cannot boot a machine, so the jobs in real machines run on a Mac of your own:
+
+```sh
+gh release download <image tag> -R codefusion-cc/runner -D target/it/release
+cargo xtask build && cargo xtask it
 ```
