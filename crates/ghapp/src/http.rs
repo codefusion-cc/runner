@@ -1,17 +1,59 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, RETRY_AFTER};
-use reqwest::{RequestBuilder, StatusCode};
+use reqwest::redirect::Policy;
+use reqwest::{RequestBuilder, StatusCode, Url};
 
 use crate::error::{Error, StatusError};
 
-/// A reqwest client with the settings GitHub's APIs need: a user agent, a connect timeout and a whole-request
-/// timeout. The long poll needs a longer `timeout` than the REST calls.
-pub fn http_client(timeout: Duration) -> reqwest::Client {
+/// The largest response body that is read. GitHub's answers to these calls are a few kilobytes, a workflow file at
+/// most [`crate::MAX_WORKFLOW_FILE_BYTES`] before its encoding; anything longer is refused instead of held in memory.
+pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many redirects on the same host are followed (a renamed repository answers with one).
+const MAX_REDIRECTS: usize = 5;
+
+/// Whether a token may go to this address: over HTTPS, or to this machine itself (the tests' fake GitHub).
+pub fn is_safe_address(url: &Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    let host = url.host_str().unwrap_or("");
+    url.scheme() == "http"
+        && (host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()))
+}
+
+/// Whether two addresses are on the same scheme, host and port.
+pub fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The client every call goes through: a user agent, a connect timeout, a whole-request timeout, and redirects
+/// followed only to the same scheme, host and port, so no answer can send a request and its token elsewhere.
+fn client(timeout: Duration) -> reqwest::Client {
+    let redirects = Policy::custom(|attempt| {
+        let stays = attempt
+            .previous()
+            .last()
+            .is_some_and(|from| same_origin(from, attempt.url()));
+        if stays && attempt.previous().len() <= MAX_REDIRECTS {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
     reqwest::Client::builder()
         .user_agent(concat!("codefusion-runner/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
         .timeout(timeout)
+        .redirect(redirects)
         .build()
         .expect("a client with these settings builds")
 }
@@ -53,27 +95,36 @@ pub struct Response {
 }
 
 /// Sends requests and tries them again when GitHub or the network is the problem.
+///
+/// A request is sent only over HTTPS (or to this machine itself), a redirect is followed only to the same scheme,
+/// host and port, every request has a time limit, and no more than [`MAX_BODY_BYTES`] of an answer are read.
 #[derive(Clone)]
 pub struct Http {
     client: reqwest::Client,
     retry: RetryPolicy,
+    max_body: usize,
 }
 
 impl Http {
-    /// Wraps a client.
-    pub fn new(client: reqwest::Client, retry: RetryPolicy) -> Http {
-        Http { client, retry }
+    /// A client whose requests take at most `timeout` each (a single request may ask for longer: the long poll).
+    pub fn new(timeout: Duration, retry: RetryPolicy) -> Http {
+        Http {
+            client: client(timeout),
+            retry,
+            max_body: MAX_BODY_BYTES,
+        }
     }
 
-    /// The underlying client, for building requests.
-    pub fn client(&self) -> &reqwest::Client {
-        &self.client
+    /// Reads at most this much of an answer instead of [`MAX_BODY_BYTES`].
+    pub fn with_max_body(mut self, bytes: usize) -> Http {
+        self.max_body = bytes;
+        self
     }
 
     /// Sends the request `build` makes. With `retry`, a network failure, a 429, a 5xx, and a 403 that carries
     /// `Retry-After` are tried again after a wait with jitter (the header's wait when there is one); a status
     /// outside 2xx that is not retried comes back as [`Error::Status`]. A body that ends early is a
-    /// [`Error::Transport`].
+    /// [`Error::Transport`]; an address a token may not go to and a body over the limit are [`Error::Refused`].
     pub async fn send(
         &self,
         build: impl Fn(&reqwest::Client) -> RequestBuilder,
@@ -106,17 +157,43 @@ impl Http {
             .map_err(|e| Error::Transport(e.without_url().to_string()))?;
         let method = request.method().to_string();
         let path = request.url().path().to_string();
-        let response = self
+        if !is_safe_address(request.url()) {
+            return Err(Error::Refused(format!(
+                "{method} {path}: not sent, {} is not an HTTPS address",
+                request.url().host_str().unwrap_or("the address")
+            )));
+        }
+        let mut response = self
             .client
             .execute(request)
             .await
             .map_err(|e| Error::Transport(e.without_url().to_string()))?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .bytes()
+        let too_long = || {
+            Error::Refused(format!(
+                "{method} {path}: the answer is over {} bytes",
+                self.max_body
+            ))
+        };
+        if response
+            .content_length()
+            .is_some_and(|n| n > self.max_body as u64)
+        {
+            return Err(too_long());
+        }
+        let mut body = bytes::BytesMut::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::Transport(format!("the response body ended early: {}", e.without_url())))?;
+            .map_err(|e| Error::Transport(format!("the response body ended early: {}", e.without_url())))?
+        {
+            if body.len() + chunk.len() > self.max_body {
+                return Err(too_long());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = body.freeze();
         if status.is_success() {
             return Ok(Response {
                 status,

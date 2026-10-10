@@ -130,6 +130,8 @@ name = "cf-fake-github"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "cf-ghapp",
+ "cf-scaleset",
  "cf-secret",
  "ring",
  "rsa",

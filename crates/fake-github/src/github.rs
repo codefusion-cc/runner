@@ -178,6 +178,11 @@ struct State {
     next_runner: i64,
     next_job: i64,
     faults: Vec<Fault>,
+    /// (matcher, how many more answers get lost)
+    lost: Vec<(String, usize)>,
+    /// Where registration and sessions say the service and its message queue are, when not here.
+    service_at: Option<String>,
+    queue_at: Option<String>,
     hooks: Vec<(String, Hook)>,
     log: Vec<Logged>,
     base: String,
@@ -362,6 +367,9 @@ impl FakeGithub {
                 next_runner: 100,
                 next_job: 1000,
                 faults: vec![],
+                lost: vec![],
+                service_at: None,
+                queue_at: None,
                 hooks: vec![],
                 log: vec![],
                 base: String::new(),
@@ -461,6 +469,27 @@ impl FakeGithub {
             reply,
             remaining: times,
         });
+    }
+
+    /// Handles the next `times` requests whose `METHOD path` contains `matcher` and then drops the connection, so
+    /// the caller never sees the answer to what was done.
+    pub fn lose_answer(&self, matcher: &str, times: usize) {
+        self.lock().lost.push((matcher.to_string(), times));
+    }
+
+    /// Makes runner registration name `url` as the Actions service from now on.
+    pub fn send_the_service_to(&self, url: &str) {
+        self.lock().service_at = Some(url.to_string());
+    }
+
+    /// Makes sessions, new and refreshed, name `url` as their message queue from now on.
+    pub fn send_the_queue_to(&self, url: &str) {
+        self.lock().queue_at = Some(url.to_string());
+    }
+
+    /// Forgets every admin token: the service refuses them although they have not run out.
+    pub fn revoke_admin_tokens(&self) {
+        self.lock().admin_tokens.clear();
     }
 
     /// Runs `hook` once, just before the next request whose `METHOD path` contains `matcher` is handled.
@@ -674,6 +703,13 @@ impl FakeGithub {
             }
         }
         let reply = self.route(req).await;
+        {
+            let mut st = self.lock();
+            if let Some(lost) = st.lost.iter_mut().find(|(m, left)| *left > 0 && line.contains(m)) {
+                lost.1 -= 1;
+                return Reply::Drop;
+            }
+        }
         let date = http_date(self.lock().now());
         reply.with_header("date", &date)
     }
@@ -723,7 +759,7 @@ impl FakeGithub {
                     Some(r) if !r.workflows.is_empty() => Reply::json(&Value::Array(
                         r.workflows
                             .iter()
-                            .map(|(file, content)| json!({"name": file, "type": "file", "sha": sha_of(content)}))
+                            .map(|(file, content)| json!({"name": file, "type": "file", "sha": sha_of(content), "size": content.len()}))
                             .collect(),
                     )),
                     _ => Reply::status_json(404, &json!({"message": "Not Found"})),
@@ -831,7 +867,11 @@ impl FakeGithub {
             "sig"
         );
         st.admin_tokens.insert(admin.clone(), (exp, repo));
-        Reply::json(&json!({"url": format!("{}/svc", st.base), "token": admin}))
+        let url = st
+            .service_at
+            .clone()
+            .unwrap_or_else(|| format!("{}/svc", st.base));
+        Reply::json(&json!({"url": url, "token": admin}))
     }
 
     async fn actions_service(&self, req: &Request, segs: &[&str]) -> Reply {
@@ -914,6 +954,18 @@ impl FakeGithub {
                 }
                 _ => {}
             }
+        }
+        if let ("GET", ["_apis", "distributedtask", "pools", "0", "agents"]) = (m, segs) {
+            let name = req.query("agentName").unwrap_or("").to_string();
+            return self.admin(&bearer, |st, _| {
+                let found: Vec<Value> = st
+                    .runners
+                    .iter()
+                    .filter(|r| r.name == name)
+                    .map(|r| json!({"id": r.id, "name": r.name}))
+                    .collect();
+                Reply::json(&json!({"count": found.len(), "value": found}))
+            });
         }
         if let ("DELETE", ["_apis", "distributedtask", "pools", "0", "agents", id]) = (m, segs) {
             let id: i64 = id.parse().unwrap_or(0);
@@ -1166,7 +1218,7 @@ fn update_scale_set(st: &mut State, id: i64, req: &Request) -> Reply {
 fn session_json(st: &State, set_id: i64, s: &Session) -> Value {
     json!({
         "sessionId": s.id, "ownerName": s.owner,
-        "messageQueueUrl": format!("{}/svc/_apis/runtime/runnerscalesets/{}/messages", st.base, set_id),
+        "messageQueueUrl": st.queue_at.clone().unwrap_or_else(|| format!("{}/svc/_apis/runtime/runnerscalesets/{}/messages", st.base, set_id)),
         "messageQueueAccessToken": s.token, "statistics": st.stats_json(set_id),
     })
 }

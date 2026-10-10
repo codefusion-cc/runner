@@ -131,37 +131,41 @@ impl AppCredentials {
                 why: "no client_id".into(),
             })?;
 
-        let pem_path = dir.join("app.pem");
-        check_mode(&pem_path)?;
-        let pem = std::fs::read_to_string(&pem_path).map_err(|e| KeyError::Read {
-            path: pem_path.clone(),
-            why: e.kind().to_string(),
-        })?;
+        let pem = Secret::new(read_key(&dir.join("app.pem"))?);
         Ok(AppCredentials {
             client_id: client_id.to_string(),
-            key: AppKey::from_pem(&Secret::new(pem))?,
+            key: AppKey::from_pem(&pem)?,
         })
     }
 }
 
-#[cfg(unix)]
-fn check_mode(path: &Path) -> Result<(), KeyError> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path).map_err(|e| KeyError::Read {
+/// Reads the key file through one handle, so the file whose mode was checked is the file that is read.
+fn read_key(path: &Path) -> Result<String, KeyError> {
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| KeyError::Read {
         path: path.to_path_buf(),
         why: e.kind().to_string(),
-    })?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(KeyError::Permissions {
+    };
+    let mut file = std::fs::File::open(path).map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(KeyError::Read {
             path: path.to_path_buf(),
-            mode,
+            why: "not a file".into(),
         });
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_mode(_: &Path) -> Result<(), KeyError> {
-    Ok(())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(KeyError::Permissions {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+    let mut pem = String::new();
+    file.read_to_string(&mut pem).map_err(unreadable)?;
+    Ok(pem)
 }

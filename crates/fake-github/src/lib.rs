@@ -6,9 +6,10 @@
 //! ([`FakeGithub::queue_job`], [`FakeGithub::complete_job`], [`FakeGithub::cancel_job`]) and make it misbehave
 //! ([`FakeGithub::fail`], [`FakeGithub::expire_session_token`], [`FakeGithub::lose_session`],
 //! [`FakeGithub::set_clock_offset`]). The code under test is never mocked: it talks to this server like it talks to
-//! GitHub.
+//! GitHub. [`harness`] is that setup, for every crate's tests: the fake, the real clients and a clock to move.
 
 mod github;
+pub mod harness;
 pub mod httpd;
 mod keys;
 

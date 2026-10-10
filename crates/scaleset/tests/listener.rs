@@ -13,7 +13,7 @@ use cf_fake_github::httpd::Reply;
 use cf_ghapp::RetryPolicy;
 use cf_scaleset::{Backoff, Error, ScaleSet, listen, shutdown, supervise};
 use serde_json::json;
-use support::recorder::{Recorder, Seen, until};
+use support::recorder::{Recorder, Seen};
 use support::*;
 use tokio::sync::Notify;
 

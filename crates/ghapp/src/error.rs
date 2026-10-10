@@ -44,6 +44,10 @@ pub enum Error {
     /// The App's key could not be used to sign.
     #[error("GitHub App key: {0}")]
     Key(String),
+    /// The call was given up for safety: an address a token may not go to (not HTTPS, or a host the service has no
+    /// business naming), or an answer too long to read.
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 impl Error {
@@ -71,7 +75,7 @@ impl Error {
             Error::Status(s) => {
                 s.status == 429 || s.status >= 500 || (s.status == 403 && s.retry_after.is_some())
             }
-            Error::Decode { .. } | Error::Key(_) => false,
+            Error::Decode { .. } | Error::Key(_) | Error::Refused(_) => false,
         }
     }
 }

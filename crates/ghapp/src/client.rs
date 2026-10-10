@@ -20,6 +20,9 @@ pub const API: &str = "https://api.github.com";
 
 const API_VERSION: &str = "2022-11-28";
 
+/// A workflow file longer than this is not fetched: `cf-workflows` reads none that long, and GitHub runs none.
+pub const MAX_WORKFLOW_FILE_BYTES: u64 = 512 * 1024;
+
 /// An installation token is replaced this long before it expires.
 const TOKEN_MARGIN_SECS: i64 = 300;
 
@@ -197,7 +200,7 @@ impl GitHubApp {
             match self.request(method.clone(), &url, &token).await {
                 Err(Error::Status(s)) if s.status == 401 && !retried => {
                     retried = true;
-                    self.forget_token(installation).await;
+                    self.forget_token(installation, &token).await;
                 }
                 other => return other,
             }
@@ -233,8 +236,13 @@ impl GitHubApp {
             .clone()
     }
 
-    async fn forget_token(&self, installation: i64) {
-        *self.slot(installation).lock().await = None;
+    /// Drops the cached token GitHub refused, unless another caller has replaced it already.
+    async fn forget_token(&self, installation: i64, refused: &Secret<String>) {
+        let slot = self.slot(installation);
+        let mut cached = slot.lock().await;
+        if cached.as_ref().is_some_and(|c| c.value == *refused) {
+            *cached = None;
+        }
     }
 
     /// An installation token, reused until five minutes before it expires. One call at a time per installation asks
@@ -244,7 +252,7 @@ impl GitHubApp {
         let mut cached = slot.lock().await;
         let now = self.inner.signer.now_epoch();
         if let Some(c) = cached.as_ref().filter(|c| now < c.expires - TOKEN_MARGIN_SECS) {
-            return Ok(Secret::new(c.value.expose().clone()));
+            return Ok(c.value.clone());
         }
         let response = self
             .as_app(
@@ -261,7 +269,7 @@ impl GitHubApp {
         }
         let value = Secret::new(parsed.token);
         *cached = Some(CachedToken {
-            value: Secret::new(value.expose().clone()),
+            value: value.clone(),
             expires: parsed.expires_at.unix_timestamp(),
         });
         Ok(value)
@@ -315,8 +323,9 @@ impl GitHubApp {
     }
 
     /// The workflow files on the repository's default branch by file name; none when it has no `.github/workflows`
-    /// folder. A file is fetched only when its content changed since the last call. Any other failure is an error,
-    /// not "no workflows": that would drop the repository's runners.
+    /// folder. A file is fetched only when its content changed since the last call, and one over
+    /// [`MAX_WORKFLOW_FILE_BYTES`] not at all. Any other failure is an error, not "no workflows": that would drop
+    /// the repository's Actions runners.
     pub async fn workflow_files(
         &self,
         installation: i64,
@@ -328,6 +337,8 @@ impl GitHubApp {
             #[serde(rename = "type")]
             kind: String,
             sha: String,
+            #[serde(default)]
+            size: u64,
         }
         #[derive(Deserialize)]
         struct Blob {
@@ -359,7 +370,7 @@ impl GitHubApp {
         let mut current = HashMap::new();
         for e in entries {
             let yaml = e.name.ends_with(".yml") || e.name.ends_with(".yaml");
-            if e.kind != "file" || !yaml {
+            if e.kind != "file" || !yaml || e.size > MAX_WORKFLOW_FILE_BYTES {
                 continue;
             }
             let content = match known.get(&e.sha) {

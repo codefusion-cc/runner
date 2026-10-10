@@ -90,10 +90,15 @@ impl Roster {
         }
     }
 
-    /// Records that a runner's job completed. Runners this machine does not know are ignored.
-    pub fn mark_done(&self, name: &str, at: SystemTime) {
-        if let Some(r) = self.lock().get_mut(name) {
-            r.done.get_or_insert(at);
+    /// Records that a runner's job completed, and says whether this was news: `false` for a runner this machine does
+    /// not know and for one whose job was already over.
+    pub fn mark_done(&self, name: &str, at: SystemTime) -> bool {
+        match self.lock().get_mut(name) {
+            Some(r) if r.done.is_none() => {
+                r.done = Some(at);
+                true
+            }
+            _ => false,
         }
     }
 

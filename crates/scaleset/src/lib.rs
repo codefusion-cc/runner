@@ -14,9 +14,11 @@ mod listener;
 mod session;
 mod types;
 
-pub use client::ScaleSetClient;
+pub use client::{ACTIONS_HOST, ScaleSetClient};
 pub use error::Error;
-pub use listener::{Backoff, Scaler, Shutdown, ShutdownTrigger, listen, shutdown, supervise};
+pub use listener::{
+    Backoff, MAX_RETRY_AFTER, Scaler, Shutdown, ShutdownTrigger, listen, shutdown, supervise,
+};
 pub use session::MessageSession;
 pub use types::{
     JitConfig, JobAvailable, JobBase, JobCompleted, JobStarted, Label, Message, RunnerRef, ScaleSet,

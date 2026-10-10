@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use cf_ghapp::Clock;
 use cf_scaleset::{Error, JobBase, Message, Statistics};
@@ -11,6 +11,10 @@ use crate::traits::{EventKind, Events, Hosts, JobEvent, Jobs, Registry, RunnerSp
 
 /// How long a new runner may wait for its job before it counts as surplus.
 pub const IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
+
+/// How long a slot stays promised to an acquired job the service has not assigned. The Go manager's reservations
+/// ran out after the same two minutes.
+pub const PROMISE_TTL: Duration = Duration::from_secs(2 * 60);
 
 /// How often a runner whose name is taken is registered again under another.
 const NAME_TRIES: usize = 3;
@@ -28,6 +32,13 @@ pub struct ScalerConfig {
     pub size_gb: u32,
 }
 
+/// A slot promised to a job this scaler acquired.
+#[derive(Debug, Clone, Copy)]
+struct Promise {
+    ticket: Ticket,
+    since: SystemTime,
+}
+
 /// Asks whether a runner whose machine is gone had lost a process for memory, once per runner.
 pub type WasOutOfMemory = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -36,6 +47,9 @@ pub type WasOutOfMemory = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 ///
 /// A message may arrive again after a failure: acquiring a job twice does nothing, and runners follow the service's
 /// counts, not the number of messages.
+///
+/// The slots it promised and no runner took go back by themselves: after [`PROMISE_TTL`] without an assignment, and
+/// when the scaler is dropped.
 pub struct Scaler<J, R, H> {
     config: ScalerConfig,
     jobs: J,
@@ -47,7 +61,7 @@ pub struct Scaler<J, R, H> {
     events: Option<Arc<dyn Events>>,
     was_out_of_memory: Option<WasOutOfMemory>,
     /// Slots promised to jobs this scaler acquired and whose runners have not started, oldest first.
-    promised: Vec<Ticket>,
+    promised: Vec<Promise>,
     last: Arc<Mutex<Option<Statistics>>>,
 }
 
@@ -84,7 +98,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     /// Who knows whether a runner whose machine is already gone had lost a process for memory.
-    pub fn with_out_of_memory_memory(mut self, was: WasOutOfMemory) -> Self {
+    pub fn with_out_of_memory_check(mut self, was: WasOutOfMemory) -> Self {
         self.was_out_of_memory = Some(was);
         self
     }
@@ -117,14 +131,21 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     /// Whether the runner's machine lost a process to the kernel for memory. The completion usually comes while the
-    /// machine still stands; for one already gone, whoever removed it knows.
+    /// machine still stands; for one already gone, or one whose host does not answer, whoever removed it knows.
     async fn out_of_memory(&self, runner: &str) -> bool {
         if runner.is_empty() {
             return false;
         }
+        let recorded = || self.was_out_of_memory.as_ref().is_some_and(|was| was(runner));
         match self.roster.get(runner) {
-            Some(r) if !r.handle.is_empty() => self.hosts.out_of_memory(&r.handle).await.unwrap_or(false),
-            _ => self.was_out_of_memory.as_ref().is_some_and(|was| was(runner)),
+            Some(r) if !r.handle.is_empty() => match self.hosts.out_of_memory(&r.handle).await {
+                Ok(answer) => answer,
+                Err(e) => {
+                    tracing::warn!(runner = %runner, error = %e, "the host did not say whether the job ran out of memory");
+                    recorded()
+                }
+            },
+            _ => recorded(),
         }
     }
 
@@ -147,10 +168,13 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 events.job(&event);
             }
         }
+        let mut finished = 0;
         for done in &message.completed {
             let mut event = self.event(EventKind::Completed, &done.runner_name, &done.job, &done.result);
             event.out_of_memory = self.out_of_memory(&done.runner_name).await;
-            self.roster.mark_done(&done.runner_name, self.clock.now());
+            if self.roster.mark_done(&done.runner_name, self.clock.now()) {
+                finished += 1;
+            }
             tracing::info!(runner = %done.runner_name, job = %done.job.job_display_name, result = %done.result, "job completed");
             if event.out_of_memory {
                 tracing::warn!(
@@ -167,8 +191,17 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 events.job(&event);
             }
         }
-        if let Some(stats) = message.statistics {
-            *self.last.lock().expect("statistics") = Some(stats);
+        let mut last = self.last.lock().expect("statistics");
+        match message.statistics {
+            Some(stats) => *last = Some(stats),
+            // Without new counts the old ones still name the jobs that just ended, and a runner would start for
+            // each. Every job that ended on a runner of this machine is one assigned job fewer; only the service's
+            // own counts raise the number again.
+            None => {
+                if let Some(kept) = last.as_mut() {
+                    kept.total_assigned_jobs = (kept.total_assigned_jobs - finished).max(0);
+                }
+            }
         }
         Ok(())
     }
@@ -185,45 +218,69 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut tickets = vec![];
+        // The promises are the scaler's as soon as they are made: were this call dropped while it waits for the
+        // service, they would still run out or go back with the scaler.
+        let first = self.promised.len();
         let mut refusal = None;
         for _ in 0..ids.len() {
             match self.slots.reserve(self.config.size_gb) {
-                Ok(ticket) => tickets.push(ticket),
+                Ok(ticket) => self.promised.push(Promise {
+                    ticket,
+                    since: self.clock.now(),
+                }),
                 Err(why) => {
                     refusal = Some(why);
                     break;
                 }
             }
         }
-        if tickets.is_empty() {
+        let reserved = self.promised.len() - first;
+        if reserved == 0 {
             let (open, reason) = self.slots.state();
             tracing::info!(offered = ids.len(), open, reason = %reason, why = ?refusal, "jobs offered; no free slot");
             return Ok(());
         }
-        ids.truncate(tickets.len());
+        ids.truncate(reserved);
         let got = match self.jobs.acquire(&ids).await {
             Ok(got) => got,
             Err(e) => {
-                for ticket in tickets {
-                    self.slots.release(ticket);
-                }
+                self.give_back(first..self.promised.len());
                 return Err(e);
             }
         };
-        // Jobs another machine took first give their slots back (the oldest promises, as the Go manager did).
-        let lost = tickets.len().saturating_sub(got.len());
-        for ticket in tickets.drain(..lost) {
-            self.slots.release(ticket);
-        }
+        // Jobs another machine took first give their slots back (the oldest of these promises, as the Go manager
+        // did).
+        let lost = reserved.saturating_sub(got.len());
+        self.give_back(first..first + lost);
         tracing::info!(
             offered = message.available.len(),
             tried = ids.len(),
             acquired = got.len(),
             "jobs offered"
         );
-        self.promised.extend(tickets);
         Ok(())
+    }
+
+    fn give_back(&mut self, promises: std::ops::Range<usize>) {
+        for promise in self.promised.drain(promises) {
+            self.slots.release(promise.ticket);
+        }
+    }
+
+    /// Gives back the slots promised to jobs the service did not assign within [`PROMISE_TTL`]: cancelled, or taken
+    /// by a runner elsewhere. A job assigned later still gets a slot, a free one ([`Slots::claim`]).
+    fn expire_promises(&mut self) {
+        let now = self.clock.now();
+        let slots = &self.slots;
+        self.promised.retain(|promise| {
+            let waited = now.duration_since(promise.since).unwrap_or(Duration::ZERO);
+            if waited < PROMISE_TTL {
+                return true;
+            }
+            slots.release(promise.ticket);
+            tracing::info!(waited = ?waited, "an acquired job was not assigned; its slot is free again");
+            false
+        });
     }
 
     /// Starts runners for the jobs assigned to the scale set that have none, and retires the surplus.
@@ -234,7 +291,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let active = self.roster.active(self.config.scale_set_id);
         let assigned = last.assigned();
         for _ in active..assigned {
-            let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0));
+            let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
             let Some(ticket) = self.slots.claim(self.config.size_gb, promised) else {
                 tracing::warn!(waiting = assigned - active, "assigned jobs wait for a free slot");
                 return Ok(());
@@ -330,12 +387,16 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                     continue;
                 }
             }
+            n -= 1;
             if let Err(e) = self.hosts.stop(&runner.handle).await {
+                // The machine may still stand and use its memory: it keeps its slot until whoever watches the
+                // machines sees it gone. Its registration is removed, so it takes no job and no longer counts.
                 tracing::warn!(runner = %runner.name, error = %e, "could not remove a surplus runner's machine");
+                self.roster.mark_done(&runner.name, self.clock.now());
+                continue;
             }
             self.roster.exited(&runner.name, &*self.slots);
             tracing::info!(runner = %runner.name, "surplus runner removed");
-            n -= 1;
         }
     }
 
@@ -356,7 +417,17 @@ impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
         if let Some(message) = message {
             self.handle(message).await?;
         }
+        // After the runners started: a job assigned late still finds the slot promised to it.
         self.converge().await?;
+        self.expire_promises();
         Ok(self.capacity())
+    }
+}
+
+impl<J, R, H> Drop for Scaler<J, R, H> {
+    fn drop(&mut self) {
+        for promise in self.promised.drain(..) {
+            self.slots.release(promise.ticket);
+        }
     }
 }

@@ -14,7 +14,7 @@ mod traits;
 
 pub use adapters::SetRegistry;
 pub use roster::{JobInfo, Roster, Runner};
-pub use scaler::{IDLE_GRACE, Scaler, ScalerConfig, WasOutOfMemory};
+pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory};
 pub use traits::{
     EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
 };

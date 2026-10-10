@@ -5,7 +5,7 @@ mod support;
 
 use std::time::Duration;
 
-use cf_daemon::{EventKind, IDLE_GRACE, JobInfo, Runner, Slots};
+use cf_daemon::{EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Runner, Slots};
 use cf_fake_github::JobState;
 use cf_fake_github::httpd::Reply;
 use cf_scaleset::{JobBase, JobCompleted, JobStarted, Message, Scaler as _, Statistics};
@@ -414,7 +414,8 @@ async fn job_events_name_the_repository_job_and_run() {
     assert!(runner.done.is_some());
     assert_eq!(
         h.scaler.statistics_handle().lock().unwrap().unwrap().assigned(),
-        1
+        0,
+        "the completion came without counts: the job that ended is no longer one to start a runner for"
     );
 }
 
@@ -435,7 +436,7 @@ async fn a_job_that_ran_out_of_memory_is_reported_as_such() {
     let asked = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let mut h = harness(2).await;
     let log = asked.clone();
-    h.scaler = h.scaler.with_out_of_memory_memory(std::sync::Arc::new(move |r| {
+    h.scaler = h.scaler.with_out_of_memory_check(std::sync::Arc::new(move |r| {
         log.lock().unwrap().push(r.to_string());
         false
     }));
@@ -499,7 +500,7 @@ async fn a_job_whose_machine_is_gone_is_still_out_of_memory() {
     let mut h = harness(1).await;
     h.scaler = h
         .scaler
-        .with_out_of_memory_memory(std::sync::Arc::new(|r| r == "macmini-gone"));
+        .with_out_of_memory_check(std::sync::Arc::new(|r| r == "macmini-gone"));
     let done = Message {
         completed: vec![
             completed("macmini-gone", "failed", JobBase::default()),
@@ -537,4 +538,204 @@ async fn a_runner_whose_job_is_done_is_never_retired_as_surplus() {
         "only the idle runner goes; the finished one exits by itself"
     );
     assert!(h.roster.get(&finished).is_some());
+}
+
+// added: what the scaler owes the machine's slots
+
+/// One job offered and acquired, and the slot promised to it.
+async fn acquired_job(h: &mut Harness) -> (i64, cf_daemon::Ticket) {
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    let message = next_message(h, 2).await;
+    h.scaler.scale(Some(&message)).await.unwrap();
+    assert_eq!(h.fake.job_state(id), Some(JobState::Acquired(h.set.id)));
+    (id, *h.slots.held().last().expect("a promised slot"))
+}
+
+#[tokio::test]
+async fn a_slot_promised_to_a_job_that_is_never_assigned_goes_back_after_two_minutes() {
+    let mut h = harness(2).await;
+    acquired_job(&mut h).await;
+    assert_eq!(h.scaler.capacity(), 2, "the promise and one free slot");
+
+    h.clock.advance(PROMISE_TTL - Duration::from_secs(5));
+    assert_eq!(h.scaler.scale(None).await.unwrap(), 2);
+    assert_eq!(h.slots.used_gb(), 1, "the promise still stands");
+
+    h.clock.advance(Duration::from_secs(10));
+    assert_eq!(
+        h.scaler.scale(None).await.unwrap(),
+        1,
+        "a promise nobody will claim is no longer offered to the service as room"
+    );
+    assert_eq!(h.slots.used_gb(), 0);
+    assert_eq!(h.slots.released().len(), 1);
+    assert!(h.hosts.started().is_empty());
+}
+
+#[tokio::test]
+async fn a_job_assigned_late_still_runs_in_the_slot_promised_to_it() {
+    let mut h = harness(1).await;
+    let (_, promised) = acquired_job(&mut h).await;
+    // No poll came back for three minutes; the next one brings the assignment.
+    h.clock.advance(PROMISE_TTL + Duration::from_secs(60));
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    let started = h.hosts.started();
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started[0].2, promised,
+        "the runner took another slot than the promised one"
+    );
+    assert!(h.slots.released().is_empty());
+    assert_eq!(h.slots.used_gb(), 1);
+}
+
+#[tokio::test]
+async fn a_scaler_that_goes_away_gives_its_promises_back_and_leaves_its_runners_their_slots() {
+    let mut h = harness(3).await;
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    acquired_job(&mut h).await;
+    assert_eq!(h.slots.held().len(), 2);
+    let running = h.hosts.started()[0].2;
+    drop(h.scaler);
+    assert_eq!(
+        h.slots.held(),
+        vec![running],
+        "a runner's slot is its machine's, not the scaler's"
+    );
+}
+
+#[tokio::test]
+async fn an_acquire_that_is_given_up_on_does_not_lose_the_slot_it_promised() {
+    let mut h = harness(2).await;
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    let message = next_message(&h, 2).await;
+    h.fake.fail("acquirejobs", Reply::Hang, 1);
+    let given_up = tokio::time::timeout(Duration::from_millis(200), h.scaler.scale(Some(&message))).await;
+    assert!(given_up.is_err(), "the acquire was to hang");
+    assert_eq!(h.fake.job_state(id), Some(JobState::Available));
+    assert_eq!(h.slots.used_gb(), 1);
+    assert_eq!(
+        h.scaler.capacity(),
+        2,
+        "the scaler still knows the promise it made"
+    );
+    h.clock.advance(PROMISE_TTL);
+    h.scaler.scale(None).await.unwrap();
+    assert_eq!(
+        h.slots.used_gb(),
+        0,
+        "the slot of the abandoned acquire is lost to the machine"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_job_without_new_counts_gets_no_second_runner() {
+    let mut h = harness(3).await;
+    h.scaler.scale(Some(&stats(2))).await.unwrap();
+    let (first, second) = (names(&h)[0].clone(), names(&h)[1].clone());
+    let counts = h.scaler.statistics_handle();
+    let done = |runner: &str| Message {
+        completed: vec![completed(runner, "succeeded", JobBase::default())],
+        ..Message::default()
+    };
+
+    h.scaler.scale(Some(&done(&first))).await.unwrap();
+    assert_eq!(
+        h.hosts.started().len(),
+        2,
+        "a runner started for a job that is over"
+    );
+    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 1);
+
+    // The same completion again, one without a runner and one of a runner nobody knows take nothing off.
+    for runner in [first.as_str(), "", "macmini-stranger"] {
+        h.scaler.scale(Some(&done(runner))).await.unwrap();
+    }
+    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 1);
+    assert_eq!(h.hosts.started().len(), 2);
+    assert_eq!(
+        h.roster.active(h.set.id),
+        1,
+        "the second job still has its runner"
+    );
+
+    h.scaler.scale(Some(&done(&second))).await.unwrap();
+    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 0);
+    assert_eq!(h.hosts.started().len(), 2);
+    assert!(h.hosts.stopped().is_empty());
+
+    // Only the service's own counts bring new runners.
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    assert_eq!(h.hosts.started().len(), 3);
+}
+
+#[tokio::test]
+async fn kept_counts_never_go_below_zero() {
+    let mut h = harness(2).await;
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    let name = names(&h)[0].clone();
+    // The service's counts already left the job out; its completion comes after, without counts.
+    h.scaler.scale(Some(&stats(0))).await.unwrap();
+    let done = Message {
+        completed: vec![completed(&name, "succeeded", JobBase::default())],
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&done)).await.unwrap();
+    let counts = h.scaler.statistics_handle();
+    assert_eq!(counts.lock().unwrap().unwrap().total_assigned_jobs, 0);
+}
+
+#[tokio::test]
+async fn a_host_that_does_not_answer_leaves_the_verdict_to_who_watched_the_machine() {
+    let mut h = harness(2).await;
+    h.scaler.scale(Some(&stats(2))).await.unwrap();
+    let (killed, fine) = (names(&h)[0].clone(), names(&h)[1].clone());
+    let watched = killed.clone();
+    h.scaler = h
+        .scaler
+        .with_out_of_memory_check(std::sync::Arc::new(move |r| r == watched));
+    h.hosts.leave_out_of_memory_unanswered();
+    let done = Message {
+        completed: vec![
+            completed(&killed, "failed", JobBase::default()),
+            completed(&fine, "failed", JobBase::default()),
+        ],
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&done)).await.unwrap();
+    let events = h.events.jobs();
+    assert_eq!(
+        (events[0].out_of_memory, events[1].out_of_memory),
+        (true, false),
+        "a job that ran out of memory was reported as an ordinary failure"
+    );
+    assert_eq!(h.events.out_of_memory().len(), 1);
+}
+
+#[tokio::test]
+async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
+    let mut h = harness(2).await;
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    let (name, _, ticket) = h.hosts.started()[0].clone();
+    h.clock.advance(IDLE_GRACE);
+    h.hosts.fail_stop(1);
+    h.scaler.scale(Some(&stats(0))).await.unwrap();
+    assert_eq!(h.fake.runners(), Vec::<String>::new(), "its registration is gone");
+    assert_eq!(
+        h.slots.held(),
+        vec![ticket],
+        "the slot of a machine that may still stand was given to the next job"
+    );
+    assert_eq!(h.roster.active(h.set.id), 0, "it waits for no job any more");
+    assert!(
+        h.roster.get(&name).is_some(),
+        "whoever watches the machines still finds it"
+    );
+
+    // A new job gets its own runner and slot beside it, and the watcher's word frees the old one.
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    assert_eq!(h.hosts.started().len(), 2);
+    assert_eq!(h.slots.used_gb(), 2);
+    h.roster.exited(&name, &*h.slots);
+    assert_eq!(h.slots.used_gb(), 1);
 }

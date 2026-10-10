@@ -4,17 +4,10 @@ mod support;
 
 use std::time::Duration;
 
+use cf_fake_github::harness::until;
 use cf_fake_github::{JobState, Options};
 use cf_scaleset::{listen, shutdown};
 use support::*;
-
-async fn until(what: &str, condition: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    while !condition() {
-        assert!(std::time::Instant::now() < deadline, "gave up waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
 
 #[tokio::test]
 async fn a_job_the_closed_machine_refused_waits_at_github_and_is_taken_once_the_machine_opens() {

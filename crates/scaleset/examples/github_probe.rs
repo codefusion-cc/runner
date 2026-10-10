@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cf_ghapp::{API, AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock, http_client};
+use cf_ghapp::{API, AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_scaleset::ScaleSetClient;
 
 fn say(what: &str) {
@@ -42,7 +42,7 @@ async fn probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let app = GitHubApp::from_credentials(
         credentials,
         API,
-        Http::new(http_client(Duration::from_secs(30)), RetryPolicy::default()),
+        Http::new(Duration::from_secs(30), RetryPolicy::default()),
         Arc::new(SystemClock),
     );
     let installation = app.repo_installation(repo).await?;

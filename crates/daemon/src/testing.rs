@@ -8,23 +8,6 @@ use cf_ghapp::Clock;
 
 use crate::traits::{Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket};
 
-/// The real time plus whatever a test moved it by.
-#[derive(Debug, Default)]
-pub struct TestClock(Mutex<Duration>);
-
-impl TestClock {
-    /// Moves the clock forward.
-    pub fn advance(&self, d: Duration) {
-        *self.0.lock().expect("clock") += d;
-    }
-}
-
-impl Clock for TestClock {
-    fn now(&self) -> SystemTime {
-        SystemTime::now() + *self.0.lock().expect("clock")
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Held {
     Reserved(SystemTime),
@@ -43,14 +26,14 @@ struct SlotState {
 
 /// A memory budget as the real one behaves: reservations that run out, a gate for new jobs, claims that ignore it.
 pub struct FakeSlots {
-    clock: Arc<TestClock>,
+    clock: Arc<dyn Clock>,
     ttl: Duration,
     state: Mutex<SlotState>,
 }
 
 impl FakeSlots {
     /// A machine with `total_gb` of memory for runners, open for new jobs.
-    pub fn new(clock: Arc<TestClock>, total_gb: u32, ttl: Duration) -> Arc<FakeSlots> {
+    pub fn new(clock: Arc<dyn Clock>, total_gb: u32, ttl: Duration) -> Arc<FakeSlots> {
         Arc::new(FakeSlots {
             clock,
             ttl,
@@ -70,6 +53,13 @@ impl FakeSlots {
         let mut st = self.state.lock().expect("slots");
         st.open = open;
         st.reason = reason.to_string();
+    }
+
+    /// The slots held by reservations or claims, oldest first.
+    pub fn held(&self) -> Vec<Ticket> {
+        let mut st = self.state.lock().expect("slots");
+        self.purge(&mut st);
+        st.held.keys().copied().collect()
     }
 
     /// How many GB are held by reservations or claims.
@@ -170,6 +160,7 @@ struct HostState {
     started: Vec<(String, i64, Ticket)>,
     stopped: Vec<String>,
     fail_start: usize,
+    fail_stop: usize,
     oom: Vec<String>,
     oom_unanswered: bool,
 }
@@ -182,6 +173,11 @@ impl FakeHosts {
     /// The next `n` starts fail.
     pub fn fail_start(&self, n: usize) {
         self.0.lock().expect("hosts").fail_start = n;
+    }
+
+    /// The next `n` stops fail and leave the machine standing.
+    pub fn fail_stop(&self, n: usize) {
+        self.0.lock().expect("hosts").fail_stop = n;
     }
 
     /// The machine of this runner lost a process for memory.
@@ -221,7 +217,12 @@ impl Hosts for FakeHosts {
     }
 
     async fn stop(&self, handle: &str) -> Result<(), HostError> {
-        self.0.lock().expect("hosts").stopped.push(handle.to_string());
+        let mut st = self.0.lock().expect("hosts");
+        if st.fail_stop > 0 {
+            st.fail_stop -= 1;
+            return Err(HostError("the machine does not stop".into()));
+        }
+        st.stopped.push(handle.to_string());
         Ok(())
     }
 

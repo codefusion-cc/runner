@@ -1,6 +1,6 @@
 [package]
 name = "cf-ghapp"
-description = "The GitHub App client: installation tokens and the registration of Actions runners. Filled in M3."
+description = "The GitHub App client: installation tokens, repositories, workflow files and variables, and the registration tokens of Actions runners."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,7 +24,7 @@ tracing = "0.1"
 cf-fake-github = { path = "../fake-github" }
 tempfile.workspace = true
 proptest.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

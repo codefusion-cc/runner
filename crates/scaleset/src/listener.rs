@@ -43,10 +43,13 @@ impl Shutdown {
         *self.0.borrow()
     }
 
-    /// Returns once stopping was asked for (at once when it was). Also returns when the trigger is gone, since
-    /// nobody could ask any more.
+    /// Returns once stopping was asked for (at once when it was). When the trigger is dropped without having asked,
+    /// nobody can ask any more and this never returns, so [`Shutdown::is_set`] and `wait` agree and a dropped
+    /// trigger cannot make [`supervise`] open sessions in a loop.
     pub async fn wait(&mut self) {
-        let _ = self.0.wait_for(|set| *set).await;
+        if self.0.wait_for(|set| *set).await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -94,6 +97,10 @@ pub async fn listen(
     }
 }
 
+/// The longest `Retry-After` that is obeyed. GitHub's limits lift within the hour; an answer that asks for more
+/// must not keep a scale set unserved for days.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
 /// How long to wait before opening a session again after one failed.
 #[derive(Debug, Clone)]
 pub struct Backoff {
@@ -125,7 +132,7 @@ impl Backoff {
 
     /// The wait after a session that ran `ran_for` and ended with `error`. Between half and the whole of the
     /// current step (the jitter keeps machines that lost the service together from coming back together), and never
-    /// less than what a `Retry-After` asked for. `jitter` is in `0.0..=1.0`.
+    /// less than what a `Retry-After` asked for, up to [`MAX_RETRY_AFTER`]. `jitter` is in `0.0..=1.0`.
     pub fn next_wait(&mut self, ran_for: Duration, error: &Error, jitter: f64) -> Duration {
         if ran_for >= self.healthy_after {
             self.next = self.first;
@@ -134,7 +141,7 @@ impl Backoff {
         self.next = (self.next * 2).min(self.max);
         let wait = step.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0));
         match error.retry_after() {
-            Some(asked) => wait.max(asked),
+            Some(asked) => wait.max(asked.min(MAX_RETRY_AFTER)),
             None => wait,
         }
     }
@@ -166,5 +173,60 @@ pub async fn supervise<F, Fut>(
             () = stop.wait() => return,
             () = tokio::time::sleep(wait) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retry_after_of_days_is_not_obeyed_beyond_an_hour() {
+        let asks = |secs| {
+            Error::Api(cf_ghapp::Error::Status(cf_ghapp::StatusError {
+                method: "GET".into(),
+                path: "/".into(),
+                status: 429,
+                body: String::new(),
+                retry_after: Some(Duration::from_secs(secs)),
+                server_time: None,
+            }))
+        };
+        let mut backoff = Backoff::new(
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            backoff.next_wait(Duration::ZERO, &asks(600), 1.0),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            backoff.next_wait(Duration::ZERO, &asks(3600), 1.0),
+            MAX_RETRY_AFTER
+        );
+        assert_eq!(
+            backoff.next_wait(Duration::ZERO, &asks(7 * 24 * 3600), 1.0),
+            MAX_RETRY_AFTER
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_trigger_does_not_end_the_wait() {
+        let (trigger, mut stop) = shutdown();
+        drop(trigger);
+        let ended = tokio::time::timeout(Duration::from_millis(50), stop.wait()).await;
+        assert!(ended.is_err(), "nobody asked to stop");
+        assert!(!stop.is_set());
+    }
+
+    #[tokio::test]
+    async fn a_trigger_ends_the_wait() {
+        let (trigger, mut stop) = shutdown();
+        trigger.trigger();
+        tokio::time::timeout(Duration::from_secs(1), stop.wait())
+            .await
+            .unwrap();
+        assert!(stop.is_set());
     }
 }

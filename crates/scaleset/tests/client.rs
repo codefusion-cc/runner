@@ -2,9 +2,11 @@
 
 mod support;
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use cf_fake_github::JobState;
+use cf_fake_github::httpd::Reply;
 use cf_scaleset::{Error, Message};
 use support::*;
 
@@ -184,4 +186,190 @@ async fn the_admin_token_is_replaced_when_it_runs_out() {
     h.clock.advance(Duration::from_secs(900));
     h.client.list_scale_sets().await.unwrap();
     assert_eq!(h.fake.count("POST /actions/runner-registration"), 2);
+}
+
+#[tokio::test]
+async fn a_clock_that_runs_ahead_keeps_the_admin_token() {
+    let h = harness_with(
+        cf_fake_github::Options {
+            admin_token_ttl: Duration::from_secs(1000),
+            ..Default::default()
+        },
+        fast(),
+        Duration::from_secs(10),
+    )
+    .await;
+    // This machine's clock is half an hour ahead of GitHub's: read by it, every admin token ran out long ago.
+    h.fake.set_clock_offset(-1800);
+    for _ in 0..3 {
+        h.client.list_scale_sets().await.unwrap();
+    }
+    assert_eq!(
+        h.fake.count("POST /actions/runner-registration"),
+        1,
+        "a token good for a quarter of an hour was thrown away"
+    );
+}
+
+#[tokio::test]
+async fn callers_refused_together_share_one_new_admin_token() {
+    let h = harness().await;
+    h.client.list_scale_sets().await.unwrap();
+    h.fake.revoke_admin_tokens();
+    let (a, b, c, d) = tokio::join!(
+        h.client.list_scale_sets(),
+        h.client.list_scale_sets(),
+        h.client.list_scale_sets(),
+        h.client.list_scale_sets(),
+    );
+    for answer in [a, b, c, d] {
+        answer.unwrap();
+    }
+    assert_eq!(
+        h.fake.count("POST /actions/runner-registration"),
+        2,
+        "each refused caller registered again and threw the others' token away"
+    );
+}
+
+#[tokio::test]
+async fn a_registration_that_names_another_host_is_refused_and_no_token_goes_there() {
+    let h = harness().await;
+    let (other, visits) = elsewhere().await;
+    h.fake.send_the_service_to(&format!("{}/svc", other.url()));
+    let error = h.client.list_scale_sets().await.unwrap_err();
+    assert!(
+        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
+        "{error:?}"
+    );
+    assert!(!error.is_transient(), "a refusal is not tried again");
+    assert_eq!(
+        visits.load(Ordering::SeqCst),
+        0,
+        "the admin token went to another host"
+    );
+    // The same goes for a host on the internet that only looks like GitHub's.
+    h.fake
+        .send_the_service_to("https://actions.githubusercontent.com.example.org/svc");
+    let error = h.client.list_scale_sets().await.unwrap_err();
+    assert!(
+        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_whose_queue_is_on_another_host_is_refused_and_closed() {
+    let h = harness().await;
+    let set = h
+        .client
+        .ensure_scale_set("air--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .await
+        .unwrap();
+    let (other, visits) = elsewhere().await;
+    h.fake.send_the_queue_to(&format!("{}/messages", other.url()));
+    let error = h.client.open_session(set.id, "air").await.unwrap_err();
+    assert!(
+        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
+        "{error:?}"
+    );
+    assert_eq!(visits.load(Ordering::SeqCst), 0);
+    assert!(
+        !h.fake.scale_sets()[0].has_session,
+        "the refused session was left open at the service"
+    );
+}
+
+#[tokio::test]
+async fn a_refreshed_session_cannot_move_its_queue_to_another_host() {
+    let h = harness().await;
+    let (set, session) = with_session(&h).await;
+    let (other, visits) = elsewhere().await;
+    h.fake.send_the_queue_to(&format!("{}/messages", other.url()));
+    h.fake.expire_session_token(set.id);
+    h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    let error = session.poll(0, 1).await.unwrap_err();
+    assert!(
+        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
+        "{error:?}"
+    );
+    assert_eq!(
+        visits.load(Ordering::SeqCst),
+        0,
+        "the session token went to another host"
+    );
+}
+
+#[tokio::test]
+async fn a_job_named_twice_in_the_answer_is_acquired_once_and_a_stranger_not_at_all() {
+    let h = harness().await;
+    let (set, session) = with_session(&h).await;
+    let request = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    session.poll(0, 1).await.unwrap().expect("the offer");
+    h.fake.fail(
+        &format!("POST /svc/_apis/runtime/runnerscalesets/{}/acquirejobs", set.id),
+        Reply::json(&serde_json::json!({"count": 3, "value": [request, 4242, request]})),
+        1,
+    );
+    assert_eq!(session.acquire_jobs(&[request]).await.unwrap(), vec![request]);
+}
+
+#[tokio::test]
+async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine() {
+    let h = harness().await;
+    let (set, _session) = with_session(&h).await;
+    // The service registers the runner, the answer is lost, and the next try meets the name it just took.
+    h.fake.lose_answer("generatejitconfig", 1);
+    let error = h
+        .client
+        .generate_jit_config(set.id, "air-cf-2g-lost", "_work")
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), Some(409), "{error:?}");
+    assert_eq!(h.fake.runners(), Vec::<String>::new());
+
+    // Every try loses its answer: the call fails as a network error, and still nothing stays behind.
+    h.fake.lose_answer("generatejitconfig", 3);
+    let error = h
+        .client
+        .generate_jit_config(set.id, "air-cf-2g-gone", "_work")
+        .await
+        .unwrap_err();
+    assert!(error.is_transient(), "{error:?}");
+    assert_eq!(h.fake.runners(), Vec::<String>::new());
+
+    // A refusal that registered nothing looks for nothing.
+    let lookups = h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents");
+    h.fake.fail(
+        "generatejitconfig",
+        Reply::status_json(403, &serde_json::json!({"message": "no"})),
+        1,
+    );
+    let error = h
+        .client
+        .generate_jit_config(set.id, "air-cf-2g-no", "_work")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status(), error.is_transient()),
+        (Some(403), false),
+        "{error:?}"
+    );
+    assert!(lookups > 0);
+    assert_eq!(
+        h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
+        lookups
+    );
+
+    // And a name that works is found by its name.
+    let jit = h
+        .client
+        .generate_jit_config(set.id, "air-cf-2g-ok", "_work")
+        .await
+        .unwrap();
+    assert_eq!(
+        h.client.runner_by_name("air-cf-2g-ok").await.unwrap(),
+        Some(jit.runner.clone())
+    );
+    assert_eq!(h.client.runner_by_name("air-cf-2g-nobody").await.unwrap(), None);
 }

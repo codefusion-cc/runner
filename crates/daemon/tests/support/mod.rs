@@ -5,14 +5,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cf_daemon::testing::{EventLog, FakeHosts, FakeSlots, TestClock};
+use cf_daemon::testing::{EventLog, FakeHosts, FakeSlots};
 use cf_daemon::{Roster, Scaler, ScalerConfig, SetRegistry};
-use cf_fake_github::{FakeGithub, Options, test_key};
-use cf_ghapp::{AppKey, GitHubApp, Http, RetryPolicy, http_client};
+pub use cf_fake_github::harness::{REPO, TestClock};
+use cf_fake_github::harness::{fast, harness_with as github};
+use cf_fake_github::{FakeGithub, Options};
 use cf_scaleset::{Message, MessageSession, ScaleSet, ScaleSetClient, Statistics};
-use cf_secret::Secret;
 
-pub const REPO: &str = "org/app";
 pub const MACHINE: &str = "macmini";
 
 pub type TestScaler = Scaler<MessageSession, SetRegistry, FakeHosts>;
@@ -30,48 +29,23 @@ pub struct Harness {
     pub scaler: TestScaler,
 }
 
-fn fast() -> RetryPolicy {
-    RetryPolicy {
-        retries: 2,
-        base: Duration::from_millis(5),
-        cap: Duration::from_millis(20),
-        max_retry_after: Duration::from_secs(2),
-    }
-}
-
 /// A machine with room for `gb` runners of 1 GB, serving one scale set `cf-1g`.
 pub async fn harness(gb: u32) -> Harness {
     harness_with(gb, Options::default()).await
 }
 
 pub async fn harness_with(gb: u32, options: Options) -> Harness {
-    let fake = FakeGithub::start(options).await;
-    fake.add_repo(REPO, true);
-    let clock = Arc::new(TestClock::default());
-    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).expect("key");
-    let timeout = Duration::from_secs(10);
-    let app = GitHubApp::new(
-        "Iv23test",
-        key,
-        &fake.url(),
-        Http::new(http_client(timeout), fast()),
-        clock.clone(),
-    );
-    let client = ScaleSetClient::new(
-        app,
-        1,
-        REPO,
-        &format!("{}/{REPO}", fake.url()),
-        clock.clone(),
-        timeout,
-    );
+    let cf_fake_github::harness::Harness {
+        fake, client, clock, ..
+    } = github(options, fast(), Duration::from_secs(10)).await;
     let labels = vec!["self-hosted".to_string(), "cf-1g".to_string()];
     let set = client
         .ensure_scale_set("macmini--cf-1g", &labels)
         .await
         .expect("scale set");
     let session = client.open_session(set.id, MACHINE).await.expect("session");
-    let slots = FakeSlots::new(clock.clone(), gb, Duration::from_secs(60));
+    // The budget's own promises outlast the scaler's, so what a test sees go back, the scaler gave back.
+    let slots = FakeSlots::new(clock.clone(), gb, Duration::from_secs(3600));
     let hosts = FakeHosts::default();
     let roster = Arc::new(Roster::new());
     let events = Arc::new(EventLog::default());

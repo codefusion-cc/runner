@@ -1,33 +1,17 @@
 //! The GitHub App client against a fake GitHub at the HTTP edge. The Go manager's `ghapp_test.go` is the model;
 //! `// Go:` comments name the test each one ports, `// added:` the ones the Go code had no test for.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cf_fake_github::httpd::{Handler, Reply, Server};
+use cf_fake_github::harness::{TestClock, elsewhere, fast};
+use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, Options, test_key};
-use cf_ghapp::{
-    AppCredentials, AppKey, Clock, Error, GitHubApp, Http, Installation, RetryPolicy, http_client,
-};
+use cf_ghapp::{AppCredentials, AppKey, Clock, Error, GitHubApp, Http, Installation, RetryPolicy};
 use cf_secret::Secret;
-
-/// The real time plus whatever a test moved it by.
-struct TestClock(Mutex<Duration>);
-
-impl TestClock {
-    fn advance(&self, d: Duration) {
-        *self.0.lock().unwrap() += d;
-    }
-}
-
-impl Clock for TestClock {
-    fn now(&self) -> SystemTime {
-        SystemTime::now() + *self.0.lock().unwrap()
-    }
-}
 
 struct Harness {
     fake: FakeGithub,
@@ -35,28 +19,13 @@ struct Harness {
     clock: Arc<TestClock>,
 }
 
-fn fast() -> RetryPolicy {
-    RetryPolicy {
-        retries: 2,
-        base: Duration::from_millis(5),
-        cap: Duration::from_millis(20),
-        max_retry_after: Duration::from_secs(2),
-    }
-}
-
 async fn harness_with(retry: RetryPolicy, timeout: Duration) -> Harness {
     let fake = FakeGithub::start(Options::default()).await;
     fake.add_repo("org/app", true);
     fake.add_repo("org/other", false);
-    let clock = Arc::new(TestClock(Mutex::new(Duration::ZERO)));
-    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).expect("key");
-    let app = GitHubApp::new(
-        "Iv23test",
-        key,
-        &fake.url(),
-        Http::new(http_client(timeout), retry),
-        clock.clone(),
-    );
+    let clock = Arc::new(TestClock::default());
+    let http = Http::new(timeout, retry).with_max_body(64 * 1024);
+    let app = cf_fake_github::harness::app(&fake, http, clock.clone());
     Harness { fake, app, clock }
 }
 
@@ -257,16 +226,7 @@ async fn repositories_follow_next_pages() {
 #[tokio::test]
 async fn a_next_page_on_another_host_is_never_followed_with_the_token() {
     let h = harness().await;
-    let visited = Arc::new(AtomicBool::new(false));
-    let flag = visited.clone();
-    let handler: Handler = Arc::new(move |_| {
-        let flag = flag.clone();
-        Box::pin(async move {
-            flag.store(true, Ordering::SeqCst);
-            Reply::empty(200)
-        })
-    });
-    let evil = Server::start(handler).await;
+    let (evil, visits) = elsewhere().await;
     let link = format!("<{}/installation/repositories?page=2>; rel=\"next\"", evil.url());
     let page =
         Reply::json(&serde_json::json!({"repositories": [{"full_name": "a/b"}]})).with_header("link", &link);
@@ -274,7 +234,7 @@ async fn a_next_page_on_another_host_is_never_followed_with_the_token() {
     let repos = h.app.repositories(1).await.unwrap();
     assert_eq!(repos.len(), 1);
     assert!(
-        !visited.load(Ordering::SeqCst),
+        visits.load(Ordering::SeqCst) == 0,
         "followed a next page to another host with the token"
     );
 }
@@ -339,6 +299,168 @@ async fn content_in_an_unknown_encoding_is_refused() {
         h.app.workflow_files(1, "org/app").await,
         Err(Error::Decode { .. })
     ));
+}
+
+// added: what an answer may cost and where a request may go
+
+#[tokio::test]
+async fn an_answer_longer_than_the_limit_is_refused_and_not_asked_for_again() {
+    let h = harness().await;
+    let long = "x".repeat(70 * 1024);
+    h.fake.fail(
+        "GET /installation/repositories",
+        Reply::json(&serde_json::json!({"repositories": [], "padding": long})),
+        5,
+    );
+    let err = h.app.repositories(1).await.unwrap_err();
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(!err.is_transient());
+    assert!(err.to_string().contains("65536 bytes"), "{err}");
+    assert_eq!(h.fake.count("GET /installation/repositories"), 1);
+}
+
+#[tokio::test]
+async fn an_answer_that_does_not_say_its_length_is_cut_off_at_the_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A server that never stops sending: no Content-Length, the body runs until the connection closes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = sent.clone();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+            .await;
+        let chunk = [b' '; 8192];
+        while stream.write_all(&chunk).await.is_ok() {
+            counter.fetch_add(chunk.len(), Ordering::SeqCst);
+        }
+    });
+    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).unwrap();
+    let app = GitHubApp::new(
+        "Iv23test",
+        key,
+        &format!("http://{address}"),
+        Http::new(Duration::from_secs(5), fast()).with_max_body(64 * 1024),
+        Arc::new(TestClock::default()),
+    );
+    let started = std::time::Instant::now();
+    let err = app.installations().await.unwrap_err();
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "read until the time limit instead of stopping at the size limit"
+    );
+    assert!(sent.load(Ordering::SeqCst) < 8 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_host_is_not_followed() {
+    let h = harness().await;
+    let (evil, visits) = elsewhere().await;
+    h.fake.fail(
+        "GET /installation/repositories",
+        Reply::empty(302).with_header("location", &format!("{}/installation/repositories", evil.url())),
+        1,
+    );
+    let err = h.app.repositories(1).await.unwrap_err();
+    assert_eq!(err.status(), Some(302), "{err:?}");
+    assert!(
+        visits.load(Ordering::SeqCst) == 0,
+        "a redirect sent the request to another host"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_on_the_same_host_is_followed() {
+    // What a renamed repository answers with.
+    let h = harness().await;
+    h.fake.fail(
+        "GET /installation/repositories",
+        Reply::empty(301).with_header(
+            "location",
+            &format!("{}/installation/repositories?moved=1", h.fake.url()),
+        ),
+        1,
+    );
+    assert_eq!(h.app.repositories(1).await.unwrap().len(), 2);
+    assert_eq!(h.fake.count("GET /installation/repositories"), 2);
+}
+
+#[tokio::test]
+async fn a_token_never_goes_out_over_plain_http() {
+    let h = harness().await;
+    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).unwrap();
+    // A name that is not this machine: nothing is even looked up.
+    let app = GitHubApp::new(
+        "Iv23test",
+        key,
+        "http://api.github.example",
+        Http::new(Duration::from_secs(5), fast()),
+        h.clock.clone(),
+    );
+    let err = app.installations().await.unwrap_err();
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(err.to_string().contains("api.github.example"), "{err}");
+    for (address, safe) in [
+        ("https://api.github.com/x", true),
+        ("http://127.0.0.1:8080/x", true),
+        ("http://[::1]:8080/x", true),
+        ("http://localhost/x", true),
+        ("http://api.github.com/x", false),
+        ("http://127.0.0.1.example.com/x", false),
+        ("http://localhost.example.com/x", false),
+        ("ftp://127.0.0.1/x", false),
+    ] {
+        assert_eq!(
+            cf_ghapp::is_safe_address(&address.parse().unwrap()),
+            safe,
+            "{address}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_workflow_file_too_long_to_be_one_is_not_fetched() {
+    let h = harness().await;
+    h.fake.set_workflow("org/app", "ci.yml", "jobs: {}\n");
+    h.fake
+        .set_workflow("org/app", "huge.yml", &"# padding\n".repeat(60 * 1024));
+    let files = h.app.workflow_files(1, "org/app").await.unwrap();
+    assert_eq!(files.keys().collect::<Vec<_>>(), ["ci.yml"]);
+    assert_eq!(h.fake.count("git/blobs"), 1, "the long file was fetched");
+}
+
+// added: many callers refused at once
+#[tokio::test]
+async fn callers_refused_together_share_one_new_token() {
+    let h = harness().await;
+    h.app.installation_token(1).await.unwrap();
+    h.fake.fail(
+        "GET /installation/repositories",
+        Reply::After(
+            Duration::from_millis(100),
+            Box::new(Reply::text(401, r#"{"message":"Bad credentials"}"#)),
+        ),
+        8,
+    );
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let app = h.app.clone();
+            tokio::spawn(async move { app.repositories(1).await })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.await.unwrap().unwrap().len(), 2);
+    }
+    assert_eq!(
+        h.fake.count("access_tokens"),
+        2,
+        "each refused caller bought a token of its own"
+    );
 }
 
 // not ported: Go's TestLatestCommit, TestTarball and TestLocate* test the source lookups (commit, tarball, moved
@@ -581,7 +703,7 @@ async fn a_401_that_is_not_about_the_clock_is_not_tried_forever() {
         "Iv23someoneelse",
         other,
         &h.fake.url(),
-        Http::new(http_client(Duration::from_secs(5)), fast()),
+        Http::new(Duration::from_secs(5), fast()),
         h.clock.clone(),
     );
     let err = wrong.installations().await.unwrap_err();

@@ -2,7 +2,6 @@
 #![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use cf_scaleset::{Error, Message, Scaler, Statistics};
 use tokio::sync::Notify;
@@ -82,14 +81,5 @@ impl Scaler for Recorder {
             }
             Ok(capacity)
         }
-    }
-}
-
-/// Waits (in real time) until `condition` holds, for at most five seconds.
-pub async fn until(what: &str, condition: impl Fn() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !condition() {
-        assert!(std::time::Instant::now() < deadline, "gave up waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

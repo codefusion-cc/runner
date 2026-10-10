@@ -10,8 +10,8 @@ mod error;
 mod http;
 mod jwt;
 
-pub use client::{API, GitHubApp, Installation, Repo};
+pub use client::{API, GitHubApp, Installation, MAX_WORKFLOW_FILE_BYTES, Repo};
 pub use credentials::{AppCredentials, AppKey, KeyError};
 pub use error::{Error, StatusError};
-pub use http::{Http, Response, RetryPolicy, backoff, http_client};
+pub use http::{Http, MAX_BODY_BYTES, Response, RetryPolicy, backoff, is_safe_address, same_origin};
 pub use jwt::{Clock, SystemClock};

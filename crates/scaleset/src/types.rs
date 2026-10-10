@@ -23,7 +23,7 @@ pub struct ScaleSet {
     /// Its name, unique in the runner group.
     pub name: String,
     /// The labels jobs must ask for.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub labels: Vec<Label>,
 }
 
@@ -109,6 +109,15 @@ pub(crate) struct JitResponse {
     pub encoded_jit_config: String,
 }
 
+/// A field the service may send as `null`, which Go's decoder reads as the empty value and serde's does not.
+pub(crate) fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 fn lenient_time<'de, D: Deserializer<'de>>(d: D) -> Result<Option<OffsetDateTime>, D::Error> {
     let text: Option<String> = Option::deserialize(d).unwrap_or(None);
     // The service writes a time it does not have as the year 1.
@@ -117,25 +126,33 @@ fn lenient_time<'de, D: Deserializer<'de>>(d: D) -> Result<Option<OffsetDateTime
         .filter(|t| t.year() > 1))
 }
 
-/// What every job message says about its job.
+/// What every job message says about its job. A field the service leaves out or sends as `null` is empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct JobBase {
     /// The request the job is known by to acquire it.
+    #[serde(deserialize_with = "null_default")]
     pub runner_request_id: i64,
     /// The repository's name without its owner.
+    #[serde(deserialize_with = "null_default")]
     pub repository_name: String,
     /// The repository's owner.
+    #[serde(deserialize_with = "null_default")]
     pub owner_name: String,
     /// The job's name as the run page shows it.
+    #[serde(deserialize_with = "null_default")]
     pub job_display_name: String,
     /// The workflow file at its ref.
+    #[serde(deserialize_with = "null_default")]
     pub job_workflow_ref: String,
     /// The workflow run.
+    #[serde(deserialize_with = "null_default")]
     pub workflow_run_id: i64,
     /// `push`, `pull_request` and so on.
+    #[serde(deserialize_with = "null_default")]
     pub event_name: String,
     /// The labels the job asked for.
+    #[serde(deserialize_with = "null_default")]
     pub request_labels: Vec<String>,
     /// When the job was queued.
     #[serde(deserialize_with = "lenient_time")]
@@ -167,6 +184,7 @@ pub struct JobStarted {
     #[serde(flatten)]
     pub job: JobBase,
     /// The runner that took it.
+    #[serde(deserialize_with = "null_default")]
     pub runner_name: String,
 }
 
@@ -178,8 +196,10 @@ pub struct JobCompleted {
     #[serde(flatten)]
     pub job: JobBase,
     /// `succeeded`, `failed`, `canceled`, `skipped` or `abandoned`.
+    #[serde(deserialize_with = "null_default")]
     pub result: String,
     /// The runner that ran it; empty for a job cancelled before any runner had it.
+    #[serde(deserialize_with = "null_default")]
     pub runner_name: String,
 }
 
@@ -221,9 +241,9 @@ impl Message {
 pub(crate) struct RawMessage {
     #[serde(default)]
     pub message_id: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub message_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub body: String,
     #[serde(default)]
     pub statistics: Option<Statistics>,
@@ -322,6 +342,39 @@ mod tests {
         assert_eq!(m.assigned[0].runner_request_id, 0);
         assert_eq!(m.assigned[0].queue_time, None);
         assert_eq!(m.assigned[0].runner_assign_time, None);
+    }
+
+    #[test]
+    fn null_fields_read_as_empty_like_go_reads_them() {
+        let raw: RawMessage =
+            serde_json::from_str(r#"{"messageId":3,"messageType":null,"body":null,"statistics":null}"#)
+                .unwrap();
+        let m = raw.into_message();
+        assert_eq!((m.id, m.skipped, m.raw.as_str()), (3, 0, ""));
+        let set: ScaleSet = serde_json::from_str(r#"{"id":1,"name":"a","labels":null}"#).unwrap();
+        assert!(set.labels.is_empty());
+    }
+
+    #[test]
+    fn a_job_with_null_fields_is_still_a_job() {
+        let m = message(
+            r#"[{"messageType":"JobAvailable","runnerRequestId":7,"requestLabels":null,"eventName":null,"queueTime":null},
+            {"messageType":"JobCompleted","runnerRequestId":7,"result":"canceled","runnerName":null,"jobDisplayName":null},
+            {"messageType":"JobStarted","runnerRequestId":8,"runnerName":null,"workflowRunId":null}]"#,
+        );
+        assert_eq!(
+            (m.available.len(), m.completed.len(), m.started.len(), m.skipped),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(m.available[0].runner_request_id, 7);
+        assert!(m.available[0].request_labels.is_empty());
+        assert_eq!(
+            (
+                m.completed[0].result.as_str(),
+                m.completed[0].runner_name.as_str()
+            ),
+            ("canceled", "")
+        );
     }
 
     #[test]

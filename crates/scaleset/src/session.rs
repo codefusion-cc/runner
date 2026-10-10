@@ -7,11 +7,9 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::client::ScaleSetClient;
+use crate::client::{API_VERSION, ScaleSetClient, encode};
 use crate::error::Error;
 use crate::types::{Message, RawMessage, SessionInfo, Statistics};
-
-const API_VERSION: &str = "6.0-preview";
 
 struct State {
     session_id: String,
@@ -43,18 +41,8 @@ impl std::fmt::Debug for MessageSession {
 
 #[derive(Deserialize)]
 struct Acquired {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::types::null_default")]
     value: Vec<i64>,
-}
-
-fn encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 impl MessageSession {
@@ -85,11 +73,7 @@ impl MessageSession {
 
     fn snapshot(&self) -> (String, String, Secret<String>) {
         let s = self.inner.state.lock().expect("session state");
-        (
-            s.session_id.clone(),
-            s.queue_url.clone(),
-            Secret::new(s.token.expose().clone()),
-        )
+        (s.session_id.clone(), s.queue_url.clone(), s.token.clone())
     }
 
     async fn refresh(&self) -> Result<(), Error> {
@@ -125,7 +109,7 @@ impl MessageSession {
             let result = self
                 .inner
                 .client
-                .session_call(
+                .send(
                     Method::GET,
                     &url,
                     &token,
@@ -171,7 +155,7 @@ impl MessageSession {
             match self
                 .inner
                 .client
-                .session_call(Method::DELETE, &url, &token, None, None, None)
+                .send(Method::DELETE, &url, &token, None, None, None)
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -207,7 +191,7 @@ impl MessageSession {
             match self
                 .inner
                 .client
-                .session_call(Method::POST, &url, &token, Some(&body), None, None)
+                .send(Method::POST, &url, &token, Some(&body), None, None)
                 .await
             {
                 Ok(r) => {
@@ -217,12 +201,15 @@ impl MessageSession {
                             why: e.to_string(),
                         })
                     })?;
-                    // Only what was asked for counts: the service has no business handing out other IDs.
-                    return Ok(parsed
-                        .value
-                        .into_iter()
-                        .filter(|id| request_ids.contains(id))
-                        .collect());
+                    // Only what was asked for counts, and once: the service has no business handing out other
+                    // IDs, and a job named twice is still one job.
+                    let mut got: Vec<i64> = vec![];
+                    for id in parsed.value {
+                        if request_ids.contains(&id) && !got.contains(&id) {
+                            got.push(id);
+                        }
+                    }
+                    return Ok(got);
                 }
                 Err(e) if e.status() == Some(401) && !refreshed => {
                     refreshed = true;

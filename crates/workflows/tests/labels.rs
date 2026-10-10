@@ -359,7 +359,7 @@ fn a_size_label_is_served_with_or_without_self_hosted() {
 fn a_label_that_only_looks_like_a_size_is_not_ours() {
     let wf = files(&[(
         "ci.yml",
-        "jobs:\n  a:\n    runs-on: cf-3g\n  b:\n    runs-on: CF-16G\n  c:\n    runs-on: cf-g\n  d:\n    runs-on: [x, cf-4gb]\n",
+        "jobs:\n  a:\n    runs-on: cf-3g\n  b:\n    runs-on: CF-16G\n  c:\n    runs-on: cf-g\n  d:\n    runs-on: [x, cf-4gb]\n  e:\n    runs-on: cf-04g\n  f:\n    runs-on: [cf-008g]\n",
     )]);
     assert!(self_hosted(&wf).is_empty());
 }
@@ -393,6 +393,11 @@ fn sizes_are_cf_labels_and_self_hosted_alone_is_four_gb() {
     assert_eq!(
         size(&["cf-2g", "cf-8g"]),
         Err(SizeError::Conflict("cf-2g".into(), "cf-8g".into()))
+    );
+    assert_eq!(
+        size(&["self-hosted", "cf-04g"]),
+        Err(SizeError::Unknown("cf-04g".into())),
+        "a size has one spelling"
     );
     assert_eq!(
         size(&["self-hosted", "cf-4gb"]),

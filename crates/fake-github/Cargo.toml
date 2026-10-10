@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+cf-ghapp = { path = "../ghapp" }
+cf-scaleset = { path = "../scaleset" }
 cf-secret = { path = "../secret" }
 ring = "0.17"
 rsa = { version = "0.9", features = ["std"] }
