@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
+jobs:
+  check:
+    name: Format, lint, tests and release build (Apple silicon)
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
+      # The guest image first: the kernel and initramfs are embedded into the crates that follow, signed with a key
+      # made for this run.
+      - name: Guest image
+        run: cargo xtask guest
+      - run: cargo clippy --locked --workspace --all-targets -j3 -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace -j3
+        env:
+          CF_REQUIRE_EMBEDDED: '1'
+      - name: Release build, ad hoc signed with the virtualization entitlement
+        run: cargo xtask build
+      - name: The binary starts and carries the entitlement
+        run: |
+          set -euo pipefail
+          target/release/codefusion-runner version
+          entitlements="$(codesign -d --entitlements - target/release/codefusion-runner 2>&1)"
+          grep -q com.apple.security.virtualization <<< "$entitlements"
+          # The bundle is signed with a key made for this build, so the committed key must refuse it, and
+          # for its signature, not for some other reason.
+          if refusal="$(target/release/codefusion-runner image verify target/guest --version "$(jq -r .version target/guest/image.json)" 2>&1)"; then
+            echo "a bundle signed with another key passed the committed key"
+            exit 1
+          fi
+          grep -q "signature of SHA256SUMS is not valid" <<< "$refusal" || { echo "refused for another reason: $refusal"; exit 1; }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codefusion-runner-aarch64-apple-darwin
+          path: target/release/codefusion-runner
+          retention-days: 7
+
+  deny:
+    name: Dependencies (cargo deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

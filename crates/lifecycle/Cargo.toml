@@ -1,0 +1,10 @@
+[package]
+name = "cf-lifecycle"
+description = "The job state machines, from queued to released (pure, no I/O). Filled in M2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

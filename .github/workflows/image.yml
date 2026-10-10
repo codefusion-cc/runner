@@ -1,0 +1,146 @@
+name: Image
+
+# The guest image: the root filesystem a job runs in (GitHub's Actions runner image plus tools, image/Dockerfile)
+# packed read-only (erofs) in parts below GitHub's 2 GB asset limit, with the guest kernel and initramfs, and a signed
+# list of their hashes.
+#
+# `build` makes all of it and proves the result verifies, signed with a key made for the run. It holds no secret, so
+# a pull request that touches the image runs it too. `publish` runs only on main: it signs what `build` made with
+# IMAGE_SIGNING_KEY, a secret of the `image` environment, which only main may use, and publishes the release.
+# Weekly, so each new Actions runner release is picked up (GitHub refuses a runner version 30 days after the next).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+  push:
+    branches: [main]
+    paths: &image-paths
+      - image/**
+      - crates/image/**
+      - crates/supervisor/**
+      - xtask/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/image.yml
+  pull_request:
+    paths: *image-paths
+
+permissions: {}
+
+concurrency:
+  group: image-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build the image and prove it verifies
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends erofs-utils
+          dpkg-query -W erofs-utils
+      - name: Root filesystem
+        run: |
+          set -euo pipefail
+          docker build -t cf-guest-rootfs image
+          docker create --name cf-guest-rootfs cf-guest-rootfs
+          docker export cf-guest-rootfs > "$RUNNER_TEMP/rootfs.tar"
+          # The tar holds everything from here on; the image's layers only take the disk the next steps need.
+          docker rm cf-guest-rootfs
+          docker system prune --all --force > /dev/null
+          # mkfs.erofs 1.7.1 on this runner writes an image fsck.erofs refuses when it compresses straight
+          # from a tar, so the tar is unpacked first. Root keeps owners, modes and file capabilities.
+          sudo mkdir "$RUNNER_TEMP/rootfs"
+          sudo tar -xf "$RUNNER_TEMP/rootfs.tar" -C "$RUNNER_TEMP/rootfs" --numeric-owner --xattrs --xattrs-include='*'
+          rm "$RUNNER_TEMP/rootfs.tar"
+          mkdir payload
+          sudo mkfs.erofs -zlz4hc payload/rootfs.erofs "$RUNNER_TEMP/rootfs"
+          sudo chown "$(id -u):$(id -g)" payload/rootfs.erofs
+          sudo rm -rf "$RUNNER_TEMP/rootfs"
+          fsck.erofs payload/rootfs.erofs
+          ls -l payload/rootfs.erofs
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Kernel and initramfs
+        run: |
+          set -euo pipefail
+          cargo xtask guest
+          cp target/guest/Image target/guest/initramfs.cpio.gz payload/
+      # `publish` runs these two programs and compiles nothing, so they are built here, where no secret is.
+      - name: The signer and the verifier
+        run: |
+          set -euo pipefail
+          cargo build --locked -p xtask -p codefusion-runner
+          mkdir tools
+          cp target/debug/xtask target/debug/codefusion-runner tools/
+      # Small parts on purpose: the real image is cut into several and read back as one, whatever its size.
+      - name: A release of it, signed with a key made for this run, verifies
+        run: |
+          set -euo pipefail
+          tools/xtask release --ephemeral --version dry-run --out "$RUNNER_TEMP/dry-run" \
+            --guest payload --rootfs payload/rootfs.erofs --max-part 268435456
+          ls -l "$RUNNER_TEMP/dry-run"
+          # The key of this run is not the committed one, so the verifier must refuse the release for its signature.
+          if refusal="$(tools/codefusion-runner image verify "$RUNNER_TEMP/dry-run" --version dry-run 2>&1)"; then
+            echo "a release signed with another key passed the committed key"
+            exit 1
+          fi
+          grep -q "signature of SHA256SUMS is not valid" <<< "$refusal" || { echo "refused for another reason: $refusal"; exit 1; }
+          rm -r "$RUNNER_TEMP/dry-run"
+      - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image
+          path: |
+            payload
+            tools
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  # No checkout, no toolchain, no cache: the job that holds the key runs the two programs `build` made, and `gh`.
+  publish:
+    name: Sign and publish the image
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    environment: image
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: image
+      - name: Sign
+        env:
+          IMAGE_SIGNING_KEY: ${{ secrets.IMAGE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          chmod +x tools/xtask tools/codefusion-runner
+          version="image-$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          # The key goes in through standard input: never a file, an argument or a log line.
+          tools/xtask release --version "$version" --out release \
+            --guest payload --rootfs payload/rootfs.erofs --key-file /dev/stdin <<< "$IMAGE_SIGNING_KEY"
+      - name: Verify what is about to be published, as a machine would after downloading it
+        run: tools/codefusion-runner image verify release --version "$VERSION"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -l release
+          gh release create "$VERSION" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes "Guest image $VERSION. Check a download with \`codefusion-runner image verify <folder> --version $VERSION\`."

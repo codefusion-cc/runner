@@ -1,0 +1,10 @@
+[package]
+name = "cf-scaleset"
+description = "GitHub's scale set client: session, long poll, acquire, the JIT config of an Actions runner. Filled in M3."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned: the compiler is part of what the signed initramfs is made of. Move it on purpose.
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-unknown-linux-musl"]

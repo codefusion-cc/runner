@@ -1,0 +1,22 @@
+[package]
+name = "codefusion-runner"
+description = "The CodeFusion Runner."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "codefusion-runner"
+path = "src/main.rs"
+
+[dependencies]
+cf-image = { path = "../image" }
+cf-vmm-vz = { path = "../vmm-vz" }
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

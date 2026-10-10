@@ -1,0 +1,10 @@
+[package]
+name = "cf-guest-proto"
+description = "The wire protocol between a vm-host and the supervisor in the guest. Filled in M1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "cf-workflows"
+description = "Ports of the Go manager's workflow handling, with its tests as the specification. Filled in M3."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

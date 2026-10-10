@@ -1,0 +1,20 @@
+[package]
+name = "cf-vmm-vz"
+description = "The virtual machine monitor on Apple's Virtualization.framework. M0 holds only the boot proof."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+libc.workspace = true
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSFileHandle", "NSRunLoop", "NSDate", "NSArray"] }
+objc2-virtualization = "0.3"
+
+[lints]
+workspace = true
