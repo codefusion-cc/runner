@@ -23,6 +23,10 @@ pub struct Options {
     pub admin_token_ttl: Duration,
     /// How long a session's message queue token lives.
     pub session_token_ttl: Duration,
+    /// Like the real service, assign queued jobs to a scale set by themselves while its long poll says it has room
+    /// (`x-scalesetmaxcapacity` above the jobs it has): they arrive as `JobAssigned` and never as `JobAvailable`.
+    /// Off, every job is only offered and has to be acquired.
+    pub auto_assign: bool,
 }
 
 impl Default for Options {
@@ -33,6 +37,7 @@ impl Default for Options {
             installation_token_ttl: Duration::from_secs(3600),
             admin_token_ttl: Duration::from_secs(3600),
             session_token_ttl: Duration::from_secs(3600),
+            auto_assign: false,
         }
     }
 }
@@ -949,12 +954,18 @@ impl FakeGithub {
             .query("lastMessageId")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        let capacity: Option<usize> = req
+            .header("x-scalesetmaxcapacity")
+            .and_then(|v| v.parse().ok());
         let deadline = tokio::time::Instant::now() + self.lock().opts.poll_timeout;
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let answer = self.session_auth(id, bearer, |st| {
+                if let Some(room) = capacity {
+                    auto_assign(st, id, room);
+                }
                 let front = st
                     .scale_sets
                     .iter()
@@ -979,6 +990,42 @@ impl FakeGithub {
                 return Reply::empty(202);
             }
         }
+    }
+}
+
+/// Assigns queued jobs to the scale set up to `capacity` runners, as the service does for a poll that says it has
+/// room: the offers for them are withdrawn and a `JobAssigned` replaces each.
+fn auto_assign(st: &mut State, id: i64, capacity: usize) {
+    if !st.opts.auto_assign {
+        return;
+    }
+    let Some(set) = st.scale_sets.iter().find(|s| s.id == id && !s.deleted) else {
+        return;
+    };
+    let (labels, repo) = (set.labels.clone(), set.repo.clone());
+    let mut room = capacity.saturating_sub(st.stats(id).assigned);
+    let wanted: Vec<usize> = (0..st.jobs.len())
+        .filter(|&i| {
+            let j = &st.jobs[i];
+            j.state == JobState::Available && j.repo == repo && matches(&labels, &j.labels)
+        })
+        .collect();
+    for i in wanted {
+        if room == 0 {
+            break;
+        }
+        room -= 1;
+        st.jobs[i].state = JobState::Acquired(id);
+        let job = st.jobs[i].clone();
+        if let Some(set) = st.scale_set(id) {
+            set.queue.retain(|m| {
+                !m.batch
+                    .iter()
+                    .any(|v| v["messageType"] == "JobAvailable" && v["runnerRequestId"] == job.request_id)
+            });
+        }
+        let msg = st.job_message("JobAssigned", &job, json!({}));
+        st.push(id, vec![msg]);
     }
 }
 

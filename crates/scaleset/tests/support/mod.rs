@@ -1,6 +1,8 @@
 //! A scale set client against the fake GitHub, with real sockets and the real GitHub App client in between.
 #![allow(dead_code)]
 
+pub mod recorder;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 

@@ -1,5 +1,6 @@
 //! A check against the real GitHub, for one throwaway repository: registers a scale set under its own name, opens a
-//! session, waits for a queued job on the long poll, acquires it, fetches (and removes) a one-job runner
+//! session, waits for a queued job on the long poll (offered, or assigned by the service itself), acquires it if it
+//! was only offered, fetches (and removes) a one-job runner
 //! configuration for it, then closes the session and deletes the scale set.
 //!
 //! `github_probe <credentials folder> <owner/name> <scale set name> <seconds to wait> <label>...`
@@ -104,17 +105,33 @@ async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn 
             message.completed.len(),
             message.skipped
         ));
-        if let Some(job) = message.available.first() {
+        // With room for the job (the poll says how many runners the machine would take) the service assigns it
+        // by itself; without, it only offers it and it has to be acquired first.
+        let mut job = None;
+        if let Some(offer) = message.available.first() {
             offered = true;
             say(&format!(
                 "offered: request {} of {} ({}), labels {:?}",
-                job.runner_request_id,
-                job.repository(),
-                job.job_display_name,
-                job.request_labels
+                offer.runner_request_id,
+                offer.repository(),
+                offer.job_display_name,
+                offer.request_labels
             ));
-            let got = session.acquire_jobs(&[job.runner_request_id]).await?;
+            let got = session.acquire_jobs(&[offer.runner_request_id]).await?;
             say(&format!("acquired {got:?}"));
+            job = Some(offer.clone());
+        } else if let Some(assigned) = message.assigned.first() {
+            offered = true;
+            say(&format!(
+                "assigned: request {} of {} ({}), labels {:?}",
+                assigned.runner_request_id,
+                assigned.repository(),
+                assigned.job_display_name,
+                assigned.request_labels
+            ));
+            job = Some(assigned.clone());
+        }
+        if job.is_some() {
             let jit = client
                 .generate_jit_config(id, "cf-runner-probe-j0000001", "_work")
                 .await?;
