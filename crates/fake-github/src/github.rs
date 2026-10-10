@@ -315,6 +315,13 @@ impl State {
             "scaleSetAssignTime": "2026-10-10T12:00:05Z", "runnerAssignTime": "2026-10-10T12:00:10Z",
             "finishTime": "2026-10-10T12:05:00Z",
         });
+        if kind == "JobAssigned" {
+            // The real service sends no request ID and no times for a job it assigned.
+            v["runnerRequestId"] = json!(0);
+            v["queueTime"] = json!("0001-01-01T00:00:00Z");
+            v["runnerAssignTime"] = json!("0001-01-01T00:00:00Z");
+            v["finishTime"] = json!("0001-01-01T00:00:00Z");
+        }
         if let (Some(obj), Some(more)) = (v.as_object_mut(), extra.as_object()) {
             for (k, val) in more {
                 obj.insert(k.clone(), val.clone());
@@ -954,9 +961,7 @@ impl FakeGithub {
             .query("lastMessageId")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let capacity: Option<usize> = req
-            .header("x-scalesetmaxcapacity")
-            .and_then(|v| v.parse().ok());
+        let capacity: Option<usize> = req.header("x-scalesetmaxcapacity").and_then(|v| v.parse().ok());
         let deadline = tokio::time::Instant::now() + self.lock().opts.poll_timeout;
         loop {
             let notified = self.inner.notify.notified();

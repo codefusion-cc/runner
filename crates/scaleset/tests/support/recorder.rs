@@ -58,7 +58,10 @@ impl Scaler for Recorder {
         async move {
             match message {
                 None => seen.lock().unwrap().push(Seen::Quiet),
-                Some(m) if m.id == 0 => seen.lock().unwrap().push(Seen::Initial(m.statistics.unwrap_or_default())),
+                Some(m) if m.id == 0 => seen
+                    .lock()
+                    .unwrap()
+                    .push(Seen::Initial(m.statistics.unwrap_or_default())),
                 Some(m) => {
                     arrived.notify_one();
                     if let Some(gate) = gate {
@@ -66,7 +69,10 @@ impl Scaler for Recorder {
                     }
                     let fail = {
                         let mut list = fail_on.lock().unwrap();
-                        list.iter().position(|id| *id == m.id).map(|i| list.remove(i)).is_some()
+                        list.iter()
+                            .position(|id| *id == m.id)
+                            .map(|i| list.remove(i))
+                            .is_some()
                     };
                     if fail {
                         return Err(Error::Scaler(format!("refused message {}", m.id)));

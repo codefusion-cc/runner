@@ -105,6 +105,15 @@ async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn 
             message.completed.len(),
             message.skipped
         ));
+        if std::env::var_os("PROBE_RAW").is_some() {
+            say(&format!("raw batch: {}", message.raw));
+        }
+        for done in &message.completed {
+            say(&format!(
+                "completed: request {} result {:?} by runner {:?}",
+                done.runner_request_id, done.result, done.runner_name
+            ));
+        }
         // With room for the job (the poll says how many runners the machine would take) the service assigns it
         // by itself; without, it only offers it and it has to be acquired first.
         let mut job = None;

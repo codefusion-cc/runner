@@ -110,6 +110,20 @@ version = "0.1.0"
 [[package]]
 name = "cf-daemon"
 version = "0.1.0"
+dependencies = [
+ "cf-fake-github",
+ "cf-ghapp",
+ "cf-scaleset",
+ "cf-secret",
+ "cf-workflows",
+ "proptest",
+ "rand 0.9.5",
+ "sha2",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cf-fake-github"

@@ -111,7 +111,10 @@ pub(crate) struct JitResponse {
 
 fn lenient_time<'de, D: Deserializer<'de>>(d: D) -> Result<Option<OffsetDateTime>, D::Error> {
     let text: Option<String> = Option::deserialize(d).unwrap_or(None);
-    Ok(text.and_then(|t| OffsetDateTime::parse(&t, &Rfc3339).ok()))
+    // The service writes a time it does not have as the year 1.
+    Ok(text
+        .and_then(|t| OffsetDateTime::parse(&t, &Rfc3339).ok())
+        .filter(|t| t.year() > 1))
 }
 
 /// What every job message says about its job.
@@ -198,6 +201,9 @@ pub struct Message {
     /// Items of the batch that were not understood and left out: a malformed one, or a kind this version does not
     /// know. Their counts still arrive in `statistics`.
     pub skipped: usize,
+    /// The batch as the service sent it, for a log line when something is not as expected. Job names and
+    /// repositories, never a credential.
+    pub raw: String,
 }
 
 impl Message {
@@ -230,6 +236,7 @@ impl RawMessage {
         let mut message = Message {
             id: self.message_id,
             statistics: self.statistics,
+            raw: self.body.clone(),
             ..Message::default()
         };
         if self.message_type != "RunnerScaleSetJobMessages" || self.body.trim().is_empty() {
@@ -285,5 +292,56 @@ impl std::ops::Deref for JobCompleted {
     type Target = JobBase;
     fn deref(&self) -> &JobBase {
         &self.job
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn message(body: &str) -> Message {
+        RawMessage {
+            message_id: 1,
+            message_type: "RunnerScaleSetJobMessages".into(),
+            body: body.into(),
+            statistics: None,
+        }
+        .into_message()
+    }
+
+    // What the real service sent for a job it assigned by itself (seen 2026-10-10): no request ID, zero times.
+    #[test]
+    fn the_real_services_assigned_job_has_no_request_id_and_no_times() {
+        let m = message(
+            r#"[{"messageType":"JobAssigned","repositoryName":"r","ownerName":"o","requestLabels":["self-hosted","cf-2g"],
+            "scaleSetAssignTime":"2026-10-10T17:22:32.94457976Z","runnerAssignTime":"0001-01-01T00:00:00Z",
+            "queueTime":"0001-01-01T00:00:00Z","runnerRequestId":0,"workflowRunId":38071473638}]"#,
+        );
+        assert_eq!((m.assigned.len(), m.skipped), (1, 0));
+        assert_eq!(m.assigned[0].runner_request_id, 0);
+        assert_eq!(m.assigned[0].queue_time, None);
+        assert_eq!(m.assigned[0].runner_assign_time, None);
+    }
+
+    #[test]
+    fn an_offer_without_a_request_id_is_left_out_because_it_cannot_be_acquired() {
+        let m = message(r#"[{"messageType":"JobAvailable","runnerRequestId":0}]"#);
+        assert_eq!((m.available.len(), m.skipped), (0, 1));
+    }
+
+    proptest! {
+        #[test]
+        fn no_body_is_a_panic(body in ".{0,300}") {
+            let m = message(&body);
+            prop_assert!(m.available.len() + m.assigned.len() + m.started.len() + m.completed.len() + m.skipped <= body.len().max(1));
+        }
+
+        #[test]
+        fn no_json_value_is_a_panic(n in any::<i64>(), kind in "[A-Za-z]{0,12}", extra in ".{0,20}") {
+            let body = serde_json::json!([{"messageType": kind, "runnerRequestId": n, "x": extra}, n, null, [kind]]).to_string();
+            let m = message(&body);
+            let _ = (m.available.len(), m.skipped);
+        }
     }
 }
