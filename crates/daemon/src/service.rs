@@ -616,8 +616,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// Ends everything this Mac has, for an uninstall: no new job is taken, every machine is stopped, every
     /// registration and scale set of this Mac is removed at GitHub, and the console hears of the jobs that ended
     /// (and, with `leave`, that the Mac is gone: its token is void after). Waits at most `wait` for the machines
-    /// and for GitHub, which says how a stopped job ended within [`crate::RESULT_WAIT`] or not at all. Says what
-    /// is left; nothing when all went.
+    /// to go and for GitHub to take the registrations back. How GitHub calls the end of a job that was stopped is
+    /// not waited for: the sessions are closed, so its word cannot come, and the job is reported as `stopped`.
+    /// Says what is left; nothing when all went.
     ///
     /// The machines' tick is the caller's, as in [`Service::run`]: without it no machine is seen to go.
     pub async fn retire(&self, wait: Duration, leave: bool) -> Vec<String> {
@@ -627,6 +628,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         for name in names {
             self.close(&name).await;
         }
+        shared.machines.hear_no_more();
         shared.machines.stop_all();
         let deadline = Instant::now() + wait;
         loop {
@@ -645,6 +647,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             left.push(format!(
                 "{}: the Actions runner {} is still registered",
                 registration.repo, registration.runner
+            ));
+        }
+        if left.is_empty() && shared.machines.unsettled() > 0 {
+            left.push(format!(
+                "{} jobs whose end is not reported yet",
+                shared.machines.unsettled()
             ));
         }
         left.extend(self.look(false).await);

@@ -58,7 +58,7 @@ A configuration file says what the Mac is:
   "machine": "mac-a-vm",
   "state_dir": "/Users/someone/Library/Application Support/codefusion-runner",
   "app_dir": "/Users/someone/.config/codefusion-runner",
-  "image": "2026.10.10-1",
+  "image": "image-2026.10.10-21",
   "console": "https://console.example",
   "use": "dedicated"
 }

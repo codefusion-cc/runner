@@ -216,12 +216,16 @@ struct Inner<H> {
     intents: BTreeMap<String, (Record, bool)>,
     paused: bool,
     draining: bool,
+    /// Nobody listens to GitHub any more (an uninstall closed every session): how a job ended is not waited for.
+    deaf: bool,
     host_error: Option<String>,
     stuck: BTreeSet<String>,
     /// Actions runners that lost a process for memory and are gone.
     recent_oom: VecDeque<String>,
     /// How long the Mac had slept in all when the machines were last told of its sleep.
     asleep: Millis,
+    /// When the Mac was last looked at.
+    looked: Option<Millis>,
 }
 
 /// The Mac's slots and machines. The scalers see it as [`Slots`], [`Hosts`] and [`Events`]; the daemon's loop
@@ -311,6 +315,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let machines = Machines {
             inner: Mutex::new(Inner {
                 asleep,
+                looked: None,
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -321,6 +326,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 intents: BTreeMap::new(),
                 paused: false,
                 draining: false,
+                deaf: false,
                 host_error: None,
                 stuck: BTreeSet::new(),
                 recent_oom: VecDeque::new(),
@@ -489,6 +495,12 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// GitHub's word of how a job ended is not waited for from now on: an uninstall closed every session, so none
+    /// can come. A job that ends is reported at once with what the Mac knows.
+    pub fn hear_no_more(&self) {
+        self.lock().deaf = true;
+    }
+
     /// New numbers for the budget.
     pub fn set_settings(&self, settings: Settings) -> Result<(), cf_budget::SettingsError> {
         self.lock().budget.set_settings(settings)
@@ -511,6 +523,19 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         };
         self.holds(&mut inner, now);
         self.woke(&mut inner, now);
+        // The budget forgets what it knew of a Mac nobody looked at for so long, and opens it again only after
+        // a calm minute. A Mac that stays closed for that is hard to explain without this line.
+        let late = inner
+            .looked
+            .replace(now.elapsed)
+            .map(|before| now.elapsed.since(before))
+            .filter(|gap| *gap > inner.budget.settings().stale_after);
+        if let Some(gap) = late {
+            tracing::warn!(
+                gap_ms = gap.0,
+                "a look at the Mac came late; its calm time starts again"
+            );
+        }
         let observed = inner.budget.observe(now, reading);
         let mut nudge = false;
         for slot in observed.expired {
@@ -750,6 +775,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// Reports a job whose machine is gone once GitHub said how it ended or the wait for that is over, and
     /// forgets an Actions runner nothing is left of. Says whether a slot opened.
     fn settle(&self, inner: &mut Inner<H>, name: &str, now: Now) -> bool {
+        let deaf = inner.deaf;
         let Some(job) = inner.jobs.get_mut(name) else {
             return false;
         };
@@ -760,7 +786,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         if !job.record.end_reported {
             let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
             let result = job.record.github.as_ref().and_then(|g| g.result.clone());
-            if result.is_none() && duration(waited) < RESULT_WAIT {
+            if result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
                 return false;
             }
             if let Some(github) = job.record.github.clone() {

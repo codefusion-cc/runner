@@ -934,6 +934,49 @@ async fn an_uninstall_stops_every_machine_and_leaves_nothing_at_github_or_the_co
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uninstall_reports_the_job_it_stopped_without_waiting_for_a_word_github_cannot_send() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let busy = rig.job_running().await;
+    until("the start at the console", || rig.events().len() == 1).await;
+    rig.stop_pump().await;
+
+    // Half a minute passes on the Mac while the uninstall runs, and then no more: far less than the time a job's
+    // end waits for GitHub's word while somebody listens for it.
+    let machines = rig.machines.clone();
+    let ticks = tokio::spawn(async move {
+        for second in 0.. {
+            if second < 30 {
+                pass(&machines, 1);
+            } else {
+                machines.tick();
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    });
+    let github = rig.github.clone();
+    let runner = busy.clone();
+    let lets_go = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        github.complete_job(&runner, "failed");
+    });
+    let left = rig.service.retire(Duration::from_secs(6), true).await;
+    ticks.abort();
+    lets_go.await.expect("GitHub lets the job go");
+    assert_eq!(left, Vec::<String>::new());
+    assert_eq!(
+        rig.events(),
+        [
+            (format!("{busy}/started"), Value::Null),
+            (format!("{busy}/completed"), json!("stopped"))
+        ],
+        "the job that was stopped is at the console before the Mac leaves it"
+    );
+    assert_eq!(rig.parts.store.load().len(), 0, "and no record of it stays");
+    assert_eq!(rig.console.left(), [MACHINE]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_uninstall_says_what_it_could_not_remove() {
     let mut rig = Rig::new(2).await;
     rig.service.discover().await;

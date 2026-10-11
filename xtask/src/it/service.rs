@@ -132,30 +132,30 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
 /// rule and no failure of the service: the answer then says what kept it, for a `SKIPPED` line.
 fn room(process: &Process) -> Result<(), String> {
     let settings = process.machines.settings();
+    // What kept the Mac closed while it was waited for, in the budget's own words.
+    let mut kept = BTreeSet::new();
+    let mut available = 0;
     let fits = || {
         let snapshot = process.machines.snapshot();
         let needed = settings.host_bytes(cf_budget::Size::G2) + snapshot.budget.limits.floor_bytes + SPARE;
-        snapshot.open
-            && snapshot
-                .budget
-                .reading
-                .is_some_and(|reading| reading.available_bytes >= needed)
+        available = snapshot
+            .budget
+            .reading
+            .map_or(0, |reading| reading.available_bytes);
+        if !snapshot.open {
+            kept.insert(snapshot.reason);
+        } else if available < needed {
+            kept.insert("short of memory".to_string());
+        }
+        snapshot.open && available >= needed
     };
     if within(Duration::from_secs(240), fits) {
         return Ok(());
     }
-    let snapshot = process.machines.snapshot();
     Err(format!(
-        "this Mac had no room for a machine in 240 s ({}, {} available): other work on it presses on its memory, and the budget starts no machine beside that",
-        if snapshot.open {
-            "open, and short of memory"
-        } else {
-            snapshot.reason.as_str()
-        },
-        mb(snapshot
-            .budget
-            .reading
-            .map_or(0, |reading| reading.available_bytes)),
+        "this Mac had no room for a machine in 240 s ({}; {} available at the end): other work on it presses on its memory, and the budget starts no machine beside that",
+        kept.into_iter().collect::<Vec<_>>().join(", "),
+        mb(available),
     ))
 }
 
