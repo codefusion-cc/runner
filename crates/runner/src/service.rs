@@ -1,7 +1,7 @@
 //! The Runner as a service of one Mac: `daemon` (what launchd runs), `enroll` at the console, `check` before an
 //! install, `install` and `uninstall`.
 
-use std::io::BufRead as _;
+use std::io::{BufRead as _, IsTerminal as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -203,6 +203,13 @@ pub fn enroll(config: &Path) -> Result<(), String> {
             "{} is there: this Mac is enrolled; `uninstall --leave` first",
             path.display()
         ));
+    }
+    // A person at a terminal is told what the silence waits for; a pipe gets no prompt.
+    if std::io::stdin().is_terminal() {
+        eprintln!(
+            "The code the console's Add a Mac made for `{}`, then Enter:",
+            config.machine
+        );
     }
     let mut code = String::new();
     std::io::stdin()

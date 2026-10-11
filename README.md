@@ -15,8 +15,9 @@ not yet to be reused.
 ## State
 
 The Runner takes jobs from GitHub and runs each in a machine of its own, as a service of the Mac. It has run so
-against a fake GitHub and a fake console with real machines (`cargo xtask it --only service`); its first job from
-the real GitHub is still to come. What is there:
+against a fake GitHub and a fake console with real machines (`cargo xtask it --only service`), and on 2026-10-11
+its first jobs from the real GitHub on a MacBook Air: one that passed, one that failed and one cancelled while it
+ran, each in a machine that was gone when the job ended. What is there:
 
 - the service (`codefusion-runner daemon`, kept running by launchd): it reads which repositories and `runs-on`
   labels to serve, keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
@@ -72,7 +73,14 @@ A configuration file says what the Mac is:
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`. Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
-  (`chmod go-w` it).
+  (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
+  reads it at every start.
+- Beside the cf-runners manager, `app_dir` is the manager's own `~/.config/codefusion-runners` (with an `s`), which
+  the Runner only reads, and `machine` is the manager's name with `-vm`.
+
+The Mac needs Rust to build the Runner (below) and nothing else. Images are public, so a Mac without `gh` fetches a
+release with `curl -fLO https://github.com/codefusion-cc/runner/releases/download/<v>/<file>` for `Image`,
+`image.json`, `initramfs.cpio.gz`, `SHA256SUMS`, `SHA256SUMS.sig` and every `rootfs.erofs.NNN`, into an empty folder.
 
 ```sh
 codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
@@ -83,7 +91,12 @@ codefusion-runner install --config <file>
 
 `install` copies the program to `<state_dir>/bin`, writes `~/Library/LaunchAgents/cc.codefusion.vm-runner.plist` and
 starts the agent. The Runner's log is `<state_dir>/logs/runner.log` (10 MB, then one older file beside it); what
-launchd itself says is in `launchd.log` there.
+launchd itself says is in `launchd.log` there. After `the Runner starts` the log is silent until a job comes: its
+scale sets, its sessions and whether the Mac is open are not in it. `check --github` and the console's page say
+those. A Mac opens after a minute in which nothing was wrong with it, and a job that comes sooner waits for that.
+
+`enroll` typed at a terminal says what it waits for; the code is the `--code` value of the command the console's
+Add a Mac shows for the cf-runners manager, made for exactly this `machine`.
 
 One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 
