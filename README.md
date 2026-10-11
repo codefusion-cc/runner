@@ -71,6 +71,8 @@ A configuration file says what the Mac is:
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`. Without `console` the Mac reports to none.
+- The file names where the App's key and the console's token go, so one that others can write is refused
+  (`chmod go-w` it).
 
 ```sh
 codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
@@ -82,6 +84,8 @@ codefusion-runner install --config <file>
 `install` copies the program to `<state_dir>/bin`, writes `~/Library/LaunchAgents/cc.codefusion.vm-runner.plist` and
 starts the agent. The Runner's log is `<state_dir>/logs/runner.log` (10 MB, then one older file beside it); what
 launchd itself says is in `launchd.log` there.
+
+One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 
 To update, build the new version and run its `install` again. It refuses while a machine stands, so a job is never
 cut off by an update. `uninstall` stops the agent and every machine, removes every scale set and registration at
