@@ -1,12 +1,15 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::io::Read as _;
 use std::mem::{MaybeUninit, offset_of, size_of};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use cf_budget::{Host, HostError, HostFacts, HostReading, Millis, Now};
 
-use crate::{Raw, reading};
+use crate::{Battery, Raw, reading};
 
 /// A Core Foundation object.
 type CfRef = *const c_void;
@@ -191,9 +194,44 @@ fn sysctl_text(name: &std::ffi::CStr) -> Option<String> {
     (status == 0).then(|| text_of(&text[..len.min(text.len())]))?
 }
 
-/// The Mac's model as macOS names it (`hw.model`, such as `Mac16,12`); `None` when macOS will not say.
+/// The Mac's chip and model as macOS names them (`machdep.cpu.brand_string` and `hw.model`), such as
+/// `Apple M5 (Mac17,3)`; `None` when macOS will say neither.
 pub fn model() -> Option<String> {
-    sysctl_text(c"hw.model")
+    crate::model_name(
+        sysctl_text(c"machdep.cpu.brand_string").as_deref(),
+        sysctl_text(c"hw.model").as_deref(),
+    )
+}
+
+/// How long `pmset` may take to answer. It needs about 10 ms.
+const PMSET_ANSWER: Duration = Duration::from_secs(1);
+
+/// The Mac's battery now, as `pmset -g batt` says it; `None` on a Mac without one, and when `pmset` does not
+/// answer within a second (it is stopped then). The caller waits for the answer.
+pub fn battery() -> Option<Battery> {
+    let mut pmset = Command::new("/usr/bin/pmset")
+        .args(["-g", "batt"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let asked = Instant::now();
+    // Its few lines fit the pipe, so it ends without anybody reading, and what it wrote is read after.
+    let ended = loop {
+        match pmset.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if asked.elapsed() < PMSET_ANSWER => std::thread::sleep(Duration::from_millis(2)),
+            _ => {
+                let _ = pmset.kill();
+                let _ = pmset.wait();
+                break false;
+            }
+        }
+    };
+    let mut text = String::new();
+    pmset.stdout.take()?.read_to_string(&mut text).ok()?;
+    ended.then(|| crate::battery_in(&text))?
 }
 
 /// The name macOS gives this start of the Mac (`kern.bootsessionuuid`): another one after every start, and the

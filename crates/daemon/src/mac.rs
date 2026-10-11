@@ -10,7 +10,7 @@ use cf_budget::{Host as _, Mode, Settings};
 use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
-use cf_host_macos::{MacHost, boot_session, boot_time, cpu_percent, host_name, load, model};
+use cf_host_macos::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model};
 use cf_secret::Secret;
 
 use crate::names::ServePolicy;
@@ -23,6 +23,28 @@ use crate::{
 pub type MacMachines = Machines<MacHost, VmHosts>;
 /// The service of a real Mac.
 pub type MacService = Service<MacHost, VmHosts>;
+
+/// How often the battery is read.
+const BATTERY_EVERY: Duration = Duration::from_secs(30);
+
+/// What `read` answers: read now, and again every `every` on a thread of its own for as long as someone keeps the
+/// answer. For what takes too long to ask on the way to a report, such as a program that has to run.
+fn watched<T: Send + 'static>(every: Duration, read: impl Fn() -> T + Send + 'static) -> Arc<Mutex<T>> {
+    let seen = Arc::new(Mutex::new(read()));
+    let kept = Arc::downgrade(&seen);
+    let started = std::thread::Builder::new().name("watched".into()).spawn(move || {
+        loop {
+            std::thread::sleep(every);
+            let Some(seen) = kept.upgrade() else { break };
+            let now = read();
+            *seen.lock().expect("watched") = now;
+        }
+    });
+    if let Err(error) = started {
+        tracing::warn!(%error, "no thread to read again on: what was read at the start stays");
+    }
+    seen
+}
 
 /// How long the console has to answer one call. A report that fails is not sent again at once: the next one
 /// carries what waits, and meanwhile the service's loop goes on.
@@ -123,6 +145,8 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
     // A reader of its own for what only the console's page shows; the machines keep theirs.
     let extras = MacHost::new(state).map_err(|error| format!("macOS: {error}"))?;
     let ticks_before = Mutex::new(extras.cpu_ticks());
+    // `pmset` is a program that has to run: a report takes the battery as it was read last.
+    let battery = watched(BATTERY_EVERY, battery);
     let service = Service::new(ServiceParts {
         app: setup.app,
         machines: machines.clone(),
@@ -143,8 +167,48 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
                     .and_then(|(before, now)| cpu_percent(before, now))
                     .unwrap_or(-1.0),
                 boot: boot_time(),
+                battery: *battery.lock().expect("battery"),
             }
         }),
     });
     Ok((machines, service))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::watched;
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(5), "{what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn what_is_watched_is_there_at_once_read_again_and_no_longer_once_nobody_keeps_it() {
+        let reads = Arc::new(AtomicU32::new(0));
+        let seen = {
+            let reads = reads.clone();
+            watched(Duration::from_millis(5), move || {
+                reads.fetch_add(1, Ordering::SeqCst) + 1
+            })
+        };
+        assert!(
+            *seen.lock().unwrap() >= 1,
+            "the first answer is there when `watched` returns"
+        );
+        until("a third read", || *seen.lock().unwrap() >= 3);
+        drop(seen);
+        // A read that was on its way may still end; after it nothing is read any more.
+        std::thread::sleep(Duration::from_millis(100));
+        let after = reads.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(reads.load(Ordering::SeqCst), after);
+    }
 }

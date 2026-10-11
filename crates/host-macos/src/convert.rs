@@ -107,3 +107,50 @@ pub fn reading(facts: HostFacts, at: Now, raw: &Raw) -> Result<HostReading, Host
         disk_free_bytes: raw.disk_free_bytes,
     })
 }
+
+/// A Mac's battery, as `pmset -g batt` says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Battery {
+    /// Whether the Mac draws from its battery and not from a charger.
+    pub on_battery: bool,
+    /// The charge, 0 to 100.
+    pub percent: u32,
+    /// Whether it is charging.
+    pub charging: bool,
+}
+
+/// The battery in what `pmset -g batt` printed; `None` for a Mac without one, and for a text that is not what
+/// `pmset` prints or names a charge no battery has. The line read is the internal battery's: a tab, the charge,
+/// `%;`, the state, `;`.
+pub fn battery_in(pmset: &str) -> Option<Battery> {
+    let (percent, state) = pmset.lines().find_map(|line| {
+        let (name, rest) = line.trim_start().split_once('\t')?;
+        let number = name.strip_prefix("-InternalBattery-")?;
+        if !number.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let (percent, rest) = rest.split_once("%;")?;
+        let (state, _) = rest.split_once(';')?;
+        if percent.len() > 3 || !percent.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Some((percent.parse::<u32>().ok()?, state.trim()))
+    })?;
+    (percent <= 100).then_some(Battery {
+        on_battery: pmset.contains("'Battery Power'"),
+        percent,
+        charging: state == "charging",
+    })
+}
+
+/// The Mac's chip and model in one name, such as `Apple M5 (Mac17,3)`: the chip as `machdep.cpu.brand_string`
+/// says it and the model as `hw.model` does. With only one of them, that one; with neither, `None`.
+pub fn model_name(chip: Option<&str>, model: Option<&str>) -> Option<String> {
+    fn said(text: Option<&str>) -> Option<&str> {
+        text.map(str::trim).filter(|text| !text.is_empty())
+    }
+    match (said(chip), said(model)) {
+        (Some(chip), Some(model)) => Some(format!("{chip} ({model})")),
+        (one, other) => one.or(other).map(str::to_string),
+    }
+}

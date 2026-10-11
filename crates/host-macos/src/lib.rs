@@ -2,7 +2,8 @@
 //!
 //! - [`MacHost`] asks macOS (only on macOS): `host_statistics64` for the page counts, `sysctl` for the pressure
 //!   level and swap, the HID system for the time since the last key or mouse event, the thermal pressure
-//!   notification, the power source and `statfs`. It only reads; nothing here changes the Mac.
+//!   notification, the power source and `statfs`. It only reads; nothing here changes the Mac. The battery's
+//!   charge, which only the console's page shows, is what `pmset -g batt` prints ([`battery`]).
 //! - [`Raw`] is what macOS answered and [`reading`] what the budget gets from it, a pure function, so the
 //!   arithmetic is tested on every platform with numbers taken from real Macs.
 //! - [`FakeHost`] is a host a test scripts: time passes, the Mac sleeps, the person comes back, a read fails.
@@ -22,7 +23,7 @@ mod fake;
 #[cfg(target_os = "macos")]
 mod mac;
 
-pub use convert::{Raw, reading};
+pub use convert::{Battery, Raw, battery_in, model_name, reading};
 pub use fake::FakeHost;
 #[cfg(target_os = "macos")]
-pub use mac::{MacHost, boot_session, boot_time, cpu_percent, host_name, load, model};
+pub use mac::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model};

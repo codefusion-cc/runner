@@ -9,6 +9,7 @@ pub struct FakeHost {
     reading: HostReading,
     failure: Option<HostError>,
     reads: u64,
+    read_takes: (Millis, Millis),
 }
 
 impl FakeHost {
@@ -34,6 +35,7 @@ impl FakeHost {
             },
             failure: None,
             reads: 0,
+            read_takes: (Millis::ZERO, Millis::ZERO),
         }
     }
 
@@ -42,6 +44,12 @@ impl FakeHost {
         self.now.awake = self.now.awake.plus(span);
         self.now.elapsed = self.now.elapsed.plus(span);
         self.reading.idle = self.reading.idle.plus(span);
+    }
+
+    /// Both clocks move on and nothing else does: time too short for the person's idle time to matter.
+    fn move_on(&mut self, span: Millis) {
+        self.now.awake = self.now.awake.plus(span);
+        self.now.elapsed = self.now.elapsed.plus(span);
     }
 
     /// The Mac sleeps: only the clock that counts sleep moves on.
@@ -74,6 +82,12 @@ impl FakeHost {
         self.facts = facts;
     }
 
+    /// A reading takes time from now on, as a real Mac's does: both clocks move on by `before` until the reading
+    /// gets its time, and by `after` until `read` answers.
+    pub fn read_takes(&mut self, before: Millis, after: Millis) {
+        self.read_takes = (before, after);
+    }
+
     /// How often `read` was called.
     pub fn reads(&self) -> u64 {
         self.reads
@@ -91,12 +105,13 @@ impl Host for FakeHost {
 
     fn read(&mut self) -> Result<HostReading, HostError> {
         self.reads += 1;
+        let (before, after) = self.read_takes;
+        self.move_on(before);
+        let at = self.now;
+        self.move_on(after);
         match &self.failure {
             Some(error) => Err(error.clone()),
-            None => Ok(HostReading {
-                at: self.now,
-                ..self.reading
-            }),
+            None => Ok(HostReading { at, ..self.reading }),
         }
     }
 }

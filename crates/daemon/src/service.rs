@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Outbox, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
+    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
 };
 use cf_ghapp::{Clock, GitHubApp};
+use cf_host_macos::Battery;
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
 use cf_workflows::self_hosted_with;
 use time::OffsetDateTime;
@@ -130,6 +131,8 @@ pub struct HostExtras {
     pub cpu_percent: f64,
     /// When the Mac started, in seconds since 1970, when it is known.
     pub boot: Option<i64>,
+    /// The battery, on a Mac that has one.
+    pub battery: Option<Battery>,
 }
 
 /// One scale set the Mac serves, as a report shows it.
@@ -792,6 +795,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 load15: extras.load[2],
                 #[allow(clippy::cast_precision_loss)]
                 free_memory_percent: (reading.available_bytes.min(total) as f64 / total as f64 * 100.0),
+                available_memory_bytes: reading.available_bytes,
+                memory_floor_bytes: snapshot.budget.limits.floor_bytes,
                 memory_pressure: match reading.pressure {
                     Pressure::Normal => 1,
                     Pressure::Warning => 2,
@@ -883,7 +888,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             },
             activity: Activity {
                 cpu_percent: extras.cpu_percent,
-                power: None,
+                power: extras.battery.map(|battery| Power {
+                    on_battery: battery.on_battery,
+                    percent: battery.percent,
+                    charging: battery.charging,
+                }),
             },
             hostname: shared.config.hostname.clone(),
             model: shared.config.model.clone(),
@@ -1116,7 +1125,12 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
             async move {
                 let set = client.ensure_scale_set(&name, &labels).await?;
                 state.lock().expect("set").id = set.id;
+                tracing::info!(
+                    set = %name, id = set.id, %repo, labels = %labels.join(","), size = size.label(),
+                    "a scale set at GitHub"
+                );
                 let session = client.open_session(set.id, &shared.config.machine).await?;
+                tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
                 let machines = shared.machines.clone();
                 let slots: Arc<dyn Slots> = machines.clone();
                 let mut scaler = Scaler::new(
@@ -1157,8 +1171,11 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                 };
                 let listened = listen_nudged(&session, &mut Watched(&mut scaler, &watch), stop, &bell).await;
                 drop(scaler);
-                if let Err(error) = session.close().await {
-                    tracing::debug!(set = %name, %error, "a session could not be closed; it expires by itself");
+                match session.close().await {
+                    Ok(()) => tracing::info!(set = %name, "the session is closed"),
+                    Err(error) => {
+                        tracing::info!(set = %name, %error, "the session could not be closed; it expires by itself");
+                    }
                 }
                 listened
             }

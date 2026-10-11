@@ -151,7 +151,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     /// Whether the Actions runner's machine lost a process to the kernel for memory. The completion usually comes while
-    /// the machine still stands; for one already gone, or one whose host does not answer, whoever removed it knows.
+    /// the machine still stands and has lost none so far; for that one, for one already gone and for one whose vm-host
+    /// cannot say, whoever watches machines go knows. Only a vm-host that cannot say is worth a warning.
     async fn out_of_memory(&self, runner: &str) -> bool {
         if runner.is_empty() {
             return false;
@@ -161,9 +162,14 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             Some(r) if !r.handle.is_empty() => match self.hosts.out_of_memory(&r.handle).await {
                 OutOfMemory::Yes(_) => true,
                 OutOfMemory::No => false,
+                OutOfMemory::NotSoFar => recorded(),
                 OutOfMemory::Unknown { reason } => {
-                    tracing::warn!(runner = %runner, %reason, "nobody could say whether the job ran out of memory");
-                    recorded()
+                    let recorded = recorded();
+                    tracing::warn!(
+                        runner = %runner, %reason, recorded,
+                        "the job's vm-host could not say whether the job ran out of memory; what the Runner recorded of its machine is used"
+                    );
+                    recorded
                 }
             },
             _ => recorded(),
@@ -185,7 +191,13 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                     started: self.clock.now(),
                 },
             );
-            tracing::info!(runner = %started.runner_name, job = %started.job.job_display_name, "job started");
+            // GitHub says so with its next message, which may be most of a minute after the start: the line names
+            // the start by GitHub's own time and how long its word took.
+            let (at, heard_after_s) = heard(event.started_at, event.at);
+            tracing::info!(
+                runner = %started.runner_name, job = %started.job.job_display_name, %at, heard_after_s,
+                "job started"
+            );
             if let (Some(events), false) = (&self.events, started.runner_name.is_empty()) {
                 events.job(&event);
             }
@@ -507,6 +519,16 @@ impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
         self.expire_promises();
         Ok(self.capacity())
     }
+}
+
+/// When GitHub says a job started, as a text, and how many seconds later its word came. A start GitHub names no
+/// time for counts as now.
+fn heard(started_at: Option<OffsetDateTime>, now: OffsetDateTime) -> (String, i64) {
+    let at = started_at.unwrap_or(now);
+    (
+        crate::service::iso(at.unix_timestamp()),
+        (now - at).whole_seconds().max(0),
+    )
 }
 
 impl<J, R, H> Scaler<J, R, H> {

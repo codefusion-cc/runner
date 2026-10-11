@@ -3,6 +3,10 @@ use std::path::Path;
 use cf_image::store::Store;
 use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
+/// The Runner's version with the commit the program was built at (`build.rs`), such as `0.1.0+446125c0a1b2`;
+/// `unknown` for a commit nobody could name. One text for `version`, the log's first line and the console.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CF_BUILT_AT"));
+
 const USAGE: &str = "usage: codefusion-runner
   version
   check --config <file> [--github]      what an install needs and, with --github, what GitHub shows this Mac
@@ -21,7 +25,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["version"] | ["--version"] => {
-            println!("codefusion-runner {}", env!("CARGO_PKG_VERSION"));
+            println!("codefusion-runner {VERSION}");
             Ok(())
         }
         ["image", "verify", folder, "--version", version] => verify_folder(folder, version),

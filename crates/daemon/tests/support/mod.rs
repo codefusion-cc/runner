@@ -23,6 +23,85 @@ use cf_vmhost::OutOfMemory;
 
 pub const MACHINE: &str = "mac-b";
 
+/// The log of each thread that keeps one, behind the one subscriber of the test's process. A subscriber of one
+/// thread alone would miss lines: `tracing` decides once for all threads whether a line is of interest, and may
+/// decide it on a thread that has no log.
+#[derive(Default)]
+struct Logs(Mutex<Vec<(std::thread::ThreadId, Arc<cf_daemon::Lines>)>>);
+
+static LOGS: std::sync::LazyLock<Arc<Logs>> = std::sync::LazyLock::new(|| {
+    let logs = Arc::new(Logs::default());
+    tracing::subscriber::set_global_default(logs.clone()).expect("the only subscriber of the tests");
+    logs
+});
+
+impl tracing::Subscriber for Logs {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let me = std::thread::current().id();
+        let lines = self
+            .0
+            .lock()
+            .expect("logs")
+            .iter()
+            .find(|(thread, _)| *thread == me)
+            .map(|(_, lines)| lines.clone());
+        if let Some(lines) = lines {
+            lines.event(event);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// What this thread writes to the Runner's log for as long as this lives, in the log file's own form. For a test
+/// that runs on one thread.
+pub struct Log {
+    folder: tempfile::TempDir,
+}
+
+impl Log {
+    pub fn start() -> Log {
+        let folder = tempfile::tempdir().expect("folder");
+        let lines = cf_daemon::Lines::new(&folder.path().join("runner.log"), cf_daemon::ROLL_AT);
+        LOGS.0
+            .lock()
+            .expect("logs")
+            .push((std::thread::current().id(), Arc::new(lines)));
+        Log { folder }
+    }
+
+    /// The lines so far that have `words` in them, each from its message on.
+    pub fn lines(&self, words: &str) -> Vec<String> {
+        std::fs::read_to_string(self.folder.path().join("runner.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(words))
+            .map(|line| line.splitn(5, ' ').last().unwrap_or_default().to_string())
+            .collect()
+    }
+}
+
+impl Drop for Log {
+    fn drop(&mut self) {
+        let me = std::thread::current().id();
+        LOGS.0.lock().expect("logs").retain(|(thread, _)| *thread != me);
+    }
+}
+
 /// The size every test's scale set has.
 pub const SIZE: Size = Size::G2;
 

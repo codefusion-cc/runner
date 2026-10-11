@@ -15,8 +15,9 @@ not yet to be reused.
 ## State
 
 The Runner takes jobs from GitHub and runs each in a machine of its own, as a service of the Mac. It has run so
-against a fake GitHub and a fake console with real machines (`cargo xtask it --only service`); its first job from
-the real GitHub is still to come. What is there:
+against a fake GitHub and a fake console with real machines (`cargo xtask it --only service`), and on 2026-10-11
+its first jobs from the real GitHub on a MacBook Air: one that passed, one that failed and one cancelled while it
+ran, each in a machine that was gone when the job ended. What is there:
 
 - the service (`codefusion-runner daemon`, kept running by launchd): it reads which repositories and `runs-on`
   labels to serve, keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
@@ -72,7 +73,14 @@ A configuration file says what the Mac is:
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`. Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
-  (`chmod go-w` it).
+  (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
+  reads it at every start.
+- Beside the cf-runners manager, `app_dir` is the manager's own `~/.config/codefusion-runners` (with an `s`), which
+  the Runner only reads, and `machine` is the manager's name with `-vm`.
+
+The Mac needs Rust to build the Runner (below) and nothing else. Images are public, so a Mac without `gh` fetches a
+release with `curl -fLO https://github.com/codefusion-cc/runner/releases/download/<v>/<file>` for `Image`,
+`image.json`, `initramfs.cpio.gz`, `SHA256SUMS`, `SHA256SUMS.sig` and every `rootfs.erofs.NNN`, into an empty folder.
 
 ```sh
 codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
@@ -84,6 +92,33 @@ codefusion-runner install --config <file>
 `install` copies the program to `<state_dir>/bin`, writes `~/Library/LaunchAgents/cc.codefusion.vm-runner.plist` and
 starts the agent. The Runner's log is `<state_dir>/logs/runner.log` (10 MB, then one older file beside it); what
 launchd itself says is in `launchd.log` there.
+
+What the log says between a start and a job, each once and again when it changes:
+
+```
+the Runner starts version="0.1.0+446125c0a1b2" machine=air-vm
+a scale set at GitHub set=air-vm--cf-4g-177a1a95 id=10 repo=org/app labels=cf-4g size="cf-4g"
+a session is open: the Runner listens for this scale set's jobs set=air-vm--cf-4g-177a1a95
+the Mac is closed: a new job waits why="calming" opens_in_s=60
+the Mac is open: a new job gets a machine
+job started runner=air-vm-j1766ef2 job=build at=2026-10-11T09:54:18Z heard_after_s=41
+```
+
+A Mac opens after a minute in which nothing was wrong with it, and a job that comes sooner waits for that. `why`
+is the budget's word for what closes it: `calming`, `memory-pressure`, `swapping`, `under-floor`, `thermal`,
+`battery`, `disk`, `no-reading`, `paused` and so on. `job started` is written when GitHub says so, which may be most
+of a minute after the start: `at` is the start by GitHub's time and `heard_after_s` how late its word came.
+
+`version` prints the package's version and the commit the program was built at (`codefusion-runner
+0.1.0+446125c0a1b2`, with `-dirty` after it when the sources it was built from differ from that commit), the text
+the log's first line and the console have too. `check` ends its list with the memory at that moment: `now: 2.30 GiB
+of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside what runs`. That is the budget's
+own arithmetic, so it says what a Runner on this Mac would decide, short of the calm minute.
+
+`enroll` typed at a terminal asks for the code and does not show it while it is typed or pasted. The code is the
+`--code` value of the command the console's Add a Mac shows for the cf-runners manager, made for exactly this
+`machine`. Do not put it on a command line (`echo <code> | …` stays in the shell's history); a script hands it over
+on standard input from where it keeps it.
 
 One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 

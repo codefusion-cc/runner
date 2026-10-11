@@ -91,6 +91,8 @@ pub fn status(machine: &str) -> Status {
             load5: 2.0,
             load15: 1.5,
             free_memory_percent: 60.0,
+            available_memory_bytes: 10_307_921_510,
+            memory_floor_bytes: 2 << 30,
             memory_pressure: 1,
             memory_bytes: 16 << 30,
             swap_used_bytes: 0,

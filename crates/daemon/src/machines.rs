@@ -229,6 +229,9 @@ struct Inner<H> {
     asleep: Millis,
     /// When the Mac was last looked at.
     looked: Option<Millis>,
+    /// Whether the Mac took new jobs at the last look, and the budget's word for why not: a change is a line in
+    /// the log.
+    door: Option<(bool, &'static str)>,
 }
 
 /// The Mac's slots and machines. The scalers see it as [`Slots`], [`Hosts`] and [`Events`]; the daemon's loop
@@ -313,6 +316,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             inner: Mutex::new(Inner {
                 asleep,
                 looked: None,
+                door: None,
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -507,7 +511,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// say. Call it every second.
     pub fn tick(&self) {
         let mut inner = self.lock();
-        let now = inner.host.now();
         let reading: Option<HostReading> = match inner.host.read() {
             Ok(reading) => {
                 inner.host_error = None;
@@ -518,6 +521,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 None
             }
         };
+        // After the reading, never before it: the budget takes a reading from later than `now` for one of another
+        // moment and closes the Mac for the calm time, and a real clock moves on while the Mac is read.
+        let now = inner.host.now();
         self.holds(&mut inner, now);
         self.woke(&mut inner, now);
         // The budget forgets what it knew of a Mac nobody looked at for so long, and opens it again only after
@@ -534,6 +540,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             );
         }
         let observed = inner.budget.observe(now, reading);
+        Self::door(&mut inner, now);
         let mut nudge = false;
         for slot in observed.expired {
             inner.grants.remove(&slot);
@@ -601,6 +608,29 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         drop(inner);
         if nudge {
             (self.nudge)();
+        }
+    }
+
+    /// Writes a line when the Mac starts or stops taking new jobs, or stops for another reason than before. Without
+    /// it a job that waits leaves nothing in the log, and nobody who reads it can tell whether the Runner listens.
+    fn door(inner: &mut Inner<H>, now: Now) {
+        let status = inner.budget.status(now);
+        let open = status.level == Level::Open;
+        // Only a Mac that is out of memory or disk is closed with nothing that refuses a new job by name.
+        let why = status
+            .closed_by
+            .map_or(if open { "" } else { "out-of-room" }, |refusal| refusal.name());
+        if inner.door.replace((open, why)) == Some((open, why)) {
+            return;
+        }
+        match status.closed_by {
+            _ if open => tracing::info!("the Mac is open: a new job gets a machine"),
+            Some(cf_budget::Refusal::Calming { left }) => tracing::info!(
+                why,
+                opens_in_s = left.0.div_ceil(1000),
+                "the Mac is closed: a new job waits"
+            ),
+            _ => tracing::info!(why, "the Mac is closed: a new job waits"),
         }
     }
 
@@ -1235,6 +1265,8 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
         };
         // Without the lock: the look may wait on the vm-host's socket.
         match self.vms.look(handle) {
+            // A machine that stands has not said its last word: that is no answer nobody could give, only an early one.
+            Seen::Alive(state) if state.end.is_none() && state.oom.is_none() => OutOfMemory::NotSoFar,
             Seen::Alive(state) | Seen::Gone(state) => state.out_of_memory(),
             Seen::Silent(_) => OutOfMemory::Unknown {
                 reason: "the vm-host does not answer".into(),
