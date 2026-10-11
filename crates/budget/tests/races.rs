@@ -5,14 +5,16 @@ mod common;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use cf_budget::{Budget, GIB, MIB, Refusal, Size};
+use cf_budget::{Budget, GIB, Refusal, Size};
 use common::*;
 
 /// An open budget with memory for exactly `slots` VMs of 4 GB, and CPUs and cap for more.
 fn room_for(slots: u64) -> Budget {
     let mut budget = open(one_vcpu(dedicated()));
     let mut reading = calm(secs(61));
-    reading.available_bytes = slots * (4 * GIB + 64 * MIB) + 2 * GIB + (4 * GIB + 64 * MIB - 1);
+    reading.available_bytes = slots * (4 * GIB + cf_budget::Settings::VM_HOST_OVERHEAD)
+        + 2 * GIB
+        + (4 * GIB + cf_budget::Settings::VM_HOST_OVERHEAD - 1);
     budget.observe(secs(61), Some(reading));
     budget
 }

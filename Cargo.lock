@@ -110,23 +110,58 @@ dependencies = [
 [[package]]
 name = "cf-console-client"
 version = "0.1.0"
+dependencies = [
+ "cf-fake-console",
+ "cf-fake-github",
+ "cf-ghapp",
+ "cf-secret",
+ "proptest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cf-daemon"
 version = "0.1.0"
 dependencies = [
+ "cf-budget",
+ "cf-console-client",
+ "cf-fake-console",
  "cf-fake-github",
  "cf-ghapp",
+ "cf-guest-proto",
+ "cf-host-macos",
+ "cf-lifecycle",
  "cf-scaleset",
  "cf-secret",
+ "cf-vmhost",
  "cf-workflows",
+ "libc",
  "proptest",
  "rand 0.9.5",
+ "serde",
+ "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "cf-fake-console"
+version = "0.1.0"
+dependencies = [
+ "cf-fake-github",
+ "rand 0.9.5",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -230,6 +265,9 @@ dependencies = [
 [[package]]
 name = "cf-secret"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "cf-supervisor"
@@ -296,15 +334,25 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "codefusion-runner"
 version = "0.1.0"
 dependencies = [
+ "cf-budget",
+ "cf-console-client",
+ "cf-daemon",
+ "cf-ghapp",
  "cf-guest-proto",
+ "cf-host-macos",
  "cf-image",
+ "cf-scaleset",
+ "cf-secret",
  "cf-vmhost",
  "cf-vmm",
  "cf-vmm-vz",
  "ed25519-dalek",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2099,12 +2147,23 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "cf-budget",
+ "cf-console-client",
+ "cf-daemon",
+ "cf-fake-console",
+ "cf-fake-github",
+ "cf-ghapp",
+ "cf-guest-proto",
  "cf-image",
+ "cf-scaleset",
+ "cf-secret",
  "ed25519-dalek",
  "flate2",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

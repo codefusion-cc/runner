@@ -147,6 +147,92 @@ fn idle_nanos() -> Option<u64> {
     if read { u64::try_from(nanos).ok() } else { None }
 }
 
+/// `kern.boottime`: a `timeval`, with the four bytes the C struct leaves empty named, so that it has no padding.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BootTime {
+    secs: i64,
+    micros: i32,
+    unused: i32,
+}
+// SAFETY: an i64 and two i32, sixteen bytes with nothing between or after them.
+unsafe impl Plain for BootTime {}
+
+/// When the Mac started, in seconds since 1970; `None` when macOS will not say.
+pub fn boot_time() -> Option<i64> {
+    sysctl::<BootTime>(c"kern.boottime")
+        .ok()
+        .map(|at| at.secs)
+        .filter(|secs| *secs > 0)
+}
+
+/// The text up to the first NUL, when it is one.
+fn text_of(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let text = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// A text macOS keeps under a name.
+fn sysctl_text(name: &std::ffi::CStr) -> Option<String> {
+    let mut text = [0u8; 128];
+    let mut len = text.len();
+    // SAFETY: the name ends with a NUL; `text` is `len` writable bytes, and the kernel writes at most `len` and
+    // stores how many it wrote; nothing is set (no new value).
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            text.as_mut_ptr().cast(),
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0).then(|| text_of(&text[..len.min(text.len())]))?
+}
+
+/// The Mac's model as macOS names it (`hw.model`, such as `Mac16,12`); `None` when macOS will not say.
+pub fn model() -> Option<String> {
+    sysctl_text(c"hw.model")
+}
+
+/// The name macOS gives this start of the Mac (`kern.bootsessionuuid`): another one after every start, and the
+/// same until the next, whatever the clock is set to meanwhile. [`boot_time`] is not that: macOS works it out
+/// from the clock, so it moves when the clock is set. `None` when macOS will not say.
+pub fn boot_session() -> Option<String> {
+    sysctl_text(c"kern.bootsessionuuid")
+}
+
+/// The Mac's host name; `None` when macOS will not say.
+pub fn host_name() -> Option<String> {
+    let mut text = [0u8; 256];
+    // SAFETY: `text` is its own length of writable bytes; one less is passed, so the last byte stays the NUL it is.
+    let status = unsafe { libc::gethostname(text.as_mut_ptr().cast(), text.len() - 1) };
+    (status == 0).then(|| text_of(&text))?
+}
+
+/// The load averages of 1, 5 and 15 minutes; zeros when macOS will not say.
+pub fn load() -> [f64; 3] {
+    let mut load = [0f64; 3];
+    // SAFETY: `load` holds the three numbers asked for.
+    let read = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+    if read == 3 { load } else { [0.0; 3] }
+}
+
+/// The share of the CPUs' time that was not idle between two counts of [`MacHost::cpu_ticks`], in percent; `None`
+/// when no time passed between them or a count ran over.
+pub fn cpu_percent(before: [u32; 4], now: [u32; 4]) -> Option<f64> {
+    let passed = |state: usize| u64::from(now[state].wrapping_sub(before[state]));
+    let idle = passed(libc::CPU_STATE_IDLE as usize);
+    let all: u64 = (0..4).map(passed).sum();
+    // The counts are 32-bit and wrap after more than a year of ticks; a pair that makes no sense says nothing.
+    if all == 0 || all > u64::from(u32::MAX / 2) {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some((all - idle) as f64 / all as f64 * 100.0)
+}
+
 /// Whether an answer of `words` 32-bit words reaches past the last field read here. An older macOS knows fewer
 /// fields and writes fewer.
 fn has_every_field_read(words: u32) -> bool {
@@ -219,6 +305,34 @@ impl MacHost {
         })
     }
 
+    /// The size of the volume with the job disks, in bytes; `None` when macOS will not say.
+    pub fn disk_total_bytes(&self) -> Option<u64> {
+        let stats = self.statfs().ok()?;
+        Some(stats.f_blocks.saturating_mul(stats.f_bsize.into()))
+    }
+
+    /// The time all CPUs spent since the Mac started, in ticks: user, system, idle, nice (`CPU_STATE_*`). Two
+    /// counts make a share, see [`cpu_percent`]. `None` when macOS will not say.
+    pub fn cpu_ticks(&self) -> Option<[u32; 4]> {
+        let mut load = MaybeUninit::<libc::host_cpu_load_info>::zeroed();
+        let mut words = libc::HOST_CPU_LOAD_INFO_COUNT;
+        // SAFETY: `load` is `words` 32-bit words long, which is what the count says; the kernel writes at most
+        // that many and stores how many it wrote.
+        let status = unsafe {
+            libc::host_statistics(
+                self.host_port,
+                libc::HOST_CPU_LOAD_INFO,
+                load.as_mut_ptr().cast(),
+                &mut words,
+            )
+        };
+        if status != 0 || words != libc::HOST_CPU_LOAD_INFO_COUNT {
+            return None;
+        }
+        // SAFETY: the struct is four integers, zeroed and then written in full by the kernel.
+        Some(unsafe { load.assume_init() }.cpu_ticks)
+    }
+
     fn memory(&self) -> Result<libc::vm_statistics64, HostError> {
         let mut stats = MaybeUninit::<libc::vm_statistics64>::zeroed();
         let mut words = libc::HOST_VM_INFO64_COUNT;
@@ -262,7 +376,8 @@ impl MacHost {
         Ok(level)
     }
 
-    fn disk_free_bytes(&self) -> Result<u64, HostError> {
+    /// What macOS says of the volume with the job disks.
+    fn statfs(&self) -> Result<libc::statfs, HostError> {
         let mut stats = MaybeUninit::<libc::statfs>::zeroed();
         // SAFETY: the path ends with a NUL and `stats` is a statfs this call may write.
         let status = unsafe { libc::statfs(self.disk.as_ptr(), stats.as_mut_ptr()) };
@@ -273,7 +388,11 @@ impl MacHost {
             });
         }
         // SAFETY: the call succeeded, so it filled the struct in.
-        let stats = unsafe { stats.assume_init() };
+        Ok(unsafe { stats.assume_init() })
+    }
+
+    fn disk_free_bytes(&self) -> Result<u64, HostError> {
+        let stats = self.statfs()?;
         Ok(stats.f_bavail.saturating_mul(stats.f_bsize.into()))
     }
 }
@@ -319,7 +438,58 @@ impl Drop for MacHost {
 
 #[cfg(test)]
 mod tests {
-    use super::has_every_field_read;
+    use super::{
+        boot_session, boot_time, cpu_percent, has_every_field_read, host_name, load, model, text_of,
+    };
+    use crate::MacHost;
+
+    #[test]
+    fn the_mac_says_who_it_is_and_since_when_it_runs() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs() as i64;
+        let boot = boot_time().expect("a boot time");
+        // After 2020 and before now: a number read in the wrong unit or at the wrong offset is neither.
+        assert!(boot > 1_577_836_800 && boot <= now, "{boot}");
+        assert!(model().is_some_and(|model| model.is_ascii() && model.len() >= 3));
+        let session = boot_session().expect("a name for this start");
+        // A UUID, whole: one cut short by a buffer too small would name two starts alike.
+        assert_eq!(session.len(), 36, "{session}");
+        assert!(
+            session.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "{session}"
+        );
+        assert_eq!(boot_session(), Some(session));
+        assert!(host_name().is_some());
+        assert!(load().iter().all(|load| load.is_finite() && *load >= 0.0));
+        let host = MacHost::new(std::path::Path::new("/")).expect("a host");
+        assert!(host.disk_total_bytes().is_some_and(|bytes| bytes > 1 << 30));
+        let ticks = host.cpu_ticks().expect("ticks");
+        assert!(ticks[libc::CPU_STATE_IDLE as usize] > 0, "{ticks:?}");
+    }
+
+    #[test]
+    fn text_ends_at_its_first_nul_and_is_none_when_empty_or_no_text() {
+        assert_eq!(text_of(b"Mac16,12\0rest"), Some("Mac16,12".to_string()));
+        assert_eq!(text_of(b"no-nul"), Some("no-nul".to_string()));
+        assert_eq!(text_of(b"\0"), None);
+        assert_eq!(text_of(b""), None);
+        assert_eq!(text_of(&[0xff, 0xfe, 0]), None);
+    }
+
+    #[test]
+    fn the_cpu_in_use_is_the_share_of_ticks_that_were_not_idle() {
+        // user, system, idle, nice
+        assert_eq!(cpu_percent([100, 100, 100, 0], [130, 110, 160, 0]), Some(40.0));
+        assert_eq!(cpu_percent([0, 0, 0, 0], [0, 0, 50, 0]), Some(0.0));
+        assert_eq!(cpu_percent([0, 0, 0, 0], [10, 10, 0, 5]), Some(100.0));
+        assert_eq!(cpu_percent([5, 5, 5, 5], [5, 5, 5, 5]), None, "no time passed");
+        // A count that wrapped around is still the time that passed.
+        assert_eq!(cpu_percent([u32::MAX - 9, 0, 0, 0], [10, 0, 20, 0]), Some(50.0));
+        // The first count after a restart of the Mac is below the one before: no share is made of that.
+        assert_eq!(cpu_percent([1000, 1000, 1000, 0], [10, 10, 10, 0]), None);
+    }
 
     #[test]
     fn an_answer_that_ends_before_the_last_field_read_is_told_apart() {

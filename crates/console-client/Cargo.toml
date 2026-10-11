@@ -1,10 +1,27 @@
 [package]
 name = "cf-console-client"
-description = "The client of the CodeFusion Console's runner protocol: enrol, report, commands. Filled in M4."
+description = "The client of the CodeFusion Console's runner protocol: enrol, report, leave, and the outbox of job events that wait for the console."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+cf-ghapp = { path = "../ghapp" }
+cf-secret = { path = "../secret" }
+reqwest = { version = "0.13", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+cf-fake-console = { path = "../fake-console" }
+cf-fake-github = { path = "../fake-github" }
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

@@ -113,10 +113,18 @@ pub enum SettingsError {
 }
 
 impl Settings {
-    /// The estimate of what one VM costs the host on top of its size, until M1 has measured it: 20 MB for the
-    /// vm-host (the plan's target) plus 23 MB that the VM's own process showed over a 10 GB guest (the memory
-    /// report: Virtualization at 10,263 MB), rounded up.
-    pub const VM_HOST_OVERHEAD_ESTIMATE: u64 = 64 * MIB;
+    /// What one VM is counted with on the host on top of its size: its vm-host, and what the hypervisor's process
+    /// holds that is not the guest's memory. A number no full machine exceeds, since a slot is opened on the
+    /// promise that the machine never takes more.
+    ///
+    /// Measured with jobs that take all the memory they get (`cargo xtask it --only full-memory`): the vm-host
+    /// holds 50 MB. The hypervisor's share is known between two numbers, since the guest's kernel does not say
+    /// how much it touched of the memory it keeps out of its own count: between 27 MB and 83 MB with a 1 GB
+    /// machine, whose kernel keeps the least (a 4 GB machine says between 21 MB and 199 MB). So a full machine
+    /// costs between 76 MB and 131 MB beyond its size, plus the page tables of a larger guest (2 MB for each
+    /// 4 GB). 64 MB, the estimate before the measurement, was below even the lower number; 192 MB is above the
+    /// higher one for every size.
+    pub const VM_HOST_OVERHEAD: u64 = 192 * MIB;
 
     /// The plan's estimate of what the guest's kernel and supervisor take of a VM's size.
     pub const GUEST_OVERHEAD_ESTIMATE: u64 = GIB / 4;
@@ -166,7 +174,7 @@ impl Settings {
             away,
             in_use,
             idle_after: Millis::mins(15),
-            vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD_ESTIMATE,
+            vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
             vcpus: [2, (all_but_two / 2).clamp(2, 4), 4, 4],
             recover_margin_bytes: GIB,
@@ -262,6 +270,13 @@ impl Settings {
     /// away. Sizes that fail are not worth offering to GitHub from this Mac.
     pub fn can_run(&self, size: Size) -> Result<(), Refusal> {
         admit(self, &self.away, self.total_bytes, &[], size)
+    }
+
+    /// How many VMs of this size run side by side under `limits`: as many as its cap and its CPUs take. Whether
+    /// the Mac has the memory for each is decided when it is asked for.
+    pub fn side_by_side(&self, limits: &Profile, size: Size) -> u32 {
+        let by_cap = u32::try_from(limits.cap_bytes / size.vm_bytes().max(1)).unwrap_or(u32::MAX);
+        by_cap.min(limits.cpus / self.vcpus_of(size).max(1))
     }
 
     /// vCPUs of a VM of this size.

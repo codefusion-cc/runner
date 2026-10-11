@@ -934,13 +934,19 @@ impl FakeGithub {
         if let ("DELETE", ["_apis", "distributedtask", "pools", "0", "agents", id]) = (m, segs) {
             let id: i64 = id.parse().unwrap_or(0);
             return self.admin(&bearer, |st, _| {
-                let before = st.runners.len();
-                st.runners.retain(|r| r.id != id);
-                if st.runners.len() == before {
-                    json_error(404, "AgentNotFoundException", "runner not found")
-                } else {
-                    Reply::empty(204)
+                let Some(name) = st.runners.iter().find(|r| r.id == id).map(|r| r.name.clone()) else {
+                    return json_error(404, "AgentNotFoundException", "runner not found");
+                };
+                // As the service: an Actions runner is not removed under its job, whatever became of its machine.
+                if st
+                    .jobs
+                    .iter()
+                    .any(|j| matches!(&j.state, JobState::Running(n) if *n == name))
+                {
+                    return json_error(422, "JobStillRunningException", "the runner still has a job");
                 }
+                st.runners.retain(|r| r.id != id);
+                Reply::empty(204)
             });
         }
         Reply::status_json(

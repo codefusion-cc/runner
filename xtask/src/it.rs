@@ -5,6 +5,10 @@
 //! target/it/release`), which it installs through the verifying store. Each scenario starts `codefusion-runner vm` the
 //! way the daemon does, with a shell script in place of the Actions runner, and judges the job's last state and what
 //! the job wrote to the machine's console. The numbers go to `target/it/report.txt`.
+//!
+//! `service` and `commands` (`it/service.rs`) run the whole service and the binary's own commands against the
+//! repository's fakes of GitHub and the console. A scenario that needs more memory than the Mac has free says
+//! `SKIPPED` and why.
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -17,6 +21,22 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod service;
+/// The service runs on macOS only; the suite is built wherever the other tasks are.
+#[cfg(not(target_os = "macos"))]
+mod service {
+    use super::{Bench, Fallible};
+
+    pub fn service(_bench: &Bench) -> Fallible<Vec<String>> {
+        Err("the service runs on macOS only".into())
+    }
+
+    pub fn commands(_bench: &Bench) -> Fallible<Vec<String>> {
+        Err("the service runs on macOS only".into())
+    }
+}
+
 type Fallible<T> = Result<T, Box<dyn Error>>;
 /// A scenario answers with the lines of its report.
 type Scenario = fn(&Bench) -> Fallible<Vec<String>>;
@@ -25,6 +45,9 @@ const MB: u64 = 1 << 20;
 const SCRATCH_BYTES: u64 = 30 << 30;
 /// The job's share of a machine of 1024 MB: the machine less what its kernel and supervisor keep.
 const LIMIT_OF_1024: &str = "805306368";
+/// Takes all the memory a job gets but 200 MB, in pieces it writes into, and prints what the guest has touched by
+/// then: all its memory but what is free. It holds on for six seconds, so that the Mac's count is read meanwhile.
+const HOLDS_ALL_IT_GETS: &str = r#"node -e 'const fs = require("fs"); const kb = (name) => Number(fs.readFileSync("/proc/meminfo", "utf8").match(new RegExp(name + ":\\s+(\\d+)"))[1]); const limit = Number(fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8")); const held = []; for (let left = limit - 200 * 1048576; left > 0; left -= 268435456) held.push(Buffer.alloc(Math.min(left, 268435456), 1)); console.log("touched_kb=" + (kb("MemTotal") - kb("MemFree")) + " total_kb=" + kb("MemTotal") + " limit_kb=" + limit / 1024); setTimeout(() => console.log("held=" + held.length), 6000)'"#;
 const MACHINE_PROCESS: &str = "com.apple.Virtualization.VirtualMachine";
 const AGENT: &str = "cc.codefusion.runner.it";
 const WAITS: &str = "trap '' TERM; echo waiting; sleep 600; echo woke";
@@ -128,11 +151,14 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         }
     }
     let bench = prepare(root, &release)?;
-    let scenarios: [(&str, Scenario); 12] = [
+    let scenarios: [(&str, Scenario); 15] = [
         ("boot", boot),
         ("lifecycle", lifecycle),
         ("exit-code", exit_code),
         ("oom", oom),
+        ("full-memory", full_memory),
+        ("service", service::service),
+        ("commands", service::commands),
         ("timeout", timeout),
         ("stop", stop),
         ("sigterm", sigterm),
@@ -776,6 +802,110 @@ echo step=$?"#;
         ),
         format!("ended {:.1} s after the start", finished.took.as_secs_f32()),
     ])
+}
+
+/// A machine whose job took all it got, as the Mac and the guest counted it.
+struct Filled {
+    size: u64,
+    limit: u64,
+    /// What the guest's kernel counts as its memory, and what of it was not free at the job's most.
+    total: u64,
+    touched: u64,
+    machine_peak: u64,
+    host_peak: u64,
+}
+
+impl Filled {
+    /// The memory of the machine the guest left free.
+    fn free(&self) -> u64 {
+        self.total.saturating_sub(self.touched)
+    }
+
+    /// What the machine's process and the vm-host hold beyond the machine's size if every page the guest left free
+    /// were touched too, and the guest's kernel had touched all it keeps out of its own count (its map of the
+    /// memory, its image): the least a full machine costs beyond its size.
+    fn at_least(&self) -> u64 {
+        (self.machine_peak + self.host_peak + self.free()).saturating_sub(self.size)
+    }
+
+    /// The same if the kernel had touched nothing of what it keeps out of its count: no full machine costs more
+    /// beyond its size. The kernel's share grows with the machine, so the smallest machine says it closest.
+    fn at_most(&self) -> u64 {
+        self.machine_peak.saturating_sub(self.touched) + self.host_peak
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "a {} machine whose job takes all it gets (limit {}): the guest had touched {} of the {} its kernel counts; the machine's process held {} at its most, its vm-host {}; a full one costs between {} and {} beyond its size",
+            mb(self.size),
+            mb(self.limit),
+            mb(self.touched),
+            mb(self.total),
+            mb(self.machine_peak),
+            mb(self.host_peak),
+            mb(self.at_least()),
+            mb(self.at_most())
+        )
+    }
+}
+
+fn filled(bench: &Bench, job_name: &str, size_mb: u64) -> Fallible<Filled> {
+    let finished = job(bench, job_name, size_mb, 180, HOLDS_ALL_IT_GETS)?;
+    ended(&finished, "ok")?;
+    tidy(bench, job_name)?;
+    let kb = |name: &str| number_after(&finished.console, name).map(|kb| kb as u64 * 1024);
+    let filled = Filled {
+        size: size_mb * MB,
+        limit: kb("limit_kb=").ok_or("the job printed no limit")?,
+        total: kb("total_kb=").ok_or("the job printed no memory")?,
+        touched: kb("touched_kb=").ok_or("the job printed no memory")?,
+        machine_peak: finished.machine_peak,
+        host_peak: finished.host_peak,
+    };
+    let least = filled.limit.saturating_sub(300 * MB);
+    expect(
+        filled.touched > least && filled.machine_peak > least,
+        format!("the measure is wrong: {}", filled.line()),
+    )?;
+    Ok(filled)
+}
+
+/// What a machine costs the Mac beyond its size when its job takes all the memory it gets: the number the budget
+/// counts every machine with (`vm_host_overhead_bytes`). A `cf-4g`, the size most jobs run in, and a machine of
+/// 1024 MB, which bounds the cost from above most closely.
+fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
+    const SIZE_MB: u64 = 4096;
+    let needed = (SIZE_MB + 2048) * MB;
+    if available() < needed {
+        return Ok(vec![format!(
+            "SKIPPED: {} of memory are available on this Mac and a cf-4g machine that fills up needs {} with the Mac's floor",
+            mb(available()),
+            mb(needed)
+        )]);
+    }
+    let available_before = available();
+    let (large, small) = (
+        filled(bench, "it-full", SIZE_MB)?,
+        filled(bench, "it-full-small", 1024)?,
+    );
+    let counted = cf_budget::Settings::VM_HOST_OVERHEAD;
+    let lines = vec![
+        large.line(),
+        small.line(),
+        format!(
+            "the budget counts {} for a machine beyond its size; the Mac's available memory was {} before",
+            mb(counted),
+            mb(available_before)
+        ),
+    ];
+    expect(
+        large.at_least() <= counted && small.at_least() <= counted && small.at_most() <= counted,
+        format!(
+            "a machine costs the Mac more beyond its size than the budget counts:\n{}",
+            indent(&lines)
+        ),
+    )?;
+    Ok(lines)
 }
 
 fn timeout(bench: &Bench) -> Fallible<Vec<String>> {

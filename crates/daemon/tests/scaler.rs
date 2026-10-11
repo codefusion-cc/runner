@@ -5,9 +5,10 @@ mod support;
 
 use std::time::Duration;
 
+use cf_daemon::testing::{pass, settings_for};
 use cf_daemon::{EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Runner, Slots};
-use cf_fake_github::JobState;
 use cf_fake_github::httpd::Reply;
+use cf_fake_github::{JobState, Options};
 use cf_scaleset::{JobBase, JobCompleted, JobStarted, Message, Scaler as _, Statistics};
 use support::*;
 
@@ -69,7 +70,7 @@ async fn assigned_jobs_beyond_the_machine_wait_for_a_slot() {
     assert_eq!(h.hosts.started().len(), 2, "a machine of 2 starts 2");
     // An Actions runner finishes and its machine is gone: the next quiet poll starts a waiting job.
     let first = names(&h)[0].clone();
-    h.roster.exited(&first, &*h.slots).expect("known runner");
+    h.hosts.gone(&first);
     h.scaler.scale(None).await.unwrap();
     assert_eq!(h.hosts.started().len(), 3);
 }
@@ -80,7 +81,7 @@ async fn acquires_only_what_fits() {
     let ids: Vec<i64> = (1..=3)
         .map(|i| {
             h.fake
-                .queue_job(REPO, &["self-hosted", "cf-1g"], &format!("job {i}"))
+                .queue_job(REPO, &["self-hosted", "cf-2g"], &format!("job {i}"))
         })
         .collect();
     let message = next_messages(&h, 3, 5).await;
@@ -93,7 +94,7 @@ async fn acquires_only_what_fits() {
         Some(JobState::Available),
         "the third waits at GitHub for a free machine"
     );
-    assert!(h.slots.reserve(1).is_err(), "acquired jobs hold their slots");
+    assert!(h.slots.reserve(SIZE).is_err(), "acquired jobs hold their slots");
     assert_eq!(
         h.scaler.capacity(),
         2,
@@ -104,12 +105,12 @@ async fn acquires_only_what_fits() {
 #[tokio::test]
 async fn jobs_offered_twice_in_one_message_are_acquired_once() {
     let mut h = harness(3).await;
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
     let mut message = next_message(&h, 3).await;
     message.available.push(message.available[0].clone());
     h.scaler.scale(Some(&message)).await.unwrap();
     assert_eq!(h.fake.job_state(id), Some(JobState::Acquired(h.set.id)));
-    assert_eq!(h.slots.used_gb(), 1, "one job, one slot");
+    assert_eq!(h.slots.used(), 1, "one job, one slot");
     assert!(
         h.slots.released().is_empty(),
         "no second slot was promised and given back"
@@ -123,7 +124,7 @@ async fn jobs_taken_elsewhere_free_their_slots() {
     let ids: Vec<i64> = (1..=3)
         .map(|i| {
             h.fake
-                .queue_job(REPO, &["self-hosted", "cf-1g"], &format!("job {i}"))
+                .queue_job(REPO, &["self-hosted", "cf-2g"], &format!("job {i}"))
         })
         .collect();
     let message = next_messages(&h, 3, 3).await;
@@ -132,7 +133,7 @@ async fn jobs_taken_elsewhere_free_their_slots() {
     h.fake.take_job(ids[2]);
     h.scaler.scale(Some(&message)).await.unwrap();
     assert_eq!(h.fake.job_state(ids[0]), Some(JobState::Acquired(h.set.id)));
-    assert_eq!(h.slots.used_gb(), 1, "only the job this machine got holds a slot");
+    assert_eq!(h.slots.used(), 1, "only the job this machine got holds a slot");
     assert_eq!(h.slots.released().len(), 2);
 }
 
@@ -141,7 +142,7 @@ async fn an_acquire_failure_gives_the_slots_back_and_fails_the_poll() {
     let mut h = harness(2).await;
     for i in 1..=2 {
         h.fake
-            .queue_job(REPO, &["self-hosted", "cf-1g"], &format!("job {i}"));
+            .queue_job(REPO, &["self-hosted", "cf-2g"], &format!("job {i}"));
     }
     let message = next_messages(&h, 2, 2).await;
     h.fake.fail("acquirejobs", Reply::text(503, "down"), 10);
@@ -151,14 +152,14 @@ async fn an_acquire_failure_gives_the_slots_back_and_fails_the_poll() {
         .await
         .expect_err("the message must come back");
     assert_eq!(err.status(), Some(503));
-    assert_eq!(h.slots.used_gb(), 0, "slots of a failed acquire are free again");
+    assert_eq!(h.slots.used(), 0, "slots of a failed acquire are free again");
 }
 
 #[tokio::test]
-async fn a_closed_machine_acquires_nothing_but_runs_what_it_has() {
+async fn a_paused_machine_acquires_nothing_and_an_assigned_job_waits_in_line() {
     let mut h = harness(2).await;
-    h.slots.set_open(false, "in use");
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    h.slots.set_open(false);
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
     let message = next_message(&h, 1).await;
     h.scaler.scale(Some(&message)).await.unwrap();
     assert_eq!(
@@ -171,8 +172,49 @@ async fn a_closed_machine_acquires_nothing_but_runs_what_it_has() {
         Some(JobState::Available),
         "the refused job stays offered at GitHub"
     );
-    assert_eq!(h.slots.used_gb(), 0);
-    // A job assigned before the machine closed still gets its Actions runner.
+    assert_eq!(h.slots.used(), 0);
+    // A job GitHub assigned all the same holds a place in line: a hold keeps every job out.
+    let capacity = h.scaler.scale(Some(&stats(1))).await.unwrap();
+    assert!(
+        h.hosts.started().is_empty(),
+        "a machine was started on a paused Mac"
+    );
+    assert_eq!(h.machines.snapshot().waiting, 1);
+    assert_eq!(capacity, 1, "the job in line counts, no free slot is offered");
+    // Asked again, the same job does not take a second place.
+    h.scaler.scale(None).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 1);
+    h.slots.set_open(true);
+    let nudges = h.parts.nudges.load(std::sync::atomic::Ordering::Relaxed);
+    pass(&h.machines, 1);
+    assert_eq!(
+        h.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
+        nudges + 1,
+        "the scalers are told that the job's turn came"
+    );
+    h.scaler.scale(None).await.unwrap();
+    assert_eq!(h.hosts.started().len(), 1);
+    assert_eq!((h.machines.snapshot().waiting, h.slots.used()), (0, 1));
+}
+
+#[tokio::test]
+async fn a_mac_someone_works_on_acquires_nothing_but_runs_what_it_has() {
+    use cf_budget::{Mode, Settings};
+    let mut settings = Settings::for_host(cf_daemon::testing::TEST_MAC, Mode::Workstation);
+    settings.vcpus = [1; 4];
+    // The fake Mac's person has only just stopped typing.
+    let mut h = harness_on(settings, Options::default()).await;
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
+    let message = next_message(&h, 1).await;
+    h.scaler.scale(Some(&message)).await.unwrap();
+    assert_eq!(
+        h.fake.count("acquirejobs"),
+        0,
+        "no job is asked for while the person is there"
+    );
+    assert_eq!(h.fake.job_state(id), Some(JobState::Available));
+    assert_eq!(h.slots.state(), (false, "person-there".to_string()));
+    // A job that is this Mac's already still gets its Actions runner.
     let capacity = h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert_eq!(
         h.hosts.started().len(),
@@ -180,6 +222,46 @@ async fn a_closed_machine_acquires_nothing_but_runs_what_it_has() {
         "an assigned job was left without a runner"
     );
     assert_eq!(capacity, 1, "just its runner, no free slot offered");
+    let held = h.machines.snapshot().budget.slots;
+    assert_eq!(
+        held.iter().map(|slot| slot.origin.name()).collect::<Vec<_>>(),
+        ["assigned-in-use"]
+    );
+}
+
+#[tokio::test]
+async fn a_job_whose_size_the_settings_rule_out_is_said_to_never_fit_and_holds_nothing() {
+    let mut settings = settings_for(2);
+    // No room for even one machine of the scale set's size, whatever the Mac reads.
+    settings.away.cap_bytes = cf_budget::GIB;
+    settings.in_use = settings.away;
+    let mut h = harness_on(settings, Options::default()).await;
+    let never = h.scaler.never_handle();
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
+    let message = next_message(&h, 1).await;
+    let capacity = h.scaler.scale(Some(&message)).await.unwrap();
+    assert_eq!(
+        h.fake.count("acquirejobs"),
+        0,
+        "a job that cannot fit is not asked for"
+    );
+    assert_eq!(h.fake.job_state(id), Some(JobState::Available));
+    assert_eq!(capacity, 0);
+    assert_eq!(*never.lock().unwrap(), None, "nothing is assigned yet");
+    // GitHub assigns one all the same.
+    h.scaler.scale(Some(&stats(1))).await.unwrap();
+    h.scaler.scale(None).await.unwrap();
+    assert!(h.hosts.started().is_empty());
+    assert!(
+        h.fake.runners().is_empty(),
+        "an Actions runner was registered for a job that cannot run"
+    );
+    let snapshot = h.machines.snapshot();
+    assert_eq!((snapshot.waiting, snapshot.budget.slots.len()), (0, 0));
+    assert_eq!(never.lock().unwrap().as_deref(), Some("full"));
+    // The job went away: the reason goes with it.
+    h.scaler.scale(Some(&stats(0))).await.unwrap();
+    assert_eq!(*never.lock().unwrap(), None);
 }
 
 #[tokio::test]
@@ -191,9 +273,9 @@ async fn a_failed_start_unregisters_and_frees_the_slot() {
         .scale(Some(&stats(1)))
         .await
         .expect_err("a failed start fails the poll");
-    assert!(err.to_string().contains("no machine"), "{err}");
+    assert!(err.to_string().contains("did not start"), "{err}");
     assert!(h.fake.runners().is_empty(), "the registration was left behind");
-    assert_eq!(h.slots.used_gb(), 0);
+    assert_eq!(h.slots.used(), 0);
     h.scaler.scale(None).await.unwrap();
     assert_eq!(
         h.hosts.started().len(),
@@ -213,7 +295,7 @@ async fn a_registration_failure_starts_no_machine() {
         .expect_err("a failed registration fails the poll");
     assert_eq!(err.status(), Some(500));
     assert!(h.hosts.started().is_empty());
-    assert_eq!(h.slots.used_gb(), 0, "slot held after a failed registration");
+    assert_eq!(h.slots.used(), 0, "slot held after a failed registration");
 }
 
 #[tokio::test]
@@ -321,10 +403,16 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
             "{kept}: busy, adopted and not-yet-removable runners must stay"
         );
     }
+    assert_eq!(h.slots.used(), 3, "a slot went back before its machine was gone");
+    pass(&h.machines, 1);
     assert_eq!(
-        h.slots.released().len(),
-        1,
-        "the retired runner's slot is back, once"
+        h.slots.used(),
+        2,
+        "the retired runner's slot is back once its machine is gone"
+    );
+    assert!(
+        h.slots.released().is_empty(),
+        "the scaler gave back a slot a machine held"
     );
 }
 
@@ -338,7 +426,7 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
         },
     )
     .await;
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
     let offered = next_message(&h, 1).await;
     h.scaler.scale(Some(&offered)).await.unwrap();
     let assigned = next_message(&h, 1).await;
@@ -357,7 +445,8 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
     h.scaler.scale(None).await.unwrap();
     assert_eq!(h.hosts.stopped().len(), 1);
     assert!(h.fake.runners().is_empty());
-    assert_eq!(h.slots.used_gb(), 0);
+    pass(&h.machines, 1);
+    assert_eq!(h.slots.used(), 0);
 }
 
 #[tokio::test]
@@ -473,8 +562,8 @@ async fn a_job_that_ran_out_of_memory_is_reported_as_such() {
     );
     assert_eq!(
         *asked.lock().unwrap(),
-        vec!["mac-b-j0000000".to_string()],
-        "only the runner this machine no longer has is asked about"
+        vec![fine.clone(), "mac-b-j0000000".to_string()],
+        "a machine that still runs cannot rule it out and one that is gone cannot say: whoever watches machines go is asked"
     );
 }
 
@@ -545,7 +634,7 @@ async fn a_runner_whose_job_is_done_is_never_retired_as_surplus() {
 
 /// One job offered and acquired, and the slot promised to it.
 async fn acquired_job(h: &mut Harness) -> (i64, cf_daemon::Ticket) {
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
     let message = next_message(h, 2).await;
     h.scaler.scale(Some(&message)).await.unwrap();
     assert_eq!(h.fake.job_state(id), Some(JobState::Acquired(h.set.id)));
@@ -560,7 +649,7 @@ async fn a_slot_promised_to_a_job_that_is_never_assigned_goes_back_after_two_min
 
     h.clock.advance(PROMISE_TTL - Duration::from_secs(5));
     assert_eq!(h.scaler.scale(None).await.unwrap(), 2);
-    assert_eq!(h.slots.used_gb(), 1, "the promise still stands");
+    assert_eq!(h.slots.used(), 1, "the promise still stands");
 
     h.clock.advance(Duration::from_secs(10));
     assert_eq!(
@@ -568,7 +657,7 @@ async fn a_slot_promised_to_a_job_that_is_never_assigned_goes_back_after_two_min
         1,
         "a promise nobody will claim is no longer offered to the service as room"
     );
-    assert_eq!(h.slots.used_gb(), 0);
+    assert_eq!(h.slots.used(), 0);
     assert_eq!(h.slots.released().len(), 1);
     assert!(h.hosts.started().is_empty());
 }
@@ -587,7 +676,7 @@ async fn a_job_assigned_late_still_runs_in_the_slot_promised_to_it() {
         "the runner took another slot than the promised one"
     );
     assert!(h.slots.released().is_empty());
-    assert_eq!(h.slots.used_gb(), 1);
+    assert_eq!(h.slots.used(), 1);
 }
 
 #[tokio::test]
@@ -608,13 +697,13 @@ async fn a_scaler_that_goes_away_gives_its_promises_back_and_leaves_its_runners_
 #[tokio::test]
 async fn an_acquire_that_is_given_up_on_does_not_lose_the_slot_it_promised() {
     let mut h = harness(2).await;
-    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-1g"], "job");
+    let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
     let message = next_message(&h, 2).await;
     h.fake.fail("acquirejobs", Reply::Hang, 1);
     let given_up = tokio::time::timeout(Duration::from_millis(200), h.scaler.scale(Some(&message))).await;
     assert!(given_up.is_err(), "the acquire was to hang");
     assert_eq!(h.fake.job_state(id), Some(JobState::Available));
-    assert_eq!(h.slots.used_gb(), 1);
+    assert_eq!(h.slots.used(), 1);
     assert_eq!(
         h.scaler.capacity(),
         2,
@@ -623,7 +712,7 @@ async fn an_acquire_that_is_given_up_on_does_not_lose_the_slot_it_promised() {
     h.clock.advance(PROMISE_TTL);
     h.scaler.scale(None).await.unwrap();
     assert_eq!(
-        h.slots.used_gb(),
+        h.slots.used(),
         0,
         "the slot of the abandoned acquire is lost to the machine"
     );
@@ -777,7 +866,7 @@ async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
     // A new job gets its own Actions runner and slot beside it, and the watcher's word frees the old one.
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert_eq!(h.hosts.started().len(), 2);
-    assert_eq!(h.slots.used_gb(), 2);
-    h.roster.exited(&name, &*h.slots);
-    assert_eq!(h.slots.used_gb(), 1);
+    assert_eq!(h.slots.used(), 2);
+    h.hosts.gone(&name);
+    assert_eq!(h.slots.used(), 1);
 }

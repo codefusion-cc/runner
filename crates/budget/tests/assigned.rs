@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use cf_budget::{
-    Assigned, Budget, Free, GIB, Grant, Held, Hold, HostFacts, HostReading, Level, MIB, Millis, Mode, Origin,
+    Assigned, Budget, Free, GIB, Grant, Held, Hold, HostFacts, HostReading, Level, Millis, Mode, Origin,
     Pressure, Refusal, Settings, Size, SlotId, Trouble, UnknownSlot, Waiting,
 };
 use common::*;
 
-const OVERHEAD: u64 = 64 * MIB;
+const OVERHEAD: u64 = Settings::VM_HOST_OVERHEAD;
 
 fn waits(assigned: Assigned) -> (SlotId, Refusal) {
     match assigned {
@@ -311,7 +311,7 @@ fn while_a_job_waits_nothing_else_is_granted_or_offered() {
     assert_eq!(budget.slots(), 0);
 
     // Why the Mac is closed is one question, why the job itself waits another: the status answers both, for
-    // every job in the line. An 8 GB VM needs its size, 64 MB and the 2 GB floor; 5 GB are available.
+    // every job in the line. An 8 GB VM needs its size, 192 MB and the 2 GB floor; 5 GB are available.
     let (behind, _) = waits(budget.assign(secs(61), Size::G2));
     let waiting = |slot, size, why| Waiting {
         slot,

@@ -7,7 +7,9 @@ use time::OffsetDateTime;
 
 use crate::names::runner_name;
 use crate::roster::{JobInfo, Roster, Runner};
-use crate::traits::{EventKind, Events, Hosts, JobEvent, Jobs, Registry, RunnerSpec, Slots, Ticket};
+use crate::traits::{Claim, EventKind, Events, Hosts, JobEvent, Jobs, Registry, RunnerSpec, Slots, Ticket};
+use cf_budget::Size;
+use cf_vmhost::OutOfMemory;
 
 /// How long a new Actions runner may wait for its job before it counts as surplus.
 pub const IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
@@ -28,8 +30,8 @@ pub struct ScalerConfig {
     pub repo: String,
     /// This machine's name, the start of every Actions runner's name.
     pub machine: String,
-    /// The memory size class of the scale set's Actions runners in GB.
-    pub size_gb: u32,
+    /// The size of the scale set's machines.
+    pub size: Size,
 }
 
 /// A slot promised to a job this scaler acquired.
@@ -63,6 +65,10 @@ pub struct Scaler<J, R, H> {
     was_out_of_memory: Option<WasOutOfMemory>,
     /// Slots promised to jobs this scaler acquired and whose Actions runners have not started, oldest first.
     promised: Vec<Promise>,
+    /// Places in line of assigned jobs the machine has no room for yet, oldest first.
+    waiting: Vec<Ticket>,
+    /// Why the scale set's jobs can never run on this machine, when its settings rule the size out.
+    never: Arc<Mutex<Option<String>>>,
     /// The counts as the service last reported them.
     last: Arc<Mutex<Option<Statistics>>>,
     /// How many Actions runners the scale set's assigned jobs need now: the service's count, less the jobs that ended
@@ -92,6 +98,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             events: None,
             was_out_of_memory: None,
             promised: vec![],
+            waiting: vec![],
+            never: Arc::new(Mutex::new(None)),
             last: Arc::new(Mutex::new(None)),
             wanted: None,
         }
@@ -113,6 +121,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// stays valid while the scaler is lent to the listener.
     pub fn statistics_handle(&self) -> Arc<Mutex<Option<Statistics>>> {
         self.last.clone()
+    }
+
+    /// Why this scale set's assigned jobs can never run here, or none while they can. The handle stays valid while
+    /// the scaler is lent to the listener.
+    pub fn never_handle(&self) -> Arc<Mutex<Option<String>>> {
+        self.never.clone()
     }
 
     fn now(&self) -> OffsetDateTime {
@@ -145,9 +159,10 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let recorded = || self.was_out_of_memory.as_ref().is_some_and(|was| was(runner));
         match self.roster.get(runner) {
             Some(r) if !r.handle.is_empty() => match self.hosts.out_of_memory(&r.handle).await {
-                Ok(answer) => answer,
-                Err(e) => {
-                    tracing::warn!(runner = %runner, error = %e, "the host did not say whether the job ran out of memory");
+                OutOfMemory::Yes(_) => true,
+                OutOfMemory::No => false,
+                OutOfMemory::Unknown { reason } => {
+                    tracing::warn!(runner = %runner, %reason, "nobody could say whether the job ran out of memory");
                     recorded()
                 }
             },
@@ -231,7 +246,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let first = self.promised.len();
         let mut refusal = None;
         for _ in 0..ids.len() {
-            match self.slots.reserve(self.config.size_gb) {
+            match self.slots.reserve(self.config.size) {
                 Ok(ticket) => self.promised.push(Promise {
                     ticket,
                     since: self.clock.now(),
@@ -285,23 +300,61 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         });
     }
 
-    /// Starts Actions runners for the jobs assigned to the scale set that have none, and retires the surplus.
+    /// Starts Actions runners for the jobs assigned to the scale set that have none, keeps a place in line for
+    /// those the machine has no room for yet, and retires the surplus.
     async fn converge(&mut self) -> Result<(), Error> {
         let Some(assigned) = self.wanted else {
             return Ok(());
         };
-        let active = self.roster.active(self.config.scale_set_id);
-        for _ in active..assigned {
-            let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
-            let Some(ticket) = self.slots.claim(self.config.size_gb, promised) else {
-                tracing::warn!(waiting = assigned - active, "assigned jobs wait for a free slot");
-                return Ok(());
-            };
+        let active = self.active();
+        // Jobs that waited in line and went away give their place back, the newest first.
+        while active + self.waiting.len() > assigned
+            && let Some(ticket) = self.waiting.pop()
+        {
+            self.slots.withdraw(ticket);
+        }
+        // Then those whose turn came.
+        let mut at = 0;
+        while at < self.waiting.len() {
+            let ticket = self.waiting[at];
+            if !self.slots.ready(ticket) {
+                at += 1;
+                continue;
+            }
+            self.waiting.remove(at);
             if let Err(e) = self.start(ticket).await {
-                self.slots.release(ticket);
+                self.slots.withdraw(ticket);
                 return Err(e);
             }
         }
+        let active = self.active();
+        for _ in active + self.waiting.len()..assigned {
+            let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
+            match self.slots.claim(self.config.size, promised) {
+                Claim::Start(ticket) => {
+                    if let Err(e) = self.start(ticket).await {
+                        self.slots.release(ticket);
+                        return Err(e);
+                    }
+                }
+                Claim::Waits { ticket, why } => {
+                    tracing::info!(%why, "an assigned job waits in line for room");
+                    self.waiting.push(ticket);
+                }
+                Claim::Never(why) => {
+                    let mut never = self.never.lock().expect("never");
+                    if never.as_deref() != Some(why.as_str()) {
+                        tracing::error!(
+                            size = self.config.size.label(), %why,
+                            "an assigned job can never run on this machine: its settings rule the size out"
+                        );
+                        *never = Some(why);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        *self.never.lock().expect("never") = None;
         if active > assigned {
             self.retire_surplus(active - assigned).await;
         }
@@ -312,12 +365,33 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let mut tries = 0;
         let (name, jit) = loop {
             tries += 1;
-            let name = runner_name(&self.config.machine, rand::random::<u32>());
+            // Never the name of an Actions runner this machine has: its record is kept under the name.
+            let name = loop {
+                let name = runner_name(&self.config.machine, rand::random::<u32>());
+                if self.roster.get(&name).is_none() {
+                    break name;
+                }
+            };
+            self.hosts
+                .registering(&name, &self.config.repo, self.config.scale_set_id);
             match self.registry.generate_jit(&name).await {
                 Ok(jit) => break (name, jit),
-                // The name is taken: names are random, another try uses another.
-                Err(e) if e.status() == Some(409) && tries < NAME_TRIES => {}
                 Err(e) => {
+                    // A refusal leaves nothing at GitHub; anything else may have registered the name before it
+                    // failed. A taken name is no refusal: only this machine makes names that begin with its own,
+                    // so the name is taken by a try of this call whose answer was lost on the way.
+                    let refused = e
+                        .status()
+                        .is_some_and(|status| (400..500).contains(&status) && status != 409);
+                    if refused {
+                        self.hosts.not_registered(&name);
+                    } else {
+                        self.hosts.registration_unsure(&name);
+                    }
+                    // The name is taken: names are random, another try uses another.
+                    if e.status() == Some(409) && tries < NAME_TRIES {
+                        continue;
+                    }
                     tracing::warn!(runner = %name, error = %e, "could not register an Actions runner");
                     return Err(e);
                 }
@@ -329,17 +403,20 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             repo: self.config.repo.clone(),
             scale_set_id: self.config.scale_set_id,
             runner_id,
-            size_gb: self.config.size_gb,
+            size: self.config.size,
             ticket,
             jit_config: jit.encoded,
         };
         let handle = match self.hosts.start(spec).await {
             Ok(handle) => handle,
             Err(e) => {
-                if runner_id != 0
-                    && let Err(remove) = self.registry.remove_runner(runner_id).await
-                {
-                    tracing::warn!(runner = %name, error = %remove, "could not unregister an Actions runner that failed to start");
+                match self.registry.remove_runner(runner_id).await {
+                    Ok(()) => self.hosts.not_registered(&name),
+                    Err(remove) if remove.is_not_found() => self.hosts.not_registered(&name),
+                    // The host keeps the name as a registration to remove.
+                    Err(remove) => {
+                        tracing::warn!(runner = %name, error = %remove, "could not unregister an Actions runner that failed to start");
+                    }
                 }
                 return Err(Error::Scaler(format!(
                     "start the machine of Actions runner {name}: {e}"
@@ -388,28 +465,35 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 }
             }
             n -= 1;
-            if let Err(e) = self.hosts.stop(&runner.handle).await {
-                // The machine may still stand and use its memory: it keeps its slot until whoever watches the
-                // machines sees it gone. Its registration is removed, so it takes no job and no longer counts.
-                tracing::warn!(runner = %runner.name, error = %e, "could not remove a surplus Actions runner's machine");
-                self.roster
-                    .mark_done(self.config.scale_set_id, &runner.name, self.clock.now());
-                continue;
+            // Its registration is removed, so it takes no job and no longer counts. The machine keeps its slot
+            // until whoever watches the machines sees it gone.
+            self.roster
+                .mark_done(self.config.scale_set_id, &runner.name, self.clock.now());
+            match self.hosts.stop(&runner.handle).await {
+                Ok(()) => tracing::info!(runner = %runner.name, "surplus Actions runner removed"),
+                Err(e) => {
+                    tracing::warn!(runner = %runner.name, error = %e, "could not stop a surplus Actions runner's machine");
+                }
             }
-            self.roster.exited(&runner.name, &*self.slots);
-            tracing::info!(runner = %runner.name, "surplus Actions runner removed");
         }
     }
 
+    /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone
+    /// under a job GitHub has not let go of.
+    fn active(&self) -> usize {
+        self.roster.active(self.config.scale_set_id) + self.hosts.lost_with_job(self.config.scale_set_id)
+    }
+
     /// How many Actions runners this scale set may have at once right now, which every wait carries to the service:
-    /// those it has, the slots promised to it, and one more while the machine has a free slot. The service may fill
+    /// those it has, the jobs that wait in line, the slots promised to it, and one more while the machine has a free slot. The service may fill
     /// every number it is given before any reports back, so offering all free slots to every scale set would let it
     /// assign this machine several times the jobs it can run while other machines stay idle. One at a time, a burst
     /// still fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
     pub fn capacity(&self) -> usize {
-        self.roster.active(self.config.scale_set_id)
+        self.active()
+            + self.waiting.len()
             + self.promised.len()
-            + self.slots.open_slots(self.config.size_gb).min(1)
+            + self.slots.open_slots(self.config.size).min(1)
     }
 }
 
@@ -436,5 +520,8 @@ impl<J, R, H> Scaler<J, R, H> {
 impl<J, R, H> Drop for Scaler<J, R, H> {
     fn drop(&mut self) {
         self.give_back(0..self.promised.len());
+        for ticket in self.waiting.drain(..) {
+            self.slots.withdraw(ticket);
+        }
     }
 }

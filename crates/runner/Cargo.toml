@@ -14,6 +14,16 @@ path = "src/main.rs"
 cf-image = { path = "../image" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cf-budget = { path = "../budget" }
+cf-console-client = { path = "../console-client" }
+cf-daemon = { path = "../daemon" }
+cf-ghapp = { path = "../ghapp" }
+cf-host-macos = { path = "../host-macos" }
+cf-scaleset = { path = "../scaleset" }
+cf-secret = { path = "../secret" }
+serde.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tracing = "0.1"
 cf-guest-proto = { path = "../guest-proto" }
 cf-vmhost = { path = "../vmhost" }
 cf-vmm = { path = "../vmm" }

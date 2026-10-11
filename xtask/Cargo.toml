@@ -9,10 +9,23 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
+cf-budget = { path = "../crates/budget" }
 cf-image = { path = "../crates/image" }
 flate2 = "1"
 serde_json.workspace = true
 sha2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cf-console-client = { path = "../crates/console-client" }
+cf-daemon = { path = "../crates/daemon" }
+cf-fake-console = { path = "../crates/fake-console" }
+cf-fake-github = { path = "../crates/fake-github" }
+cf-ghapp = { path = "../crates/ghapp" }
+cf-guest-proto = { path = "../crates/guest-proto" }
+cf-scaleset = { path = "../crates/scaleset" }
+cf-secret = { path = "../crates/secret" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
