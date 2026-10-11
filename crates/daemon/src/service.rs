@@ -339,6 +339,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// scale sets it has; a scale set no workflow asks for any more is closed and, once no Actions runner of it
     /// is left, deleted.
     pub async fn discover(&self) {
+        self.look(true).await;
+    }
+
+    /// One look at GitHub. `wants`: whether this Mac still wants scale sets; when not, every one of its own goes.
+    /// Says which scale sets of this Mac it could not delete.
+    async fn look(&self, wants: bool) -> Vec<String> {
         let shared = &self.shared;
         let machine = &shared.config.machine;
         let settings = shared.machines.settings();
@@ -352,7 +358,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // Nothing is known: everything stays as it is.
                 tracing::warn!(%error, "the App's installations could not be read");
                 *shared.discovery_error.lock().expect("discovery") = Some(format!("GitHub: {error}"));
-                return;
+                return vec!["GitHub could not be asked for this Mac's scale sets".into()];
             }
         };
         for installation in installations {
@@ -415,6 +421,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         BTreeMap::new()
                     }
                 };
+                if !wants {
+                    continue;
+                }
                 for set in self_hosted_with(&files, &variables) {
                     let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str)) else {
                         continue;
@@ -446,12 +455,17 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .map(|(repo, client)| (repo.clone(), client.clone()))
             .collect();
         let prefix = format!("{machine}--");
+        let mut kept: Vec<String> = Vec::new();
         for (repo, client) in clients {
             if unread.contains(&repo) {
                 continue;
             }
-            let Ok(sets) = client.list_scale_sets().await else {
-                continue;
+            let sets = match client.list_scale_sets().await {
+                Ok(sets) => sets,
+                Err(error) => {
+                    kept.push(format!("{repo}: its scale sets could not be listed ({error})"));
+                    continue;
+                }
             };
             for set in sets {
                 if !set.name.starts_with(&prefix) || wanted.contains_key(&set.name) {
@@ -465,8 +479,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         }
                         Err(error) => {
                             tracing::debug!(%repo, set = %set.name, %error, "a scale set could not be deleted yet");
+                            kept.push(format!("{repo}: scale set {} ({error})", set.name));
                         }
                     }
+                } else {
+                    kept.push(format!(
+                        "{repo}: scale set {} still has Actions runners",
+                        set.name
+                    ));
                 }
             }
         }
@@ -498,6 +518,91 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         for problem in &problems {
             tracing::warn!(%problem, "discovery");
         }
+        kept.extend(problems);
+        kept
+    }
+
+    /// The client of a repository no look at GitHub has shown since the Runner started: a registration of before
+    /// may be all that is left of it here.
+    async fn client_for(&self, repo: &str) -> Option<ScaleSetClient> {
+        let shared = &self.shared;
+        if let Some(client) = shared.clients.lock().expect("clients").get(repo) {
+            return Some(client.clone());
+        }
+        let installation = shared.app.repo_installation(repo).await.ok()?;
+        let found = shared
+            .app
+            .repositories(installation)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|found| found.full_name.eq_ignore_ascii_case(repo))?;
+        let client = ScaleSetClient::new(
+            shared.app.clone(),
+            installation,
+            repo,
+            &found.html_url,
+            shared.config.poll_timeout,
+        );
+        shared
+            .clients
+            .lock()
+            .expect("clients")
+            .insert(repo.to_string(), client.clone());
+        Some(client)
+    }
+
+    /// Ends everything this Mac has, for an uninstall: no new job is taken, every machine is stopped, every
+    /// registration and scale set of this Mac is removed at GitHub, and the console hears of the jobs that ended
+    /// (and, with `leave`, that the Mac is gone: its token is void after). Waits at most `wait` for the machines
+    /// and for GitHub, which says how a stopped job ended within [`crate::RESULT_WAIT`] or not at all. Says what
+    /// is left; nothing when all went.
+    ///
+    /// The machines' tick is the caller's, as in [`Service::run`]: without it no machine is seen to go.
+    pub async fn retire(&self, wait: Duration, leave: bool) -> Vec<String> {
+        let shared = &self.shared;
+        shared.machines.drain();
+        let names: Vec<String> = shared.serving.lock().expect("serving").keys().cloned().collect();
+        for name in names {
+            self.close(&name).await;
+        }
+        shared.machines.stop_all();
+        let deadline = Instant::now() + wait;
+        loop {
+            self.sweep().await;
+            // Until nothing is left to stop, to unregister or to report.
+            if shared.machines.unsettled() == 0 || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(shared.config.sweep_again.min(Duration::from_millis(500))).await;
+        }
+        let mut left: Vec<String> = Vec::new();
+        for machine in shared.machines.snapshot().machines {
+            left.push(format!("the machine of {} still stands", machine.runner));
+        }
+        for registration in shared.machines.registrations_to_remove() {
+            left.push(format!(
+                "{}: the Actions runner {} is still registered",
+                registration.repo, registration.runner
+            ));
+        }
+        left.extend(self.look(false).await);
+        if let Some(console) = &shared.console {
+            if tokio::time::timeout(Duration::from_secs(10), self.report())
+                .await
+                .is_err()
+                || !console.outbox.is_empty()
+            {
+                left.push(format!(
+                    "{} job events the console has not heard",
+                    console.outbox.len()
+                ));
+            }
+            if leave && let Err(error) = console.client.leave().await {
+                left.push(format!("the console was not told that the Mac is gone ({error})"));
+            }
+        }
+        left
     }
 
     /// Ends a scale set's listener and waits for its session to be closed.
@@ -529,15 +634,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             if waits {
                 continue;
             }
-            let client = shared
-                .clients
-                .lock()
-                .expect("clients")
-                .get(&registration.repo)
-                .cloned();
-            let Some(client) = client else {
-                // Its repository was not seen since the Runner started; the next look at GitHub may find it.
+            let Some(client) = self.client_for(&registration.repo).await else {
+                // The App no longer reads its repository, or GitHub is away: asked again later.
                 tracing::debug!(runner = %registration.runner, repo = %registration.repo, "no client for a registration yet");
+                shared
+                    .refused
+                    .lock()
+                    .expect("refused")
+                    .insert(registration.runner, Instant::now() + shared.config.sweep_again);
                 continue;
             };
             let id = match registration.runner_id {

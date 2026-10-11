@@ -814,3 +814,68 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
     rig.service.report().await;
     assert_eq!(rig.events().len(), 2, "it arrives with the Mac's own token");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uninstall_stops_every_machine_and_leaves_nothing_at_github_or_the_console() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let busy = rig.job_running().await;
+    rig.queue();
+    until("a second machine", || rig.standing().len() == 2).await;
+
+    // GitHub ends the job of an Actions runner that went away, in its own time.
+    let github = rig.github.clone();
+    let ends = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        github.complete_job(&busy, "failed");
+    });
+    let left = rig.service.retire(Duration::from_secs(8), true).await;
+    ends.await.expect("ends");
+    assert_eq!(left, Vec::<String>::new());
+    assert_eq!(rig.standing(), Vec::<String>::new());
+    assert_eq!(rig.github.runners(), Vec::<String>::new());
+    assert_eq!(rig.github.scale_sets().len(), 0, "its scale set is deleted");
+    assert_eq!(rig.parts.store.load().len(), 0);
+    assert_eq!(rig.console.left(), [MACHINE]);
+    let ends: Vec<Value> = rig
+        .events()
+        .into_iter()
+        .map(|event| event.1)
+        .filter(|end| !end.is_null())
+        .collect();
+    assert_eq!(ends, [json!("stopped")], "the job that was stopped is reported");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uninstall_says_what_it_could_not_remove() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let busy = rig.job_running().await;
+    rig.stop_pump().await;
+    // Nobody looks at the machines and GitHub never ends the job: the machine stands, its registration stays.
+    rig.parts.vms.ignore_stops(true);
+    let left = rig.service.retire(Duration::from_millis(300), false).await;
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert_eq!(left[0], format!("the machine of {busy} still stands"));
+    assert!(left[1].ends_with("still has Actions runners"), "{left:?}");
+    assert_eq!(
+        rig.console.left(),
+        Vec::<String>::new(),
+        "the Mac was not asked to leave the console"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_of_a_repository_no_look_has_shown_is_removed_all_the_same() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    // The Runner starts again and its machine died meanwhile; GitHub cannot be asked for the repositories.
+    rig.restart().await;
+    rig.parts.vms.die(job_name(&runner));
+    rig.github.complete_job(&runner, "failed");
+    // No look at GitHub ran in this Runner: the registration's repository is found by its name.
+    until("the end at the console", || rig.events().len() == 2).await;
+    rig.nothing_left().await;
+    assert_eq!(rig.service.sets(), [], "no scale set was served to do it");
+}

@@ -843,6 +843,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// How many Actions runners the Runner still has something to do for: a machine that stands, an end to
+    /// report, a registration to remove.
+    pub fn unsettled(&self) -> usize {
+        let inner = self.lock();
+        inner.jobs.len() + inner.intents.len()
+    }
+
     /// What there is to report.
     pub fn snapshot(&self) -> Snapshot {
         let mut inner = self.lock();
