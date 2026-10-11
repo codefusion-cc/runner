@@ -218,6 +218,7 @@ version = "0.1.0"
 dependencies = [
  "cf-budget",
  "libc",
+ "tempfile",
 ]
 
 [[package]]

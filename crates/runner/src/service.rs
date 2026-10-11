@@ -124,6 +124,15 @@ fn service(config: &Config, program: &Path) -> Result<(Arc<MacMachines>, MacServ
     })
 }
 
+/// Asks Time Machine to skip a folder the Runner made: the images, scratch disks and machine files below it come from
+/// a release or are made again, and a backup of gigabytes that change with every job helps nobody. Nothing here is
+/// fatal: the answer is what to tell the person when the folder could not be marked, and `None` when it is.
+pub(crate) fn keep_out_of_backups(folder: &Path) -> Option<String> {
+    cf_host_macos::exclude_from_backup(folder)
+        .err()
+        .map(|error| format!("{} stays in Time Machine's backups: {error}", folder.display()))
+}
+
 /// The one Runner of a state folder: held for as long as the file it returns is. Two Runners over the same folder
 /// would each end the machines the other started and remove what it wrote.
 fn only_runner(config: &Config) -> Result<std::fs::File, String> {
@@ -171,6 +180,9 @@ pub fn daemon(config: &Path) -> Result<(), String> {
     let _only = only_runner(&config)?;
     tracing::subscriber::set_global_default(Lines::new(&config.log(), ROLL_AT))
         .map_err(|error| format!("the log: {error}"))?;
+    if let Some(said) = keep_out_of_backups(&config.state_dir) {
+        tracing::warn!("{said}");
+    }
     let program = own_program()?;
     runtime(2)?.block_on(async {
         let (_machines, service) = service(&config, &program)?;
@@ -226,6 +238,9 @@ pub fn enroll(config: &Path) -> Result<(), String> {
     let code = one_time_code(&config.machine)?;
     cf_secret::private_dir(&config.state_dir)
         .map_err(|error| format!("{}: {error}", config.state_dir.display()))?;
+    if let Some(said) = keep_out_of_backups(&config.state_dir) {
+        eprintln!("note: {said}");
+    }
     let facts = MacHost::new(&config.state_dir)
         .and_then(|host| host.facts())
         .map_err(|error| format!("macOS: {error}"))?;
@@ -506,6 +521,9 @@ pub fn install(config_path: &Path) -> Result<(), String> {
         ));
     }
     place(&program, &config.program())?;
+    if let Some(said) = keep_out_of_backups(&config.state_dir) {
+        eprintln!("note: {said}");
+    }
     agent.start(&plist(&config.program(), &config_path, &config.state_dir))?;
     println!(
         "ok: installed as {LABEL}; it runs {} and logs to {}",
@@ -730,6 +748,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         only_runner(&config).expect("the folder is free once its Runner is gone");
+    }
+
+    #[test]
+    fn the_state_folder_is_marked_for_time_machine_once_and_a_failure_is_only_a_line_to_say() {
+        let folder = tempfile::tempdir().expect("folder");
+        let state = folder.path().join("state");
+        std::fs::create_dir(&state).expect("folder");
+        for _ in 0..2 {
+            assert_eq!(keep_out_of_backups(&state), None);
+        }
+        let mark = std::process::Command::new("/usr/bin/xattr")
+            .args(["-px", cf_host_macos::ATTRIBUTE])
+            .arg(&state)
+            .output()
+            .expect("xattr runs");
+        assert!(mark.status.success(), "the folder carries the mark");
+
+        let gone = folder.path().join("gone");
+        let said = keep_out_of_backups(&gone).expect("a folder that is not there cannot be marked");
+        assert!(
+            said.contains(&gone.display().to_string()) && said.contains("Time Machine"),
+            "{said}"
+        );
     }
 
     #[test]
