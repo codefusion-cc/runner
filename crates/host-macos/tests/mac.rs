@@ -55,7 +55,10 @@ fn the_battery_is_the_one_pmset_prints_and_none_on_a_mac_without_one() {
     let after = battery_in(&output("/usr/bin/pmset", &["-g", "batt"]));
     // The charge may move between the looks; whether there is a battery does not.
     assert_eq!(read.is_some(), before.is_some());
-    assert!(read == before || read == after || read.is_some_and(|battery| battery.percent <= 100));
+    assert!(
+        read == before || read == after,
+        "{read:?} between {before:?} and {after:?}"
+    );
     assert_eq!(
         before.is_some(),
         output("/usr/bin/pmset", &["-g", "batt"]).contains("InternalBattery")

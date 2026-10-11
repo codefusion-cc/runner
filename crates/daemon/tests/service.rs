@@ -1266,11 +1266,13 @@ async fn the_log_says_which_scale_set_the_runner_keeps_and_when_it_listens_and_s
     let log = support::Log::start();
     let mut rig = Rig::new(1).await;
     rig.service.discover().await;
-    until("a session", || {
-        rig.github.scale_sets().iter().any(|s| s.has_session)
+    // GitHub has the session before the Runner has its answer and writes the line.
+    until("a session, and the line about it", || {
+        !log.lines("session is").is_empty()
     })
     .await;
     let set = rig.github.scale_sets()[0].clone();
+    assert!(set.has_session);
     assert_eq!(
         log.lines("a scale set at GitHub"),
         [format!(

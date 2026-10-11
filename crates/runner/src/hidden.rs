@@ -17,6 +17,14 @@ extern "C" fn came(signal: libc::c_int) {
     CAME.store(signal, Ordering::Relaxed);
 }
 
+/// Says so when an ending signal came since the signals were caught.
+fn came_signal() -> Result<(), NoLine> {
+    match CAME.load(Ordering::Relaxed) {
+        0 => Ok(()),
+        signal => Err(NoLine::Signal(signal)),
+    }
+}
+
 /// Why no line was read.
 #[derive(Debug)]
 pub enum NoLine {
@@ -35,12 +43,12 @@ struct Quiet {
 }
 
 impl Quiet {
-    fn new(fd: libc::c_int) -> io::Result<Quiet> {
+    fn new(fd: libc::c_int) -> Result<Quiet, NoLine> {
         // SAFETY: zeroes are a termios, and `tcgetattr` fills the one it is given.
         let mut before: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: `before` is a termios this call may write.
         if unsafe { libc::tcgetattr(fd, &mut before) } != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(NoLine::Io(io::Error::last_os_error()));
         }
         let mut quiet = before;
         quiet.c_lflag &= !libc::ECHO;
@@ -48,8 +56,14 @@ impl Quiet {
         quiet.c_lflag |= libc::ECHONL;
         // SAFETY: `quiet` is a whole termios. What was typed before the question is thrown away with the change:
         // it was typed while the terminal still showed it.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
-            return Err(io::Error::last_os_error());
+        while unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
+            // The change waits until the question is written out, and a signal ends that wait: an ending one ends
+            // the question, any other is no reason to stop.
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(NoLine::Io(error));
+            }
+            came_signal()?;
         }
         Ok(Quiet { fd, before })
     }
@@ -64,7 +78,8 @@ impl Drop for Quiet {
     }
 }
 
-/// The ending signals caught for as long as this lives, without restarting the read they interrupt.
+/// The ending signals caught for as long as this lives, without restarting the read they interrupt. One the
+/// program was started to ignore (`nohup`, a shell's `trap '' INT`) stays ignored.
 struct Caught([libc::sigaction; ENDING.len()]);
 
 impl Caught {
@@ -77,9 +92,13 @@ impl Caught {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             action.sa_sigaction = came as extern "C" fn(libc::c_int) as libc::sighandler_t;
             // SAFETY: the handler only stores into an atomic, which a signal handler may do, and lives as long as
-            // the program; `before` is a sigaction this call may write.
+            // the program; `before` is a sigaction this call may write, and is what this signal had when it is
+            // given back.
             unsafe {
                 libc::sigaction(signal, &action, before);
+                if before.sa_sigaction == libc::SIG_IGN {
+                    libc::sigaction(signal, before, std::ptr::null_mut());
+                }
             }
         }
         Caught(before)
@@ -105,14 +124,18 @@ pub fn read_line(fd: libc::c_int, question: &str, mut ask: impl Write) -> Result
     let terminal = unsafe { libc::isatty(fd) } == 1;
     // In this order: the terminal is put back before the signals are let go.
     let (_caught, _quiet) = if terminal {
-        let _ = ask.write_all(question.as_bytes()).and_then(|()| ask.flush());
         let caught = Caught::new();
-        (Some(caught), Some(Quiet::new(fd).map_err(NoLine::Io)?))
+        let _ = ask.write_all(question.as_bytes()).and_then(|()| ask.flush());
+        (Some(caught), Some(Quiet::new(fd)?))
     } else {
         (None, None)
     };
+    // A signal ends a read only when it comes during one. One that came between two reads, or before the first,
+    // is asked for here: none is lost, and no line is given after one.
+    let signal = || if terminal { came_signal() } else { Ok(()) };
     let mut line = Vec::new();
     loop {
+        signal()?;
         let mut byte = 0u8;
         // SAFETY: `byte` is one byte this call may write.
         match unsafe { libc::read(fd, (&raw mut byte).cast(), 1) } {
@@ -125,13 +148,10 @@ pub fn read_line(fd: libc::c_int, question: &str, mut ask: impl Write) -> Result
                 if error.kind() != io::ErrorKind::Interrupted {
                     return Err(NoLine::Io(error));
                 }
-                match CAME.load(Ordering::Relaxed) {
-                    0 => {}
-                    signal => return Err(NoLine::Signal(signal)),
-                }
             }
         }
     }
+    signal()?;
     String::from_utf8(line).map_err(|_| NoLine::NoCode)
 }
 
@@ -264,18 +284,101 @@ mod tests {
         unsafe {
             libc::pthread_kill(reader.as_pthread_t(), libc::SIGHUP);
         }
-        // A read the signal did not end is ended by a line, so that this test fails and does not wait for ever.
+        let ended = answer(reader, &mut person);
+        assert!(matches!(ended, Err(NoLine::Signal(libc::SIGHUP))), "{ended:?}");
+        assert!(was_quiet, "the terminal showed what was typed at the question");
+        assert!(echoes(&program), "the terminal shows what is typed again");
+    }
+
+    /// Asks by sending its own thread a signal: one that comes while nothing is read.
+    struct AskedWithASignal;
+
+    impl std::io::Write for AskedWithASignal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // SAFETY: a signal to the thread that runs this.
+            unsafe {
+                libc::pthread_kill(libc::pthread_self(), libc::SIGTERM);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The reader's answer. A read nothing ended is ended by a line after a few seconds, so that a test fails and
+    /// does not wait for ever.
+    fn answer(
+        reader: std::thread::JoinHandle<Result<String, NoLine>>,
+        person: &mut File,
+    ) -> Result<String, NoLine> {
         let start = Instant::now();
         while !reader.is_finished() && start.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(5));
         }
         if !reader.is_finished() {
-            person.write_all(b"\n").unwrap();
+            person.write_all(b"typed-after-the-signal\n").unwrap();
         }
-        let ended = reader.join().unwrap();
-        assert!(matches!(ended, Err(NoLine::Signal(libc::SIGHUP))), "{ended:?}");
-        assert!(was_quiet, "the terminal showed what was typed at the question");
+        reader.join().unwrap()
+    }
+
+    #[test]
+    fn a_signal_that_comes_while_nothing_is_read_is_not_lost() {
+        let _one = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut person, program) = terminal();
+        let reader = {
+            let fd = program.as_raw_fd();
+            std::thread::spawn(move || read_line(fd, "The code: ", AskedWithASignal))
+        };
+        let ended = answer(reader, &mut person);
+        assert!(matches!(ended, Err(NoLine::Signal(libc::SIGTERM))), "{ended:?}");
         assert!(echoes(&program), "the terminal shows what is typed again");
+        // Whether the line was waited for: nothing had to be typed for the question to end.
+        assert_eq!(shown(&mut person), "");
+    }
+
+    /// What a signal does in this program now.
+    fn disposition(signal: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: zeroes are a sigaction, and with no new one given `sigaction` only fills it.
+        let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: `now` may be written.
+        assert_eq!(unsafe { libc::sigaction(signal, std::ptr::null(), &mut now) }, 0);
+        now.sa_sigaction
+    }
+
+    #[test]
+    fn a_signal_the_program_was_started_to_ignore_stays_ignored() {
+        let _one = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: the signal is ignored in this program, as under `nohup`, and gets back what it had below.
+        let before = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let (mut person, program) = terminal();
+        let reader = {
+            let fd = program.as_raw_fd();
+            std::thread::spawn(move || read_line(fd, "", std::io::sink()))
+        };
+        until_quiet(&program);
+        // SAFETY: the thread runs: it is joined only below.
+        unsafe {
+            libc::pthread_kill(reader.as_pthread_t(), libc::SIGHUP);
+        }
+        person.write_all(b"code-under-nohup\n").unwrap();
+        let ended = reader.join().unwrap();
+        let after = disposition(libc::SIGHUP);
+        // SAFETY: what the signal had before this test.
+        unsafe {
+            libc::signal(libc::SIGHUP, before);
+        }
+        assert_eq!(ended.expect("a line"), "code-under-nohup");
+        assert_eq!(
+            after,
+            libc::SIG_IGN,
+            "the signal is still ignored after the question"
+        );
     }
 
     fn pipe(holds: &[u8]) -> OwnedFd {

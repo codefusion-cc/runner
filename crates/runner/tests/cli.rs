@@ -61,22 +61,38 @@ fn an_empty_folder_and_bad_usage_are_refused_with_a_reason() {
 fn the_version_command_names_the_package_version_and_the_commit_it_was_built_at() {
     let (ok, text) = runner(&["version"]);
     assert!(ok);
-    // The commit of this checkout, which the program under test was just built from; `unknown` where no git is.
-    let commit = Command::new("git")
-        .args([
-            "-C",
-            env!("CARGO_MANIFEST_DIR"),
-            "rev-parse",
-            "--short=12",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map_or("unknown".to_string(), |output| {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        });
-    assert!(commit == "unknown" || commit.len() == 12, "{commit}");
+    // The commit of this checkout, which the program under test was just built from, and whether what goes into
+    // the program differs from it; the name the build was given instead; `unknown` where no git is.
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-C", concat!(env!("CARGO_MANIFEST_DIR"), "/../..")])
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let commit = match std::env::var("CF_COMMIT") {
+        Ok(named) if !named.trim().is_empty() => named.trim().to_string(),
+        _ => git(&["rev-parse", "--short=12", "HEAD"]).map_or("unknown".to_string(), |commit| {
+            assert_eq!(commit.len(), 12, "{commit}");
+            let changed = git(&[
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--",
+                "crates",
+                ":(glob,exclude)crates/*/tests/**",
+                "Cargo.toml",
+                "Cargo.lock",
+            ]);
+            if changed.is_some_and(|changed| !changed.is_empty()) {
+                format!("{commit}-dirty")
+            } else {
+                commit
+            }
+        }),
+    };
     assert_eq!(
         text.trim(),
         format!("codefusion-runner {}+{commit}", env!("CARGO_PKG_VERSION"))
