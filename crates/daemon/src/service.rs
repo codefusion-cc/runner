@@ -1,0 +1,942 @@
+//! The Runner's service: it finds the repositories and sizes to serve, keeps one listener per scale set, lets the
+//! machines see the time pass, removes the registrations at GitHub that have to go, and reports to the console.
+//!
+//! Every round is a method of its own ([`Service::discover`], [`Service::sweep`], [`Service::report`]) so that a
+//! test drives them one at a time; [`Service::run`] is the loop that calls them until it is told to stop.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use cf_budget::{Host, Pressure, Size};
+use cf_console_client::{
+    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MachineInfo, Outbox, Report,
+    RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
+};
+use cf_ghapp::{Clock, GitHubApp};
+use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
+use cf_workflows::self_hosted_with;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+
+use crate::adapters::SetRegistry;
+use crate::machines::{JobReport, Machines, Reports, Snapshot};
+use crate::names::{ServePolicy, scale_set_name};
+use crate::roster::Roster;
+use crate::scaler::{Scaler, ScalerConfig};
+use crate::traits::{EventKind, Hosts, Slots};
+use crate::vms::Vms;
+
+/// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
+#[derive(Debug, Default)]
+pub struct Nudge(Mutex<Vec<Weak<Notify>>>);
+
+impl Nudge {
+    /// A listener's own bell. One ring is kept for a listener that is busy when it comes.
+    pub fn subscribe(&self) -> Arc<Notify> {
+        let bell = Arc::new(Notify::new());
+        let mut bells = self.0.lock().expect("nudge");
+        bells.retain(|bell| bell.strong_count() > 0);
+        bells.push(Arc::downgrade(&bell));
+        bell
+    }
+
+    /// Rings every bell.
+    pub fn fire(&self) {
+        for bell in self.0.lock().expect("nudge").iter().filter_map(Weak::upgrade) {
+            bell.notify_one();
+        }
+    }
+}
+
+/// How the service runs on one Mac.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// This Mac's name: the start of every Actions runner's and scale set's name.
+    pub machine: String,
+    /// The Mac's host name, for the console.
+    pub hostname: String,
+    /// The Mac's model, for the console.
+    pub model: String,
+    /// The Runner's version.
+    pub version: String,
+    /// Which repositories are served.
+    pub policy: ServePolicy,
+    /// How long one long poll may take in all.
+    pub poll_timeout: Duration,
+    /// How often repositories and workflows are read again.
+    pub discover_every: Duration,
+    /// How often registrations that have to go are removed.
+    pub sweep_every: Duration,
+    /// How long a registration GitHub would not remove is left alone.
+    pub sweep_again: Duration,
+    /// How often the machines look at the Mac.
+    pub tick_every: Duration,
+    /// How often the console hears from the Mac when it names no other time.
+    pub report_every: Duration,
+    /// The largest workflow file that is read.
+    pub max_workflow_bytes: u64,
+    /// The first and the longest wait after a listener failed, and how long one must work for the wait to start
+    /// small again.
+    pub backoff: (Duration, Duration, Duration),
+}
+
+impl ServiceConfig {
+    /// The times the Runner keeps in service.
+    pub fn new(machine: &str, hostname: &str, model: &str, version: &str) -> ServiceConfig {
+        ServiceConfig {
+            machine: machine.to_string(),
+            hostname: hostname.to_string(),
+            model: model.to_string(),
+            version: version.to_string(),
+            policy: ServePolicy::default(),
+            poll_timeout: Duration::from_secs(70),
+            discover_every: Duration::from_secs(300),
+            sweep_every: Duration::from_secs(5),
+            sweep_again: Duration::from_secs(30),
+            tick_every: Duration::from_secs(1),
+            report_every: Duration::from_secs(60),
+            max_workflow_bytes: 1 << 20,
+            backoff: (
+                Duration::from_secs(5),
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+            ),
+        }
+    }
+}
+
+/// The console and the job events that wait for it.
+pub struct Console {
+    /// The client, with this Mac's token.
+    pub client: Client,
+    /// The job events that wait.
+    pub outbox: Arc<Outbox>,
+}
+
+/// What the Mac reads beside the budget's reading, for the console's page.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HostExtras {
+    /// The load averages of 1, 5 and 15 minutes.
+    pub load: [f64; 3],
+    /// The size of the disk the machines' files are on.
+    pub disk_total_bytes: u64,
+    /// The swap space the system has made.
+    pub swap_total_bytes: u64,
+    /// The CPU in use, in percent; -1 when it is not known.
+    pub cpu_percent: f64,
+}
+
+/// One scale set the Mac serves, as a report shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetState {
+    /// `owner/name`.
+    pub repo: String,
+    /// The scale set's name.
+    pub name: String,
+    /// GitHub's number for it; 0 until GitHub made it.
+    pub id: i64,
+    /// Its labels.
+    pub labels: Vec<String>,
+    /// The size of its machines.
+    pub size: Size,
+    /// Why its listener is not listening, when it is not.
+    pub error: Option<String>,
+    /// Since when, in seconds since 1970.
+    pub error_at: Option<i64>,
+    /// GitHub's counts, as the listener last heard them.
+    pub statistics: Option<Statistics>,
+    /// Why a job assigned to it can never start on this Mac, when one cannot.
+    pub never: Option<String>,
+}
+
+struct Wanted {
+    repo: String,
+    client: ScaleSetClient,
+    labels: Vec<String>,
+    size: Size,
+}
+
+struct Serving {
+    stop: ShutdownTrigger,
+    task: JoinHandle<()>,
+    state: Arc<Mutex<SetState>>,
+}
+
+/// Everything the service is made of.
+pub struct ServiceParts<H, V> {
+    /// The GitHub App.
+    pub app: GitHubApp,
+    /// The machines. Their `nudge` rings [`ServiceParts::nudge`].
+    pub machines: Arc<Machines<H, V>>,
+    /// The Actions runners, shared with the machines.
+    pub roster: Arc<Roster>,
+    /// The wall clock.
+    pub clock: Arc<dyn Clock>,
+    /// The bell the machines ring.
+    pub nudge: Arc<Nudge>,
+    /// The console; none on a Mac that is not enrolled.
+    pub console: Option<Console>,
+    /// How the service runs.
+    pub config: ServiceConfig,
+    /// Reads what the console's page shows beside the budget's reading.
+    pub extras: Box<dyn Fn() -> HostExtras + Send + Sync>,
+}
+
+struct Shared<H, V> {
+    app: GitHubApp,
+    machines: Arc<Machines<H, V>>,
+    roster: Arc<Roster>,
+    clock: Arc<dyn Clock>,
+    nudge: Arc<Nudge>,
+    console: Option<Console>,
+    config: ServiceConfig,
+    extras: Box<dyn Fn() -> HostExtras + Send + Sync>,
+    serving: Mutex<BTreeMap<String, Serving>>,
+    /// A scale set client per repository that was ever served, for removing what is left there.
+    clients: Mutex<BTreeMap<String, ScaleSetClient>>,
+    discovery_error: Mutex<Option<String>>,
+    not_serving: Mutex<Option<String>>,
+    results: Mutex<Vec<CommandResult>>,
+    /// Registrations GitHub would not remove, and when each is tried again.
+    refused: Mutex<BTreeMap<String, Instant>>,
+    console_paused: Mutex<bool>,
+}
+
+/// The Runner's service on one Mac.
+pub struct Service<H, V> {
+    shared: Arc<Shared<H, V>>,
+}
+
+fn secs(at: SystemTime) -> i64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// A moment as the console reads it.
+pub fn iso(seconds: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|at| at.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// A job report as the console takes it. The console's `result` is GitHub's word when there is one and the
+/// Runner's own end otherwise; `end` is always the Runner's own.
+pub fn job_event(report: &JobReport) -> cf_console_client::JobEvent {
+    let text = |value: &str| (!value.is_empty()).then(|| value.to_string());
+    let github = &report.github;
+    let machine = &report.machine;
+    cf_console_client::JobEvent {
+        id: report.id.clone(),
+        kind: match report.kind {
+            EventKind::Started => JobKind::Started,
+            EventKind::Completed => JobKind::Completed,
+        },
+        runner: report.runner.clone(),
+        repo: text(&github.repo),
+        job: text(&github.job),
+        workflow: text(&github.workflow),
+        run_id: u64::try_from(github.run_id).ok().filter(|id| *id > 0),
+        event: text(&github.event),
+        queued_at: github.queued_at.map(iso),
+        started_at: github.started_at.map(iso),
+        at: iso(report.at),
+        result: report
+            .end
+            .map(|end| github.result.clone().unwrap_or_else(|| end.name().to_string())),
+        out_of_memory: report.out_of_memory,
+        end: report.end.map(|end| end.name().to_string()),
+        machine: Some(MachineInfo {
+            size: machine.size.clone(),
+            memory_bytes: machine.memory_bytes,
+            limit_bytes: machine.limit_bytes,
+            cpus: machine.cpus,
+            origin: machine.origin.clone(),
+            boot_ms: machine.boot_ms,
+            memory_peak_bytes: machine.memory_peak_bytes,
+            disk_peak_bytes: machine.disk_peak_bytes,
+            cpu_usec: machine.cpu_usec,
+            wall_ms: machine.wall_ms,
+        }),
+    }
+}
+
+/// Puts job reports into the console's outbox.
+pub struct OutboxReports(pub Arc<Outbox>);
+
+impl Reports for OutboxReports {
+    fn job(&self, report: JobReport) {
+        if !self.0.push(job_event(&report)) {
+            tracing::debug!(id = %report.id, "a job report that waits or went already was not queued again");
+        }
+    }
+}
+
+/// Job reports on a Mac without a console: they are logged.
+pub struct LoggedReports;
+
+impl Reports for LoggedReports {
+    fn job(&self, report: JobReport) {
+        tracing::info!(
+            id = %report.id, repo = %report.github.repo, job = %report.github.job,
+            end = report.end.map_or("", crate::EndKind::name), "job"
+        );
+    }
+}
+
+impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
+    /// A service that does nothing until its rounds are called.
+    pub fn new(parts: ServiceParts<H, V>) -> Service<H, V> {
+        Service {
+            shared: Arc::new(Shared {
+                app: parts.app,
+                machines: parts.machines,
+                roster: parts.roster,
+                clock: parts.clock,
+                nudge: parts.nudge,
+                console: parts.console,
+                config: parts.config,
+                extras: parts.extras,
+                serving: Mutex::new(BTreeMap::new()),
+                clients: Mutex::new(BTreeMap::new()),
+                discovery_error: Mutex::new(None),
+                not_serving: Mutex::new(None),
+                results: Mutex::new(Vec::new()),
+                refused: Mutex::new(BTreeMap::new()),
+                console_paused: Mutex::new(false),
+            }),
+        }
+    }
+
+    /// The scale sets that are served, by name.
+    pub fn sets(&self) -> Vec<SetState> {
+        let serving = self.shared.serving.lock().expect("serving");
+        serving
+            .values()
+            .map(|s| s.state.lock().expect("set").clone())
+            .collect()
+    }
+
+    /// Ends the listeners as a process that dies does: no session is closed, nothing is given back at GitHub.
+    #[doc(hidden)]
+    pub fn kill(&self) {
+        for (_, serving) in std::mem::take(&mut *self.shared.serving.lock().expect("serving")) {
+            serving.task.abort();
+        }
+    }
+
+    /// What kept the last look at GitHub from being whole, when something did.
+    pub fn discovery_error(&self) -> Option<String> {
+        self.shared.discovery_error.lock().expect("discovery").clone()
+    }
+
+    /// Reads the repositories the App serves, their workflows and their variables, and serves one scale set per
+    /// repository and set of labels whose size this Mac can run. A repository that could not be read keeps the
+    /// scale sets it has; a scale set no workflow asks for any more is closed and, once no Actions runner of it
+    /// is left, deleted.
+    pub async fn discover(&self) {
+        let shared = &self.shared;
+        let machine = &shared.config.machine;
+        let settings = shared.machines.settings();
+        let mut wanted: BTreeMap<String, Wanted> = BTreeMap::new();
+        let mut unread: BTreeSet<String> = BTreeSet::new();
+        let mut problems: Vec<String> = Vec::new();
+        let mut served = 0usize;
+        let installations = match shared.app.installations().await {
+            Ok(installations) => installations,
+            Err(error) => {
+                // Nothing is known: everything stays as it is.
+                tracing::warn!(%error, "the App's installations could not be read");
+                *shared.discovery_error.lock().expect("discovery") = Some(format!("GitHub: {error}"));
+                return;
+            }
+        };
+        for installation in installations {
+            let repos = match shared.app.repositories(installation.id).await {
+                Ok(repos) => repos,
+                Err(error) => {
+                    problems.push(format!("installation {}: {error}", installation.id));
+                    // Whichever repositories it has keep their scale sets.
+                    let serving = shared.serving.lock().expect("serving");
+                    unread.extend(
+                        serving
+                            .values()
+                            .map(|s| s.state.lock().expect("set").repo.clone()),
+                    );
+                    continue;
+                }
+            };
+            for repo in repos {
+                if !shared.config.policy.serves(&repo) {
+                    continue;
+                }
+                served += 1;
+                let name = repo.full_name.clone();
+                let client = shared
+                    .clients
+                    .lock()
+                    .expect("clients")
+                    .entry(name.clone())
+                    .or_insert_with(|| {
+                        ScaleSetClient::new(
+                            shared.app.clone(),
+                            installation.id,
+                            &name,
+                            &repo.html_url,
+                            shared.config.poll_timeout,
+                        )
+                    })
+                    .clone();
+                let files = match shared
+                    .app
+                    .workflow_files(installation.id, &name, shared.config.max_workflow_bytes)
+                    .await
+                {
+                    Ok(files) => files,
+                    Err(error) => {
+                        problems.push(format!("{name}: its workflows could not be read ({error})"));
+                        unread.insert(name);
+                        continue;
+                    }
+                };
+                // Needs the App's "Variables: read" permission. Without it a label that comes from a variable
+                // names no size, and the scale sets of the labels written out are still served.
+                let variables = match shared.app.variables(installation.id, &name).await {
+                    Ok(variables) => variables,
+                    Err(error) => {
+                        problems.push(format!(
+                            "{name}: its variables could not be read ({error}); a `runs-on` that takes its \
+                             label from a variable is not served"
+                        ));
+                        BTreeMap::new()
+                    }
+                };
+                for set in self_hosted_with(&files, &variables) {
+                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str)) else {
+                        continue;
+                    };
+                    if let Err(refusal) = settings.can_run(size) {
+                        // Not offered to GitHub at all: a job nobody here can run is left to the other Macs.
+                        tracing::info!(repo = %name, size = size.label(), why = refusal.name(), "a size this Mac never runs is not served");
+                        continue;
+                    }
+                    wanted.insert(
+                        scale_set_name(machine, &set),
+                        Wanted {
+                            repo: name.clone(),
+                            client: client.clone(),
+                            labels: set.labels().to_vec(),
+                            size,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Scale sets of this Mac that nothing asks for any more, from this run of the Runner or one before.
+        let clients: Vec<(String, ScaleSetClient)> = shared
+            .clients
+            .lock()
+            .expect("clients")
+            .iter()
+            .map(|(repo, client)| (repo.clone(), client.clone()))
+            .collect();
+        let prefix = format!("{machine}--");
+        for (repo, client) in clients {
+            if unread.contains(&repo) {
+                continue;
+            }
+            let Ok(sets) = client.list_scale_sets().await else {
+                continue;
+            };
+            for set in sets {
+                if !set.name.starts_with(&prefix) || wanted.contains_key(&set.name) {
+                    continue;
+                }
+                self.close(&set.name).await;
+                if shared.roster.active(set.id) == 0 {
+                    match client.delete_scale_set(set.id).await {
+                        Ok(()) => {
+                            tracing::info!(%repo, set = %set.name, "a scale set nothing asks for was deleted")
+                        }
+                        Err(error) => {
+                            tracing::debug!(%repo, set = %set.name, %error, "a scale set could not be deleted yet");
+                        }
+                    }
+                }
+            }
+        }
+
+        for (name, want) in wanted {
+            let mut serving = shared.serving.lock().expect("serving");
+            if serving.contains_key(&name) {
+                continue;
+            }
+            let state = Arc::new(Mutex::new(SetState {
+                repo: want.repo.clone(),
+                name: name.clone(),
+                id: 0,
+                labels: want.labels.clone(),
+                size: want.size,
+                error: None,
+                error_at: None,
+                statistics: None,
+                never: None,
+            }));
+            let (stop, stopped) = cf_scaleset::shutdown();
+            let task = tokio::spawn(serve(shared.clone(), want.client.clone(), state.clone(), stopped));
+            serving.insert(name, Serving { stop, task, state });
+        }
+        *shared.not_serving.lock().expect("not serving") = (served == 0 && problems.is_empty())
+            .then(|| "the App is installed on no repository this Mac serves".to_string());
+        *shared.discovery_error.lock().expect("discovery") =
+            (!problems.is_empty()).then(|| problems.join("; "));
+        for problem in &problems {
+            tracing::warn!(%problem, "discovery");
+        }
+    }
+
+    /// Ends a scale set's listener and waits for its session to be closed.
+    async fn close(&self, name: &str) {
+        let serving = self.shared.serving.lock().expect("serving").remove(name);
+        if let Some(serving) = serving {
+            serving.stop.trigger();
+            if tokio::time::timeout(Duration::from_secs(10), serving.task)
+                .await
+                .is_err()
+            {
+                tracing::warn!(set = %name, "a listener did not end in time");
+            }
+        }
+    }
+
+    /// Removes at GitHub the registrations the machines name: of machines that are gone and of Actions runners
+    /// that never got one. One GitHub would not remove (its job is still GitHub's to end, or GitHub is away) is
+    /// tried again later, for as long as it takes.
+    pub async fn sweep(&self) {
+        let shared = &self.shared;
+        for registration in shared.machines.registrations_to_remove() {
+            let waits = shared
+                .refused
+                .lock()
+                .expect("refused")
+                .get(&registration.runner)
+                .is_some_and(|until| Instant::now() < *until);
+            if waits {
+                continue;
+            }
+            let client = shared
+                .clients
+                .lock()
+                .expect("clients")
+                .get(&registration.repo)
+                .cloned();
+            let Some(client) = client else {
+                // Its repository was not seen since the Runner started; the next look at GitHub may find it.
+                tracing::debug!(runner = %registration.runner, repo = %registration.repo, "no client for a registration yet");
+                continue;
+            };
+            let id = match registration.runner_id {
+                Some(id) => Ok(Some(id)),
+                // Registered or not, nobody heard: GitHub is asked by name.
+                None => client
+                    .runner_by_name(&registration.runner)
+                    .await
+                    .map(|found| found.map(|runner| runner.id)),
+            };
+            let removed = match id {
+                Ok(None) => Ok(()),
+                Ok(Some(id)) => match client.remove_runner(id).await {
+                    Err(error) if !error.is_not_found() => Err(error),
+                    _ => Ok(()),
+                },
+                Err(error) => Err(error),
+            };
+            match removed {
+                Ok(()) => {
+                    shared
+                        .refused
+                        .lock()
+                        .expect("refused")
+                        .remove(&registration.runner);
+                    shared.machines.unregistered(&registration.runner);
+                }
+                Err(error) => {
+                    tracing::warn!(runner = %registration.runner, %error, "a registration could not be removed; it is tried again");
+                    shared
+                        .refused
+                        .lock()
+                        .expect("refused")
+                        .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                }
+            }
+        }
+    }
+
+    /// What the console is told now, without the job events.
+    pub fn status(&self) -> Report {
+        let shared = &self.shared;
+        let snapshot = shared.machines.snapshot();
+        let extras = (shared.extras)();
+        let sets = self.sets();
+        let settings = shared.machines.settings();
+        let now = secs(shared.clock.now());
+        let host = snapshot.budget.reading.map(|reading| {
+            let total = settings.total_bytes.max(1);
+            HostStatus {
+                cpus: settings.cores,
+                load1: extras.load[0],
+                load5: extras.load[1],
+                load15: extras.load[2],
+                #[allow(clippy::cast_precision_loss)]
+                free_memory_percent: (reading.available_bytes.min(total) as f64 / total as f64 * 100.0),
+                memory_pressure: match reading.pressure {
+                    Pressure::Normal => 1,
+                    Pressure::Warning => 2,
+                    Pressure::Critical => 4,
+                },
+                memory_bytes: settings.total_bytes,
+                swap_used_bytes: reading.swap_used_bytes,
+                swap_total_bytes: extras.swap_total_bytes.max(reading.swap_used_bytes),
+                disk_free_bytes: reading.disk_free_bytes,
+                disk_total_bytes: extras.disk_total_bytes.max(reading.disk_free_bytes),
+                boot_time: None,
+                #[allow(clippy::cast_precision_loss)]
+                idle_seconds: reading.idle.0 as f64 / 1000.0,
+            }
+        });
+        let paused = *shared.console_paused.lock().expect("paused");
+        Report {
+            status: Status {
+                machine: shared.config.machine.clone(),
+                version: shared.config.version.clone(),
+                updated_at: iso(now),
+                open: snapshot.open,
+                reason: (!snapshot.open).then(|| snapshot.reason.clone()),
+                max_jobs: max_jobs(&snapshot),
+                paused,
+                host,
+                host_error: snapshot.host_error.clone().or_else(|| {
+                    (!snapshot.stuck.is_empty())
+                        .then(|| format!("a vm-host does not end: {}", snapshot.stuck.join(", ")))
+                }),
+                discovery_error: self.discovery_error(),
+                update: None,
+                not_serving: shared.not_serving.lock().expect("not serving").clone(),
+                scale_sets: sets
+                    .iter()
+                    .map(|set| ScaleSetStatus {
+                        repo: set.repo.clone(),
+                        name: set.name.clone(),
+                        id: set.id,
+                        labels: set.labels.clone(),
+                        capacity: u32::try_from(shared.machines.open_slots(set.size)).unwrap_or(u32::MAX),
+                        waiting: set.statistics.as_ref().map_or(0, |s| {
+                            u32::try_from(s.total_available_jobs.max(0)).unwrap_or(u32::MAX)
+                        }),
+                        error: set.error.clone().or_else(|| {
+                            set.never.as_ref().map(|why| {
+                                format!("a job of {} can never start on this Mac: {why}", set.size.label())
+                            })
+                        }),
+                        error_at: set.error_at.map(iso),
+                    })
+                    .collect(),
+                runners: snapshot
+                    .machines
+                    .iter()
+                    .map(|machine| RunnerStatus {
+                        name: machine.runner.clone(),
+                        scale_set: machine.scale_set_id,
+                        state: machine.state.to_string(),
+                        started: iso(machine.started),
+                        job: machine.github.as_ref().map(|job| RunnerJob {
+                            repo: job.repo.clone(),
+                            name: job.job.clone(),
+                            workflow: job.workflow.clone(),
+                            run_id: u64::try_from(job.run_id).unwrap_or(0),
+                            started: iso(job.started_at.unwrap_or(machine.started)),
+                        }),
+                        usage: machine.used_bytes.map(|memory_bytes| RunnerUsage {
+                            cpu_percent: 0.0,
+                            memory_bytes,
+                        }),
+                    })
+                    .collect(),
+            },
+            activity: Activity {
+                cpu_percent: extras.cpu_percent,
+                power: None,
+            },
+            hostname: shared.config.hostname.clone(),
+            model: shared.config.model.clone(),
+            settings: None,
+            image: None,
+            jobs: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+
+    /// Reports to the console, with the job events that wait, and does what its answer says. Returns when the
+    /// console wants to hear again. A console that is away loses nothing: the job events wait in the outbox.
+    pub async fn report(&self) -> Duration {
+        let shared = &self.shared;
+        let Some(console) = &shared.console else {
+            return shared.config.report_every;
+        };
+        let mut report = self.status();
+        let results: Vec<CommandResult> = std::mem::take(&mut *shared.results.lock().expect("results"));
+        report.results.clone_from(&results);
+        match console.client.deliver(&console.outbox, report).await {
+            Ok(answer) => self.answered(answer).await,
+            Err(error) => {
+                // What was done for the console is said again with the next report.
+                let mut kept = shared.results.lock().expect("results");
+                let later = std::mem::replace(&mut *kept, results);
+                kept.extend(later);
+                kept.truncate(cf_console_client::MAX_RESULTS);
+                drop(kept);
+                match error {
+                    cf_console_client::Error::Unauthorized => {
+                        tracing::error!("the console does not know this Mac's token; enrol it again");
+                        shared.config.report_every * 5
+                    }
+                    error => {
+                        tracing::warn!(%error, waiting = console.outbox.len(), "the console could not be told");
+                        shared.config.report_every
+                    }
+                }
+            }
+        }
+    }
+
+    async fn answered(&self, answer: Answer) -> Duration {
+        let shared = &self.shared;
+        *shared.console_paused.lock().expect("paused") = answer.paused;
+        shared.machines.pause(answer.paused);
+        for command in answer.commands {
+            let done = shared
+                .results
+                .lock()
+                .expect("results")
+                .iter()
+                .any(|result| result.id == command.id);
+            if done {
+                continue;
+            }
+            let (ok, message) = self.command(&command).await;
+            tracing::info!(id = %command.id, kind = %command.kind, ok, %message, "a command of the console");
+            let mut results = shared.results.lock().expect("results");
+            if results.len() < cf_console_client::MAX_RESULTS {
+                results.push(CommandResult {
+                    id: command.id,
+                    ok,
+                    message,
+                    at: iso(secs(shared.clock.now())),
+                });
+            }
+        }
+        Duration::from_secs(answer.report_every.clamp(1, 600))
+    }
+
+    /// Does one command of the console's. Only what this Runner can do today is done; the rest is answered as
+    /// not done, so that the console's page says so instead of waiting.
+    async fn command(&self, command: &Command) -> (bool, String) {
+        match command.kind.as_str() {
+            "stop-runner" => {
+                let name = command
+                    .args
+                    .as_ref()
+                    .and_then(|args| args.get("name").or_else(|| args.get("runner")))
+                    .and_then(|name| name.as_str());
+                let Some(name) = name else {
+                    return (false, "the command names no Actions runner".into());
+                };
+                let stands = self
+                    .shared
+                    .machines
+                    .snapshot()
+                    .machines
+                    .iter()
+                    .any(|machine| machine.runner == name);
+                if !stands {
+                    return (false, format!("{name} is not on this Mac"));
+                }
+                match self.shared.machines.stop(crate::names::job_name(name)).await {
+                    Ok(()) => (true, format!("{name} is being stopped")),
+                    Err(error) => (false, error.to_string()),
+                }
+            }
+            kind => (false, format!("this Runner does not do `{kind}` yet")),
+        }
+    }
+
+    /// Runs the service until `stop` is set: the machines' tick every second, a look at GitHub's repositories now
+    /// and then, the sweep of registrations, the reports. Then it stops taking jobs and closes its sessions; the
+    /// machines that stand go on and are found by the Runner that starts next.
+    pub async fn run(&self, mut stop: Shutdown) {
+        let config = &self.shared.config;
+        let machines = self.shared.machines.clone();
+        let (tick_stop, mut ticking) = cf_scaleset::shutdown();
+        let every = config.tick_every;
+        let ticks = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(every);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    () = ticking.wait() => return,
+                    _ = timer.tick() => {}
+                }
+                // A look at every vm-host: it may wait on a socket, so it has a thread of its own.
+                let machines = machines.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || machines.tick()).await {
+                    tracing::error!(%error, "a tick failed");
+                }
+            }
+        });
+        let mut discover = tokio::time::interval(config.discover_every);
+        let mut sweep = tokio::time::interval(config.sweep_every);
+        let mut report = Box::pin(tokio::time::sleep(Duration::ZERO));
+        loop {
+            tokio::select! {
+                () = stop.wait() => break,
+                _ = discover.tick() => self.discover().await,
+                _ = sweep.tick() => self.sweep().await,
+                () = &mut report => {
+                    let next = self.report().await;
+                    report.as_mut().reset(tokio::time::Instant::now() + next);
+                }
+            }
+        }
+        self.shutdown().await;
+        tick_stop.trigger();
+        let _ = ticks.await;
+    }
+
+    /// Stops taking jobs, closes every session at GitHub and tells the console once more. Machines are left as
+    /// they are.
+    pub async fn shutdown(&self) {
+        self.shared.machines.drain();
+        let names: Vec<String> = self
+            .shared
+            .serving
+            .lock()
+            .expect("serving")
+            .keys()
+            .cloned()
+            .collect();
+        for name in names {
+            self.close(&name).await;
+        }
+        self.sweep().await;
+        if self.shared.console.is_some() {
+            let _ = tokio::time::timeout(Duration::from_secs(10), self.report()).await;
+        }
+    }
+}
+
+/// How many machines of the commonest size the Mac gives room to under the limits in force.
+fn max_jobs(snapshot: &Snapshot) -> u32 {
+    u32::try_from(snapshot.budget.limits.cap_bytes / Size::G4.vm_bytes()).unwrap_or(u32::MAX)
+}
+
+/// One scale set's listener, for as long as it is wanted: the scale set is made, a session opened, and the scaler
+/// hears its messages; a session that fails is opened again after a wait.
+async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
+    shared: Arc<Shared<H, V>>,
+    client: ScaleSetClient,
+    state: Arc<Mutex<SetState>>,
+    stop: Shutdown,
+) {
+    let bell = shared.nudge.subscribe();
+    let (name, labels, size, repo) = {
+        let state = state.lock().expect("set");
+        (
+            state.name.clone(),
+            state.labels.clone(),
+            state.size,
+            state.repo.clone(),
+        )
+    };
+    let (first, longest, healthy) = shared.config.backoff;
+    let session_stop = stop.clone();
+    supervise(
+        stop,
+        Backoff::new(first, longest, healthy),
+        || {
+            let (shared, client, state, bell) = (shared.clone(), client.clone(), state.clone(), bell.clone());
+            let (name, labels, repo, stop) = (name.clone(), labels.clone(), repo.clone(), session_stop.clone());
+            async move {
+                let set = client.ensure_scale_set(&name, &labels).await?;
+                state.lock().expect("set").id = set.id;
+                let session = client.open_session(set.id, &shared.config.machine).await?;
+                let machines = shared.machines.clone();
+                let slots: Arc<dyn Slots> = machines.clone();
+                let mut scaler = Scaler::new(
+                    ScalerConfig {
+                        scale_set_id: set.id,
+                        repo,
+                        machine: shared.config.machine.clone(),
+                        size,
+                    },
+                    session.clone(),
+                    SetRegistry {
+                        client: client.clone(),
+                        scale_set_id: set.id,
+                    },
+                    machines.clone(),
+                    slots,
+                    shared.roster.clone(),
+                    shared.clock.clone(),
+                )
+                .with_events(machines.clone())
+                .with_out_of_memory_check({
+                    let machines = machines.clone();
+                    Arc::new(move |runner| machines.was_out_of_memory(runner))
+                });
+                let (statistics, never) = (scaler.statistics_handle(), scaler.never_handle());
+                {
+                    let mut state = state.lock().expect("set");
+                    state.error = None;
+                    state.error_at = None;
+                }
+                let watch = {
+                    let state = state.clone();
+                    move || {
+                        let mut state = state.lock().expect("set");
+                        state.statistics.clone_from(&statistics.lock().expect("statistics"));
+                        state.never.clone_from(&never.lock().expect("never"));
+                    }
+                };
+                let listened = listen_nudged(&session, &mut Watched(&mut scaler, &watch), stop, &bell).await;
+                drop(scaler);
+                if let Err(error) = session.close().await {
+                    tracing::debug!(set = %name, %error, "a session could not be closed; it expires by itself");
+                }
+                listened
+            }
+        },
+        |error, wait| {
+            tracing::warn!(set = %name, %error, wait = ?wait, "a listener failed; it starts again");
+            let mut state = state.lock().expect("set");
+            state.error = Some(error.to_string());
+            state.error_at = Some(secs(shared.clock.now()));
+        },
+    )
+    .await;
+}
+
+/// A scaler whose counts are copied to the scale set's state after every message.
+struct Watched<'a, S, F>(&'a mut S, &'a F);
+
+impl<S: cf_scaleset::Scaler, F: Fn() + Send + Sync> cf_scaleset::Scaler for Watched<'_, S, F> {
+    async fn scale(&mut self, message: Option<&cf_scaleset::Message>) -> Result<usize, cf_scaleset::Error> {
+        let capacity = self.0.scale(message).await;
+        (self.1)();
+        capacity
+    }
+}

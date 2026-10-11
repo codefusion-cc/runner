@@ -811,3 +811,66 @@ async fn a_stop_in_the_moment_the_mac_wakes_is_not_put_off_by_the_time_it_slept(
     assert_eq!(w.slots(), 0);
     w.assert_nothing_left();
 }
+
+#[test]
+fn a_pause_and_a_drain_tell_the_polls_in_flight_once() {
+    let w = World::new(2);
+    let before = w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed);
+    w.m.pause(true);
+    w.m.pause(true);
+    assert_eq!(
+        w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1
+    );
+    w.m.pause(false);
+    assert_eq!(
+        w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
+        before + 2
+    );
+    w.m.drain();
+    w.m.drain();
+    assert_eq!(
+        w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
+        before + 3
+    );
+}
+
+#[tokio::test]
+async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() {
+    let mut w = World::new(3);
+    // One dies before any job came to it: GitHub counts nothing for it.
+    let idle = w.start().await;
+    w.parts.vms.die(job_name(&idle));
+    // Two die under their jobs.
+    let (first, second) = (w.start().await, w.start().await);
+    w.github(EventKind::Started, &first, "");
+    w.github(EventKind::Started, &second, "");
+    w.parts.vms.die(job_name(&first));
+    w.parts.vms.die(job_name(&second));
+    pass(&w.m, 2);
+    assert_eq!(w.parts.vms.standing(), Vec::<String>::new());
+    assert_eq!(w.m.lost_with_job(SET), 2, "GitHub still counts both jobs");
+    assert_eq!(w.m.lost_with_job(SET + 1), 0, "and for this scale set only");
+    // GitHub says how the first ended; the registration of the second is gone, and its job with it.
+    w.github(EventKind::Completed, &first, "failed");
+    assert_eq!(w.m.lost_with_job(SET), 1);
+    w.registered.remove(&second);
+    w.m.unregistered(&second);
+    assert_eq!(w.m.lost_with_job(SET), 0);
+    w.assert_nothing_left();
+}
+
+#[tokio::test]
+async fn a_machine_that_dies_before_it_was_seen_up_but_took_a_job_is_lost_and_not_a_failed_start() {
+    let mut w = World::new(2);
+    w.parts.vms.slow_boot(true);
+    let runner = w.start().await;
+    // The vm-host dies between two looks; GitHub's word that the job started arrives after.
+    w.parts.vms.die(job_name(&runner));
+    pass(&w.m, 2);
+    w.github(EventKind::Started, &runner, "");
+    w.github(EventKind::Completed, &runner, "failed");
+    pass(&w.m, 1);
+    assert_eq!(w.ends(), [(runner, EndKind::GuestLost)]);
+    w.assert_nothing_left();
+}

@@ -263,6 +263,7 @@ pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harn
         settings,
         nudges: Arc::new(AtomicUsize::new(0)),
         boot: 1,
+        bell: Arc::default(),
     };
     let machines = parts.machines(None);
     parts.nudges.store(0, Ordering::Relaxed);

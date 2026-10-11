@@ -85,9 +85,13 @@ impl EndKind {
         EndKind::ALL.into_iter().find(|kind| kind.name() == name)
     }
 
-    /// The end once GitHub said how the job went. Only a job that ran to its end takes GitHub's word: for one the
-    /// Mac stopped or lost, GitHub's "failed" says less than what the Mac knows.
+    /// The end of a machine that took a job, once GitHub said how the job went. Only a job that ran to its end
+    /// takes GitHub's word: for one the Mac stopped or lost, GitHub's "failed" says less than what the Mac knows.
+    /// A machine the Runner never saw up had started all the same if a job reached it: it was lost.
     pub fn with_result(self, result: Option<&str>) -> EndKind {
+        if self == EndKind::StartFailed {
+            return EndKind::GuestLost;
+        }
         if self != EndKind::Finished {
             return self;
         }
@@ -157,10 +161,16 @@ mod tests {
         assert_eq!(EndKind::Finished.with_result(Some("skipped")), EndKind::Finished);
         assert_eq!(EndKind::Finished.with_result(None), EndKind::Finished);
         for kind in EndKind::ALL {
-            if kind != EndKind::Finished {
+            if !matches!(kind, EndKind::Finished | EndKind::StartFailed) {
                 assert_eq!(kind.with_result(Some("failed")), kind, "{}", kind.name());
             }
         }
+        // A job reached a machine the Runner never saw up: it had started, and was lost.
+        assert_eq!(
+            EndKind::StartFailed.with_result(Some("failed")),
+            EndKind::GuestLost
+        );
+        assert_eq!(EndKind::StartFailed.with_result(None), EndKind::GuestLost);
     }
 
     #[test]

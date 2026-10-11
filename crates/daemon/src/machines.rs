@@ -472,14 +472,21 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         inner.budget.hold(Hold::Draining, inner.draining);
     }
 
-    /// Takes new jobs or not, as the console or the person asks.
+    /// Takes new jobs or not, as the console or the person asks. The polls in flight are told, since each still
+    /// offers GitHub the slot the Mac had when it began.
     pub fn pause(&self, paused: bool) {
-        self.lock().paused = paused;
+        let changed = std::mem::replace(&mut self.lock().paused, paused) != paused;
+        if changed {
+            (self.nudge)();
+        }
     }
 
-    /// The Runner is going away: no new job is taken. Machines that stand go on.
+    /// Takes no new job from now on: the Runner is about to stop. The polls in flight are told.
     pub fn drain(&self) {
-        self.lock().draining = true;
+        let changed = !std::mem::replace(&mut self.lock().draining, true);
+        if changed {
+            (self.nudge)();
+        }
     }
 
     /// New numbers for the budget.
@@ -1049,6 +1056,23 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
         if let Some((_, stale)) = self.lock().intents.get_mut(name) {
             *stale = true;
         }
+    }
+
+    fn lost_with_job(&self, scale_set_id: i64) -> usize {
+        self.lock()
+            .jobs
+            .values()
+            .filter(|job| {
+                let record = &job.record;
+                record.scale_set_id == scale_set_id
+                    && record.ended.is_some()
+                    && !record.unregistered
+                    && record
+                        .github
+                        .as_ref()
+                        .is_some_and(|github| github.result.is_none())
+            })
+            .count()
     }
 
     async fn start(&self, spec: RunnerSpec) -> Result<String, HostError> {

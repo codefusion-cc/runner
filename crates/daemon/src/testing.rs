@@ -337,6 +337,8 @@ pub struct TestParts {
     pub settings: Settings,
     /// How often the machines nudged the scalers.
     pub nudges: Arc<std::sync::atomic::AtomicUsize>,
+    /// The bell the machines ring, for a test with listeners.
+    pub bell: Arc<crate::service::Nudge>,
     /// The Mac's boot.
     pub boot: i64,
 }
@@ -352,7 +354,7 @@ impl TestParts {
 
     /// Machines as a daemon that just started has them, before its first look at the Mac.
     pub fn restored(&self, host: FakeHost) -> Arc<TestMachines> {
-        let nudges = self.nudges.clone();
+        let (nudges, bell) = (self.nudges.clone(), self.bell.clone());
         let machines = Machines::restore(MachineParts {
             host,
             vms: self.vms.clone(),
@@ -364,6 +366,7 @@ impl TestParts {
             reports: self.reports.clone(),
             nudge: Box::new(move || {
                 nudges.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                bell.fire();
             }),
         })
         .expect("settings");
@@ -380,19 +383,27 @@ pub fn pass(machines: &TestMachines, seconds: u64) {
 }
 
 /// Collects job reports.
-#[derive(Debug, Default)]
-pub struct ReportLog(Mutex<Vec<JobReport>>);
+#[derive(Default)]
+pub struct ReportLog(Mutex<Vec<JobReport>>, Mutex<Option<Arc<dyn Reports>>>);
 
 impl ReportLog {
     /// Every report, in order.
     pub fn all(&self) -> Vec<JobReport> {
         self.0.lock().expect("reports").clone()
     }
+
+    /// Every report from now on goes there too.
+    pub fn forward_to(&self, reports: Arc<dyn Reports>) {
+        *self.1.lock().expect("reports") = Some(reports);
+    }
 }
 
 impl Reports for ReportLog {
     fn job(&self, report: JobReport) {
-        self.0.lock().expect("reports").push(report);
+        self.0.lock().expect("reports").push(report.clone());
+        if let Some(also) = self.1.lock().expect("reports").as_ref() {
+            also.job(report);
+        }
     }
 }
 

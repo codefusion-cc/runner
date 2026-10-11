@@ -306,7 +306,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let Some(assigned) = self.wanted else {
             return Ok(());
         };
-        let active = self.roster.active(self.config.scale_set_id);
+        let active = self.active();
         // Jobs that waited in line and went away give their place back, the newest first.
         while active + self.waiting.len() > assigned
             && let Some(ticket) = self.waiting.pop()
@@ -327,7 +327,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 return Err(e);
             }
         }
-        let active = self.roster.active(self.config.scale_set_id);
+        let active = self.active();
         for _ in active + self.waiting.len()..assigned {
             let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
             match self.slots.claim(self.config.size, promised) {
@@ -365,15 +365,25 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let mut tries = 0;
         let (name, jit) = loop {
             tries += 1;
-            let name = runner_name(&self.config.machine, rand::random::<u32>());
+            // Never the name of an Actions runner this machine has: its record is kept under the name.
+            let name = loop {
+                let name = runner_name(&self.config.machine, rand::random::<u32>());
+                if self.roster.get(&name).is_none() {
+                    break name;
+                }
+            };
             self.hosts
                 .registering(&name, &self.config.repo, self.config.scale_set_id);
             match self.registry.generate_jit(&name).await {
                 Ok(jit) => break (name, jit),
                 Err(e) => {
-                    // A refusal leaves nothing at GitHub (a taken name is somebody else's registration); anything
-                    // else may have registered the name before it failed.
-                    if e.status().is_some_and(|status| (400..500).contains(&status)) {
+                    // A refusal leaves nothing at GitHub; anything else may have registered the name before it
+                    // failed. A taken name is no refusal: only this machine makes names that begin with its own,
+                    // so the name is taken by a try of this call whose answer was lost on the way.
+                    let refused = e
+                        .status()
+                        .is_some_and(|status| (400..500).contains(&status) && status != 409);
+                    if refused {
                         self.hosts.not_registered(&name);
                     } else {
                         self.hosts.registration_unsure(&name);
@@ -468,13 +478,19 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         }
     }
 
+    /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone
+    /// under a job GitHub has not let go of.
+    fn active(&self) -> usize {
+        self.roster.active(self.config.scale_set_id) + self.hosts.lost_with_job(self.config.scale_set_id)
+    }
+
     /// How many Actions runners this scale set may have at once right now, which every wait carries to the service:
     /// those it has, the jobs that wait in line, the slots promised to it, and one more while the machine has a free slot. The service may fill
     /// every number it is given before any reports back, so offering all free slots to every scale set would let it
     /// assign this machine several times the jobs it can run while other machines stay idle. One at a time, a burst
     /// still fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
     pub fn capacity(&self) -> usize {
-        self.roster.active(self.config.scale_set_id)
+        self.active()
             + self.waiting.len()
             + self.promised.len()
             + self.slots.open_slots(self.config.size).min(1)

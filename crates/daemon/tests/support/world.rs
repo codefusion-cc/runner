@@ -45,6 +45,7 @@ impl World {
             settings,
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: 1,
+            bell: Arc::default(),
         };
         let m = parts.machines(None);
         World {

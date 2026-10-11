@@ -1,9 +1,11 @@
-//! The daemon's GitHub half: scale sets per repository and size, and the scaler that ties a claimed job to a slot.
+//! The daemon: scale sets per repository and size, the scaler that ties a job to a slot, the machines that join
+//! the budget, the lifecycle and the vm-hosts, and the service that runs them all.
 //!
 //! The scaler is the Go manager's `scaler` package ported: a message from a scale set's poll becomes acquired jobs,
-//! Actions runners and retired Actions runners. The machine's slots ([`Slots`], the budget) and its virtual machines
-//! ([`Hosts`], the VM monitor) are traits, so this crate depends on neither; the GitHub side is the real
-//! [`cf_scaleset`] client.
+//! Actions runners and retired Actions runners. It asks for slots ([`Slots`]) and machines ([`Hosts`]) through
+//! traits; [`Machines`] is both, on the real budget ([`cf_budget`]), the real lifecycle ([`cf_lifecycle`]) and the
+//! vm-hosts ([`Vms`]: [`VmHosts`] in service, a stand-in in tests). [`Service`] finds what to serve, keeps a listener
+//! per scale set, removes registrations that have to go and reports to the console.
 
 mod adapters;
 mod ends;
@@ -12,6 +14,7 @@ pub mod names;
 mod records;
 mod roster;
 mod scaler;
+mod service;
 #[doc(hidden)]
 pub mod testing;
 mod traits;
@@ -26,6 +29,10 @@ pub use machines::{
 pub use records::{DiskStore, Ending, GithubJob, MemoryStore, Record, SavedSlot, Store, replace_private};
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory};
+pub use service::{
+    Console, HostExtras, LoggedReports, Nudge, OutboxReports, Service, ServiceConfig, ServiceParts, SetState,
+    iso, job_event,
+};
 pub use traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
 };

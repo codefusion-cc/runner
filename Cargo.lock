@@ -130,6 +130,8 @@ name = "cf-daemon"
 version = "0.1.0"
 dependencies = [
  "cf-budget",
+ "cf-console-client",
+ "cf-fake-console",
  "cf-fake-github",
  "cf-ghapp",
  "cf-guest-proto",
@@ -145,6 +147,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",
