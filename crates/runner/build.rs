@@ -61,5 +61,7 @@ fn main() {
         .filter(|commit| !commit.is_empty())
         .or_else(|| commit(&root))
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=CF_COMMIT={commit}");
+    // Under a name of its own: cargo hands what is set here to the tests it runs too, and `CF_COMMIT` there would
+    // read as a build that was given its name.
+    println!("cargo:rustc-env=CF_BUILT_AT={commit}");
 }

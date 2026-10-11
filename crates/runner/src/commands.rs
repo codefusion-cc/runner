@@ -5,7 +5,7 @@ use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
 /// The Runner's version with the commit the program was built at (`build.rs`), such as `0.1.0+446125c0a1b2`;
 /// `unknown` for a commit nobody could name. One text for `version`, the log's first line and the console.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CF_COMMIT"));
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CF_BUILT_AT"));
 
 const USAGE: &str = "usage: codefusion-runner
   version
