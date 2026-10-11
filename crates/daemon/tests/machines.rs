@@ -15,6 +15,18 @@ use cf_guest_proto::StopReason;
 use cf_vmhost::End;
 use support::world::{REPO, SET, SIZE, World, ids};
 
+// --- the Mac's clock ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_clock_that_moves_on_while_the_mac_is_read_closes_nothing() {
+    // The Air, 2026-10-11: a look whose reading crossed a millisecond was thrown away as one of another moment,
+    // and each time the Mac was closed for another calm minute.
+    let w = World::new(2);
+    w.m.with_host(|host| host.read_takes(Millis(1)));
+    pass(&w.m, 61);
+    assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
+}
+
 // --- every end ---------------------------------------------------------------------------------------------------
 
 #[tokio::test]

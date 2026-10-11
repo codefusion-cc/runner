@@ -9,6 +9,7 @@ pub struct FakeHost {
     reading: HostReading,
     failure: Option<HostError>,
     reads: u64,
+    read_takes: Millis,
 }
 
 impl FakeHost {
@@ -34,6 +35,7 @@ impl FakeHost {
             },
             failure: None,
             reads: 0,
+            read_takes: Millis::ZERO,
         }
     }
 
@@ -74,6 +76,12 @@ impl FakeHost {
         self.facts = facts;
     }
 
+    /// A reading takes this long from now on: both clocks move on by it before the reading gets its time, as a
+    /// real Mac's do between the start of a look and the reading.
+    pub fn read_takes(&mut self, span: Millis) {
+        self.read_takes = span;
+    }
+
     /// How often `read` was called.
     pub fn reads(&self) -> u64 {
         self.reads
@@ -91,6 +99,8 @@ impl Host for FakeHost {
 
     fn read(&mut self) -> Result<HostReading, HostError> {
         self.reads += 1;
+        self.now.awake = self.now.awake.plus(self.read_takes);
+        self.now.elapsed = self.now.elapsed.plus(self.read_takes);
         match &self.failure {
             Some(error) => Err(error.clone()),
             None => Ok(HostReading {

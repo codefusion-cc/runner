@@ -507,7 +507,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// say. Call it every second.
     pub fn tick(&self) {
         let mut inner = self.lock();
-        let now = inner.host.now();
         let reading: Option<HostReading> = match inner.host.read() {
             Ok(reading) => {
                 inner.host_error = None;
@@ -518,6 +517,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 None
             }
         };
+        // After the reading, never before it: the budget takes a reading from later than `now` for one of another
+        // moment and closes the Mac for the calm time, and a real clock moves on while the Mac is read.
+        let now = inner.host.now();
         self.holds(&mut inner, now);
         self.woke(&mut inner, now);
         // The budget forgets what it knew of a Mac nobody looked at for so long, and opens it again only after
