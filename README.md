@@ -91,12 +91,34 @@ codefusion-runner install --config <file>
 
 `install` copies the program to `<state_dir>/bin`, writes `~/Library/LaunchAgents/cc.codefusion.vm-runner.plist` and
 starts the agent. The Runner's log is `<state_dir>/logs/runner.log` (10 MB, then one older file beside it); what
-launchd itself says is in `launchd.log` there. After its line "the Runner starts" the log is silent until a job comes: its
-scale sets, its sessions and whether the Mac is open are not in it. `check --github` and the console's page say
-those. A Mac opens after a minute in which nothing was wrong with it, and a job that comes sooner waits for that.
+launchd itself says is in `launchd.log` there.
 
-`enroll` typed at a terminal says what it waits for; the code is the `--code` value of the command the console's
-Add a Mac shows for the cf-runners manager, made for exactly this `machine`.
+What the log says between a start and a job, each once and again when it changes:
+
+```
+the Runner starts version="0.1.0+446125c0a1b2" machine=air-vm
+a scale set at GitHub set=air-vm--cf-4g-177a1a95 id=10 repo=org/app labels=cf-4g size="cf-4g"
+a session is open: the Runner listens for this scale set's jobs set=air-vm--cf-4g-177a1a95
+the Mac is closed: a new job waits why="calming" opens_in_s=60
+the Mac is open: a new job gets a machine
+job started runner=air-vm-j1766ef2 job=build at=2026-10-11T09:54:18Z heard_after_s=41
+```
+
+A Mac opens after a minute in which nothing was wrong with it, and a job that comes sooner waits for that. `why`
+is the budget's word for what closes it: `calming`, `memory-pressure`, `swapping`, `under-floor`, `thermal`,
+`battery`, `disk`, `no-reading`, `paused` and so on. `job started` is written when GitHub says so, which may be most
+of a minute after the start: `at` is the start by GitHub's time and `heard_after_s` how late its word came.
+
+`version` prints the package's version and the commit the program was built at (`codefusion-runner
+0.1.0+446125c0a1b2`), the text the log's first line and the console have too. `check` ends its list with the memory
+at that moment: `now: 2.30 GiB of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside
+what runs`. That is the budget's own arithmetic, so it says what a Runner on this Mac would decide, short of the
+calm minute.
+
+`enroll` typed at a terminal asks for the code and does not show it while it is typed or pasted. The code is the
+`--code` value of the command the console's Add a Mac shows for the cf-runners manager, made for exactly this
+`machine`. Do not put it on a command line (`echo <code> | …` stays in the shell's history); a script hands it over
+on standard input from where it keeps it.
 
 One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 
