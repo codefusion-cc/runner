@@ -127,6 +127,8 @@ pub struct HostExtras {
     pub swap_total_bytes: u64,
     /// The CPU in use, in percent; -1 when it is not known.
     pub cpu_percent: f64,
+    /// When the Mac started, in seconds since 1970, when it is known.
+    pub boot: Option<i64>,
 }
 
 /// One scale set the Mac serves, as a report shows it.
@@ -763,7 +765,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 swap_total_bytes: extras.swap_total_bytes.max(reading.swap_used_bytes),
                 disk_free_bytes: reading.disk_free_bytes,
                 disk_total_bytes: extras.disk_total_bytes.max(reading.disk_free_bytes),
-                boot_time: None,
+                boot_time: extras.boot.map(iso),
                 #[allow(clippy::cast_precision_loss)]
                 idle_seconds: reading.idle.0 as f64 / 1000.0,
             }
@@ -821,7 +823,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             started: iso(job.started_at.unwrap_or(machine.started)),
                         }),
                         usage: machine.used_bytes.map(|memory_bytes| RunnerUsage {
-                            cpu_percent: 0.0,
+                            // A machine's share of the CPUs is not measured.
+                            cpu_percent: -1.0,
                             memory_bytes,
                         }),
                     })

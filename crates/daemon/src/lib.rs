@@ -9,6 +9,8 @@
 
 mod adapters;
 mod ends;
+#[cfg(target_os = "macos")]
+mod mac;
 mod machines;
 pub mod names;
 mod records;
@@ -22,6 +24,8 @@ mod vms;
 
 pub use adapters::SetRegistry;
 pub use ends::{EndKind, machine_end};
+#[cfg(target_os = "macos")]
+pub use mac::{MacMachines, MacService, MacSetup, mac_service, records_dir};
 pub use machines::{
     JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT, Registration,
     Reports, Snapshot,

@@ -1,7 +1,15 @@
-//! The CodeFusion Runner: `version`, `image verify` and `image install`, `vm` (the vm-host of one job) and
-//! `boot-proof`.
+//! The CodeFusion Runner: the service of one Mac (`daemon`, `enroll`, `check`, `install`, `uninstall`), `version`,
+//! `image verify` and `image install`, `vm` (the vm-host of one job) and `boot-proof`.
 
 mod commands;
+#[cfg(target_os = "macos")]
+mod config;
+#[cfg(target_os = "macos")]
+mod launchd;
+#[cfg(target_os = "macos")]
+mod log;
+#[cfg(target_os = "macos")]
+mod service;
 #[cfg(target_os = "macos")]
 mod vm;
 

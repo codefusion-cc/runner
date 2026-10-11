@@ -248,6 +248,7 @@ fn service(
             disk_total_bytes: 2000 << 30,
             swap_total_bytes: 0,
             cpu_percent: 12.0,
+            boot: Some(1_790_000_000),
         }),
     })
 }
@@ -298,6 +299,11 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
     assert_eq!(report["status"]["host"]["memoryBytes"], json!(64u64 << 30));
     assert_eq!(report["status"]["host"]["memoryPressure"], json!(1));
     assert_eq!(report["status"]["host"]["load1"], json!(1.5));
+    assert_eq!(
+        report["status"]["host"]["bootTime"],
+        json!("2026-09-21T14:13:20Z")
+    );
+    assert_eq!(report["activity"]["cpuPercent"], json!(12.0));
 
     rig.finish(&runner, "succeeded");
     until("the end at the console", || rig.events().len() == 2).await;
