@@ -117,6 +117,11 @@ impl FakeVms {
         self.with(job, |vm| vm.alive = false);
     }
 
+    /// Nothing of the job is there, as when the daemon died before its vm-host existed.
+    pub fn forget(&self, job: &str) {
+        self.lock().vms.remove(job);
+    }
+
     /// The vm-host stops answering.
     pub fn hang(&self, job: &str) {
         self.with(job, |vm| vm.silent = true);
@@ -340,9 +345,16 @@ impl TestParts {
     /// Machines on a calm Mac that was watched for a minute, so slots are open. `host` carries the Mac's clock on
     /// from the daemon before.
     pub fn machines(&self, host: Option<FakeHost>) -> Arc<TestMachines> {
+        let machines = self.restored(host.unwrap_or_else(|| FakeHost::new(TEST_MAC)));
+        pass(&machines, 61);
+        machines
+    }
+
+    /// Machines as a daemon that just started has them, before its first look at the Mac.
+    pub fn restored(&self, host: FakeHost) -> Arc<TestMachines> {
         let nudges = self.nudges.clone();
         let machines = Machines::restore(MachineParts {
-            host: host.unwrap_or_else(|| FakeHost::new(TEST_MAC)),
+            host,
             vms: self.vms.clone(),
             settings: self.settings.clone(),
             config: MachineConfig::new("mac-b", "2026.10.1", self.boot, Duration::from_secs(6 * 3600)),
@@ -355,7 +367,6 @@ impl TestParts {
             }),
         })
         .expect("settings");
-        pass(&machines, 61);
         Arc::new(machines)
     }
 }

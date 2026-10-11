@@ -121,6 +121,8 @@ pub fn machine_end(life: End, vm: Option<VmEnd>, draining: bool) -> EndKind {
             Some(VmEnd::EvictedMemory) => EndKind::EvictedMemory,
             Some(VmEnd::EvictedDisk) => EndKind::EvictedDisk,
             Some(VmEnd::HostSlept) => EndKind::HostSlept,
+            // The job was over before the machine was asked to go: how the machine was put away says nothing of it.
+            Some(VmEnd::Cancelled) if life != End::GuestLost => EndKind::Finished,
             Some(VmEnd::Cancelled) if draining => EndKind::HostShutdown,
             Some(VmEnd::Cancelled) => EndKind::Stopped,
             Some(VmEnd::GuestLost) => EndKind::GuestLost,

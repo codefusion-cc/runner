@@ -2,6 +2,8 @@
 //! on the real budget and lifecycle. Only the vm-hosts and the Mac's readings are stand-ins.
 #![allow(dead_code)]
 
+pub mod world;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

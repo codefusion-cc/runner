@@ -220,6 +220,8 @@ struct Inner<H> {
     stuck: BTreeSet<String>,
     /// Actions runners that lost a process for memory and are gone.
     recent_oom: VecDeque<String>,
+    /// How long the Mac had slept in all when the machines were last told of its sleep.
+    asleep: Millis,
 }
 
 /// The Mac's slots and machines. The scalers see it as [`Slots`], [`Hosts`] and [`Events`]; the daemon's loop
@@ -263,6 +265,11 @@ fn secs(at: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+/// How long the Mac has slept in all, on its two clocks.
+const fn asleep(now: Now) -> Millis {
+    Millis(now.elapsed.0.saturating_sub(now.awake.0))
+}
+
 fn duration(span: Millis) -> Duration {
     Duration::from_millis(span.0)
 }
@@ -300,8 +307,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             reports,
             nudge,
         } = parts;
+        let asleep = asleep(host.now());
         let machines = Machines {
             inner: Mutex::new(Inner {
+                asleep,
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -494,6 +503,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             }
         };
         self.holds(&mut inner, now);
+        self.woke(&mut inner, now);
         let observed = inner.budget.observe(now, reading);
         let mut nudge = false;
         for slot in observed.expired {
@@ -509,11 +519,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             nudge = true;
         }
         let names: Vec<String> = inner.jobs.keys().cloned().collect();
-        if observed.slept > Millis::ZERO {
-            for name in &names {
-                self.feed(&mut inner, name, now, Event::Slept(observed.slept));
-            }
-        }
         if let Some(eviction) = observed.evict {
             let job = inner
                 .jobs
@@ -615,7 +620,26 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// Tells every machine of the time the Mac slept since they were last told, before anything else happens to
+    /// one: a wait that starts now is not put off by a sleep that is over.
+    fn woke(&self, inner: &mut Inner<H>, now: Now) {
+        let total = asleep(now);
+        let slept = Millis(total.0.saturating_sub(inner.asleep.0));
+        inner.asleep = total;
+        if slept > Millis::ZERO {
+            let names: Vec<String> = inner.jobs.keys().cloned().collect();
+            for name in names {
+                self.step(inner, &name, now, Event::Slept(slept));
+            }
+        }
+    }
+
     fn feed(&self, inner: &mut Inner<H>, name: &str, now: Now, event: Event) {
+        self.woke(inner, now);
+        self.step(inner, name, now, event);
+    }
+
+    fn step(&self, inner: &mut Inner<H>, name: &str, now: Now, event: Event) {
         let Some(job) = inner.jobs.get_mut(name) else {
             return;
         };
@@ -1059,6 +1083,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             env: Vec::new(),
             deadline_s: self.config.deadline.as_secs(),
         };
+        self.woke(&mut inner, now);
         let mut life = Slot::reserved(self.config.limits);
         let effects = life.on(now.elapsed, Event::Assigned);
         debug_assert_eq!(effects, [Effect::StartVm]);
