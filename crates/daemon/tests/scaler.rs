@@ -870,3 +870,68 @@ async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
     h.hosts.gone(&name);
     assert_eq!(h.slots.used(), 1);
 }
+
+#[tokio::test]
+async fn only_a_vm_host_that_cannot_say_is_worth_a_warning_about_memory() {
+    let mut h = harness(2).await;
+    h.scaler.scale(Some(&stats(2))).await.unwrap();
+    let names = names(&h);
+    let log = support::Log::start();
+    // The usual order: GitHub's word of the end comes while the machine still stands.
+    let done = Message {
+        completed: vec![completed(&names[0], "succeeded", JobBase::default())],
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&done)).await.unwrap();
+    assert_eq!(log.lines("out of memory"), Vec::<String>::new());
+    h.hosts.leave_out_of_memory_unanswered();
+    let done = Message {
+        completed: vec![completed(&names[1], "succeeded", JobBase::default())],
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&done)).await.unwrap();
+    assert_eq!(
+        log.lines("out of memory"),
+        [format!(
+            "the job's vm-host could not say whether the job ran out of memory; what the Runner recorded of its \
+             machine is used runner={} reason=the vm-host does not answer recorded=false",
+            names[1]
+        )]
+    );
+}
+
+#[tokio::test]
+async fn the_log_names_a_jobs_start_by_githubs_time_and_says_how_late_its_word_came() {
+    let mut h = harness(2).await;
+    h.scaler.scale(Some(&stats(2))).await.unwrap();
+    let names = names(&h);
+    let log = support::Log::start();
+    let now = time::OffsetDateTime::from(cf_ghapp::Clock::now(&*h.clock));
+    let job = JobBase {
+        job_display_name: "build".into(),
+        runner_assign_time: Some(now - time::Duration::seconds(41)),
+        ..JobBase::default()
+    };
+    h.scaler.scale(Some(&started(&names[0], job))).await.unwrap();
+    // GitHub names no time: the start counts as now.
+    h.scaler
+        .scale(Some(&started(&names[1], JobBase::default())))
+        .await
+        .unwrap();
+    let at = |at: time::OffsetDateTime| cf_daemon::iso(at.unix_timestamp());
+    assert_eq!(
+        log.lines("job started"),
+        [
+            format!(
+                "job started runner={} job=build at={} heard_after_s=41",
+                names[0],
+                at(now - time::Duration::seconds(41))
+            ),
+            format!(
+                "job started runner={} job= at={} heard_after_s=0",
+                names[1],
+                at(now)
+            ),
+        ]
+    );
+}

@@ -91,7 +91,7 @@ codefusion-runner install --config <file>
 
 `install` copies the program to `<state_dir>/bin`, writes `~/Library/LaunchAgents/cc.codefusion.vm-runner.plist` and
 starts the agent. The Runner's log is `<state_dir>/logs/runner.log` (10 MB, then one older file beside it); what
-launchd itself says is in `launchd.log` there. After `the Runner starts` the log is silent until a job comes: its
+launchd itself says is in `launchd.log` there. After its line "the Runner starts" the log is silent until a job comes: its
 scale sets, its sessions and whether the Mac is open are not in it. `check --github` and the console's page say
 those. A Mac opens after a minute in which nothing was wrong with it, and a job that comes sooner waits for that.
 

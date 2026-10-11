@@ -124,8 +124,8 @@ pub struct JobState {
     pub end: Option<Ended>,
 }
 
-/// Whether a job ran out of memory. Three answers on purpose: what cannot be known is `Unknown` with the reason, and
-/// never `No`. `No` is only said of a job whose guest gave its own account of the end, or whose workload never started.
+/// Whether a job ran out of memory. What cannot be known is `Unknown` with the reason, and never `No`; what is only
+/// not known yet is `NotSoFar`. `No` is only said of a job whose guest gave its own account of the end, or whose workload never started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "kebab-case")]
 pub enum OutOfMemory {
@@ -133,6 +133,9 @@ pub enum OutOfMemory {
     Yes(OomEvent),
     /// The job ended and the guest, heard to the end, reported no such stop; or the workload never started.
     No,
+    /// The job's machine still stands and no process of it was stopped for memory so far: its end will say. Only
+    /// one who sees the vm-host run answers this, never a state file.
+    NotSoFar,
     /// Nobody can say.
     Unknown {
         /// Why, in words for a person: the state could not be read, the job has no end yet, the guest was lost.

@@ -5,6 +5,8 @@ mod commands;
 #[cfg(target_os = "macos")]
 mod config;
 #[cfg(target_os = "macos")]
+mod hidden;
+#[cfg(target_os = "macos")]
 mod launchd;
 #[cfg(target_os = "macos")]
 mod service;

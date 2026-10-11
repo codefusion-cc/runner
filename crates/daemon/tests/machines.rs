@@ -12,7 +12,8 @@ use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
 use cf_daemon::{Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, Slots, Ticket};
 use cf_guest_proto::StopReason;
-use cf_vmhost::End;
+use cf_vmhost::{End, OutOfMemory};
+use support::Log;
 use support::world::{REPO, SET, SIZE, World, ids};
 
 // --- the Mac's clock ---------------------------------------------------------------------------------------------
@@ -22,9 +23,63 @@ async fn a_clock_that_moves_on_while_the_mac_is_read_closes_nothing() {
     // The Air, 2026-10-11: a look whose reading crossed a millisecond was thrown away as one of another moment,
     // and each time the Mac was closed for another calm minute.
     let w = World::new(2);
-    w.m.with_host(|host| host.read_takes(Millis(1)));
+    w.m.with_host(|host| host.read_takes(Millis(1), Millis::ZERO));
     pass(&w.m, 61);
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
+}
+
+#[test]
+fn the_log_says_when_the_mac_opens_and_closes_and_why_and_says_it_once() {
+    let mut w = World::new(2);
+    let log = Log::start();
+    // A Runner that has just started: a minute of looks that find nothing wrong, then the Mac opens.
+    w.restart();
+    pass(&w.m, 60);
+    assert_eq!(
+        log.lines("the Mac is"),
+        ["the Mac is closed: a new job waits why=\"calming\" opens_in_s=60"]
+    );
+    pass(&w.m, 1);
+    w.m.with_host(|host| host.set(|r| r.pressure = Pressure::Warning));
+    pass(&w.m, 3);
+    w.m.with_host(|host| host.set(|r| r.pressure = Pressure::Normal));
+    pass(&w.m, 61);
+    // What someone set closes it too, and ends with no calm time after.
+    w.m.pause(true);
+    pass(&w.m, 2);
+    w.m.pause(false);
+    pass(&w.m, 2);
+    assert_eq!(
+        log.lines("the Mac is")[1..],
+        [
+            "the Mac is open: a new job gets a machine",
+            "the Mac is closed: a new job waits why=\"memory-pressure\"",
+            "the Mac is closed: a new job waits why=\"calming\" opens_in_s=60",
+            "the Mac is open: a new job gets a machine",
+            "the Mac is closed: a new job waits why=\"paused\"",
+            "the Mac is open: a new job gets a machine",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_machine_that_stands_is_not_taken_for_one_nobody_can_ask_about_memory() {
+    let mut w = World::new(1);
+    let runner = w.running().await;
+    let job = job_name(&runner).to_string();
+    pass(&w.m, 1);
+    // GitHub's word that a job is over comes while its machine still stands: its end will say the rest.
+    assert_eq!(w.m.out_of_memory(&job).await, OutOfMemory::NotSoFar);
+    w.parts.vms.out_of_memory(&job);
+    assert!(matches!(w.m.out_of_memory(&job).await, OutOfMemory::Yes(_)));
+    w.parts.vms.hang(&job);
+    let silent = w.m.out_of_memory(&job).await;
+    assert_eq!(
+        silent,
+        OutOfMemory::Unknown {
+            reason: "the vm-host does not answer".into()
+        }
+    );
 }
 
 // --- every end ---------------------------------------------------------------------------------------------------

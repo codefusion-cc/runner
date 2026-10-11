@@ -9,7 +9,7 @@ pub struct FakeHost {
     reading: HostReading,
     failure: Option<HostError>,
     reads: u64,
-    read_takes: Millis,
+    read_takes: (Millis, Millis),
 }
 
 impl FakeHost {
@@ -35,7 +35,7 @@ impl FakeHost {
             },
             failure: None,
             reads: 0,
-            read_takes: Millis::ZERO,
+            read_takes: (Millis::ZERO, Millis::ZERO),
         }
     }
 
@@ -44,6 +44,12 @@ impl FakeHost {
         self.now.awake = self.now.awake.plus(span);
         self.now.elapsed = self.now.elapsed.plus(span);
         self.reading.idle = self.reading.idle.plus(span);
+    }
+
+    /// Both clocks move on and nothing else does: time too short for the person's idle time to matter.
+    fn move_on(&mut self, span: Millis) {
+        self.now.awake = self.now.awake.plus(span);
+        self.now.elapsed = self.now.elapsed.plus(span);
     }
 
     /// The Mac sleeps: only the clock that counts sleep moves on.
@@ -76,10 +82,10 @@ impl FakeHost {
         self.facts = facts;
     }
 
-    /// A reading takes this long from now on: both clocks move on by it before the reading gets its time, as a
-    /// real Mac's do between the start of a look and the reading.
-    pub fn read_takes(&mut self, span: Millis) {
-        self.read_takes = span;
+    /// A reading takes time from now on, as a real Mac's does: both clocks move on by `before` until the reading
+    /// gets its time, and by `after` until `read` answers.
+    pub fn read_takes(&mut self, before: Millis, after: Millis) {
+        self.read_takes = (before, after);
     }
 
     /// How often `read` was called.
@@ -99,14 +105,13 @@ impl Host for FakeHost {
 
     fn read(&mut self) -> Result<HostReading, HostError> {
         self.reads += 1;
-        self.now.awake = self.now.awake.plus(self.read_takes);
-        self.now.elapsed = self.now.elapsed.plus(self.read_takes);
+        let (before, after) = self.read_takes;
+        self.move_on(before);
+        let at = self.now;
+        self.move_on(after);
         match &self.failure {
             Some(error) => Err(error.clone()),
-            None => Ok(HostReading {
-                at: self.now,
-                ..self.reading
-            }),
+            None => Ok(HostReading { at, ..self.reading }),
         }
     }
 }

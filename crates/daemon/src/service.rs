@@ -1116,7 +1116,12 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
             async move {
                 let set = client.ensure_scale_set(&name, &labels).await?;
                 state.lock().expect("set").id = set.id;
+                tracing::info!(
+                    set = %name, id = set.id, %repo, labels = %labels.join(","), size = size.label(),
+                    "a scale set at GitHub"
+                );
                 let session = client.open_session(set.id, &shared.config.machine).await?;
+                tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
                 let machines = shared.machines.clone();
                 let slots: Arc<dyn Slots> = machines.clone();
                 let mut scaler = Scaler::new(
@@ -1157,8 +1162,11 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                 };
                 let listened = listen_nudged(&session, &mut Watched(&mut scaler, &watch), stop, &bell).await;
                 drop(scaler);
-                if let Err(error) = session.close().await {
-                    tracing::debug!(set = %name, %error, "a session could not be closed; it expires by itself");
+                match session.close().await {
+                    Ok(()) => tracing::info!(set = %name, "the session is closed"),
+                    Err(error) => {
+                        tracing::info!(set = %name, %error, "the session could not be closed; it expires by itself");
+                    }
                 }
                 listened
             }

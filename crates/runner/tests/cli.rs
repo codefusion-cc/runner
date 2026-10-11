@@ -58,12 +58,28 @@ fn an_empty_folder_and_bad_usage_are_refused_with_a_reason() {
 }
 
 #[test]
-fn the_version_command_names_the_package_version() {
+fn the_version_command_names_the_package_version_and_the_commit_it_was_built_at() {
     let (ok, text) = runner(&["version"]);
     assert!(ok);
+    // The commit of this checkout, which the program under test was just built from; `unknown` where no git is.
+    let commit = Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "rev-parse",
+            "--short=12",
+            "HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or("unknown".to_string(), |output| {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        });
+    assert!(commit == "unknown" || commit.len() == 12, "{commit}");
     assert_eq!(
         text.trim(),
-        format!("codefusion-runner {}", env!("CARGO_PKG_VERSION"))
+        format!("codefusion-runner {} ({commit})", env!("CARGO_PKG_VERSION"))
     );
 }
 

@@ -2,6 +2,8 @@
 //! GitHub's queue to the console's page, what GitHub and the console do when they fail, and a Runner that starts
 //! again. Only the vm-hosts and the Mac's readings are stand-ins.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1242,4 +1244,34 @@ async fn an_uninstall_hands_the_console_every_job_event_that_waits_and_not_only_
     assert_eq!(left, Vec::<String>::new());
     assert_eq!(rig.console.job_events().len(), waiting);
     assert!(rig.outbox.is_empty());
+}
+
+#[tokio::test]
+async fn the_log_says_which_scale_set_the_runner_keeps_and_when_it_listens_and_stops() {
+    let log = support::Log::start();
+    let mut rig = Rig::new(1).await;
+    rig.service.discover().await;
+    until("a session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let set = rig.github.scale_sets()[0].clone();
+    assert_eq!(
+        log.lines("a scale set at GitHub"),
+        [format!(
+            "a scale set at GitHub set={} id={} repo={REPO} labels=cf-2g,self-hosted size=\"cf-2g\"",
+            set.name, set.id
+        )]
+    );
+    let listens = format!(
+        "a session is open: the Runner listens for this scale set's jobs set={}",
+        set.name
+    );
+    assert_eq!(log.lines("session is"), std::slice::from_ref(&listens));
+    rig.stop_pump().await;
+    rig.service.shutdown().await;
+    assert_eq!(
+        log.lines("session is"),
+        [listens, format!("the session is closed set={}", set.name)]
+    );
 }

@@ -1,13 +1,12 @@
 //! The Runner as a service of one Mac: `daemon` (what launchd runs), `enroll` at the console, `check` before an
 //! install, `install` and `uninstall`.
 
-use std::io::{BufRead as _, IsTerminal as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cf_budget::{Host as _, Settings, Size};
+use cf_budget::{Budget, Host as _, HostReading, Settings, Size, admit};
 use cf_daemon::names::ServePolicy;
 use cf_daemon::{Lines, MacMachines, MacService, MacSetup, ROLL_AT, mac_service};
 use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
@@ -15,6 +14,7 @@ use cf_host_macos::{MacHost, host_name, model};
 use cf_secret::Secret;
 
 use crate::config::{Config, check_beside_old_manager};
+use crate::hidden::{self, NoLine};
 use crate::launchd::{AGENT_PAUSE, Agent, LABEL, launchctl, plist};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -182,15 +182,37 @@ pub fn daemon(config: &Path) -> Result<(), String> {
             }
             trigger.trigger();
         });
-        tracing::info!(version = VERSION, machine = %config.machine, "the Runner starts");
+        tracing::info!(
+            version = VERSION, commit = crate::commands::COMMIT, machine = %config.machine,
+            "the Runner starts"
+        );
         service.run(stop).await;
         tracing::info!("the Runner ends; machines that stand go on and are found again");
         Ok(())
     })
 }
 
+/// The console's one-time code from standard input. A person at a terminal is told what is waited for, and what
+/// they type is not shown; a pipe is asked nothing.
+fn one_time_code(machine: &str) -> Result<Secret<String>, String> {
+    let question =
+        format!("The code the console's Add a Mac made for `{machine}` (it is not shown), then Enter: ");
+    let line = match hidden::read_line(libc::STDIN_FILENO, &question, std::io::stderr()) {
+        Ok(line) => line,
+        Err(NoLine::Signal(signal)) => hidden::end_by(signal),
+        Err(NoLine::NoCode) => return Err("the line on standard input is no code".into()),
+        Err(NoLine::Io(error)) => return Err(format!("standard input: {error}")),
+    };
+    let code = line.trim();
+    if code.is_empty() {
+        return Err("no code on standard input".into());
+    }
+    Ok(Secret::new(code.to_string()))
+}
+
 /// Enrols this Mac at the console with the one-time code on standard input, and keeps the token the console
-/// answers in the state folder, for this user alone. Neither is printed.
+/// answers in the state folder, for this user alone. Neither is printed, and the code is not shown while it is
+/// typed.
 pub fn enroll(config: &Path) -> Result<(), String> {
     let config = Config::load(config)?;
     let address = config
@@ -204,22 +226,7 @@ pub fn enroll(config: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    // A person at a terminal is told what the silence waits for; a pipe gets no prompt.
-    if std::io::stdin().is_terminal() {
-        eprintln!(
-            "The code the console's Add a Mac made for `{}`, then Enter:",
-            config.machine
-        );
-    }
-    let mut code = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut code)
-        .map_err(|error| format!("standard input: {error}"))?;
-    let code = code.trim().to_string();
-    if code.is_empty() {
-        return Err("no code on standard input".into());
-    }
+    let code = one_time_code(&config.machine)?;
     cf_secret::private_dir(&config.state_dir)
         .map_err(|error| format!("{}: {error}", config.state_dir.display()))?;
     let facts = MacHost::new(&config.state_dir)
@@ -238,7 +245,7 @@ pub fn enroll(config: &Path) -> Result<(), String> {
             ),
             &address,
             &cf_console_client::Enroll {
-                code: Secret::new(code),
+                code,
                 machine: config.machine.clone(),
                 hostname: hostname(),
                 model: model().unwrap_or_else(|| "Mac".into()),
@@ -310,6 +317,61 @@ fn room(config: &Config) -> Result<String, String> {
     ))
 }
 
+/// The Mac's memory at this moment against the floor the budget keeps free, and the sizes a machine could have
+/// right now. The budget's own numbers and arithmetic, so the line never disagrees with a Runner that runs; a
+/// Runner still waits out its calm minute before it starts one.
+fn memory_now(settings: &Settings, reading: &HostReading) -> String {
+    // The budget itself says which limits are in force: with the person there, a workstation's are others.
+    let limits = match Budget::new(settings.clone()) {
+        Ok(mut budget) => {
+            budget.observe(reading.at, Some(*reading));
+            budget.status(reading.at).limits
+        }
+        Err(error) => return format!("the settings do not fit this Mac: {error}"),
+    };
+    let gib = |bytes: u64| bytes as f64 / cf_budget::GIB as f64;
+    let fit: Vec<&str> = [Size::G2, Size::G4, Size::G6, Size::G8]
+        .into_iter()
+        .filter(|size| admit(settings, &limits, reading.available_bytes, &[], *size).is_ok())
+        .map(Size::label)
+        .collect();
+    let floor = limits.floor_bytes;
+    format!(
+        "{:.2} GiB of memory available, {}; {}",
+        gib(reading.available_bytes),
+        if reading.available_bytes >= floor {
+            format!(
+                "{:.2} GiB above the floor of {:.2} GiB",
+                gib(reading.available_bytes - floor),
+                gib(floor)
+            )
+        } else {
+            format!(
+                "{:.2} GiB under the floor of {:.2} GiB",
+                gib(floor - reading.available_bytes),
+                gib(floor)
+            )
+        },
+        if fit.is_empty() {
+            "no machine fits beside what runs".to_string()
+        } else {
+            format!("a machine fits beside what runs: {}", fit.join(", "))
+        },
+    )
+}
+
+/// What the Mac reads at this moment, as a line of `check`. A look, not something an install needs.
+fn now_line(config: &Config) -> String {
+    let read = MacHost::new(Path::new("/")).and_then(|mut host| {
+        let facts = host.facts()?;
+        Ok((facts, host.read()?))
+    });
+    match read {
+        Ok((facts, reading)) => memory_now(&Settings::for_host(facts, config.mode()), &reading),
+        Err(error) => format!("macOS could not be read: {error}"),
+    }
+}
+
 /// What an install needs, each as a line that says whether it is there. Nothing is changed.
 fn needs(config: &Config, home: &Path, hostname: &str, program: &Path) -> Vec<Result<String, String>> {
     vec![
@@ -354,6 +416,7 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
     let config = Config::load(config)?;
     let program = own_program()?;
     let mut missing = print(&needs(&config, &home()?, &hostname(), &program));
+    println!("now: {}", now_line(&config));
     if github {
         // The service is built on a folder of its own that is removed after: building it takes up what a Runner
         // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
@@ -545,6 +608,55 @@ mod tests {
             }
         ))
         .expect("a configuration")
+    }
+
+    /// A dedicated 16 GB Mac (floor 2 GiB) that reads this much available memory.
+    fn memory_line(mode: cf_budget::Mode, available_bytes: u64, idle: cf_budget::Millis) -> String {
+        let facts = cf_budget::HostFacts {
+            total_bytes: 16 * cf_budget::GIB,
+            cores: 8,
+        };
+        let mut host = cf_host_macos::FakeHost::new(facts);
+        host.set(|reading| {
+            reading.available_bytes = available_bytes;
+            reading.idle = idle;
+        });
+        memory_now(&Settings::for_host(facts, mode), &host.read().expect("a reading"))
+    }
+
+    #[test]
+    fn the_memory_line_of_a_check_says_what_is_there_now_against_the_floor_and_what_fits() {
+        use cf_budget::{GIB, MIB, Millis, Mode};
+        // The Air on 2026-10-11: 0.3 GiB above the floor, and `check` still read "2 cf-4g side by side".
+        assert_eq!(
+            memory_line(Mode::Dedicated, 2 * GIB + 307 * MIB, Millis::ZERO),
+            "2.30 GiB of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside what runs"
+        );
+        assert_eq!(
+            memory_line(Mode::Dedicated, GIB + 512 * MIB, Millis::ZERO),
+            "1.50 GiB of memory available, 0.50 GiB under the floor of 2.00 GiB; no machine fits beside what runs"
+        );
+        // A machine is counted as its size and the vm-host's own 192 MiB, on top of the floor: one byte less than
+        // that is no room.
+        let needs = |size: Size| 2 * GIB + size.vm_bytes() + 192 * MIB;
+        assert!(
+            memory_line(Mode::Dedicated, needs(Size::G2) - 1, Millis::ZERO)
+                .ends_with("no machine fits beside what runs")
+        );
+        assert!(
+            memory_line(Mode::Dedicated, needs(Size::G2), Millis::ZERO)
+                .ends_with("a machine fits beside what runs: cf-2g")
+        );
+        assert!(
+            memory_line(Mode::Dedicated, needs(Size::G4), Millis::ZERO)
+                .ends_with("a machine fits beside what runs: cf-2g, cf-4g")
+        );
+        // Someone's own Mac keeps more free while the person is there, and all of it at the floor of a Mac nobody
+        // is at once they are away.
+        let there = memory_line(Mode::Workstation, 16 * GIB, Millis::ZERO);
+        let away = memory_line(Mode::Workstation, 16 * GIB, Millis::mins(15));
+        assert!(there.contains("above the floor of 4.00 GiB"), "{there}");
+        assert!(away.contains("above the floor of 3.00 GiB"), "{away}");
     }
 
     #[test]
