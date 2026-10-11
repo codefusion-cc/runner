@@ -879,3 +879,54 @@ async fn a_registration_of_a_repository_no_look_has_shown_is_removed_all_the_sam
     rig.nothing_left().await;
     assert_eq!(rig.service.sets(), [], "no scale set was served to do it");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_survey_says_what_would_be_served_and_what_cannot_be_read_and_changes_nothing_at_github() {
+    let rig = Rig::new(3).await;
+    rig.github.set_workflow(
+        REPO,
+        "sized.yml",
+        "on: push\njobs:\n  sized:\n    runs-on: ${{ vars.CI_RUNNER }}\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER", "cf-4g");
+    let (served, problems) = rig.service.survey().await;
+    assert_eq!(
+        served,
+        [
+            "org/app: [cf-2g, self-hosted] as cf-2g",
+            "org/app: [cf-4g] as cf-4g"
+        ]
+    );
+    assert_eq!(problems, Vec::<String>::new());
+
+    // The App may not read variables: the survey says so, which is what an install is checked with.
+    rig.github.fail(
+        "actions/variables",
+        Reply::status_json(403, &json!({"message": "Resource not accessible by integration"})),
+        100,
+    );
+    let (served, problems) = rig.service.survey().await;
+    // A label that comes from a variable is not known then: it stands for the pool's label, at its size.
+    assert_eq!(
+        served,
+        [
+            "org/app: [self-hosted] as cf-4g",
+            "org/app: [cf-2g, self-hosted] as cf-2g"
+        ]
+    );
+    assert_eq!(problems.len(), 1);
+    assert!(
+        problems[0].starts_with("org/app: its variables could not be read"),
+        "{problems:?}"
+    );
+
+    assert_eq!(rig.github.scale_sets().len(), 0, "no scale set was made");
+    let writes: Vec<String> = rig
+        .github
+        .requests()
+        .into_iter()
+        .map(|request| request.line)
+        .filter(|line| !line.starts_with("GET ") && !line.contains("/access_tokens"))
+        .collect();
+    assert_eq!(writes, Vec::<String>::new(), "GitHub was only read");
+}

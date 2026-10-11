@@ -152,6 +152,17 @@ pub struct SetState {
     pub never: Option<String>,
 }
 
+/// One look's reading of GitHub.
+struct Read {
+    /// The scale sets to serve, by name.
+    wanted: BTreeMap<String, Wanted>,
+    /// Repositories that could not be read: nothing is concluded about them.
+    unread: BTreeSet<String>,
+    problems: Vec<String>,
+    /// How many repositories this Mac serves.
+    served: usize,
+}
+
 struct Wanted {
     repo: String,
     client: ScaleSetClient,
@@ -347,13 +358,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     async fn look(&self, wants: bool) -> Vec<String> {
         let shared = &self.shared;
         let machine = &shared.config.machine;
-        let settings = shared.machines.settings();
-        let mut wanted: BTreeMap<String, Wanted> = BTreeMap::new();
-        let mut unread: BTreeSet<String> = BTreeSet::new();
-        let mut problems: Vec<String> = Vec::new();
-        let mut served = 0usize;
-        let installations = match shared.app.installations().await {
-            Ok(installations) => installations,
+        let Read {
+            wanted,
+            unread,
+            problems,
+            served,
+        } = match self.read(wants).await {
+            Ok(read) => read,
             Err(error) => {
                 // Nothing is known: everything stays as it is.
                 tracing::warn!(%error, "the App's installations could not be read");
@@ -361,90 +372,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 return vec!["GitHub could not be asked for this Mac's scale sets".into()];
             }
         };
-        for installation in installations {
-            let repos = match shared.app.repositories(installation.id).await {
-                Ok(repos) => repos,
-                Err(error) => {
-                    problems.push(format!("installation {}: {error}", installation.id));
-                    // Whichever repositories it has keep their scale sets.
-                    let serving = shared.serving.lock().expect("serving");
-                    unread.extend(
-                        serving
-                            .values()
-                            .map(|s| s.state.lock().expect("set").repo.clone()),
-                    );
-                    continue;
-                }
-            };
-            for repo in repos {
-                if !shared.config.policy.serves(&repo) {
-                    continue;
-                }
-                served += 1;
-                let name = repo.full_name.clone();
-                let client = shared
-                    .clients
-                    .lock()
-                    .expect("clients")
-                    .entry(name.clone())
-                    .or_insert_with(|| {
-                        ScaleSetClient::new(
-                            shared.app.clone(),
-                            installation.id,
-                            &name,
-                            &repo.html_url,
-                            shared.config.poll_timeout,
-                        )
-                    })
-                    .clone();
-                let files = match shared
-                    .app
-                    .workflow_files(installation.id, &name, shared.config.max_workflow_bytes)
-                    .await
-                {
-                    Ok(files) => files,
-                    Err(error) => {
-                        problems.push(format!("{name}: its workflows could not be read ({error})"));
-                        unread.insert(name);
-                        continue;
-                    }
-                };
-                // Needs the App's "Variables: read" permission. Without it a label that comes from a variable
-                // names no size, and the scale sets of the labels written out are still served.
-                let variables = match shared.app.variables(installation.id, &name).await {
-                    Ok(variables) => variables,
-                    Err(error) => {
-                        problems.push(format!(
-                            "{name}: its variables could not be read ({error}); a `runs-on` that takes its \
-                             label from a variable is not served"
-                        ));
-                        BTreeMap::new()
-                    }
-                };
-                if !wants {
-                    continue;
-                }
-                for set in self_hosted_with(&files, &variables) {
-                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str)) else {
-                        continue;
-                    };
-                    if let Err(refusal) = settings.can_run(size) {
-                        // Not offered to GitHub at all: a job nobody here can run is left to the other Macs.
-                        tracing::info!(repo = %name, size = size.label(), why = refusal.name(), "a size this Mac never runs is not served");
-                        continue;
-                    }
-                    wanted.insert(
-                        scale_set_name(machine, &set),
-                        Wanted {
-                            repo: name.clone(),
-                            client: client.clone(),
-                            labels: set.labels().to_vec(),
-                            size,
-                        },
-                    );
-                }
-            }
-        }
 
         // Scale sets of this Mac that nothing asks for any more, from this run of the Runner or one before.
         let clients: Vec<(String, ScaleSetClient)> = shared
@@ -520,6 +447,134 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
         kept.extend(problems);
         kept
+    }
+
+    /// What GitHub shows of the repositories this Mac serves: the scale sets their workflows ask for (none when
+    /// the Mac wants none), the repositories that could not be read, and what went wrong. It only reads. An
+    /// error: GitHub did not even list the App's installations.
+    async fn read(&self, wants: bool) -> Result<Read, cf_ghapp::Error> {
+        let shared = &self.shared;
+        let machine = &shared.config.machine;
+        let settings = shared.machines.settings();
+        let mut wanted: BTreeMap<String, Wanted> = BTreeMap::new();
+        let mut unread: BTreeSet<String> = BTreeSet::new();
+        let mut problems: Vec<String> = Vec::new();
+        let mut served = 0usize;
+        let installations = shared.app.installations().await?;
+        for installation in installations {
+            let repos = match shared.app.repositories(installation.id).await {
+                Ok(repos) => repos,
+                Err(error) => {
+                    problems.push(format!("installation {}: {error}", installation.id));
+                    // Whichever repositories it has keep their scale sets.
+                    let serving = shared.serving.lock().expect("serving");
+                    unread.extend(
+                        serving
+                            .values()
+                            .map(|s| s.state.lock().expect("set").repo.clone()),
+                    );
+                    continue;
+                }
+            };
+            for repo in repos {
+                if !shared.config.policy.serves(&repo) {
+                    continue;
+                }
+                served += 1;
+                let name = repo.full_name.clone();
+                let client = shared
+                    .clients
+                    .lock()
+                    .expect("clients")
+                    .entry(name.clone())
+                    .or_insert_with(|| {
+                        ScaleSetClient::new(
+                            shared.app.clone(),
+                            installation.id,
+                            &name,
+                            &repo.html_url,
+                            shared.config.poll_timeout,
+                        )
+                    })
+                    .clone();
+                let files = match shared
+                    .app
+                    .workflow_files(installation.id, &name, shared.config.max_workflow_bytes)
+                    .await
+                {
+                    Ok(files) => files,
+                    Err(error) => {
+                        problems.push(format!("{name}: its workflows could not be read ({error})"));
+                        unread.insert(name);
+                        continue;
+                    }
+                };
+                // Needs the App's "Variables: read" permission. Without it a label that comes from a variable
+                // is not known and stands for the pool's label, as any value does that names no size.
+                let variables = match shared.app.variables(installation.id, &name).await {
+                    Ok(variables) => variables,
+                    Err(error) => {
+                        problems.push(format!(
+                            "{name}: its variables could not be read ({error}); a `runs-on` that takes its \
+                             label from a variable counts as `self-hosted`"
+                        ));
+                        BTreeMap::new()
+                    }
+                };
+                if !wants {
+                    continue;
+                }
+                for set in self_hosted_with(&files, &variables) {
+                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str)) else {
+                        continue;
+                    };
+                    if let Err(refusal) = settings.can_run(size) {
+                        // Not offered to GitHub at all: a job nobody here can run is left to the other Macs.
+                        tracing::info!(repo = %name, size = size.label(), why = refusal.name(), "a size this Mac never runs is not served");
+                        continue;
+                    }
+                    wanted.insert(
+                        scale_set_name(machine, &set),
+                        Wanted {
+                            repo: name.clone(),
+                            client: client.clone(),
+                            labels: set.labels().to_vec(),
+                            size,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Read {
+            wanted,
+            unread,
+            problems,
+            served,
+        })
+    }
+
+    /// What this Mac would serve, read from GitHub and nothing else: no scale set is made, no session opened, no
+    /// Actions runner registered. Each line is a repository and the labels of one scale set with its size; the
+    /// second list is what could not be read. For a check before the service is installed: a missing permission
+    /// of the App (its variables, its workflows) shows here.
+    pub async fn survey(&self) -> (Vec<String>, Vec<String>) {
+        match self.read(true).await {
+            Ok(read) => (
+                read.wanted
+                    .values()
+                    .map(|want| {
+                        format!(
+                            "{}: [{}] as {}",
+                            want.repo,
+                            want.labels.join(", "),
+                            want.size.label()
+                        )
+                    })
+                    .collect(),
+                read.problems,
+            ),
+            Err(error) => (Vec::new(), vec![format!("GitHub: {error}")]),
+        }
     }
 
     /// The client of a repository no look at GitHub has shown since the Runner started: a registration of before
