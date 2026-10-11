@@ -110,10 +110,10 @@ is the budget's word for what closes it: `calming`, `memory-pressure`, `swapping
 of a minute after the start: `at` is the start by GitHub's time and `heard_after_s` how late its word came.
 
 `version` prints the package's version and the commit the program was built at (`codefusion-runner
-0.1.0+446125c0a1b2`), the text the log's first line and the console have too. `check` ends its list with the memory
-at that moment: `now: 2.30 GiB of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside
-what runs`. That is the budget's own arithmetic, so it says what a Runner on this Mac would decide, short of the
-calm minute.
+0.1.0+446125c0a1b2`, with `-dirty` after it when the sources it was built from differ from that commit), the text
+the log's first line and the console have too. `check` ends its list with the memory at that moment: `now: 2.30 GiB
+of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside what runs`. That is the budget's
+own arithmetic, so it says what a Runner on this Mac would decide, short of the calm minute.
 
 `enroll` typed at a terminal asks for the code and does not show it while it is typed or pasted. The code is the
 `--code` value of the command the console's Add a Mac shows for the cf-runners manager, made for exactly this
