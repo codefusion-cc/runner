@@ -227,8 +227,8 @@ pub struct Service<H, V> {
     shared: Arc<Shared<H, V>>,
 }
 
-/// The longest `discoveryError` and scale set `error` the console reads (it takes four times the bound of a text and
-/// cuts it; over that it refuses the whole report).
+/// The longest `discoveryError`, scale set `error` and command result `message` the console reads (it takes four
+/// times the bound of a text and cuts it; over that it refuses the whole report).
 const STATUS_TEXT_MAX: usize = 1000;
 /// The longest `hostError` the console keeps.
 const HOST_ERROR_MAX: usize = 300;
@@ -561,7 +561,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         continue;
                     }
                     wanted.insert(
-                        scale_set_name(machine, &set),
+                        scale_set_name(machine, &name, &set),
                         Wanted {
                             repo: name.clone(),
                             client: client.clone(),
@@ -946,6 +946,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         *shared.console_paused.lock().expect("paused") = answer.paused;
         shared.machines.pause(answer.paused);
         for command in answer.commands {
+            // A result names its command by the id. One the console would not read back cannot be answered, and a
+            // result it refuses would hold up every report after it: such a command is not done at all.
+            if command.id.is_empty() || command.id.encode_utf16().count() > cf_console_client::RESULT_ID_MAX {
+                tracing::warn!(kind = %cut(command.kind, 50), "a command of the console has no id a result can name");
+                continue;
+            }
             let done = shared
                 .results
                 .lock()
@@ -962,7 +968,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 results.push(CommandResult {
                     id: command.id,
                     ok,
-                    message,
+                    message: cut(message, STATUS_TEXT_MAX),
                     at: iso(secs(shared.clock.now())),
                 });
             }

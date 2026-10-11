@@ -43,10 +43,11 @@ pub fn job_name(runner: &str) -> &str {
     runner.rsplit('-').next().unwrap_or(runner)
 }
 
-/// Names a machine's scale set for one label set: the machine, a double dash (which machine names never contain,
-/// so `mac-a` never claims the sets of `mac-a-2`), the labels that tell repositories' sets apart, and a hash of the
-/// whole set so that two sets never share a name.
-pub fn scale_set_name(machine: &str, set: &LabelSet) -> String {
+/// Names a machine's scale set for one repository's label set: the machine, a double dash (which machine names
+/// never contain, so `mac-a` never claims the sets of `mac-a-2`), the labels for a person to read, and a hash of the
+/// repository and the whole set, so that two repositories that ask for the same labels, and two sets whose labels
+/// read the same, never share a name.
+pub fn scale_set_name(machine: &str, repo: &str, set: &LabelSet) -> String {
     let parts: Vec<String> = set
         .labels()
         .iter()
@@ -59,12 +60,16 @@ pub fn scale_set_name(machine: &str, set: &LabelSet) -> String {
         name.push('-');
         name.push_str(&parts.join("-"));
     }
-    if name.len() > 50 {
-        name.truncate(50);
+    if name.len() > 46 {
+        name.truncate(46);
         name.truncate(name.trim_end_matches('-').len());
     }
-    let sum = Sha256::digest(set.key().as_bytes());
-    format!("{name}-{:02x}{:02x}", sum[0], sum[1])
+    let mut hash = Sha256::new();
+    hash.update(repo.to_lowercase().as_bytes());
+    hash.update([0]);
+    hash.update(set.key().as_bytes());
+    let sum = hash.finalize();
+    format!("{name}-{:02x}{:02x}{:02x}{:02x}", sum[0], sum[1], sum[2], sum[3])
 }
 
 /// Which repositories the Runner takes jobs from.
@@ -143,23 +148,38 @@ mod tests {
     }
 
     #[test]
-    fn scale_set_names_tell_sets_apart_and_machines_never_claim_each_others() {
+    fn scale_set_names_tell_sets_and_repositories_apart_and_machines_never_claim_each_others() {
         let plain = LabelSet::new(["self-hosted", "cf-2g"]);
         let other = LabelSet::new(["self-hosted", "cf-4g"]);
-        let a = scale_set_name("mac-a", &plain);
+        let a = scale_set_name("mac-a", "org/app", &plain);
         assert!(a.starts_with("mac-a--cf-2g-"), "{a}");
-        assert_ne!(a, scale_set_name("mac-a", &other));
-        assert_ne!(scale_set_name("mac-a", &plain), scale_set_name("mac-a-2", &plain));
+        assert_ne!(a, scale_set_name("mac-a", "org/app", &other));
+        assert_ne!(
+            a,
+            scale_set_name("mac-a", "org/shop", &plain),
+            "two repositories that ask for the same labels"
+        );
+        assert_ne!(
+            scale_set_name("mac-a", "org/a", &LabelSet::new(["self-hosted", "b"])),
+            scale_set_name("mac-a", "org/a-b", &LabelSet::new(["self-hosted"])),
+        );
+        assert_ne!(a, scale_set_name("mac-a-2", "org/app", &plain));
         assert!(
-            !scale_set_name("mac-a-2", &plain).starts_with("mac-a--"),
+            !scale_set_name("mac-a-2", "org/app", &plain).starts_with("mac-a--"),
             "mac-a must not claim the sets of mac-a-2"
         );
         assert_eq!(
             a,
-            scale_set_name("mac-a", &LabelSet::new(["CF-2G", "Self-Hosted"])),
+            scale_set_name("mac-a", "Org/App", &LabelSet::new(["CF-2G", "Self-Hosted"])),
             "case and order do not matter"
         );
-        assert!(scale_set_name("mac-a", &LabelSet::new(["self-hosted", &"x".repeat(80)])).len() <= 50 + 5);
+        let long = scale_set_name(
+            &"m".repeat(24),
+            "org/app",
+            &LabelSet::new(["self-hosted", &"x".repeat(80)]),
+        );
+        assert!(long.len() <= 55, "{long}");
+        assert!(long.starts_with(&format!("{}--x", "m".repeat(24))), "{long}");
     }
 
     #[test]

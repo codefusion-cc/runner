@@ -457,6 +457,60 @@ async fn a_scale_set_no_workflow_asks_for_any_more_is_closed_and_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_repositories_that_ask_for_the_same_labels_each_get_their_jobs() {
+    const OTHER: &str = "org/other";
+    let rig = Rig::new(3).await;
+    rig.github.add_repo(OTHER, true);
+    rig.github.set_workflow(OTHER, "ci.yml", WORKFLOW);
+    rig.service.discover().await;
+    until("a session for each repository's scale set", || {
+        let sets = rig.github.scale_sets();
+        sets.len() == 2 && sets.iter().all(|s| s.has_session)
+    })
+    .await;
+    let sets = rig.github.scale_sets();
+    let repos: BTreeSet<&str> = sets.iter().map(|s| s.repo.as_str()).collect();
+    assert_eq!(repos, BTreeSet::from([OTHER, REPO]));
+    assert_ne!(sets[0].name, sets[1].name, "a name of its own for each");
+
+    // A second look takes neither for a set nothing asks for.
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 2);
+    assert!(rig.github.scale_sets().iter().all(|s| s.has_session));
+
+    rig.queue();
+    rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
+    until("a machine for the job of each", || rig.standing().len() == 2).await;
+    for runner in rig.standing() {
+        rig.github.start_job(&runner);
+    }
+    until("both starts at the console", || rig.events().len() == 2).await;
+    let of: BTreeSet<String> = rig
+        .console
+        .job_events()
+        .iter()
+        .map(|event| event["repo"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(of, BTreeSet::from([OTHER.to_string(), REPO.to_string()]));
+
+    // One of them stops asking: only its scale set goes, once its job is over.
+    for runner in rig.standing() {
+        rig.finish(&runner, "succeeded");
+    }
+    rig.nothing_left().await;
+    rig.github.set_workflow(
+        OTHER,
+        "ci.yml",
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n",
+    );
+    rig.service.discover().await;
+    let left = rig.github.scale_sets();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].repo, REPO);
+    assert!(left[0].has_session, "the other repository's listener goes on");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
     type Fault = Box<dyn Fn(&FakeGithub)>;
     let answers = |matcher: &'static str, reply: fn() -> Reply, times: usize| -> Fault {
@@ -915,6 +969,38 @@ async fn what_was_done_for_the_console_is_said_again_and_not_done_again() {
         heard[1]["message"],
         json!("this Runner does not do `restart` yet")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_whose_answer_the_console_would_refuse_holds_up_no_report() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.stop_pump().await;
+    rig.service.report().await;
+    let before = rig.console.reports().len();
+    // A result names its command by an id of 1 to 64 characters and says at most 4000 about it.
+    rig.console.queue_command_as(&"i".repeat(65), "stop-runner", None);
+    rig.console.queue_command_as("", "update", None);
+    let wordy = rig.console.queue_command(&"k".repeat(5000), None);
+    for _ in 0..3 {
+        rig.service.report().await;
+    }
+    assert_eq!(
+        rig.console.reports().len(),
+        before + 3,
+        "every report after the commands came still arrives"
+    );
+    let heard = results(&rig.console);
+    assert_eq!(
+        heard.len(),
+        1,
+        "only the one that can be answered, once: {heard:?}"
+    );
+    assert_eq!(heard[0]["id"], json!(wordy));
+    assert_eq!(heard[0]["ok"], json!(false));
+    let said = heard[0]["message"].as_str().expect("message");
+    assert!(said.starts_with("this Runner does not do `kkkk"), "{said}");
+    assert_eq!(said.chars().count(), 1000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

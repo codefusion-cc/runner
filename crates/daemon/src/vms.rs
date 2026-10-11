@@ -156,6 +156,29 @@ fn exists(pid: u32) -> bool {
     answer == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Waits until the child `pid` of this process has ended, and leaves its exit to be collected: until someone does,
+/// the number goes to no other process. False when the system would not wait this way.
+fn ended_uncollected(pid: u32) -> bool {
+    loop {
+        // SAFETY: `waitid` writes only into `info`, which is a `siginfo_t` of this frame, zeroed as C would have it.
+        let waited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if waited == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
 /// The program a process runs.
 #[cfg(target_os = "macos")]
 fn process_path(pid: u32) -> Option<PathBuf> {
@@ -260,10 +283,16 @@ impl Vms for VmHosts {
         let (exited, children, job) = (self.exited.clone(), self.children.clone(), request.job.clone());
         children.lock().expect("children").insert(job.clone(), child.id());
         std::thread::spawn(move || {
-            // The number leaves the list after the exit is collected and under the list's lock, so that a signal
-            // to a number from the list never reaches another process.
-            let _ = child.wait();
+            // The exit is collected under the list's lock, and the number leaves the list with it: a number in the
+            // list is a process nobody collected yet, so a signal to it never reaches another process.
+            let ended = ended_uncollected(child.id());
+            if !ended {
+                let _ = child.wait();
+            }
             let mut children = children.lock().expect("children");
+            if ended {
+                let _ = child.wait();
+            }
             children.remove(&job);
             exited.lock().expect("exited").insert(job);
         });
@@ -436,6 +465,21 @@ mod tests {
     const SLEEP: &str = "/bin/sleep";
 
     /// A process of the program, as a vm-host that hangs. It never outlives its test.
+    #[test]
+    fn a_vm_hosts_exit_is_waited_for_without_giving_its_number_to_another_process() {
+        let mut child = Command::new(SLEEP).arg("0.2").spawn().expect("a process");
+        let pid = child.id();
+        assert!(ended_uncollected(pid));
+        assert!(exists(pid), "ended, and still this process's to collect");
+        let status = child.try_wait().expect("a child").expect("it has ended");
+        assert!(status.success());
+        assert!(!exists(pid));
+        assert!(
+            !ended_uncollected(pid),
+            "a number that is no child of this process any more"
+        );
+    }
+
     struct Asleep(std::process::Child);
 
     impl Asleep {

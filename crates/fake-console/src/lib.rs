@@ -385,6 +385,18 @@ impl FakeConsole {
         self.queue(Some(machine.to_string()), kind, args)
     }
 
+    /// Queues a command for every Mac under an id of the test's choosing, as a console that broke its own contract
+    /// would send one: the real one makes the ids itself.
+    pub fn queue_command_as(&self, id: &str, kind: &str, args: Option<Value>) {
+        self.lock().commands.push(Pending {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            args,
+            machine: None,
+            done_by: HashSet::new(),
+        });
+    }
+
     fn queue(&self, machine: Option<String>, kind: &str, args: Option<Value>) -> String {
         let mut state = self.lock();
         let id = format!("cmd-{}", state.commands.len() + 1);
