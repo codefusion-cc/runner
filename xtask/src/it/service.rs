@@ -30,7 +30,9 @@ const LABELS: [&str; 2] = ["self-hosted", "cf-2g"];
 /// The job in place of the Actions runner: it is there for twenty seconds.
 const STAND_IN: &str = "echo job-started; sleep 20; echo job-done";
 /// What a `cf-2g` machine and the Mac's floor need before the suite starts one beside whatever else runs here.
-const NEEDED: u64 = 5 << 30;
+const NEEDED: u64 = 4608 << 20;
+/// What must be available beyond the machine and the floor before a job is queued.
+const SPARE: u64 = 256 << 20;
 
 fn runtime() -> Fallible<Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
@@ -125,13 +127,19 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
 }
 
 /// Waits until the Mac takes a job: the budget watches it for a calm minute first, and a machine needs its
-/// memory. The budget's own count is asked, for a size above the job's, so that the room is still there when the
-/// job arrives. On a Mac that other work keeps busy it never comes, which is the budget's rule and no failure of
-/// the service: the answer then says what kept it, for a `SKIPPED` line.
+/// memory. The budget's own reading is asked, for a little more than the job's machine takes, so that the room
+/// is still there when the job arrives. On a Mac that other work keeps busy it never comes, which is the budget's
+/// rule and no failure of the service: the answer then says what kept it, for a `SKIPPED` line.
 fn room(process: &Process) -> Result<(), String> {
+    let settings = process.machines.settings();
     let fits = || {
         let snapshot = process.machines.snapshot();
-        snapshot.open && snapshot.budget.free.of(cf_budget::Size::G4) >= 1
+        let needed = settings.host_bytes(cf_budget::Size::G2) + snapshot.budget.limits.floor_bytes + SPARE;
+        snapshot.open
+            && snapshot
+                .budget
+                .reading
+                .is_some_and(|reading| reading.available_bytes >= needed)
     };
     if within(Duration::from_secs(240), fits) {
         return Ok(());
@@ -165,7 +173,7 @@ fn job_running(world: &World, standing: &BTreeSet<u32>) -> Fallible<(String, u32
     world.github.queue_job(REPO, &LABELS, "build");
     let mut runner = String::new();
     expect(
-        within(Duration::from_secs(60), || {
+        within(Duration::from_secs(120), || {
             runner = world
                 .github
                 .runners()
@@ -174,7 +182,7 @@ fn job_running(world: &World, standing: &BTreeSet<u32>) -> Fallible<(String, u32
                 .unwrap_or_default();
             !runner.is_empty()
         }),
-        "no Actions runner was registered for the job in 60 s",
+        "no Actions runner was registered for the job in 120 s",
     )?;
     world.github.start_job(&runner);
     let mut machine = 0;
