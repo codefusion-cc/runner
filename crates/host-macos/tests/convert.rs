@@ -2,7 +2,7 @@
 //! (`vm_stat`, `sysctl`, `ioreg`, `pmset`), and on answers that cannot be right.
 
 use cf_budget::{GIB, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
-use cf_host_macos::{Raw, reading};
+use cf_host_macos::{Battery, Raw, battery_in, model_name, reading};
 
 const FACTS: HostFacts = HostFacts {
     total_bytes: 16 * GIB,
@@ -361,4 +361,113 @@ fn swap_and_disk_pass_through_as_they_are() {
         (reading.swap_used_bytes, reading.swapouts, reading.disk_free_bytes),
         (u64::MAX, u64::MAX, u64::MAX)
     );
+}
+
+/// What `pmset -g batt` prints, with this as the battery's line.
+fn pmset(source: &str, line: &str) -> String {
+    format!("Now drawing from '{source}'\n{line}\n")
+}
+
+#[test]
+fn the_battery_is_what_pmset_prints_of_the_internal_one() {
+    let battery = |on_battery, percent, charging| {
+        Some(Battery {
+            on_battery,
+            percent,
+            charging,
+        })
+    };
+    // Printed by the MacBooks here.
+    assert_eq!(
+        battery_in(&pmset(
+            "AC Power",
+            " -InternalBattery-0 (id=24641635)\t80%; AC attached; not charging present: true"
+        )),
+        battery(false, 80, false)
+    );
+    assert_eq!(
+        battery_in(&pmset(
+            "AC Power",
+            " -InternalBattery-0 (id=24641635)\t100%; charged; 0:00 remaining present: true"
+        )),
+        battery(false, 100, false)
+    );
+    assert_eq!(
+        battery_in(&pmset(
+            "AC Power",
+            " -InternalBattery-0 (id=1)\t42%; charging; 1:10 remaining present: true"
+        )),
+        battery(false, 42, true)
+    );
+    assert_eq!(
+        battery_in(&pmset(
+            "Battery Power",
+            " -InternalBattery-0 (id=1)\t7%; discharging; 0:21 remaining present: true"
+        )),
+        battery(true, 7, false)
+    );
+    assert_eq!(
+        battery_in(&pmset(
+            "Battery Power",
+            " -InternalBattery-0 (id=1)\t0%; discharging; (no estimate) present: true"
+        )),
+        battery(true, 0, false)
+    );
+}
+
+#[test]
+fn a_mac_without_a_battery_and_a_text_that_is_not_pmsets_have_none() {
+    // A Mac mini, and a Mac on an uninterruptible power supply: that is no battery of the Mac's.
+    assert_eq!(battery_in("Now drawing from 'AC Power'\n"), None);
+    assert_eq!(
+        battery_in(&pmset(
+            "UPS Power",
+            " -UPS CP1500 (id=-1900544)\t96%; discharging; 0:42 remaining present: true"
+        )),
+        None
+    );
+    assert_eq!(battery_in(""), None);
+    for line in [
+        // More than a battery holds, and what is no number.
+        " -InternalBattery-0 (id=1)\t101%; charging; present: true",
+        " -InternalBattery-0 (id=1)\t420%; charging; present: true",
+        " -InternalBattery-0 (id=1)\t4294967297%; charging; present: true",
+        " -InternalBattery-0 (id=1)\t-5%; charging; present: true",
+        " -InternalBattery-0 (id=1)\t%; charging; present: true",
+        " -InternalBattery-0 (id=1)\t8 %; charging; present: true",
+        " -InternalBattery-0 (id=1)\t\u{0668}0%; charging; present: true",
+        // Cut short, without the tab, and a name that only begins like the battery's.
+        " -InternalBattery-0 (id=1)\t80%",
+        " -InternalBattery-0 (id=1)\t80%; charging",
+        " -InternalBattery-0 (id=1) 80%; charging; present: true",
+        " -InternalBattery-x (id=1)\t80%; charging; present: true",
+        " -InternalBatteryPack\t80%; charging; present: true",
+        "80%; charging; present: true",
+    ] {
+        assert_eq!(battery_in(&pmset("AC Power", line)), None, "{line:?}");
+    }
+}
+
+#[test]
+fn the_mac_is_named_by_its_chip_and_its_model_or_by_the_one_macos_says() {
+    assert_eq!(
+        model_name(Some("Apple M5"), Some("Mac17,3")).as_deref(),
+        Some("Apple M5 (Mac17,3)")
+    );
+    assert_eq!(
+        model_name(Some(" Apple M1 Pro \n"), Some("MacBookPro18,3")).as_deref(),
+        Some("Apple M1 Pro (MacBookPro18,3)")
+    );
+    assert_eq!(model_name(Some("Apple M5"), None).as_deref(), Some("Apple M5"));
+    assert_eq!(model_name(None, Some("Mac17,3")).as_deref(), Some("Mac17,3"));
+    assert_eq!(
+        model_name(Some("  "), Some("Mac17,3")).as_deref(),
+        Some("Mac17,3")
+    );
+    assert_eq!(
+        model_name(Some("Apple M5"), Some("")).as_deref(),
+        Some("Apple M5")
+    );
+    assert_eq!(model_name(None, None), None);
+    assert_eq!(model_name(Some(""), Some(" ")), None);
 }

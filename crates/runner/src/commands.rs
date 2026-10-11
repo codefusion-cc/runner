@@ -3,8 +3,9 @@ use std::path::Path;
 use cf_image::store::Store;
 use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
-/// The commit the program was built at (`build.rs`), or `unknown`.
-pub const COMMIT: &str = env!("CF_COMMIT");
+/// The Runner's version with the commit the program was built at (`build.rs`), such as `0.1.0+446125c0a1b2`;
+/// `unknown` for a commit nobody could name. One text for `version`, the log's first line and the console.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CF_COMMIT"));
 
 const USAGE: &str = "usage: codefusion-runner
   version
@@ -24,7 +25,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["version"] | ["--version"] => {
-            println!("codefusion-runner {} ({COMMIT})", env!("CARGO_PKG_VERSION"));
+            println!("codefusion-runner {VERSION}");
             Ok(())
         }
         ["image", "verify", folder, "--version", version] => verify_folder(folder, version),

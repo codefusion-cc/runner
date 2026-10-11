@@ -5,8 +5,8 @@
 mod support;
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
@@ -20,7 +20,7 @@ use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, Options};
 use cf_ghapp::{Http, RetryPolicy};
-use cf_host_macos::FakeHost;
+use cf_host_macos::{Battery, FakeHost};
 use cf_secret::Secret;
 use cf_vmhost::End;
 use serde_json::{Value, json};
@@ -39,6 +39,8 @@ struct Rig {
     outbox: Arc<Outbox>,
     token: Secret<String>,
     folder: tempfile::TempDir,
+    /// The battery the Mac says it has.
+    battery: Arc<Mutex<Option<Battery>>>,
     /// Lets time pass on the Mac and runs the service's rounds, as its loop does.
     pump: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>)>,
 }
@@ -90,6 +92,7 @@ impl Rig {
         };
         parts.reports.forward_to(Arc::new(OutboxReports(outbox.clone())));
         let machines = parts.machines(None);
+        let battery = Arc::new(Mutex::new(None));
         let mut rig = Rig {
             service: Arc::new(service(
                 &github,
@@ -98,6 +101,7 @@ impl Rig {
                 &machines,
                 &outbox,
                 &enrolled.token,
+                &battery,
             )),
             github,
             console,
@@ -106,6 +110,7 @@ impl Rig {
             outbox,
             token: enrolled.token,
             folder,
+            battery,
             pump: None,
         };
         rig.pump();
@@ -155,6 +160,7 @@ impl Rig {
             &self.machines,
             &self.outbox,
             &self.token,
+            &self.battery,
         ));
         pass(&self.machines, 61);
         self.pump();
@@ -226,8 +232,15 @@ fn service(
     machines: &Arc<TestMachines>,
     outbox: &Arc<Outbox>,
     token: &Secret<String>,
+    battery: &Arc<Mutex<Option<Battery>>>,
 ) -> TestService {
-    let mut config = ServiceConfig::new(MACHINE, "Build-Mac-2.local", "Mac16,12", "0.1.0");
+    let battery = battery.clone();
+    let mut config = ServiceConfig::new(
+        MACHINE,
+        "Build-Mac-2.local",
+        "Apple M5 (Mac17,3)",
+        "0.1.0+446125c0a1b2",
+    );
     config.poll_timeout = Duration::from_secs(5);
     config.sweep_again = Duration::from_millis(50);
     config.backoff = (
@@ -246,12 +259,13 @@ fn service(
             outbox: outbox.clone(),
         }),
         config,
-        extras: Box::new(|| HostExtras {
+        extras: Box::new(move || HostExtras {
             load: [1.5, 1.0, 0.5],
             disk_total_bytes: 2000 << 30,
             swap_total_bytes: 0,
             cpu_percent: 12.0,
             boot: Some(1_790_000_000),
+            battery: *battery.lock().expect("battery"),
         }),
     })
 }
@@ -1019,6 +1033,7 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
         &rig.machines,
         &rig.outbox,
         &Secret::new("not-this-macs-token".to_string()),
+        &rig.battery,
     );
     rig.finish(&runner, "succeeded");
     until("the end waits to be sent", || {
@@ -1273,5 +1288,79 @@ async fn the_log_says_which_scale_set_the_runner_keeps_and_when_it_listens_and_s
     assert_eq!(
         log.lines("session is"),
         [listens, format!("the session is closed set={}", set.name)]
+    );
+}
+
+#[tokio::test]
+async fn a_report_says_the_memory_that_is_available_what_the_runner_keeps_free_and_the_battery_if_there_is_one()
+ {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let report = |rig: &Rig| {
+        pass(&rig.machines, 1);
+        serde_json::to_value(rig.service.status()).expect("a report")
+    };
+    // 64 GB installed, of which a quarter and a byte are available: three quarters are in use.
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = (16 << 30) + 1));
+    let said = report(&rig);
+    let host = &said["status"]["host"];
+    let free = host["freeMemoryPercent"].as_f64().expect("a share");
+    assert!((free - 25.0).abs() < 1e-6, "{free}");
+    assert_eq!(host["availableMemoryBytes"], json!((16u64 << 30) + 1));
+    assert_eq!(
+        host["memoryFloorBytes"],
+        json!(rig.parts.settings.away.floor_bytes)
+    );
+    assert_eq!(host["memoryBytes"], json!(64u64 << 30));
+    assert_eq!(said["model"], json!("Apple M5 (Mac17,3)"));
+    assert_eq!(said["status"]["version"], json!("0.1.0+446125c0a1b2"));
+    // A Mac without a battery says nothing of one.
+    assert_eq!(said["activity"].get("power"), None);
+
+    // Nothing available, and more than is installed (a reading the budget refuses is no reading at all).
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = 0));
+    let said = report(&rig);
+    assert_eq!(said["status"]["host"]["freeMemoryPercent"], json!(0.0));
+    assert_eq!(said["status"]["host"]["availableMemoryBytes"], json!(0));
+
+    for (battery, power) in [
+        (
+            Battery {
+                on_battery: true,
+                percent: 7,
+                charging: false,
+            },
+            json!({"onBattery": true, "percent": 7, "charging": false}),
+        ),
+        (
+            Battery {
+                on_battery: false,
+                percent: 100,
+                charging: false,
+            },
+            json!({"onBattery": false, "percent": 100, "charging": false}),
+        ),
+        (
+            Battery {
+                on_battery: false,
+                percent: 0,
+                charging: true,
+            },
+            json!({"onBattery": false, "percent": 0, "charging": true}),
+        ),
+    ] {
+        *rig.battery.lock().expect("battery") = Some(battery);
+        assert_eq!(report(&rig)["activity"]["power"], power);
+    }
+    // The console takes the report as it is.
+    let before = rig.console.reports().len();
+    rig.service.report().await;
+    let reports = rig.console.reports();
+    assert_eq!(reports.len(), before + 1);
+    assert_eq!(
+        reports[before]["activity"]["power"],
+        json!({"onBattery": false, "percent": 0, "charging": true})
     );
 }

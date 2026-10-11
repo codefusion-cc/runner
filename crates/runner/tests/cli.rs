@@ -79,7 +79,7 @@ fn the_version_command_names_the_package_version_and_the_commit_it_was_built_at(
     assert!(commit == "unknown" || commit.len() == 12, "{commit}");
     assert_eq!(
         text.trim(),
-        format!("codefusion-runner {} ({commit})", env!("CARGO_PKG_VERSION"))
+        format!("codefusion-runner {}+{commit}", env!("CARGO_PKG_VERSION"))
     );
 }
 

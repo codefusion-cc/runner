@@ -10,7 +10,7 @@ use cf_budget::{Host as _, Mode, Settings};
 use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
-use cf_host_macos::{MacHost, boot_session, boot_time, cpu_percent, host_name, load, model};
+use cf_host_macos::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model};
 use cf_secret::Secret;
 
 use crate::names::ServePolicy;
@@ -143,6 +143,7 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
                     .and_then(|(before, now)| cpu_percent(before, now))
                     .unwrap_or(-1.0),
                 boot: boot_time(),
+                battery: battery(),
             }
         }),
     });

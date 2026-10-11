@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use cf_budget::{Host, HostError};
-use cf_host_macos::{MacHost, Raw, reading};
+use cf_host_macos::{MacHost, Raw, battery, battery_in, model, reading};
 
 fn output(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output().unwrap();
@@ -39,6 +39,27 @@ fn the_facts_are_what_sysctl_prints() {
     let facts = host.facts().unwrap();
     assert_eq!(facts.total_bytes.to_string(), sysctl("hw.memsize"));
     assert_eq!(facts.cores.to_string(), sysctl("hw.ncpu"));
+}
+
+#[test]
+fn the_mac_is_named_by_the_chip_and_the_model_sysctl_prints() {
+    let (chip, name) = (sysctl("machdep.cpu.brand_string"), sysctl("hw.model"));
+    assert!(!chip.is_empty() && !name.is_empty(), "{chip:?} {name:?}");
+    assert_eq!(model(), Some(format!("{chip} ({name})")));
+}
+
+#[test]
+fn the_battery_is_the_one_pmset_prints_and_none_on_a_mac_without_one() {
+    let before = battery_in(&output("/usr/bin/pmset", &["-g", "batt"]));
+    let read = battery();
+    let after = battery_in(&output("/usr/bin/pmset", &["-g", "batt"]));
+    // The charge may move between the looks; whether there is a battery does not.
+    assert_eq!(read.is_some(), before.is_some());
+    assert!(read == before || read == after || read.is_some_and(|battery| battery.percent <= 100));
+    assert_eq!(
+        before.is_some(),
+        output("/usr/bin/pmset", &["-g", "batt"]).contains("InternalBattery")
+    );
 }
 
 #[test]

@@ -17,7 +17,7 @@ use crate::config::{Config, check_beside_old_manager};
 use crate::hidden::{self, NoLine};
 use crate::launchd::{AGENT_PAUSE, Agent, LABEL, launchctl, plist};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::commands::VERSION;
 /// The entitlement without which macOS starts no virtual machine for a program.
 const VIRTUALIZATION: &str = "com.apple.security.virtualization";
 /// How long GitHub and the console have to answer one call of a command.
@@ -182,10 +182,7 @@ pub fn daemon(config: &Path) -> Result<(), String> {
             }
             trigger.trigger();
         });
-        tracing::info!(
-            version = VERSION, commit = crate::commands::COMMIT, machine = %config.machine,
-            "the Runner starts"
-        );
+        tracing::info!(version = VERSION, machine = %config.machine, "the Runner starts");
         service.run(stop).await;
         tracing::info!("the Runner ends; machines that stand go on and are found again");
         Ok(())

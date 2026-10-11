@@ -22,9 +22,9 @@ pub struct Enroll {
     pub machine: String,
     /// The Mac's host name.
     pub hostname: String,
-    /// The Mac's model, such as `Apple M5`.
+    /// The Mac's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,
-    /// The Runner's version.
+    /// The Runner's version with the commit it was built at, such as `0.1.0+446125c0a1b2`.
     pub version: String,
     /// The Mac's CPU count, 1 to 4096.
     pub cpus: u32,
@@ -53,8 +53,15 @@ pub struct HostStatus {
     pub load5: f64,
     /// Load average over fifteen minutes.
     pub load15: f64,
-    /// Free memory, 0 to 100.
+    /// The share of the Mac's memory that is available, 0 to 100: free memory, the file cache and purgeable memory,
+    /// which is what Activity Monitor leaves when "Memory Used" is taken from the memory installed. The console
+    /// shows 100 less this as memory used.
     pub free_memory_percent: f64,
+    /// That available memory in bytes: what the Runner admits machines by.
+    pub available_memory_bytes: u64,
+    /// The available memory the Runner keeps free under the limits in force: a machine starts only when its size
+    /// fits above this.
+    pub memory_floor_bytes: u64,
     /// The kernel's memory pressure level, 0 to 8.
     pub memory_pressure: u32,
     /// Memory in bytes.
@@ -172,7 +179,7 @@ pub struct Update {
 pub struct Status {
     /// The Mac's name, as enrolled. A different one renames the Mac on the console, unless another has the name.
     pub machine: String,
-    /// The Runner's version.
+    /// The Runner's version with the commit it was built at, such as `0.1.0+446125c0a1b2`.
     pub version: String,
     /// When this status was made.
     pub updated_at: String,
@@ -397,7 +404,7 @@ pub struct Report {
     pub activity: Activity,
     /// The Mac's host name.
     pub hostname: String,
-    /// The Mac's model.
+    /// The Mac's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,
     /// The settings in effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
