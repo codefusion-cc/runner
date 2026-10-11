@@ -25,8 +25,11 @@ use objc2_virtualization::{
 };
 
 /// `quiet` keeps the kernel's own lines off the console; `panic=-1` restarts a guest whose kernel panics, which
-/// closes the channel, and the host takes a closed channel for a lost guest at once.
-const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1";
+/// closes the channel, and the host takes a closed channel for a lost guest at once. `arm64.nosme` hides SME from the
+/// guest's programs (the kernel clears the SME and SME2 feature registers, so `/proc/cpuinfo` and `getauxval` stop
+/// listing them): on an M5 the guest's CPU reports it, but Chromium's code that uses it dies with SIGILL (a camera
+/// in Playwright's Chromium crashed its video capture). The guest reports no SVE, so `arm64.nosve` is not needed.
+const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 arm64.nosme";
 /// How long the framework gets to answer a start or a connect before the call gives up.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -410,7 +413,7 @@ impl Channel for Stream {
 
 #[cfg(test)]
 mod tests {
-    use super::patient_for;
+    use super::{COMMAND_LINE, patient_for};
     use std::io::{ErrorKind, Write};
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -434,5 +437,10 @@ mod tests {
             .expect("the write is still waiting");
         assert_eq!(outcome, Err(ErrorKind::WouldBlock));
         drop(theirs);
+    }
+
+    #[test]
+    fn the_guest_is_told_to_hide_sme_from_its_programs() {
+        assert!(COMMAND_LINE.split(' ').any(|word| word == "arm64.nosme"));
     }
 }
