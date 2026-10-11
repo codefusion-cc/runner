@@ -7,7 +7,7 @@ use cf_vmm::{Network, VmSpec};
 use cf_vmm_vz::VzVmm;
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ pub fn host(state_dir: &str) -> Result<(), String> {
 /// Boots the embedded guest with no disk and no network, has it answer and power off, and prints what happened.
 pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
     let guest = guest()?;
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new("proof")?;
     let console = scratch.0.join("console.log");
     let spec = VmSpec {
         kernel: scratch.write("kernel", guest.kernel)?,
@@ -101,19 +101,28 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
     }
 }
 
-/// A folder of this process alone for the proof's kernel and initramfs, removed when it goes out of scope, however
-/// the proof ends. What the hypervisor loads from it is what was verified: nobody else can write there.
-struct Scratch(PathBuf);
+/// A folder of this process alone under the temporary folder, `codefusion-runner-<what>-<pid>`, removed when it goes
+/// out of scope, however the work ends. Nobody else can write there: what the hypervisor loads from it is what was
+/// verified, and a state folder made in it holds only what this process put there.
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!("codefusion-runner-proof-{}", std::process::id()));
+    pub(crate) fn new(what: &str) -> Result<Self, String> {
+        Self::under(&std::env::temp_dir(), what)
+    }
+
+    fn under(folder: &Path, what: &str) -> Result<Self, String> {
+        let path = folder.join(format!("codefusion-runner-{what}-{}", std::process::id()));
         // Made new and private in one step. A folder already there is not ours to trust, whoever left it.
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
 
     /// Writes a file that did not exist, readable by this user only.
@@ -127,5 +136,29 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn a_scratch_folder_is_new_for_this_user_alone_and_one_already_there_is_not_taken() {
+        let folder = tempfile::tempdir().expect("folder");
+        let scratch = Scratch::under(folder.path(), "test").expect("made");
+        let path = scratch.path().to_path_buf();
+        let mode = std::fs::metadata(&path).expect("there").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        std::fs::write(path.join("theirs"), b"left by someone").expect("written");
+        let again = Scratch::under(folder.path(), "test").map(|_| ());
+        let said = again.expect_err("a folder that is already there is nobody's to build on");
+        assert!(said.contains("exists"), "{said}");
+        assert!(path.join("theirs").exists(), "and it is left as it was");
+
+        drop(scratch);
+        assert!(!path.exists(), "gone with the work it was for");
     }
 }

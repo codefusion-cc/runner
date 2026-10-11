@@ -350,18 +350,16 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
     if github {
         // The service is built on a folder of its own that is removed after: building it takes up what a Runner
         // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
-        let scratch = std::env::temp_dir().join(format!("codefusion-runner-check-{}", std::process::id()));
+        let scratch = crate::vm::Scratch::new("check")?;
         let probe = Config {
-            state_dir: scratch.clone(),
+            state_dir: scratch.path().to_path_buf(),
             console: None,
             ..config.clone()
         };
-        let surveyed = runtime(1)?.block_on(async {
+        let (served, problems) = runtime(1)?.block_on(async {
             let (_machines, service) = service(&probe, &program)?;
             Ok::<_, String>(service.survey().await)
-        });
-        let _ = std::fs::remove_dir_all(&scratch);
-        let (served, problems) = surveyed?;
+        })?;
         for line in &served {
             println!("serves: {line}");
         }
