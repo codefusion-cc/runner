@@ -14,9 +14,19 @@ not yet to be reused.
 
 ## State
 
-The parts exist and are tested, each on its own. The daemon that joins them into a service comes next, so nothing
-here takes a job from GitHub by itself yet. What works:
+The Runner takes jobs from GitHub and runs each in a machine of its own, as a service of the Mac. It has run so
+against a fake GitHub and a fake console with real machines (`cargo xtask it --only service`); its first job from
+the real GitHub is still to come. What is there:
 
+- the service (`codefusion-runner daemon`, kept running by launchd): it reads which repositories and `runs-on`
+  labels to serve, keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
+  budget for memory, starts a machine and registers an Actions runner for that one job. When the job ends, however
+  it ends, the machine is destroyed, the registration removed, the memory given back, and the console told once,
+- sizes from the label: `cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`; `self-hosted` alone is 4 GB. A machine is counted as
+  its size and 192 MB. A 16 GB Mac nobody works on runs two `cf-4g` at once; one somebody works on runs them only
+  while the person is away,
+- nothing stays behind: a Runner that starts finds the machines of the one before, goes on with those that run and
+  removes what is left of the others, on the Mac and at GitHub,
 - a job in its own virtual machine (`codefusion-runner vm`): one Linux machine per job with a fixed amount of memory
   and CPU, no swap and nothing that gives memory back while it runs. The job runs in a container in that machine as
   the image's user; its `sudo` makes it root of the container, not of the machine. When the job ends the machine and
@@ -31,11 +41,57 @@ here takes a job from GitHub by itself yet. What works:
 - images: an Ed25519 signature over `SHA256SUMS`, every hash and size checked, the root filesystem in parts below
   GitHub's 2 GB asset limit. `image install` verifies a release in a folder of its own before a machine boots from
   it, and refuses one older than the newest it has accepted,
-- admission by memory (`cf-budget`), the life of a slot (`cf-lifecycle`), GitHub's scale set protocol and the scaler
-  (`cf-scaleset`, `cf-daemon`), the GitHub App client (`cf-ghapp`),
-- `codefusion-runner boot-proof`, which boots the embedded guest in a 1 GB machine and waits for `ready`.
+- reports to the CodeFusion Console: the Mac's state every minute, and each job's start and end within a second
+  or two. While the console is away up to 500 job events wait in a file and arrive later, each once.
 
 `docs/MAP.md` says where things are and how a job's machine is put together.
+
+## Run it on a Mac
+
+The Runner is a launchd agent of the person logged in: no root, no password, nothing outside the home folder. It
+takes no job between a start of the Mac and the log-in, so a Mac that runs jobs logs in by itself.
+
+A configuration file says what the Mac is:
+
+```json
+{
+  "machine": "mac-a-vm",
+  "state_dir": "/Users/someone/Library/Application Support/codefusion-runner",
+  "app_dir": "/Users/someone/.config/codefusion-runner",
+  "image": "2026.10.10-1",
+  "console": "https://console.example",
+  "use": "dedicated"
+}
+```
+
+- `machine` names the Mac at GitHub and at the console. Its scale sets and Actions runners carry it, so no other
+  Runner and no cf-runners manager may have the same name.
+- `state_dir` holds everything the Runner keeps and is on the Mac's own disk. `app_dir` holds the GitHub App's
+  `app.json` and `app.pem` (0600).
+- `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
+- Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
+  `github_api`. Without `console` the Mac reports to none.
+
+```sh
+codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
+codefusion-runner check --config <file> --github   # what is missing, and what GitHub shows this Mac
+codefusion-runner enroll --config <file>           # the console's one-time code on standard input
+codefusion-runner install --config <file>
+```
+
+`install` copies the program to `<state_dir>/bin`, writes `~/Library/LaunchAgents/cc.codefusion.vm-runner.plist` and
+starts the agent. The Runner's log is `<state_dir>/logs/runner.log` (10 MB, then one older file beside it); what
+launchd itself says is in `launchd.log` there.
+
+To update, build the new version and run its `install` again. It refuses while a machine stands, so a job is never
+cut off by an update. `uninstall` stops the agent and every machine, removes every scale set and registration at
+GitHub and says what it could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the
+state folder with its images.
+
+Beside the cf-runners manager of `codefusion-cc/codefusion` the Runner touches nothing of it: another launchd label,
+another folder, another name at GitHub (it refuses to run under the manager's own). Both serve a `runs-on` that includes
+`self-hosted`, so GitHub gives such a job to whichever has room first. A `runs-on: cf-4g` alone goes only to the
+Runner.
 
 ## Build and try it
 
@@ -67,3 +123,6 @@ CI's Macs cannot boot a machine, so the jobs in real machines run on a Mac of yo
 gh release download <image tag> -R codefusion-cc/runner -D target/it/release
 cargo xtask build && cargo xtask it
 ```
+
+`it` installs nothing and calls neither GitHub nor a console: its `service` and `commands` scenarios run against
+fakes of both on the Mac itself.
