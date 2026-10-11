@@ -64,8 +64,21 @@ const fn deadline_minutes() -> u64 {
 }
 
 impl Config {
-    /// Reads and checks the file.
+    /// Reads and checks the file. One that others can write is refused: it says where the console's token and the
+    /// App's key go.
     pub fn load(path: &Path) -> Result<Config, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{}: others can write it (mode {:o}); `chmod go-w` it",
+                path.display(),
+                mode & 0o777
+            ));
+        }
         let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
         Config::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
     }
@@ -102,10 +115,7 @@ impl Config {
             return Err("deadline_minutes: between 1 and 1440".into());
         }
         for url in std::iter::once(&self.github_api).chain(&self.console) {
-            let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-                .iter()
-                .any(|prefix| url.starts_with(prefix));
-            if !url.starts_with("https://") && !local {
+            if !url.starts_with("https://") && !is_this_mac(url) {
                 return Err(format!("`{url}` is no https address"));
             }
         }
@@ -152,6 +162,30 @@ impl Config {
     pub fn program(&self) -> PathBuf {
         self.state_dir.join("bin").join("codefusion-runner")
     }
+}
+
+/// Whether `url` is plain HTTP to this Mac itself: the host is exactly `127.0.0.1`, `localhost` or `[::1]`, so
+/// `http://localhost.example` (a prefix match would take it) is not.
+fn is_this_mac(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+        let Some((host, after)) = inside.split_once(']') else {
+            return false;
+        };
+        match after {
+            "" => (host, ""),
+            _ => match after.strip_prefix(':') {
+                Some(port) => (host, port),
+                None => return false,
+            },
+        }
+    } else {
+        authority.split_once(':').unwrap_or((authority, ""))
+    };
+    ["127.0.0.1", "localhost", "::1"].contains(&host) && port.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The name the cf-runners manager has on this Mac, when it is installed for this user: the `machine` of its
@@ -204,6 +238,30 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(WHOLE).expect("json");
         change(&mut value);
         Config::parse(&value.to_string())
+    }
+
+    #[test]
+    fn a_file_others_can_write_is_not_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let path = folder.path().join("config.json");
+        std::fs::write(&path, WHOLE).expect("a file");
+        let set = |mode: u32| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("a mode");
+        };
+        // It says where the console's token and the App's key go: whoever writes it has them.
+        for mode in [0o666, 0o664, 0o646] {
+            set(mode);
+            let error = Config::load(&path).expect_err("refused");
+            assert!(
+                error.contains("others can write it") && error.contains(&path.display().to_string()),
+                "{mode:o}: {error}"
+            );
+        }
+        for mode in [0o644, 0o600, 0o444] {
+            set(mode);
+            Config::load(&path).unwrap_or_else(|error| panic!("{mode:o}: {error}"));
+        }
     }
 
     #[test]
@@ -263,6 +321,23 @@ mod tests {
         assert!(with(|v| v["github_api"] = "ftp://api.github.com".into()).is_err());
         assert!(with(|v| v["console"] = "https://console.example".into()).is_ok());
         assert!(with(|v| v["console"] = "http://127.0.0.1:8787".into()).is_ok());
+        for url in [
+            "http://localhost.example",
+            "http://127.0.0.1.example:8787",
+            "http://localhost@example.com",
+            "http://[::1]x",
+            "http://localhost:80a",
+        ] {
+            assert!(with(|v| v["console"] = url.into()).is_err(), "{url}");
+        }
+        for url in [
+            "http://localhost",
+            "http://localhost:8787/x",
+            "http://[::1]:8787",
+            "http://[::1]/",
+        ] {
+            assert!(with(|v| v["console"] = url.into()).is_ok(), "{url}");
+        }
     }
 
     #[test]

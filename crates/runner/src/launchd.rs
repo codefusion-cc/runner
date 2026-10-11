@@ -67,6 +67,10 @@ pub fn plist(program: &Path, config: &Path, state_dir: &Path) -> String {
     )
 }
 
+/// How often [`Agent::stop`] looks whether launchd let go of the agent: with the 200 ms the Runner waits between
+/// two looks, ten seconds more than the property list's `ExitTimeOut`.
+const STOP_TRIES: u32 = 350;
+
 /// Runs `launchctl` with these arguments and says what it printed, as an error when it failed.
 pub type Launchctl<'a> = &'a dyn Fn(&[&str]) -> Result<String, String>;
 
@@ -122,19 +126,24 @@ impl Agent<'_> {
     }
 
     /// Ends the agent if launchd has it and waits until launchd has let go of it. The Runner is sent a SIGTERM
-    /// and has the property list's `ExitTimeOut` to end.
+    /// and has the property list's `ExitTimeOut` to end, so the wait is longer than that. What `bootout` says
+    /// decides nothing: it can call a Runner that is still ending a failure. Whether launchd still has the agent
+    /// does.
     pub fn stop(&self) -> Result<(), String> {
         if !self.loaded() {
             return Ok(());
         }
-        (self.run)(&["bootout", &self.target()])?;
-        for _ in 0..150 {
+        let said = (self.run)(&["bootout", &self.target()]).err();
+        for _ in 0..STOP_TRIES {
             if !self.loaded() {
                 return Ok(());
             }
             std::thread::sleep(self.pause);
         }
-        Err("launchd did not let go of the agent".into())
+        Err(match said {
+            Some(said) => format!("launchd did not let go of the agent ({said})"),
+            None => "launchd did not let go of the agent".into(),
+        })
     }
 
     /// Writes the property list and has launchd start the agent, in place of one that ran before.
@@ -234,6 +243,8 @@ mod tests {
         busy: RefCell<u32>,
         /// How many `print` calls still find the agent after a `bootout`.
         lingers: RefCell<u32>,
+        /// What `bootout` answers when it does not wait for the Runner to end, or cannot end the agent at all.
+        bootout_says: RefCell<Option<(&'static str, bool)>>,
     }
 
     impl Fake {
@@ -243,6 +254,7 @@ mod tests {
                 calls: RefCell::default(),
                 busy: RefCell::new(0),
                 lingers: RefCell::new(0),
+                bootout_says: RefCell::default(),
             }
         }
 
@@ -260,10 +272,16 @@ mod tests {
                     }
                     Err("Could not find service".into())
                 }
-                "bootout" => {
-                    *self.loaded.borrow_mut() = false;
-                    Ok(String::new())
-                }
+                "bootout" => match *self.bootout_says.borrow() {
+                    Some((words, ends)) => {
+                        *self.loaded.borrow_mut() = !ends;
+                        Err(words.into())
+                    }
+                    None => {
+                        *self.loaded.borrow_mut() = false;
+                        Ok(String::new())
+                    }
+                },
                 "bootstrap" => {
                     let mut busy = self.busy.borrow_mut();
                     if *busy > 0 {
@@ -324,6 +342,49 @@ mod tests {
             4
         );
         assert!(*fake.loaded.borrow());
+    }
+
+    #[test]
+    fn a_bootout_that_does_not_wait_for_the_runner_to_end_is_waited_for() {
+        let home = tempfile::tempdir().expect("home");
+        let fake = Fake::new(true);
+        // launchd sent the SIGTERM and says so as a failure; the Runner closes its sessions meanwhile.
+        *fake.bootout_says.borrow_mut() = Some(("Boot-out failed: 36: Operation now in progress", true));
+        *fake.lingers.borrow_mut() = 5;
+        let run = |args: &[&str]| fake.run(args);
+        agent(home.path(), &run).stop().expect("stopped");
+        assert_eq!(*fake.lingers.borrow(), 0, "it was waited for");
+    }
+
+    #[test]
+    fn a_runner_that_takes_all_the_time_launchd_gives_it_to_end_is_waited_for() {
+        let home = tempfile::tempdir().expect("home");
+        let fake = Fake::new(true);
+        // A look every 200 ms for the 60 seconds of the property list's `ExitTimeOut`.
+        *fake.lingers.borrow_mut() = 60 * 5;
+        let run = |args: &[&str]| fake.run(args);
+        agent(home.path(), &run).stop().expect("stopped");
+    }
+
+    #[test]
+    fn an_agent_launchd_will_not_end_is_an_error_with_launchds_words() {
+        let home = tempfile::tempdir().expect("home");
+        let fake = Fake::new(true);
+        *fake.bootout_says.borrow_mut() = Some(("Boot-out failed: 1: Operation not permitted", false));
+        let run = |args: &[&str]| fake.run(args);
+        let error = agent(home.path(), &run).stop().expect_err("refused");
+        assert_eq!(
+            error,
+            "launchd did not let go of the agent (Boot-out failed: 1: Operation not permitted)"
+        );
+        assert_eq!(
+            fake.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("bootout"))
+                .count(),
+            1
+        );
     }
 
     #[test]

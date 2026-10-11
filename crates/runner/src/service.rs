@@ -124,6 +124,43 @@ fn service(config: &Config, program: &Path) -> Result<(Arc<MacMachines>, MacServ
     })
 }
 
+/// The one Runner of a state folder: held for as long as the file it returns is. Two Runners over the same folder
+/// would each end the machines the other started and remove what it wrote.
+fn only_runner(config: &Config) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let folder = &config.state_dir;
+    let said = |error: std::io::Error| format!("{}: {error}", folder.display());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(folder)
+        .map_err(said)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(folder.join("runner.lock"))
+        .map_err(said)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another Runner runs over {}; end it first",
+            folder.display()
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(said(error)),
+    }
+}
+
+/// The configuration an uninstall works with: a Mac without a token it can use (it never enrolled, or its
+/// enrolment was cut off) has nobody to tell, and must still be able to go.
+fn for_uninstall(mut config: Config) -> Config {
+    if console(&config).is_err() {
+        config.console = None;
+    }
+    config
+}
+
 fn own_program() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|error| format!("the Runner's own program: {error}"))
 }
@@ -135,6 +172,7 @@ pub fn daemon(config: &Path) -> Result<(), String> {
     check_beside_old_manager(&config, &home()?, &hostname())?;
     // A job is not taken from GitHub to fail for a missing image.
     installed_image(&config)?;
+    let _only = only_runner(&config)?;
     tracing::subscriber::set_global_default(Lines::new(&config.log(), ROLL_AT))
         .map_err(|error| format!("the log: {error}"))?;
     let program = own_program()?;
@@ -190,7 +228,15 @@ pub fn enroll(config: &Path) -> Result<(), String> {
         .map_err(|error| format!("macOS: {error}"))?;
     let enrolled = runtime(1)?
         .block_on(cf_console_client::enroll(
-            &Http::new(ANSWER, RetryPolicy::default()),
+            // The code is spent by the first request that reaches the console: a retry after a lost answer would
+            // meet a token that is gone.
+            &Http::new(
+                ANSWER,
+                RetryPolicy {
+                    retries: 0,
+                    ..RetryPolicy::default()
+                },
+            ),
             &address,
             &cf_console_client::Enroll {
                 code: Secret::new(code),
@@ -310,10 +356,20 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
     let program = own_program()?;
     let mut missing = print(&needs(&config, &home()?, &hostname(), &program));
     if github {
-        let (served, problems) = runtime(1)?.block_on(async {
-            let (_machines, service) = service(&config, &program)?;
+        // The service is built on a folder of its own that is removed after: building it takes up what a Runner
+        // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
+        let scratch = std::env::temp_dir().join(format!("codefusion-runner-check-{}", std::process::id()));
+        let probe = Config {
+            state_dir: scratch.clone(),
+            console: None,
+            ..config.clone()
+        };
+        let surveyed = runtime(1)?.block_on(async {
+            let (_machines, service) = service(&probe, &program)?;
             Ok::<_, String>(service.survey().await)
-        })?;
+        });
+        let _ = std::fs::remove_dir_all(&scratch);
+        let (served, problems) = surveyed?;
         for line in &served {
             println!("serves: {line}");
         }
@@ -405,7 +461,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 /// program's copy. `leave` also takes the Mac off the console; `purge` removes the state folder with the images
 /// and the logs. What could not be removed is said, and is an error.
 pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> {
-    let config = Config::load(config)?;
+    let config = for_uninstall(Config::load(config)?);
     let home = home()?;
     let agent = Agent {
         home: &home,
@@ -414,6 +470,8 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
         pause: Duration::from_millis(200),
     };
     agent.stop()?;
+    // A Runner started by hand is not the agent's and was not ended with it.
+    let _only = only_runner(&config)?;
     // The installed copy when it is there: a vm-host is known by the program it runs.
     let program = Some(config.program())
         .filter(|program| program.exists())
@@ -528,6 +586,41 @@ mod tests {
         assert_eq!(token.expose(), "the-token");
         let none = config(folder.path(), folder.path(), false);
         assert!(console(&none).expect("no console is no error").is_none());
+    }
+
+    #[test]
+    fn a_mac_without_a_token_it_can_use_is_uninstalled_without_the_console() {
+        let folder = tempfile::tempdir().expect("folder");
+        let with = || config(folder.path(), folder.path(), true);
+        assert_eq!(for_uninstall(with()).console, None, "it never enrolled");
+        // An enrolment that was cut off, or a token removed by hand.
+        std::fs::write(with().console_token(), "\n").expect("a file");
+        assert_eq!(for_uninstall(with()).console, None, "an empty file is no token");
+        std::fs::write(with().console_token(), "the-token\n").expect("a file");
+        assert_eq!(
+            for_uninstall(with()).console.as_deref(),
+            Some("https://console.example"),
+            "an enrolled Mac tells the console"
+        );
+    }
+
+    #[test]
+    fn a_state_folder_has_one_runner_at_a_time() {
+        let folder = tempfile::tempdir().expect("folder");
+        let config = config(&folder.path().join("state"), folder.path(), false);
+        let first = only_runner(&config).expect("the first Runner");
+        let refused = only_runner(&config).expect_err("a second Runner over the same folder");
+        assert!(
+            refused.contains("another Runner") && refused.contains(&config.state_dir.display().to_string()),
+            "{refused}"
+        );
+        drop(first);
+        // A process another test starts at this moment holds a copy of the lock until it has become its program.
+        let began = std::time::Instant::now();
+        while only_runner(&config).is_err() && began.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        only_runner(&config).expect("the folder is free once its Runner is gone");
     }
 
     #[test]
