@@ -6,6 +6,8 @@
 //!   charge, which only the console's page shows, is what `pmset -g batt` prints ([`battery`]).
 //! - [`Raw`] is what macOS answered and [`reading`] what the budget gets from it, a pure function, so the
 //!   arithmetic is tested on every platform with numbers taken from real Macs.
+//! - [`exclude_from_backup`] marks a folder the Runner made as skipped by Time Machine, the way `tmutil addexclusion`
+//!   does; [`exclude_with`] is the decision behind an [`Attributes`] edge a test scripts.
 //! - [`FakeHost`] is a host a test scripts: time passes, the Mac sleeps, the person comes back, a read fails.
 //!
 //! # What "available" means
@@ -18,11 +20,15 @@
 //! compressed yet (measured: (active + inactive + free + speculative) / usable memory), so it read 64% and
 //! pressure "normal" on a 16 GB Mac that had 7.4 of 8.2 GB of swap in use and 3 GB available.
 
+mod backup;
 mod convert;
 mod fake;
 #[cfg(target_os = "macos")]
 mod mac;
 
+#[cfg(target_os = "macos")]
+pub use backup::exclude_from_backup;
+pub use backup::{ATTRIBUTE, Attributes, Exclusion, VALUE, exclude_with};
 pub use convert::{Battery, Raw, battery_in, model_name, reading};
 pub use fake::FakeHost;
 #[cfg(target_os = "macos")]

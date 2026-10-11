@@ -120,6 +120,11 @@ own arithmetic, so it says what a Runner on this Mac would decide, short of the 
 `machine`. Do not put it on a command line (`echo <code> | …` stays in the shell's history); a script hands it over
 on standard input from where it keeps it.
 
+The state folder (images, scratch disks, machine files, the Runner's copy) is marked as skipped by Time Machine, the way
+`tmutil addexclusion <folder>` does it, by the daemon at every start and by `enroll`, `install` and `image install`. A
+Mac that cannot set the mark logs a line and goes on. A cache folder the Runner makes later goes through
+`cf_host_macos::exclude_from_backup` as it is made.
+
 One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 
 To update, build the new version and run its `install` again. It refuses while a machine stands, so a job is never

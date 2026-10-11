@@ -68,6 +68,10 @@ fn install(folder: &str, version: &str, state: &str) -> Result<(), String> {
         .install(Path::new(folder), version, &key)
         .map_err(|error| error.to_string())?;
     println!("ok: image {} installed", manifest.version);
+    #[cfg(target_os = "macos")]
+    if let Some(said) = crate::service::keep_out_of_backups(Path::new(state)) {
+        eprintln!("note: {said}");
+    }
     Ok(())
 }
 
