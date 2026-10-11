@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 /// What is there of a job's machine at one moment.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,9 +80,7 @@ struct Spawned {
 }
 
 fn now_s() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
+    u64::try_from(crate::secs(SystemTime::now())).unwrap_or(0)
 }
 
 /// The real vm-hosts: `<program> vm --state-dir <folder>`, each a session of its own that outlives the daemon.
@@ -126,11 +124,7 @@ impl VmHosts {
 
     /// Writes down the process a job's vm-host was started as.
     fn note(&self, job: &str, pid: u32) -> std::io::Result<()> {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(self.layout.run())?;
+        cf_secret::private_dir(&self.layout.run())?;
         let spawned = serde_json::to_vec(&Spawned { pid, at: now_s() }).map_err(std::io::Error::other)?;
         cf_secret::replace_private(&self.spawned(job), &spawned)
     }

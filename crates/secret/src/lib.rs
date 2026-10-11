@@ -9,7 +9,7 @@ mod file;
 
 use std::fmt;
 
-pub use file::replace_private;
+pub use file::{private_dir, replace_private};
 
 /// A value that must not be printed. See the [crate documentation](crate).
 #[derive(Clone, PartialEq, Eq)]

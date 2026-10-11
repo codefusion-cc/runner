@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use cf_budget::{
     Assigned, Budget, Grant, Hold, Host, HostReading, Level, Millis, Now, Settings, Size, SlotId, Status,
@@ -23,6 +23,7 @@ use crate::ends::{EndKind, machine_end};
 use crate::names::job_name;
 use crate::records::{Ending, GithubJob, Record, Store};
 use crate::roster::{JobInfo, Roster, Runner};
+use crate::secs;
 use crate::traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
 };
@@ -265,12 +266,6 @@ pub struct MachineParts<H, V> {
     pub nudge: Box<dyn Fn() + Send + Sync>,
 }
 
-fn secs(at: SystemTime) -> i64 {
-    at.duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
-
 /// How long the Mac has slept in all, on its two clocks.
 const fn asleep(now: Now) -> Millis {
     Millis(now.elapsed.0.saturating_sub(now.awake.0))
@@ -375,8 +370,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 continue;
             };
             let name = record.job.clone();
+            let saved = saved.saved();
             if record.ended.is_some() {
-                let (life, _) = Slot::restore(self.config.limits, now.elapsed, saved.saved(), false);
+                let (life, _) = Slot::restore(self.config.limits, now.elapsed, saved, false);
                 self.vms.clean(&name);
                 inner.jobs.insert(
                     name.clone(),
@@ -419,12 +415,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 }
                 _ => None,
             };
-            let phase = saved.saved().phase;
-            let (life, effects) = Slot::restore(self.config.limits, now.elapsed, saved.saved(), alive);
+            let (life, effects) = Slot::restore(self.config.limits, now.elapsed, saved, alive);
             let restored_end = (!alive).then(|| match state.as_ref().and_then(|s| s.end.as_ref()) {
-                Some(ended) => machine_end(saved.saved().end.unwrap_or(End::Ok), Some(ended.end), false),
+                Some(ended) => machine_end(saved.end.unwrap_or(End::Ok), Some(ended.end), false),
                 None if !same_boot => EndKind::HostShutdown,
-                None if matches!(phase, Phase::Reserved | Phase::Starting | Phase::Retrying) => {
+                None if matches!(saved.phase, Phase::Reserved | Phase::Starting | Phase::Retrying) => {
                     EndKind::DaemonRestart
                 }
                 None => EndKind::GuestLost,

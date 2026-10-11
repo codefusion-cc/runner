@@ -127,15 +127,10 @@ impl Outbox {
     pub fn open(path: impl Into<PathBuf>, capacity: usize) -> Outbox {
         let path = path.into();
         let capacity = capacity.max(1);
-        if let Some(folder) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            use std::os::unix::fs::DirBuilderExt as _;
-            if let Err(error) = std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(folder)
-            {
-                tracing::error!(%error, "could not make the outbox's folder");
-            }
+        if let Some(folder) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(error) = cf_secret::private_dir(folder)
+        {
+            tracing::error!(%error, "could not make the outbox's folder");
         }
         let saved = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<Saved>(&bytes) {

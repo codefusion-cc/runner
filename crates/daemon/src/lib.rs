@@ -32,7 +32,7 @@ pub use machines::{
     JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT, Registration,
     Reports, Snapshot,
 };
-pub use records::{DiskStore, Ending, GithubJob, MemoryStore, Record, SavedSlot, Store, replace_private};
+pub use records::{DiskStore, Ending, GithubJob, MemoryStore, Record, SavedSlot, Store};
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory};
 pub use service::{
@@ -43,3 +43,9 @@ pub use traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
 };
 pub use vms::{Seen, VmError, VmHosts, Vms};
+
+/// A moment in seconds since 1970; 0 for one before that.
+pub(crate) fn secs(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+}

@@ -67,8 +67,11 @@ pub fn plist(program: &Path, config: &Path, state_dir: &Path) -> String {
     )
 }
 
-/// How often [`Agent::stop`] looks whether launchd let go of the agent: with the 200 ms the Runner waits between
-/// two looks, ten seconds more than the property list's `ExitTimeOut`.
+/// How long the Runner waits between two looks at what launchd has.
+pub const AGENT_PAUSE: Duration = Duration::from_millis(200);
+
+/// How often [`Agent::stop`] looks whether launchd let go of the agent: with [`AGENT_PAUSE`] between two looks,
+/// ten seconds more than the property list's `ExitTimeOut`.
 const STOP_TRIES: u32 = 350;
 
 /// Runs `launchctl` with these arguments and says what it printed, as an error when it failed.

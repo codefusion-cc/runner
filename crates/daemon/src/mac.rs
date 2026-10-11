@@ -66,13 +66,8 @@ pub struct MacSetup {
 /// An error is a Mac the Runner cannot work on: a state folder that cannot be made, macOS not answering what the
 /// budget needs, settings no budget takes.
 pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), String> {
-    use std::os::unix::fs::DirBuilderExt as _;
     let state = &setup.state_dir;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state)
-        .map_err(|error| format!("{}: {error}", state.display()))?;
+    cf_secret::private_dir(state).map_err(|error| format!("{}: {error}", state.display()))?;
     let host = MacHost::new(state).map_err(|error| format!("macOS: {error}"))?;
     let facts = host.facts().map_err(|error| format!("macOS: {error}"))?;
     // A record of before another start of the Mac has no machine, so the start must be known.
@@ -83,12 +78,22 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let roster = Arc::new(Roster::new());
     let bell = Arc::new(Nudge::default());
-    let outbox = setup
-        .console
-        .as_ref()
-        .map(|_| Arc::new(Outbox::open(state.join("outbox.json"), OUTBOX_CAPACITY)));
-    let reports: Arc<dyn Reports> = match &outbox {
-        Some(outbox) => Arc::new(OutboxReports(outbox.clone())),
+    let console = setup.console.map(|(address, token)| Console {
+        client: Client::new(
+            &address,
+            token,
+            Http::new(
+                CONSOLE_ANSWER,
+                RetryPolicy {
+                    retries: 0,
+                    ..RetryPolicy::default()
+                },
+            ),
+        ),
+        outbox: Arc::new(Outbox::open(state.join("outbox.json"), OUTBOX_CAPACITY)),
+    });
+    let reports: Arc<dyn Reports> = match &console {
+        Some(console) => Arc::new(OutboxReports(console.outbox.clone())),
         None => Arc::new(LoggedReports),
     };
     let mut config = MachineConfig::new(&setup.machine, &setup.image, &boot, setup.deadline);
@@ -115,23 +120,6 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
         &setup.version,
     );
     service.policy = setup.policy;
-    let console = setup
-        .console
-        .zip(outbox)
-        .map(|((address, token), outbox)| Console {
-            client: Client::new(
-                &address,
-                token,
-                Http::new(
-                    CONSOLE_ANSWER,
-                    RetryPolicy {
-                        retries: 0,
-                        ..RetryPolicy::default()
-                    },
-                ),
-            ),
-            outbox,
-        });
     // A reader of its own for what only the console's page shows; the machines keep theirs.
     let extras = MacHost::new(state).map_err(|error| format!("macOS: {error}"))?;
     let ticks_before = Mutex::new(extras.cpu_ticks());

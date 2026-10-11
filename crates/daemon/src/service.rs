@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
@@ -26,6 +26,7 @@ use crate::machines::{JobReport, Machines, Reports};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig};
+use crate::secs;
 use crate::traits::{EventKind, Hosts, Slots};
 use crate::vms::Vms;
 
@@ -224,12 +225,6 @@ struct Shared<H, V> {
 /// The Runner's service on one Mac.
 pub struct Service<H, V> {
     shared: Arc<Shared<H, V>>,
-}
-
-fn secs(at: SystemTime) -> i64 {
-    at.duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 /// The longest `discoveryError` and scale set `error` the console reads (it takes four times the bound of a text and
@@ -650,10 +645,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     pub async fn retire(&self, wait: Duration, leave: bool) -> Vec<String> {
         let shared = &self.shared;
         shared.machines.drain();
-        let names: Vec<String> = shared.serving.lock().expect("serving").keys().cloned().collect();
-        for name in names {
-            self.close(&name).await;
-        }
+        self.close_all().await;
         shared.machines.hear_no_more();
         shared.machines.stop_all();
         let deadline = Instant::now() + wait;
@@ -1062,10 +1054,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let _ = ticks.await;
     }
 
-    /// Stops taking jobs, closes every session at GitHub and tells the console once more. Machines are left as
-    /// they are.
-    pub async fn shutdown(&self) {
-        self.shared.machines.drain();
+    /// Closes every scale set's session at GitHub, one after the other.
+    async fn close_all(&self) {
         let names: Vec<String> = self
             .shared
             .serving
@@ -1077,6 +1067,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         for name in names {
             self.close(&name).await;
         }
+    }
+
+    /// Stops taking jobs, closes every session at GitHub and tells the console once more. Machines are left as
+    /// they are.
+    pub async fn shutdown(&self) {
+        self.shared.machines.drain();
+        self.close_all().await;
         self.sweep().await;
         if self.shared.console.is_some() {
             let _ = tokio::time::timeout(Duration::from_secs(10), self.report()).await;

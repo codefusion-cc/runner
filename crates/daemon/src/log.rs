@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -113,9 +113,7 @@ impl Subscriber for Lines {
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX));
+        let seconds = crate::secs(SystemTime::now());
         let mut fields = Fields(String::new());
         event.record(&mut fields);
         let line = format!(

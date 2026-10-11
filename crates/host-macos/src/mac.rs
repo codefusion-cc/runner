@@ -307,14 +307,7 @@ impl MacHost {
 
     /// The size of the volume with the job disks, in bytes; `None` when macOS will not say.
     pub fn disk_total_bytes(&self) -> Option<u64> {
-        let mut stats = MaybeUninit::<libc::statfs>::zeroed();
-        // SAFETY: the path ends with a NUL and `stats` is a statfs this call may write.
-        let status = unsafe { libc::statfs(self.disk.as_ptr(), stats.as_mut_ptr()) };
-        if status != 0 {
-            return None;
-        }
-        // SAFETY: the call succeeded, so it filled the struct in.
-        let stats = unsafe { stats.assume_init() };
+        let stats = self.statfs().ok()?;
         Some(stats.f_blocks.saturating_mul(stats.f_bsize.into()))
     }
 
@@ -383,7 +376,8 @@ impl MacHost {
         Ok(level)
     }
 
-    fn disk_free_bytes(&self) -> Result<u64, HostError> {
+    /// What macOS says of the volume with the job disks.
+    fn statfs(&self) -> Result<libc::statfs, HostError> {
         let mut stats = MaybeUninit::<libc::statfs>::zeroed();
         // SAFETY: the path ends with a NUL and `stats` is a statfs this call may write.
         let status = unsafe { libc::statfs(self.disk.as_ptr(), stats.as_mut_ptr()) };
@@ -394,7 +388,11 @@ impl MacHost {
             });
         }
         // SAFETY: the call succeeded, so it filled the struct in.
-        let stats = unsafe { stats.assume_init() };
+        Ok(unsafe { stats.assume_init() })
+    }
+
+    fn disk_free_bytes(&self) -> Result<u64, HostError> {
+        let stats = self.statfs()?;
         Ok(stats.f_bavail.saturating_mul(stats.f_bsize.into()))
     }
 }

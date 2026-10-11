@@ -223,17 +223,13 @@ pub struct DiskStore(PathBuf);
 impl DiskStore {
     /// The records in this folder, which is made for this user alone when it is not there.
     pub fn new(dir: impl AsRef<Path>) -> std::io::Result<DiskStore> {
-        use std::os::unix::fs::DirBuilderExt as _;
         let dir = dir.as_ref().to_path_buf();
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
+        cf_secret::private_dir(&dir)?;
         Ok(DiskStore(dir))
     }
 }
 
-pub use cf_secret::replace_private;
+use cf_secret::replace_private;
 
 impl Store for DiskStore {
     fn save(&self, record: &Record) {

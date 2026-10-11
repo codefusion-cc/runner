@@ -28,6 +28,12 @@ pub fn is_safe_address(url: &Url) -> bool {
                 .is_ok_and(|ip| ip.is_loopback()))
 }
 
+/// [`is_safe_address`] for an address still in writing, as a configuration file has it. One that is no address is
+/// not safe.
+pub fn is_safe_address_text(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| is_safe_address(&url))
+}
+
 /// Whether two addresses are on the same scheme, host and port.
 pub fn same_origin(a: &Url, b: &Url) -> bool {
     a.scheme() == b.scheme()

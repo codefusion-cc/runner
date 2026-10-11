@@ -15,7 +15,7 @@ use cf_host_macos::{MacHost, host_name, model};
 use cf_secret::Secret;
 
 use crate::config::{Config, check_beside_old_manager};
-use crate::launchd::{Agent, LABEL, launchctl, plist};
+use crate::launchd::{AGENT_PAUSE, Agent, LABEL, launchctl, plist};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The entitlement without which macOS starts no virtual machine for a program.
@@ -127,14 +127,10 @@ fn service(config: &Config, program: &Path) -> Result<(Arc<MacMachines>, MacServ
 /// The one Runner of a state folder: held for as long as the file it returns is. Two Runners over the same folder
 /// would each end the machines the other started and remove what it wrote.
 fn only_runner(config: &Config) -> Result<std::fs::File, String> {
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
     let folder = &config.state_dir;
     let said = |error: std::io::Error| format!("{}: {error}", folder.display());
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(folder)
-        .map_err(said)?;
+    cf_secret::private_dir(folder).map_err(said)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -196,7 +192,6 @@ pub fn daemon(config: &Path) -> Result<(), String> {
 /// Enrols this Mac at the console with the one-time code on standard input, and keeps the token the console
 /// answers in the state folder, for this user alone. Neither is printed.
 pub fn enroll(config: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt as _;
     let config = Config::load(config)?;
     let address = config
         .console
@@ -218,10 +213,7 @@ pub fn enroll(config: &Path) -> Result<(), String> {
     if code.is_empty() {
         return Err("no code on standard input".into());
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&config.state_dir)
+    cf_secret::private_dir(&config.state_dir)
         .map_err(|error| format!("{}: {error}", config.state_dir.display()))?;
     let facts = MacHost::new(&config.state_dir)
         .and_then(|host| host.facts())
@@ -388,6 +380,16 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
     }
 }
 
+/// This person's agent, as the real launchd has it.
+fn agent(home: &Path) -> Agent<'_> {
+    Agent {
+        home,
+        uid: uid(),
+        run: &launchctl,
+        pause: AGENT_PAUSE,
+    }
+}
+
 /// How many machines have a record. Counted from the files, so that a look from beside a Runner that runs
 /// changes nothing; a record nobody can read counts, since its machine may stand.
 fn standing(config: &Config) -> usize {
@@ -428,12 +430,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
         0 => {}
         n => return Err(format!("not installed: {n} machines stand; {waits}")),
     }
-    let agent = Agent {
-        home: &home,
-        uid: uid(),
-        run: &launchctl,
-        pause: Duration::from_millis(200),
-    };
+    let agent = agent(&home);
     let before = std::fs::read_to_string(agent.path()).ok();
     agent.stop()?;
     // A job may have come between the look and the stop.
@@ -463,19 +460,17 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> {
     let config = for_uninstall(Config::load(config)?);
     let home = home()?;
-    let agent = Agent {
-        home: &home,
-        uid: uid(),
-        run: &launchctl,
-        pause: Duration::from_millis(200),
-    };
+    let agent = agent(&home);
     agent.stop()?;
     // A Runner started by hand is not the agent's and was not ended with it.
     let _only = only_runner(&config)?;
     // The installed copy when it is there: a vm-host is known by the program it runs.
-    let program = Some(config.program())
-        .filter(|program| program.exists())
-        .map_or_else(own_program, Ok)?;
+    let installed = config.program();
+    let program = if installed.exists() {
+        installed
+    } else {
+        own_program()?
+    };
     let left = runtime(2)?.block_on(async {
         let (machines, service) = service(&config, &program).map_err(|error| {
             format!(

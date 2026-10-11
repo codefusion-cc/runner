@@ -1,8 +1,17 @@
 //! Files that hold a secret or state that only this user may read.
 
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::Path;
+
+/// Makes a folder for this user alone (mode 0700), with the folders above it. One that is there already stays as it
+/// is.
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
 
 /// Writes a file for this user alone and puts it in place in one step, so that a reader never sees half of it.
 ///

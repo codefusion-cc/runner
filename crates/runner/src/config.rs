@@ -115,7 +115,8 @@ impl Config {
             return Err("deadline_minutes: between 1 and 1440".into());
         }
         for url in std::iter::once(&self.github_api).chain(&self.console) {
-            if !url.starts_with("https://") && !is_this_mac(url) {
+            // The App client's own rule for where a token may go: HTTPS, or this Mac itself.
+            if !cf_ghapp::is_safe_address_text(url) {
                 return Err(format!("`{url}` is no https address"));
             }
         }
@@ -162,30 +163,6 @@ impl Config {
     pub fn program(&self) -> PathBuf {
         self.state_dir.join("bin").join("codefusion-runner")
     }
-}
-
-/// Whether `url` is plain HTTP to this Mac itself: the host is exactly `127.0.0.1`, `localhost` or `[::1]`, so
-/// `http://localhost.example` (a prefix match would take it) is not.
-fn is_this_mac(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
-        let Some((host, after)) = inside.split_once(']') else {
-            return false;
-        };
-        match after {
-            "" => (host, ""),
-            _ => match after.strip_prefix(':') {
-                Some(port) => (host, port),
-                None => return false,
-            },
-        }
-    } else {
-        authority.split_once(':').unwrap_or((authority, ""))
-    };
-    ["127.0.0.1", "localhost", "::1"].contains(&host) && port.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The name the cf-runners manager has on this Mac, when it is installed for this user: the `machine` of its
@@ -327,6 +304,8 @@ mod tests {
             "http://localhost@example.com",
             "http://[::1]x",
             "http://localhost:80a",
+            "http://192.168.1.10:8787",
+            "https://",
         ] {
             assert!(with(|v| v["console"] = url.into()).is_err(), "{url}");
         }
@@ -335,6 +314,7 @@ mod tests {
             "http://localhost:8787/x",
             "http://[::1]:8787",
             "http://[::1]/",
+            "http://127.0.0.2:8787",
         ] {
             assert!(with(|v| v["console"] = url.into()).is_ok(), "{url}");
         }
