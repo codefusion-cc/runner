@@ -160,7 +160,7 @@ fn under_the_floor_closes_and_only_a_margin_above_it_opens() {
     assert_eq!(
         after(&mut budget, 61, |r| r.available_bytes = floor),
         Some(Refusal::Memory {
-            short_bytes: 2 * GIB + 64 * MIB
+            short_bytes: 2 * GIB + cf_budget::Settings::VM_HOST_OVERHEAD
         })
     );
     assert_eq!(
@@ -191,7 +191,7 @@ fn under_the_floor_closes_and_only_a_margin_above_it_opens() {
     assert_eq!(
         refusal(&budget, 261),
         Some(Refusal::Memory {
-            short_bytes: 2 * GIB + 64 * MIB - 1
+            short_bytes: 2 * GIB + cf_budget::Settings::VM_HOST_OVERHEAD - 1
         })
     );
 }

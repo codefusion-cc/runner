@@ -8,7 +8,9 @@ use cf_budget::{
 };
 use common::*;
 
-const HOST_4G: u64 = 4 * GIB + 64 * MIB;
+/// What a machine is counted with beyond its size.
+const OVERHEAD: u64 = Settings::VM_HOST_OVERHEAD;
+const HOST_4G: u64 = 4 * GIB + OVERHEAD;
 
 #[test]
 fn the_defaults_are_the_plans_table() {
@@ -81,7 +83,7 @@ fn the_default_cpus_and_times() {
         (Millis::mins(15), Millis::mins(2), Millis::secs(60))
     );
     assert_eq!(w.job_limit_bytes(Size::G4), 4 * GIB - GIB / 4);
-    assert_eq!(w.host_bytes(Size::G4), HOST_4G);
+    assert_eq!(w.host_bytes(Size::G4), 4 * GIB + 192 * MIB);
     // A Mac with one or two cores still gets one CPU for CI, and never more than it has.
     for cores in [1, 2] {
         let small = Settings::for_host(
@@ -349,6 +351,24 @@ fn what_fits_each_of_the_two_macs() {
             committed_bytes: 6 * GIB
         })
     );
+    // What the console's page and `check` say fits: what the cap and the CPUs take, whichever is less.
+    assert_eq!(
+        dedicated().side_by_side(&dedicated().away, G4),
+        2,
+        "three by the cap, two by the CPUs"
+    );
+    assert_eq!(workstation().side_by_side(&workstation().away, G4), 2);
+    assert_eq!(
+        workstation().side_by_side(&workstation().away, G2),
+        3,
+        "four by the cap"
+    );
+    assert_eq!(workstation().side_by_side(&workstation().away, G8), 1);
+    assert_eq!(
+        workstation().side_by_side(&workstation().in_use, G2),
+        0,
+        "none while its person works"
+    );
     // Half of the CPUs for CI, between 2 and 4, whatever the Mac.
     let g4_vcpus = |cores: u32| {
         let facts = HostFacts {
@@ -362,8 +382,8 @@ fn what_fits_each_of_the_two_macs() {
         [2, 2, 2, 2, 3, 3, 4, 4, 4]
     );
 
-    // By memory, two cf-4g need 2 x (4 GB + 64 MB) and the floor available before either starts: 11.125 GB on
-    // the workstation, 10.125 GB on the dedicated Mac. A byte less and the second waits.
+    // By memory, two cf-4g need 2 x (4 GB + 192 MB) and the floor available before either starts: 11.375 GB on
+    // the workstation, 10.375 GB on the dedicated Mac. A byte less and the second waits.
     for (settings, floor) in [(workstation(), 3 * GIB), (dedicated(), 2 * GIB)] {
         for (short, second) in [(0, Ok(())), (1, Err(Refusal::Memory { short_bytes: 1 }))] {
             let mut budget = Budget::new(settings.clone()).unwrap();
@@ -399,7 +419,7 @@ fn the_floor_holds_to_the_byte() {
 #[test]
 fn a_vm_that_grew_is_not_counted_twice() {
     // One 4 GB VM is promised; 10.5 GB are available. A second and a third 4 GB VM need
-    // 3 x (4 GB + 64 MB) + 2 GB = 14.19 GB: no. Once the first VM has taken 3 GB (available falls by 3 GB, its
+    // 3 x (4 GB + 192 MB) + 2 GB = 14.56 GB: no. Once the first VM has taken 3 GB (available falls by 3 GB, its
     // share still to come too), the answer must be the same: growth of a VM changes nothing.
     let mut budget = open(one_vcpu(dedicated()));
     let first = budget.claim(secs(60), Size::G4).unwrap().slot;
@@ -458,7 +478,7 @@ fn a_vm_nobody_measured_yet_is_all_still_to_come() {
     let mut budget = open(one_vcpu(dedicated()));
     let first = budget.claim(secs(60), Size::G4).unwrap().slot;
     let mut reading = calm(secs(61));
-    reading.available_bytes = HOST_4G + (2 * GIB + 64 * MIB) + 2 * GIB - 1;
+    reading.available_bytes = HOST_4G + (2 * GIB + OVERHEAD) + 2 * GIB - 1;
     budget.observe(secs(61), Some(reading));
     assert_eq!(
         budget.fits(secs(61), Size::G2),
@@ -902,7 +922,7 @@ fn free_slots_and_status_say_what_a_claim_would() {
     reading.available_bytes = 16 * GIB;
     budget.observe(secs(61), Some(reading));
     let now = secs(61);
-    // 12 GB cap; 16 GB available less the 2 GB floor is room for six VMs of 2 GB + 64 MB, by the cap too.
+    // 12 GB cap; 16 GB available less the 2 GB floor is room for six VMs of 2 GB + 192 MB, by the cap too.
     assert_eq!(budget.free(now), Free([6, 3, 2, 1]));
     let job = budget.claim(now, Size::G6).unwrap().slot;
     assert_eq!(budget.free(now), Free([3, 1, 1, 0]));
