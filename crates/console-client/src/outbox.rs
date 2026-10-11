@@ -34,6 +34,7 @@ struct State {
     sent: VecDeque<String>,
     sent_ids: HashSet<String>,
     dropped: u64,
+    queued: u64,
 }
 
 impl State {
@@ -192,8 +193,15 @@ impl Outbox {
         }
         state.waiting_ids.insert(event.id.clone());
         state.waiting.push_back(event);
+        state.queued += 1;
         self.persist(&state);
         true
+    }
+
+    /// How many events were queued since the outbox was opened. A number that moved says there is news for the
+    /// console; it is not kept over a restart, where what waits is sent with the first report anyway.
+    pub fn queued(&self) -> u64 {
+        self.lock().queued
     }
 
     /// The oldest waiting events, at most `max`. Nothing leaves the outbox until [`Outbox::sent`].

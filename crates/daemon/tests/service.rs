@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use cf_console_client::{Client, Enroll, OUTBOX_CAPACITY, Outbox, enroll};
+use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
@@ -730,6 +730,87 @@ async fn a_service_that_is_told_to_stop_closes_its_sessions_and_leaves_its_machi
     let last = rig.console.reports().last().cloned().expect("a last report");
     assert_eq!(last["status"]["open"], json!(false));
     assert_eq!(last["status"]["reason"], json!("draining"));
+}
+
+/// A job event as the machines queue one.
+fn started(runner: &str) -> JobEvent {
+    serde_json::from_value(json!({
+        "id": format!("{runner}/started"),
+        "kind": "started",
+        "runner": runner,
+        "at": "2026-10-10T10:00:00Z",
+    }))
+    .expect("a job event")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_event_is_on_the_consoles_page_within_a_moment_and_a_console_that_is_away_is_not_asked_for_each()
+ {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let before = rig.console.reports().len();
+    let (stop, stopped) = cf_scaleset::shutdown();
+    let service = rig.service.clone();
+    let running = tokio::spawn(async move { service.run(stopped).await });
+    until("the loop's first report", || rig.console.reports().len() > before).await;
+
+    // The console wants to hear again in a minute. The job's start does not wait for it.
+    assert!(rig.outbox.push(started("mac-a-j1")));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        rig.console.job_event_ids(),
+        ["mac-a-j1/started"],
+        "the start is on the console's page within two looks"
+    );
+    assert!(rig.outbox.is_empty());
+    // Told once: with nothing new the console hears again in its turn.
+    let told = rig.console.reports().len();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        rig.console.reports().len(),
+        told,
+        "the console is told again with nothing new"
+    );
+
+    // A console that is away is asked once, and then in its turn: not once more for every job event.
+    rig.console.down(true);
+    let calls = rig.console.calls();
+    assert!(rig.outbox.push(started("mac-a-j2")));
+    until("the console was asked", || rig.console.calls() > calls).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let asked = rig.console.calls();
+    assert!(rig.outbox.push(started("mac-a-j3")));
+    assert!(rig.outbox.push(started("mac-a-j4")));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        rig.console.calls(),
+        asked,
+        "a console that is away was asked for every event"
+    );
+    assert_eq!(rig.outbox.len(), 3, "and the events wait");
+
+    // Its next report in its turn carries them all, in order.
+    rig.console.down(false);
+    rig.service.report().await;
+    assert_eq!(
+        rig.console.job_event_ids(),
+        [
+            "mac-a-j1/started",
+            "mac-a-j2/started",
+            "mac-a-j3/started",
+            "mac-a-j4/started"
+        ]
+    );
+    // And a console that answers again hears the next event at once.
+    assert!(rig.outbox.push(started("mac-a-j5")));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        rig.console.job_event_ids().len(),
+        5,
+        "the next start is on the console's page at once"
+    );
+    stop.trigger();
+    running.await.expect("the loop ends");
 }
 
 /// Every command result the console took, in order.

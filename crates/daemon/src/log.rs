@@ -120,7 +120,7 @@ impl Subscriber for Lines {
         event.record(&mut fields);
         let line = format!(
             "{} {:5} {}{}\n",
-            cf_daemon::iso(seconds),
+            crate::iso(seconds),
             event.metadata().level(),
             event.metadata().target(),
             fields.0.replace('\n', " ")

@@ -114,6 +114,11 @@ pub async fn listen_nudged(
 /// must not keep a scale set unserved for days.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 
+/// The longest wait while a session of this machine from before is still open. That is the state a Runner that
+/// died leaves: GitHub drops the session by itself, and until a new one opens no job is taken and none that ended
+/// is heard of, so the next try is never minutes away.
+pub const SESSION_EXISTS_WAIT: Duration = Duration::from_secs(30);
+
 /// How long to wait before opening a session again after one failed.
 #[derive(Debug, Clone)]
 pub struct Backoff {
@@ -145,7 +150,8 @@ impl Backoff {
 
     /// The wait after a session that ran `ran_for` and ended with `error`. Between half and the whole of the
     /// current step (the jitter keeps machines that lost the service together from coming back together), and never
-    /// less than what a `Retry-After` asked for, up to [`MAX_RETRY_AFTER`]. `jitter` is in `0.0..=1.0`.
+    /// less than what a `Retry-After` asked for, up to [`MAX_RETRY_AFTER`]. `jitter` is in `0.0..=1.0`. While a
+    /// session of before is still open the wait is [`SESSION_EXISTS_WAIT`] at most.
     pub fn next_wait(&mut self, ran_for: Duration, error: &Error, jitter: f64) -> Duration {
         if ran_for >= self.healthy_after {
             self.next = self.first;
@@ -153,6 +159,9 @@ impl Backoff {
         let step = self.next;
         self.next = (self.next * 2).min(self.max);
         let wait = step.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0));
+        if matches!(error, Error::SessionExists) {
+            return wait.min(SESSION_EXISTS_WAIT);
+        }
         match error.retry_after() {
             Some(asked) => wait.max(asked.min(MAX_RETRY_AFTER)),
             None => wait,
@@ -192,6 +201,26 @@ pub async fn supervise<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_of_before_that_is_still_open_is_asked_for_again_within_half_a_minute() {
+        let mut backoff = Backoff::standard();
+        let waits: Vec<Duration> = (0..10)
+            .map(|_| backoff.next_wait(Duration::ZERO, &Error::SessionExists, 1.0))
+            .collect();
+        assert_eq!(
+            waits[..4],
+            [5, 10, 20, 30].map(Duration::from_secs),
+            "it starts as any failure does"
+        );
+        assert!(waits.iter().all(|wait| *wait <= SESSION_EXISTS_WAIT), "{waits:?}");
+        // Any other failure after it waits as long as so many failures in a row do.
+        let other = Error::Scaler("it would not answer".into());
+        assert_eq!(
+            backoff.next_wait(Duration::ZERO, &other, 1.0),
+            Duration::from_secs(300)
+        );
+    }
 
     #[test]
     fn a_retry_after_of_days_is_not_obeyed_beyond_an_hour() {

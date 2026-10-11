@@ -4,7 +4,7 @@
 use cf_guest_proto::StopReason;
 use cf_vmhost::control::{self, Request};
 use cf_vmhost::{JobRequest, JobState, Layout};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -68,6 +68,9 @@ pub struct VmHosts {
     layout: Layout,
     /// The jobs whose vm-host, started here, has exited.
     exited: Arc<Mutex<BTreeSet<String>>>,
+    /// The process numbers of the vm-hosts started here whose exit nobody collected yet: while one is in here
+    /// its number is still its own.
+    children: Arc<Mutex<BTreeMap<String, u32>>>,
 }
 
 impl VmHosts {
@@ -78,6 +81,7 @@ impl VmHosts {
             state_dir: state_dir.as_ref().to_path_buf(),
             layout: Layout::new(state_dir),
             exited: Arc::default(),
+            children: Arc::default(),
         }
     }
 
@@ -172,9 +176,14 @@ impl Vms for VmHosts {
         }
         // The vm-host is a session of its own and ends in its own time: only its exit is collected, on a thread
         // that holds nothing else, so that it is no zombie whose number looks alive.
-        let (exited, job) = (self.exited.clone(), request.job.clone());
+        let (exited, children, job) = (self.exited.clone(), self.children.clone(), request.job.clone());
+        children.lock().expect("children").insert(job.clone(), child.id());
         std::thread::spawn(move || {
+            // The number leaves the list after the exit is collected and under the list's lock, so that a signal
+            // to a number from the list never reaches another process.
             let _ = child.wait();
+            let mut children = children.lock().expect("children");
+            children.remove(&job);
             exited.lock().expect("exited").insert(job);
         });
         Ok(())
@@ -207,6 +216,13 @@ impl Vms for VmHosts {
 
     fn kill(&self, job: &str) {
         let Ok(state) = JobState::read(&self.layout, job) else {
+            // It wrote nothing yet, so only the Runner that started it knows its number.
+            let children = self.children.lock().expect("children");
+            if let Some(pid) = children.get(job).and_then(|pid| libc::pid_t::try_from(*pid).ok()) {
+                // SAFETY: the number is a child of this process whose exit was not collected (the list's lock is
+                // held), so it is that vm-host and nothing else; SIGKILL ends it.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
             return;
         };
         let answers = control::answers(&self.layout, &state, ANSWER);
@@ -246,5 +262,72 @@ impl Vms for VmHosts {
         let _ = std::fs::remove_dir_all(self.layout.job_dir(job));
         let _ = std::fs::remove_file(self.layout.state(job));
         self.exited.lock().expect("exited").remove(job);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Instant;
+
+    use cf_guest_proto::Workload;
+
+    use super::*;
+
+    fn request(job: &str) -> JobRequest {
+        JobRequest {
+            job: job.into(),
+            host: "mac-a".into(),
+            memory_bytes: 2 << 30,
+            cpus: 2,
+            scratch_bytes: 1 << 30,
+            image: "2026.10.1".into(),
+            workload: Workload::Command {
+                argv: vec!["true".into()],
+            },
+            env: Vec::new(),
+            deadline_s: 60,
+        }
+    }
+
+    /// A program in place of the Runner's binary, as a vm-host that hangs before it wrote anything.
+    fn hanging(folder: &Path) -> PathBuf {
+        let program = folder.join("vm-host");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").expect("a program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("a mode");
+        program
+    }
+
+    fn within(limit: Duration, mut holds: impl FnMut() -> bool) -> bool {
+        let began = Instant::now();
+        while began.elapsed() < limit {
+            if holds() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        holds()
+    }
+
+    #[test]
+    fn a_vm_host_that_hangs_before_it_wrote_anything_is_still_killed() {
+        let folder = tempfile::tempdir().expect("folder");
+        let vms = VmHosts::new(hanging(folder.path()), folder.path().join("state"));
+        vms.start(&request("j1")).expect("started");
+        assert!(
+            matches!(vms.look("j1"), Seen::Nothing),
+            "it wrote nothing and has not exited"
+        );
+        // A job nobody started here names no process: nothing is sent anywhere.
+        vms.kill("j2");
+        assert!(matches!(vms.look("j1"), Seen::Nothing));
+        vms.kill("j1");
+        assert!(
+            within(Duration::from_secs(5), || matches!(vms.look("j1"), Seen::Exited)),
+            "the vm-host outlived its kill"
+        );
+        // Its number is nobody's now: a second kill sends nothing.
+        assert!(vms.children.lock().expect("children").is_empty());
+        vms.kill("j1");
     }
 }

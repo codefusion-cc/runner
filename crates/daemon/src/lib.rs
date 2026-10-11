@@ -9,6 +9,7 @@
 
 mod adapters;
 mod ends;
+mod log;
 #[cfg(target_os = "macos")]
 mod mac;
 mod machines;
@@ -24,6 +25,7 @@ mod vms;
 
 pub use adapters::SetRegistry;
 pub use ends::{EndKind, machine_end};
+pub use log::{Lines, ROLL_AT};
 #[cfg(target_os = "macos")]
 pub use mac::{MacMachines, MacService, MacSetup, mac_service, records_dir};
 pub use machines::{

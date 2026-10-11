@@ -874,3 +874,46 @@ async fn a_machine_that_dies_before_it_was_seen_up_but_took_a_job_is_lost_and_no
     assert_eq!(w.ends(), [(runner, EndKind::GuestLost)]);
     w.assert_nothing_left();
 }
+
+#[tokio::test]
+async fn a_job_githubs_word_names_before_the_vm_host_wrote_anything_runs_to_its_end() {
+    let mut w = World::new(2);
+    w.parts.vms.late_state(true);
+    let runner = w.start().await;
+    // GitHub's word that the job started is here before the first look finds anything of the vm-host.
+    w.github(EventKind::Started, &runner, "");
+    pass(&w.m, 3);
+    assert_eq!(
+        w.m.snapshot()
+            .machines
+            .iter()
+            .map(|m| m.state)
+            .collect::<Vec<_>>(),
+        ["running"],
+        "a vm-host that has not written yet is no machine that is gone"
+    );
+    assert_eq!(w.parts.vms.killed(), Vec::<String>::new());
+    w.parts.vms.written(job_name(&runner));
+    pass(&w.m, 2);
+    w.parts.vms.end(job_name(&runner), End::Ok);
+    w.github(EventKind::Completed, &runner, "succeeded");
+    pass(&w.m, 2);
+    assert_eq!(w.ends(), [(runner, EndKind::Success)]);
+    w.assert_nothing_left();
+}
+
+#[tokio::test]
+async fn a_vm_host_that_never_writes_anything_under_a_job_is_ended_as_one_that_hangs() {
+    let mut w = World::new(2);
+    w.parts.vms.late_state(true);
+    let runner = w.start().await;
+    w.github(EventKind::Started, &runner, "");
+    // The time a vm-host may be silent, and no more: no wait without an end.
+    pass(&w.m, 59);
+    assert_eq!(w.ends(), []);
+    pass(&w.m, 30);
+    w.github(EventKind::Completed, &runner, "failed");
+    pass(&w.m, 30);
+    assert_eq!(w.ends(), [(runner, EndKind::GuestLost)]);
+    w.assert_nothing_left();
+}

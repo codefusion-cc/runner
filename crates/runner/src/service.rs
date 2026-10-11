@@ -9,14 +9,13 @@ use std::time::Duration;
 
 use cf_budget::{Host as _, Settings, Size};
 use cf_daemon::names::ServePolicy;
-use cf_daemon::{MacMachines, MacService, MacSetup, mac_service};
+use cf_daemon::{Lines, MacMachines, MacService, MacSetup, ROLL_AT, mac_service};
 use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_host_macos::{MacHost, host_name, model};
 use cf_secret::Secret;
 
 use crate::config::{Config, check_beside_old_manager};
 use crate::launchd::{Agent, LABEL, launchctl, plist};
-use crate::log::{Lines, ROLL_AT};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The entitlement without which macOS starts no virtual machine for a program.
@@ -243,7 +242,7 @@ fn room(config: &Config) -> Result<String, String> {
         .filter(|size| settings.can_run(*size).is_ok())
         .map(|size| format!("{} with {} CPUs", size.label(), settings.vcpus_of(size)))
         .collect();
-    let side_by_side = settings.away.cap_bytes / Size::G4.vm_bytes();
+    let side_by_side = settings.side_by_side(&settings.away, Size::G4);
     Ok(format!(
         "{} GB and {} cores, {}: {} GB for machines{}; {}; {} cf-4g side by side",
         facts.total_bytes >> 30,

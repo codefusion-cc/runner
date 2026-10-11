@@ -35,6 +35,7 @@ struct VmState {
     cleaned: Vec<String>,
     fail_start: usize,
     slow_boot: bool,
+    late_state: bool,
     ignore_stops: bool,
     next_pid: u32,
 }
@@ -63,6 +64,16 @@ impl FakeVms {
     /// Machines stay booting until [`FakeVms::ready`].
     pub fn slow_boot(&self, slow: bool) {
         self.lock().slow_boot = slow;
+    }
+
+    /// A vm-host that starts has written nothing yet, until [`FakeVms::written`].
+    pub fn late_state(&self, late: bool) {
+        self.lock().late_state = late;
+    }
+
+    /// The vm-host writes its first state.
+    pub fn written(&self, job: &str) {
+        self.with(job, |vm| vm.files = true);
     }
 
     /// Machines take a stop and go on.
@@ -215,6 +226,7 @@ impl Vms for FakeVms {
         request.check().map_err(|error| VmError(error.to_string()))?;
         state.next_pid += 1;
         let ready = !state.slow_boot;
+        let files = !state.late_state;
         let vm = FakeVm {
             state: JobState {
                 job: request.job.clone(),
@@ -233,7 +245,7 @@ impl Vms for FakeVms {
             },
             alive: true,
             silent: false,
-            files: true,
+            files,
             unkillable: false,
         };
         state.vms.insert(request.job.clone(), vm);
@@ -243,7 +255,9 @@ impl Vms for FakeVms {
 
     fn look(&self, job: &str) -> Seen {
         match self.lock().vms.get(job) {
-            Some(vm) if !vm.files => Seen::Nothing,
+            // It wrote nothing: there while its process is, and known to have exited after.
+            Some(vm) if !vm.files && vm.alive => Seen::Nothing,
+            Some(vm) if !vm.files => Seen::Exited,
             Some(vm) if !vm.alive => Seen::Gone(vm.state.clone()),
             Some(vm) if vm.silent => Seen::Silent(vm.state.clone()),
             Some(vm) => Seen::Alive(vm.state.clone()),

@@ -567,11 +567,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
         let slot = job.slot;
         let had_oom = job.record.oom;
+        let never_seen = job.last.is_none();
         let seen = self.vms.look(name);
         let mut events = Vec::new();
         match &seen {
-            // The vm-host has not written its state yet; the start's own time runs.
-            Seen::Nothing if phase == Phase::Starting => {}
+            // The vm-host has not written its state yet; the start's own time runs. So it does when GitHub's word
+            // of the job was here before the first look: then the time a vm-host may be silent runs.
+            Seen::Nothing if phase == Phase::Starting || never_seen => {}
             Seen::Nothing | Seen::Exited => events.push(Event::VmExited),
             Seen::Silent(_) => {}
             Seen::Alive(state) => {

@@ -22,7 +22,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::machines::{JobReport, Machines, Reports, Snapshot};
+use crate::machines::{JobReport, Machines, Reports};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig};
@@ -216,6 +216,9 @@ struct Shared<H, V> {
     /// Registrations GitHub would not remove, and when each is tried again.
     refused: Mutex<BTreeMap<String, Instant>>,
     console_paused: Mutex<bool>,
+    /// The outbox's count of queued events as of the last report, and whether the console took that report: news
+    /// goes to a console that answers at once, and to one that does not with the next report in its turn.
+    told: Mutex<(u64, bool)>,
 }
 
 /// The Runner's service on one Mac.
@@ -321,6 +324,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 results: Mutex::new(Vec::new()),
                 refused: Mutex::new(BTreeMap::new()),
                 console_paused: Mutex::new(false),
+                told: Mutex::new((0, false)),
             }),
         }
     }
@@ -778,7 +782,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 updated_at: iso(now),
                 open: snapshot.open,
                 reason: (!snapshot.open).then(|| snapshot.reason.clone()),
-                max_jobs: max_jobs(&snapshot),
+                // Of the commonest size, under the limits in force.
+                max_jobs: settings.side_by_side(&snapshot.budget.limits, Size::G4),
                 paused,
                 host,
                 host_error: snapshot.host_error.clone().or_else(|| {
@@ -853,7 +858,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let mut report = self.status();
         let results: Vec<CommandResult> = std::mem::take(&mut *shared.results.lock().expect("results"));
         report.results.clone_from(&results);
-        match console.client.deliver(&console.outbox, report).await {
+        // Read before the events are taken for the report: one queued meanwhile is news after it.
+        let queued = console.outbox.queued();
+        let delivered = console.client.deliver(&console.outbox, report).await;
+        *shared.told.lock().expect("told") = (queued, delivered.is_ok());
+        match delivered {
             Ok(answer) => self.answered(answer).await,
             Err(error) => {
                 // What was done for the console is said again with the next report.
@@ -874,6 +883,16 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
+    }
+
+    /// Whether a job event was queued since the last report, for a console that took that one. A console that
+    /// did not is told in its turn, not once for every event.
+    fn has_news(&self) -> bool {
+        let Some(console) = &self.shared.console else {
+            return false;
+        };
+        let (queued, taken) = *self.shared.told.lock().expect("told");
+        taken && console.outbox.queued() != queued
     }
 
     async fn answered(&self, answer: Answer) -> Duration {
@@ -963,6 +982,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let mut discover = tokio::time::interval(config.discover_every);
         let mut sweep = tokio::time::interval(config.sweep_every);
         let mut report = Box::pin(tokio::time::sleep(Duration::ZERO));
+        let mut news = tokio::time::interval(config.tick_every);
+        news.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 () = stop.wait() => break,
@@ -971,6 +992,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 () = &mut report => {
                     let next = self.report().await;
                     report.as_mut().reset(tokio::time::Instant::now() + next);
+                }
+                // A job that was queued, started or ended is on the console's page within a moment, not with
+                // the next report in its turn.
+                _ = news.tick() => {
+                    if self.has_news() {
+                        let next = self.report().await;
+                        report.as_mut().reset(tokio::time::Instant::now() + next);
+                    }
                 }
             }
         }
@@ -999,11 +1028,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             let _ = tokio::time::timeout(Duration::from_secs(10), self.report()).await;
         }
     }
-}
-
-/// How many machines of the commonest size the Mac gives room to under the limits in force.
-fn max_jobs(snapshot: &Snapshot) -> u32 {
-    u32::try_from(snapshot.budget.limits.cap_bytes / Size::G4.vm_bytes()).unwrap_or(u32::MAX)
 }
 
 /// One scale set's listener, for as long as it is wanted: the scale set is made, a session opened, and the scaler
