@@ -173,15 +173,15 @@ fn text_of(bytes: &[u8]) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// The Mac's model as macOS names it (`hw.model`, such as `Mac16,12`); `None` when macOS will not say.
-pub fn model() -> Option<String> {
+/// A text macOS keeps under a name.
+fn sysctl_text(name: &std::ffi::CStr) -> Option<String> {
     let mut text = [0u8; 128];
     let mut len = text.len();
     // SAFETY: the name ends with a NUL; `text` is `len` writable bytes, and the kernel writes at most `len` and
     // stores how many it wrote; nothing is set (no new value).
     let status = unsafe {
         libc::sysctlbyname(
-            c"hw.model".as_ptr(),
+            name.as_ptr(),
             text.as_mut_ptr().cast(),
             &mut len,
             ptr::null_mut(),
@@ -189,6 +189,18 @@ pub fn model() -> Option<String> {
         )
     };
     (status == 0).then(|| text_of(&text[..len.min(text.len())]))?
+}
+
+/// The Mac's model as macOS names it (`hw.model`, such as `Mac16,12`); `None` when macOS will not say.
+pub fn model() -> Option<String> {
+    sysctl_text(c"hw.model")
+}
+
+/// The name macOS gives this start of the Mac (`kern.bootsessionuuid`): another one after every start, and the
+/// same until the next, whatever the clock is set to meanwhile. [`boot_time`] is not that: macOS works it out
+/// from the clock, so it moves when the clock is set. `None` when macOS will not say.
+pub fn boot_session() -> Option<String> {
+    sysctl_text(c"kern.bootsessionuuid")
 }
 
 /// The Mac's host name; `None` when macOS will not say.
@@ -428,7 +440,9 @@ impl Drop for MacHost {
 
 #[cfg(test)]
 mod tests {
-    use super::{boot_time, cpu_percent, has_every_field_read, host_name, load, model, text_of};
+    use super::{
+        boot_session, boot_time, cpu_percent, has_every_field_read, host_name, load, model, text_of,
+    };
     use crate::MacHost;
 
     #[test]
@@ -441,6 +455,14 @@ mod tests {
         // After 2020 and before now: a number read in the wrong unit or at the wrong offset is neither.
         assert!(boot > 1_577_836_800 && boot <= now, "{boot}");
         assert!(model().is_some_and(|model| model.is_ascii() && model.len() >= 3));
+        let session = boot_session().expect("a name for this start");
+        // A UUID, whole: one cut short by a buffer too small would name two starts alike.
+        assert_eq!(session.len(), 36, "{session}");
+        assert!(
+            session.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "{session}"
+        );
+        assert_eq!(boot_session(), Some(session));
         assert!(host_name().is_some());
         assert!(load().iter().all(|load| load.is_finite() && *load >= 0.0));
         let host = MacHost::new(std::path::Path::new("/")).expect("a host");

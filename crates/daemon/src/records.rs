@@ -80,8 +80,9 @@ pub struct Record {
     pub slot: Option<SavedSlot>,
     /// When the machine was asked for, in seconds since 1970.
     pub created_at: i64,
-    /// The Mac's boot this was written in: a record from another boot has no machine.
-    pub boot: i64,
+    /// The start of the Mac this was written in, by the name macOS gives it: a record from another start has no
+    /// machine.
+    pub boot: String,
     /// Whether the registration is known to be gone from GitHub.
     pub unregistered: bool,
     /// GitHub's job on this Actions runner, once it took one.

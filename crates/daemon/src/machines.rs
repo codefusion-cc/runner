@@ -1,9 +1,10 @@
 //! The join: the budget, the lifecycle and the vm-hosts as one thing the scalers ask for slots and machines.
 //!
 //! One lock holds everything a decision reads, so a grant, the machine started on it and the record of both never
-//! disagree. Every path a machine can end by goes through the lifecycle's effects, in their order: the slot's
-//! memory goes back only after the vm-host is gone, the registration at GitHub is queued for removal, and the job
-//! is reported once.
+//! disagree. It is not held while a vm-host is looked at: what a look showed is told to the machine afterwards, as
+//! of the phase the machine is in then. Every path a machine can end by goes through the lifecycle's effects, in
+//! their order: the slot's memory goes back only after the vm-host is gone, the registration at GitHub is queued
+//! for removal, and the job is reported once.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -45,8 +46,9 @@ pub struct MachineConfig {
     /// The lifecycle's waits. One vm-host boots a machine twice by itself, so `starts` is 1 and `start` covers
     /// both boots.
     pub limits: Limits,
-    /// When the Mac started, in seconds since 1970: a record from another start has no machine.
-    pub boot: i64,
+    /// This start of the Mac, by a name that is another after every start and the same until then (not the time
+    /// of the start, which moves with the clock): a record from another start has no machine.
+    pub boot: String,
     /// What runs in place of GitHub's Actions runner: the integration suite's command. None in service.
     pub stand_in: Option<Workload>,
 }
@@ -54,7 +56,7 @@ pub struct MachineConfig {
 impl MachineConfig {
     /// The Runner's own waits for jobs of at most `deadline`: the vm-host keeps the deadline itself, so the
     /// lifecycle's own limit is a backstop past the vm-host's longest run.
-    pub fn new(host: &str, image: &str, boot: i64, deadline: Duration) -> MachineConfig {
+    pub fn new(host: &str, image: &str, boot: &str, deadline: Duration) -> MachineConfig {
         let vm = cf_vmhost::Limits::for_deadline(deadline);
         let millis = |d: Duration| Millis(u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         MachineConfig {
@@ -76,7 +78,7 @@ impl MachineConfig {
                 kill_again: Millis::secs(10),
                 long_sleep: Millis::mins(5),
             },
-            boot,
+            boot: boot.to_string(),
             stand_in: None,
         }
     }
@@ -297,8 +299,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// same boot, is adopted; its memory is counted first, oldest machine first, and its job goes on. Every other
     /// record has no machine any more and is ended: with the end its vm-host wrote if it wrote one, as
     /// `host-shutdown` when the Mac started again since, as `daemon-restart` when its machine was not up yet, and
-    /// as `guest-lost` otherwise. A vm-host that is there and silent is killed first. What is in the state folder
-    /// without a record is nobody's job: killed and removed.
+    /// as `guest-lost` otherwise. A vm-host that is there and silent is killed first, and so is one that has written
+    /// nothing yet. What is in the state folder without a record is nobody's job: killed and removed.
     pub fn restore(parts: MachineParts<H, V>) -> Result<Machines<H, V>, cf_budget::SettingsError> {
         let MachineParts {
             host,
@@ -359,9 +361,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         for job in self.vms.jobs() {
             if !known.contains(&job) {
                 tracing::warn!(%job, "a machine without a record was found; it is ended and removed");
-                if matches!(self.vms.look(&job), Seen::Alive(_) | Seen::Silent(_)) {
-                    self.vms.kill(&job);
-                }
+                self.vms.kill(&job);
                 self.vms.clean(&job);
             }
         }
@@ -394,7 +394,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 continue;
             }
             let mut seen = self.vms.look(&name);
-            if matches!(seen, Seen::Silent(_)) {
+            // One that wrote nothing may still be there, hanging before its first word: it would boot a machine
+            // nobody counts if it ever went on.
+            if matches!(seen, Seen::Silent(_) | Seen::Nothing) {
                 self.vms.kill(&name);
                 seen = self.vms.look(&name);
             }
@@ -562,16 +564,42 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     tracing::warn!(job = %name, cause = ?eviction.cause, "the Mac needs room; a job is stopped");
                     self.feed(&mut inner, &name, now, Event::Evict(eviction.cause));
                 }
-                // A promise or a place in line holds no machine: giving it back is all there is to stop.
+                // A promise or a place in line holds no machine: giving it back is all there is to stop. No start
+                // was tried on it, which a Mac closed for failed starts must know.
                 None => {
                     let _ = inner.budget.release(eviction.slot);
                     inner.grants.remove(&eviction.slot);
                     inner.ready.remove(&eviction.slot);
+                    inner.breaker.unused();
                 }
             }
         }
+        // A look may wait on a vm-host's socket for as long as one that hangs lets it. The lock is given up for the
+        // looks, so that the listeners, which ask for slots and bring GitHub's word, never wait with them.
+        let standing: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                inner
+                    .jobs
+                    .get(*name)
+                    .is_some_and(|job| job.life.phase() != Phase::Released)
+            })
+            .cloned()
+            .collect();
+        drop(inner);
+        let mut seen: BTreeMap<String, Seen> = standing
+            .into_iter()
+            .map(|name| {
+                let seen = self.vms.look(&name);
+                (name, seen)
+            })
+            .collect();
+        let mut inner = self.lock();
+        let now = inner.host.now();
         for name in &names {
-            self.watch(&mut inner, name, now);
+            if let Some(seen) = seen.remove(name) {
+                self.watch(&mut inner, name, now, seen);
+            }
             self.feed(&mut inner, name, now, Event::Tick);
             nudge |= self.settle(&mut inner, name, now);
         }
@@ -581,8 +609,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
-    /// Looks at a job's vm-host and tells the lifecycle what there is to tell.
-    fn watch(&self, inner: &mut Inner<H>, name: &str, now: Now) {
+    /// Tells the lifecycle what a look at a job's vm-host showed. The look was taken without the lock, so the job
+    /// may have moved on since: its phase is read here, and one that is gone by now is told nothing.
+    fn watch(&self, inner: &mut Inner<H>, name: &str, now: Now, seen: Seen) {
         let Some(job) = inner.jobs.get(name) else {
             return;
         };
@@ -593,7 +622,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let slot = job.slot;
         let had_oom = job.record.oom;
         let never_seen = job.last.is_none();
-        let seen = self.vms.look(name);
         let mut events = Vec::new();
         match &seen {
             // The vm-host has not written its state yet; the start's own time runs. So it does when GitHub's word
@@ -1069,7 +1097,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             origin: String::new(),
             slot: None,
             created_at: self.wall(),
-            boot: self.config.boot,
+            boot: self.config.boot.clone(),
             unregistered: false,
             github: None,
             start_reported: false,
@@ -1159,7 +1187,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             origin: grant.origin.name().to_string(),
             slot: Some(life.saved().into()),
             created_at: self.wall(),
-            boot: self.config.boot,
+            boot: self.config.boot.clone(),
             unregistered: false,
             github: None,
             start_reported: false,
@@ -1205,18 +1233,18 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
     }
 
     async fn out_of_memory(&self, handle: &str) -> OutOfMemory {
-        let inner = self.lock();
-        let Some(job) = inner.jobs.get(handle) else {
+        let Some(last) = self.lock().jobs.get(handle).map(|job| job.last.clone()) else {
             return OutOfMemory::Unknown {
                 reason: "the machine is gone".into(),
             };
         };
+        // Without the lock: the look may wait on the vm-host's socket.
         match self.vms.look(handle) {
             Seen::Alive(state) | Seen::Gone(state) => state.out_of_memory(),
             Seen::Silent(_) => OutOfMemory::Unknown {
                 reason: "the vm-host does not answer".into(),
             },
-            Seen::Nothing | Seen::Exited => match &job.last {
+            Seen::Nothing | Seen::Exited => match &last {
                 Some(state) => state.out_of_memory(),
                 None => OutOfMemory::Unknown {
                     reason: "the vm-host has said nothing yet".into(),

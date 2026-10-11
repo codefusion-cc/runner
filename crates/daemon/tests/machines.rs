@@ -10,7 +10,7 @@ use std::time::Duration;
 use cf_budget::{GIB, MIB, Millis, Pressure, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{Claim, EndKind, EventKind, Hosts, RESULT_WAIT, Slots, Ticket};
+use cf_daemon::{Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, Slots, Ticket};
 use cf_guest_proto::StopReason;
 use cf_vmhost::End;
 use support::world::{REPO, SET, SIZE, World, ids};
@@ -320,7 +320,7 @@ async fn a_stop_for_every_machine_ends_jobs_as_stopped_and_a_drained_macs_cancel
 async fn a_machine_that_never_comes_up_is_killed_frees_its_slot_and_three_in_a_row_close_the_mac() {
     let mut w = World::new(1);
     w.parts.vms.slow_boot(true);
-    let start = cf_daemon::MachineConfig::new("mac-b", "x", 1, Duration::from_secs(6 * 3600))
+    let start = cf_daemon::MachineConfig::new("mac-b", "x", "start-1", Duration::from_secs(6 * 3600))
         .limits
         .start;
     for round in 1..=3 {
@@ -339,6 +339,46 @@ async fn a_machine_that_never_comes_up_is_killed_frees_its_slot_and_three_in_a_r
     assert_eq!(w.m.registrations_to_remove().len(), 3);
     assert_eq!(w.m.state(), (false, "start-failures".to_string()));
     assert!(matches!(w.m.claim(SIZE, None), Claim::Waits { why, .. } if why == "start-failures"));
+}
+
+#[tokio::test]
+async fn a_slot_taken_back_for_room_before_its_machine_started_is_not_the_one_try_of_a_closed_mac() {
+    let mut w = World::new(1);
+    w.parts.vms.slow_boot(true);
+    let start = cf_daemon::MachineConfig::new("mac-b", "x", "start-1", Duration::from_secs(6 * 3600))
+        .limits
+        .start;
+    for _ in 1..=3 {
+        w.start().await;
+        pass(&w.m, start.0 / 1000 + 2);
+    }
+    // The one try after each wait fails too, and the wait doubles: 30 s to 15 minutes.
+    for wait in [30, 60, 120, 240, 480] {
+        pass(&w.m, wait);
+        w.start().await;
+        pass(&w.m, start.0 / 1000 + 2);
+        assert_eq!(w.m.state(), (false, "start-failures".to_string()));
+    }
+    // The next try gets its slot, and the Mac runs out of memory before the machine is started.
+    pass(&w.m, 900);
+    let Claim::Start(_) = w.m.claim(SIZE, None) else {
+        panic!("the one try");
+    };
+    assert_eq!(
+        w.m.state(),
+        (false, "start-failures".to_string()),
+        "one try, not two"
+    );
+    let critical = w.m.settings().critical_for;
+    w.m.with_host(|host| host.set(|r| r.pressure = Pressure::Critical));
+    pass(&w.m, critical.0 / 1000 + 3);
+    assert_eq!(w.slots(), 0, "the slot was taken back");
+    w.m.with_host(|host| host.set(|r| r.pressure = Pressure::Normal));
+    // The Mac is calm again long before a quarter of an hour is over. No start was tried, so none is awaited and
+    // none failed: the try is still to be had.
+    pass(&w.m, 300);
+    assert_eq!(w.m.state(), (true, String::new()));
+    assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
 }
 
 #[tokio::test]
@@ -915,5 +955,76 @@ async fn a_vm_host_that_never_writes_anything_under_a_job_is_ended_as_one_that_h
     w.github(EventKind::Completed, &runner, "failed");
     pass(&w.m, 30);
     assert_eq!(w.ends(), [(runner, EndKind::GuestLost)]);
+    w.assert_nothing_left();
+}
+
+#[tokio::test]
+async fn a_look_at_a_vm_host_that_does_not_answer_keeps_nobody_else_waiting() {
+    let mut w = World::new(2);
+    let runner = w.running().await;
+    let held = w.parts.vms.hold_looks();
+    let (m, ticking) = (w.m.clone(), w.m.clone());
+    let tick = std::thread::spawn(move || ticking.tick());
+    assert!(
+        held.waiting(Duration::from_secs(10)),
+        "the tick looks at the vm-host"
+    );
+    // What the listeners ask and tell meanwhile: a slot, the Mac's state, GitHub's word of a job.
+    let (asked, answered) = std::sync::mpsc::channel();
+    let name = runner.clone();
+    let asking = std::thread::spawn(move || {
+        let state = m.state();
+        let claim = m.claim(SIZE, None);
+        m.job(&JobEvent {
+            kind: EventKind::Completed,
+            runner: name,
+            repo: REPO.into(),
+            job: "build".into(),
+            workflow: "ci.yml".into(),
+            run_id: 42,
+            event: "push".into(),
+            queued_at: None,
+            started_at: None,
+            at: time::OffsetDateTime::UNIX_EPOCH,
+            result: "succeeded".into(),
+            out_of_memory: false,
+        });
+        let _ = asked.send((state, claim));
+    });
+    let got = answered.recv_timeout(Duration::from_secs(5));
+    held.let_go();
+    tick.join().expect("the tick");
+    asking.join().expect("the asking");
+    let (state, claim) = got.expect("an answer while the look still waits");
+    assert_eq!(state, (true, String::new()));
+    assert!(matches!(claim, Claim::Start(_)), "{claim:?}");
+    // The look that waited is still told to the machine, and the word that came meanwhile is kept.
+    w.parts.vms.end(job_name(&runner), End::Ok);
+    pass(&w.m, 2);
+    assert_eq!(w.ends(), [(runner, EndKind::Success)]);
+}
+
+#[tokio::test]
+async fn a_vm_host_that_hangs_before_it_wrote_anything_is_ended_by_the_runner_that_starts_next() {
+    let mut w = World::new(1);
+    w.parts.vms.late_state(true);
+    let runner = w.start().await;
+    assert_eq!(
+        w.parts.vms.standing(),
+        [job_name(&runner)],
+        "its process is there"
+    );
+    // The Runner dies; the one that starts finds a record and no state, and a process only the record names.
+    w.restart();
+    assert_eq!(
+        w.parts.vms.standing(),
+        Vec::<String>::new(),
+        "the vm-host of before is ended, not left to boot a machine nobody counts"
+    );
+    assert_eq!(w.slots(), 0);
+    w.github(EventKind::Started, &runner, "");
+    w.github(EventKind::Completed, &runner, "failed");
+    pass(&w.m, 2);
+    assert_eq!(w.ends(), [(runner, EndKind::DaemonRestart)]);
     w.assert_nothing_left();
 }

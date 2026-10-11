@@ -44,7 +44,7 @@ impl World {
             reports: Arc::new(ReportLog::default()),
             settings,
             nudges: Arc::new(AtomicUsize::new(0)),
-            boot: 1,
+            boot: "start-1".into(),
             bell: Arc::default(),
         };
         let m = parts.machines(None);
@@ -68,7 +68,7 @@ impl World {
         for job in self.parts.vms.standing() {
             self.parts.vms.die(&job);
         }
-        self.parts.boot += 1;
+        self.parts.boot.push_str("-and-one-more");
         self.restart();
     }
 

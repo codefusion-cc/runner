@@ -262,7 +262,7 @@ pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harn
         reports: Arc::new(ReportLog::default()),
         settings,
         nudges: Arc::new(AtomicUsize::new(0)),
-        boot: 1,
+        boot: "start-1".into(),
         bell: Arc::default(),
     };
     let machines = parts.machines(None);

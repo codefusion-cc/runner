@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MachineInfo, Outbox, Report,
-    RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
+    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
+    MachineInfo, Outbox, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -230,6 +230,25 @@ fn secs(at: SystemTime) -> i64 {
     at.duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// The longest `discoveryError` and scale set `error` the console reads (it takes four times the bound of a text and
+/// cuts it; over that it refuses the whole report).
+const STATUS_TEXT_MAX: usize = 1000;
+/// The longest `hostError` the console keeps.
+const HOST_ERROR_MAX: usize = 300;
+/// The most labels a scale set lists to the console.
+const MAX_LABELS: usize = 30;
+
+/// `text` cut to `max` characters, with an ellipsis where it was cut: one long error must not make the console
+/// refuse the Mac's whole report.
+fn cut(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('\u{2026}');
+    cut
 }
 
 /// A moment as the console reads it.
@@ -519,12 +538,19 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // is not known and stands for the pool's label, as any value does that names no size.
                 let variables = match shared.app.variables(installation.id, &name).await {
                     Ok(variables) => variables,
-                    Err(error) => {
+                    Err(cf_ghapp::Error::Status(refused)) if matches!(refused.status, 403 | 404) => {
                         problems.push(format!(
-                            "{name}: its variables could not be read ({error}); a `runs-on` that takes its \
+                            "{name}: its variables could not be read ({refused}); a `runs-on` that takes its \
                              label from a variable counts as `self-hosted`"
                         ));
                         BTreeMap::new()
+                    }
+                    // GitHub did not answer, which says nothing of the variables: the scale sets made from them
+                    // stay as they are until it does.
+                    Err(error) => {
+                        problems.push(format!("{name}: its variables could not be read ({error})"));
+                        unread.insert(name);
+                        continue;
                     }
                 };
                 if !wants {
@@ -657,11 +683,18 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
         left.extend(self.look(false).await);
         if let Some(console) = &shared.console {
-            if tokio::time::timeout(Duration::from_secs(10), self.report())
-                .await
-                .is_err()
-                || !console.outbox.is_empty()
-            {
+            // One report carries one batch of the outbox: go on while the console takes them.
+            let drained = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    self.report().await;
+                    let taken = shared.told.lock().expect("told").1;
+                    if console.outbox.is_empty() || !taken {
+                        break;
+                    }
+                }
+            })
+            .await;
+            if drained.is_err() || !console.outbox.is_empty() {
                 left.push(format!(
                     "{} job events the console has not heard",
                     console.outbox.len()
@@ -794,35 +827,48 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 max_jobs: settings.side_by_side(&snapshot.budget.limits, Size::G4),
                 paused,
                 host,
-                host_error: snapshot.host_error.clone().or_else(|| {
-                    (!snapshot.stuck.is_empty())
-                        .then(|| format!("a vm-host does not end: {}", snapshot.stuck.join(", ")))
-                }),
-                discovery_error: self.discovery_error(),
+                host_error: snapshot
+                    .host_error
+                    .clone()
+                    .or_else(|| {
+                        (!snapshot.stuck.is_empty())
+                            .then(|| format!("a vm-host does not end: {}", snapshot.stuck.join(", ")))
+                    })
+                    .map(|error| cut(error, HOST_ERROR_MAX)),
+                discovery_error: self.discovery_error().map(|error| cut(error, STATUS_TEXT_MAX)),
                 update: None,
                 not_serving: shared.not_serving.lock().expect("not serving").clone(),
                 scale_sets: sets
                     .iter()
+                    .take(MAX_SCALE_SETS)
                     .map(|set| ScaleSetStatus {
                         repo: set.repo.clone(),
                         name: set.name.clone(),
                         id: set.id,
-                        labels: set.labels.clone(),
+                        labels: set.labels.iter().take(MAX_LABELS).cloned().collect(),
                         capacity: u32::try_from(shared.machines.open_slots(set.size)).unwrap_or(u32::MAX),
                         waiting: set.statistics.as_ref().map_or(0, |s| {
                             u32::try_from(s.total_available_jobs.max(0)).unwrap_or(u32::MAX)
                         }),
-                        error: set.error.clone().or_else(|| {
-                            set.never.as_ref().map(|why| {
-                                format!("a job of {} can never start on this Mac: {why}", set.size.label())
+                        error: set
+                            .error
+                            .clone()
+                            .or_else(|| {
+                                set.never.as_ref().map(|why| {
+                                    format!(
+                                        "a job of {} can never start on this Mac: {why}",
+                                        set.size.label()
+                                    )
+                                })
                             })
-                        }),
+                            .map(|error| cut(error, STATUS_TEXT_MAX)),
                         error_at: set.error_at.map(iso),
                     })
                     .collect(),
                 runners: snapshot
                     .machines
                     .iter()
+                    .take(MAX_RUNNERS)
                     .map(|machine| RunnerStatus {
                         name: machine.runner.clone(),
                         scale_set: machine.scale_set_id,

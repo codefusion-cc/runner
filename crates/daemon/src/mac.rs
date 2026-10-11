@@ -10,7 +10,7 @@ use cf_budget::{Host as _, Mode, Settings};
 use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
-use cf_host_macos::{MacHost, boot_time, cpu_percent, host_name, load, model};
+use cf_host_macos::{MacHost, boot_session, boot_time, cpu_percent, host_name, load, model};
 use cf_secret::Secret;
 
 use crate::names::ServePolicy;
@@ -76,7 +76,7 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
     let host = MacHost::new(state).map_err(|error| format!("macOS: {error}"))?;
     let facts = host.facts().map_err(|error| format!("macOS: {error}"))?;
     // A record of before another start of the Mac has no machine, so the start must be known.
-    let boot = boot_time().ok_or("macOS does not say when the Mac started")?;
+    let boot = boot_session().ok_or("macOS does not name this start of the Mac")?;
     let hostname = host_name().unwrap_or_else(|| setup.machine.clone());
     let store = DiskStore::new(records_dir(state))
         .map_err(|error| format!("{}: {error}", records_dir(state).display()))?;
@@ -91,7 +91,7 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
         Some(outbox) => Arc::new(OutboxReports(outbox.clone())),
         None => Arc::new(LoggedReports),
     };
-    let mut config = MachineConfig::new(&setup.machine, &setup.image, boot, setup.deadline);
+    let mut config = MachineConfig::new(&setup.machine, &setup.image, &boot, setup.deadline);
     config.stand_in = setup.stand_in;
     let rings = bell.clone();
     let machines = Machines::restore(MachineParts {
@@ -154,7 +154,7 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
                     .zip(now)
                     .and_then(|(before, now)| cpu_percent(before, now))
                     .unwrap_or(-1.0),
-                boot: Some(boot),
+                boot: boot_time(),
             }
         }),
     });

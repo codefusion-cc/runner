@@ -1,7 +1,7 @@
 //! Stand-ins for the edges of the daemon: the vm-hosts, the Mac's readings, and where reports go. For tests.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use cf_budget::{GIB, HostFacts, Millis, Mode, Settings, Size};
@@ -38,6 +38,42 @@ struct VmState {
     late_state: bool,
     ignore_stops: bool,
     next_pid: u32,
+    held: Option<Arc<HeldLooks>>,
+}
+
+/// Looks at vm-hosts that wait, as a look at a vm-host that does not answer does, until a test lets them go.
+#[derive(Debug, Default)]
+pub struct HeldLooks {
+    /// How many looks wait, and whether they may go on.
+    state: Mutex<(usize, bool)>,
+    moved: Condvar,
+}
+
+impl HeldLooks {
+    fn pass(&self) {
+        let mut state = self.state.lock().expect("looks");
+        state.0 += 1;
+        self.moved.notify_all();
+        while !state.1 {
+            state = self.moved.wait(state).expect("looks");
+        }
+    }
+
+    /// Waits until a look waits; `false` when none came within `limit`.
+    pub fn waiting(&self, limit: Duration) -> bool {
+        let state = self.state.lock().expect("looks");
+        let (state, _) = self
+            .moved
+            .wait_timeout_while(state, limit, |state| state.0 == 0)
+            .expect("looks");
+        state.0 > 0
+    }
+
+    /// Lets every look go on, those that wait and those to come.
+    pub fn let_go(&self) {
+        self.state.lock().expect("looks").1 = true;
+        self.moved.notify_all();
+    }
 }
 
 /// The vm-hosts of a test: machines that start, boot, end, die, hang and refuse as a test says. By default a
@@ -79,6 +115,13 @@ impl FakeVms {
     /// Machines take a stop and go on.
     pub fn ignore_stops(&self, ignore: bool) {
         self.lock().ignore_stops = ignore;
+    }
+
+    /// Every look at a vm-host waits from now on, until the test lets them go.
+    pub fn hold_looks(&self) -> Arc<HeldLooks> {
+        let held = Arc::new(HeldLooks::default());
+        self.lock().held = Some(held.clone());
+        held
     }
 
     /// The guest reports `ready` and the workload starts.
@@ -254,6 +297,10 @@ impl Vms for FakeVms {
     }
 
     fn look(&self, job: &str) -> Seen {
+        let held = self.lock().held.clone();
+        if let Some(held) = held {
+            held.pass();
+        }
         match self.lock().vms.get(job) {
             // It wrote nothing: there while its process is, and known to have exited after.
             Some(vm) if !vm.files && vm.alive => Seen::Nothing,
@@ -354,7 +401,7 @@ pub struct TestParts {
     /// The bell the machines ring, for a test with listeners.
     pub bell: Arc<crate::service::Nudge>,
     /// The Mac's boot.
-    pub boot: i64,
+    pub boot: String,
 }
 
 impl TestParts {
@@ -373,7 +420,7 @@ impl TestParts {
             host,
             vms: self.vms.clone(),
             settings: self.settings.clone(),
-            config: MachineConfig::new("mac-b", "2026.10.1", self.boot, Duration::from_secs(6 * 3600)),
+            config: MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600)),
             roster: self.roster.clone(),
             store: self.store.clone(),
             clock: self.clock.clone(),

@@ -25,4 +25,4 @@ mod mac;
 pub use convert::{Raw, reading};
 pub use fake::FakeHost;
 #[cfg(target_os = "macos")]
-pub use mac::{MacHost, boot_time, cpu_percent, host_name, load, model};
+pub use mac::{MacHost, boot_session, boot_time, cpu_percent, host_name, load, model};

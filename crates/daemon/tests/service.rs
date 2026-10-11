@@ -2,6 +2,7 @@
 //! GitHub's queue to the console's page, what GitHub and the console do when they fail, and a Runner that starts
 //! again. Only the vm-hosts and the Mac's readings are stand-ins.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -82,7 +83,7 @@ impl Rig {
             reports: Arc::new(ReportLog::default()),
             settings: settings_for(machines),
             nudges: Arc::new(AtomicUsize::new(0)),
-            boot: 1,
+            boot: "start-1".into(),
             bell: Arc::new(Nudge::default()),
         };
         parts.reports.forward_to(Arc::new(OutboxReports(outbox.clone())));
@@ -339,6 +340,53 @@ async fn a_size_the_mac_never_runs_gets_no_scale_set_and_a_label_from_a_variable
     labels.sort();
     assert_eq!(labels, [vec!["cf-2g", "self-hosted"], vec!["cf-4g"]]);
     assert_eq!(rig.service.discovery_error(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn variables_github_could_not_show_for_a_moment_change_no_scale_set() {
+    let rig = Rig::new(3).await;
+    rig.github.set_workflow(
+        REPO,
+        "sized.yml",
+        "on: push\njobs:\n  sized:\n    runs-on: ${{ vars.CI_RUNNER }}\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER", "cf-4g");
+    rig.service.discover().await;
+    until("two scale sets", || rig.github.scale_sets().len() == 2).await;
+    let before: BTreeSet<(i64, Vec<String>)> = rig
+        .github
+        .scale_sets()
+        .into_iter()
+        .map(|s| (s.id, s.labels))
+        .collect();
+    assert!(
+        before.iter().any(|(_, labels)| labels == &["cf-4g"]),
+        "{before:?}"
+    );
+
+    // GitHub is unwell for a moment: that is not a variable taken away.
+    rig.github.fail(
+        "actions/variables",
+        Reply::status_json(503, &json!({"message": "Service unavailable"})),
+        100,
+    );
+    rig.service.discover().await;
+    let error = rig.service.discovery_error().expect("said");
+    assert!(
+        error.contains("org/app: its variables could not be read"),
+        "{error}"
+    );
+    let after: BTreeSet<(i64, Vec<String>)> = rig
+        .github
+        .scale_sets()
+        .into_iter()
+        .map(|s| (s.id, s.labels))
+        .collect();
+    assert_eq!(
+        after, before,
+        "a scale set was deleted or made for a variable nobody could read"
+    );
+    assert_eq!(rig.service.sets().len(), 2, "a listener was closed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1059,4 +1107,53 @@ async fn a_survey_says_what_would_be_served_and_what_cannot_be_read_and_changes_
         .filter(|line| !line.starts_with("GET ") && !line.contains("/access_tokens"))
         .collect();
     assert_eq!(writes, Vec::<String>::new(), "GitHub was only read");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_list_of_problems_with_the_repositories_does_not_make_the_console_refuse_the_report() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    // Forty repositories whose variables the App may not read: the problems together are far over a text the
+    // console takes (4000 characters), and it refuses the whole report that carries one.
+    for n in 0..40 {
+        let repo = format!("org/repository-with-a-long-name-{n:02}");
+        rig.github.add_repo(&repo, true);
+        rig.github.set_workflow(&repo, "ci.yml", WORKFLOW);
+    }
+    rig.github.fail(
+        "actions/variables",
+        Reply::status_json(403, &json!({"message": "Resource not accessible by integration"})),
+        1000,
+    );
+    rig.service.discover().await;
+    let said = rig.service.discovery_error().expect("said");
+    assert!(
+        said.chars().count() > 4000,
+        "the problems are long: {}",
+        said.len()
+    );
+    let before = rig.console.reports().len();
+    rig.service.report().await;
+    let reports = rig.console.reports();
+    assert_eq!(reports.len(), before + 1, "the console took the report");
+    let told = reports.last().expect("a report")["status"]["discoveryError"]
+        .as_str()
+        .expect("the problems are said")
+        .to_string();
+    assert_eq!(told.chars().count(), 1000);
+    assert!(told.starts_with("org/") && told.ends_with('\u{2026}'), "{told}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uninstall_hands_the_console_every_job_event_that_waits_and_not_only_the_first_batch() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let waiting = cf_console_client::REPORT_BATCH * 2 + 30;
+    for n in 0..waiting {
+        assert!(rig.outbox.push(started(&format!("mac-a-j{n}"))));
+    }
+    let left = rig.service.retire(Duration::from_secs(6), false).await;
+    assert_eq!(left, Vec::<String>::new());
+    assert_eq!(rig.console.job_events().len(), waiting);
+    assert!(rig.outbox.is_empty());
 }
