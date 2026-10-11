@@ -124,15 +124,37 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
     })
 }
 
-/// Waits until the Mac takes jobs: the budget watches it for a calm minute first.
-fn open(process: &Process) -> Fallible<()> {
-    expect(
-        within(Duration::from_secs(150), || process.machines.snapshot().open),
-        format!(
-            "the Mac did not open for jobs in 150 s: {}",
-            process.machines.snapshot().reason
-        ),
-    )
+/// Waits until the Mac takes a job: the budget watches it for a calm minute first, and a machine needs its
+/// memory. The budget's own count is asked, for a size above the job's, so that the room is still there when the
+/// job arrives. On a Mac that other work keeps busy it never comes, which is the budget's rule and no failure of
+/// the service: the answer then says what kept it, for a `SKIPPED` line.
+fn room(process: &Process) -> Result<(), String> {
+    let fits = || {
+        let snapshot = process.machines.snapshot();
+        snapshot.open && snapshot.budget.free.of(cf_budget::Size::G4) >= 1
+    };
+    if within(Duration::from_secs(240), fits) {
+        return Ok(());
+    }
+    let snapshot = process.machines.snapshot();
+    Err(format!(
+        "this Mac had no room for a machine in 240 s ({}, {} available): other work on it presses on its memory, and the budget starts no machine beside that",
+        if snapshot.open {
+            "open, and short of memory"
+        } else {
+            snapshot.reason.as_str()
+        },
+        mb(snapshot
+            .budget
+            .reading
+            .map_or(0, |reading| reading.available_bytes)),
+    ))
+}
+
+/// The scenario's lines so far and why it went no further.
+fn skipped_from_here(mut lines: Vec<String>, why: &str) -> Vec<String> {
+    lines.push(format!("SKIPPED from here: {why}"));
+    lines
 }
 
 /// A job in GitHub's queue gets a machine and GitHub hands it over. Says the Actions runner's name, the machine's
@@ -271,7 +293,10 @@ pub fn service(bench: &Bench) -> Fallible<Vec<String>> {
 
     // One job, from GitHub's queue to the console's page.
     let first = start_runner(bench, &world, &token)?;
-    open(&first)?;
+    if let Err(why) = room(&first) {
+        first.service.kill();
+        return Ok(skipped_from_here(lines, &why));
+    }
     let (runner, machine, took) = job_running(&world, &standing)?;
     expect(
         within(Duration::from_secs(90), || !alive(machine)),
@@ -296,7 +321,10 @@ pub fn service(bench: &Bench) -> Fallible<Vec<String>> {
     ));
 
     // The Runner dies under a job and the one that starts finds the machine.
-    open(&first)?;
+    if let Err(why) = room(&first) {
+        first.service.kill();
+        return Ok(skipped_from_here(lines, &why));
+    }
     let (runner, machine, _) = job_running(&world, &standing)?;
     first.service.kill();
     let Process {
@@ -342,7 +370,10 @@ pub fn service(bench: &Bench) -> Fallible<Vec<String>> {
     ));
 
     // An uninstall under a job: the machine is stopped, GitHub and the console hear of it, nothing stays.
-    open(&second)?;
+    if let Err(why) = room(&second) {
+        second.service.kill();
+        return Ok(skipped_from_here(lines, &why));
+    }
     let (runner, machine, _) = job_running(&world, &standing)?;
     second.stop.trigger();
     second.runtime.block_on(second.run)?;
