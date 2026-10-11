@@ -22,9 +22,9 @@ fn escape(text: &str) -> String {
 /// `ProcessType` is `Interactive`: launchd throttles the CPU and the disk of a job that names no type, and of
 /// every process it starts, and a vm-host that is throttled boots no machine in time (one under the background
 /// policy got no CPU for 150 seconds). `KeepAlive` starts the Runner again when it ends, whatever the reason; the
-/// machines that stand are found again by the one that starts. `ThrottleInterval` keeps a Runner that cannot start (no
-/// image, no key) to two tries and two log lines a minute; one that ran longer starts again at once. `ExitTimeOut` gives it the time to close its
-/// sessions at GitHub before launchd ends it for good.
+/// machines that stand are found again by the one that starts. `ThrottleInterval` keeps a Runner that cannot
+/// start (no image, no key) to two tries and two log lines a minute; one that ran longer starts again at once.
+/// `ExitTimeOut` gives it the time to close its sessions at GitHub before launchd ends it for good.
 pub fn plist(program: &Path, config: &Path, state_dir: &Path) -> String {
     let log = state_dir.join("logs").join("launchd.log");
     format!(

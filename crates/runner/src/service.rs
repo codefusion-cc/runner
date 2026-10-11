@@ -350,7 +350,10 @@ fn place(program: &Path, at: &Path) -> Result<(), String> {
     std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     let fresh = at.with_extension("new");
     std::fs::copy(program, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
-    entitled(&fresh)?;
+    if let Err(error) = entitled(&fresh) {
+        let _ = std::fs::remove_file(&fresh);
+        return Err(error);
+    }
     std::fs::rename(&fresh, at).map_err(|error| format!("{}: {error}", at.display()))
 }
 
@@ -541,6 +544,12 @@ mod tests {
             "the one before",
             "the program that runs is not replaced by one that cannot start a machine"
         );
+        let left: Vec<_> = std::fs::read_dir(at.parent().expect("a folder"))
+            .expect("the folder")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left, ["codefusion-runner"], "the copy that was refused is gone");
     }
 
     #[test]
