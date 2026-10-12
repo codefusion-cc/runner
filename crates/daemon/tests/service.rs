@@ -18,9 +18,10 @@ use cf_daemon::{
 use cf_fake_console::FakeConsole;
 use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
-use cf_fake_github::{FakeGithub, Options};
+use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Http, RetryPolicy};
 use cf_host_macos::{Battery, FakeHost};
+use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 use cf_vmhost::End;
 use serde_json::{Value, json};
@@ -1365,4 +1366,125 @@ async fn a_report_says_the_memory_that_is_available_what_the_runner_keeps_free_a
         reports[before]["activity"]["power"],
         json!({"onBattery": false, "percent": 0, "charging": true})
     );
+}
+
+/// The Air and the mini, 2026-10-12. Each of a Mac's scale sets offers GitHub the Mac's free slot with its long
+/// poll, and GitHub assigns against that number for as long as the poll stands. A slot one repository's job took
+/// must end the other repositories' polls, or their next job is assigned to this Mac, where it waits in line,
+/// instead of staying at GitHub for a Mac with room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_with_room_gets_it() {
+    const OTHER: &str = "org/other";
+    let rig = Rig::new(1).await;
+    rig.github.add_repo(OTHER, true);
+    rig.github.set_workflow(OTHER, "ci.yml", WORKFLOW);
+    rig.service.discover().await;
+    until("a session for each repository's scale set", || {
+        let sets = rig.github.scale_sets();
+        sets.len() == 2 && sets.iter().all(|s| s.has_session)
+    })
+    .await;
+    // Polls that stand for seconds, as GitHub's do: only the Runner ends one early.
+    rig.github.set_poll_timeout(Duration::from_secs(4));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    rig.queue();
+    until("a machine for the first repository's job", || {
+        rig.standing().len() == 1
+    })
+    .await;
+    let runner = rig.standing().remove(0);
+    rig.github.start_job(&runner);
+    let others = rig
+        .github
+        .scale_sets()
+        .into_iter()
+        .find(|set| set.repo == OTHER)
+        .expect("the other repository's scale set")
+        .id;
+    until("the other repository's poll to offer no slot any more", || {
+        let polls = format!("GET /svc/_apis/runtime/runnerscalesets/{others}/messages");
+        rig.github
+            .requests()
+            .iter()
+            .rfind(|request| request.line.starts_with(&polls))
+            .is_some_and(|poll| poll.max_capacity.as_deref() == Some("0"))
+    })
+    .await;
+    let job = rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        rig.github.job_state(job),
+        Some(JobState::Available),
+        "the full Mac was assigned a job it cannot start"
+    );
+    assert_eq!(rig.machines.snapshot().waiting, 0);
+
+    // Another Mac serves the same repository with the same labels and has room: the job is its.
+    let elsewhere = ScaleSetClient::new(
+        app(&rig.github, http(), rig.parts.clock.clone()),
+        1,
+        OTHER,
+        &format!("{}/{OTHER}", rig.github.url()),
+        Duration::from_secs(5),
+    );
+    let labels = ["self-hosted".to_string(), "cf-2g".to_string()];
+    let set = elsewhere
+        .ensure_scale_set("mac-c--cf-2g", &labels)
+        .await
+        .expect("a scale set");
+    let session = elsewhere.open_session(set.id, "mac-c").await.expect("a session");
+    session.poll(0, 1).await.expect("a poll");
+    assert_eq!(rig.github.job_state(job), Some(JobState::Acquired(set.id)));
+    assert_eq!(rig.standing().len(), 1, "and the full Mac started nothing for it");
+
+    // Alone again, the first Mac still runs what is queued for it once its slot is free.
+    let later = rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.github.job_state(later), Some(JobState::Available));
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    rig.github.complete_job(&runner, "succeeded");
+    until("a machine for the job that waited at GitHub", || {
+        rig.standing().iter().any(|standing| *standing != runner)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_mac_whose_other_programs_leave_no_memory_for_what_it_serves_tells_the_console_it_is_closed_for_memory()
+ {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    rig.stop_pump().await;
+    let status = |rig: &Rig| {
+        pass(&rig.machines, 1);
+        serde_json::to_value(rig.service.status()).expect("a report")["status"].clone()
+    };
+    let said = status(&rig);
+    assert_eq!((&said["open"], &said["reason"]), (&json!(true), &Value::Null));
+
+    let short = rig.parts.settings.away.floor_bytes + (1 << 30);
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = short));
+    let said = status(&rig);
+    assert_eq!(
+        (&said["open"], &said["reason"]),
+        (&json!(false), &json!("memory"))
+    );
+    assert_eq!(said["scaleSets"][0]["capacity"], json!(0));
+    rig.service.report().await;
+    assert_eq!(
+        rig.console.reports().last().expect("a report")["status"]["reason"],
+        json!("memory"),
+        "the console takes the report"
+    );
+
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = 64 << 30));
+    let said = status(&rig);
+    assert_eq!((&said["open"], &said["reason"]), (&json!(true), &Value::Null));
 }

@@ -28,7 +28,10 @@ pub struct Runner {
     pub handle: String,
     /// The service's ID for the registration.
     pub runner_id: i64,
-    /// The scale set it belongs to.
+    /// The repository of its scale set, `owner/name`.
+    pub repo: String,
+    /// The scale set it belongs to, by GitHub's number, which counts within the repository: two repositories'
+    /// scale sets may have the same one, so a scale set is named by both.
     pub scale_set_id: i64,
     /// The slot it holds until its machine is gone.
     pub ticket: Option<Ticket>,
@@ -42,6 +45,13 @@ pub struct Runner {
     pub done: Option<SystemTime>,
     /// The job it took.
     pub job: Option<JobInfo>,
+}
+
+impl Runner {
+    /// Whether it belongs to this repository's scale set of this number.
+    pub fn is_of(&self, repo: &str, scale_set_id: i64) -> bool {
+        self.scale_set_id == scale_set_id && self.repo.eq_ignore_ascii_case(repo)
+    }
 }
 
 /// The Actions runners of this machine, for every scale set. Safe to share between the scalers and whoever watches
@@ -84,9 +94,9 @@ impl Roster {
 
     /// Records that an Actions runner of a scale set took a job. A name this machine does not know is ignored, and so
     /// is one of another scale set: whoever can register Actions runners there chooses their names.
-    pub fn mark_busy(&self, scale_set_id: i64, name: &str, job: JobInfo) {
+    pub fn mark_busy(&self, repo: &str, scale_set_id: i64, name: &str, job: JobInfo) {
         if let Some(r) = self.lock().get_mut(name)
-            && r.scale_set_id == scale_set_id
+            && r.is_of(repo, scale_set_id)
         {
             r.busy = true;
             r.job = Some(job);
@@ -95,9 +105,9 @@ impl Roster {
 
     /// Records that the job of a scale set's Actions runner completed, and says whether this was news: `false` for an
     /// Actions runner this machine does not know, for one of another scale set and for one whose job was already over.
-    pub fn mark_done(&self, scale_set_id: i64, name: &str, at: SystemTime) -> bool {
+    pub fn mark_done(&self, repo: &str, scale_set_id: i64, name: &str, at: SystemTime) -> bool {
         match self.lock().get_mut(name) {
-            Some(r) if r.scale_set_id == scale_set_id && r.done.is_none() => {
+            Some(r) if r.is_of(repo, scale_set_id) && r.done.is_none() => {
                 r.done = Some(at);
                 true
             }
@@ -105,20 +115,20 @@ impl Roster {
         }
     }
 
-    /// Every Actions runner of a scale set (all of them for 0), by name.
-    pub fn runners(&self, scale_set_id: i64) -> Vec<Runner> {
+    /// Every Actions runner of a repository's scale set, by name.
+    pub fn runners(&self, repo: &str, scale_set_id: i64) -> Vec<Runner> {
         self.lock()
             .values()
-            .filter(|r| scale_set_id == 0 || r.scale_set_id == scale_set_id)
+            .filter(|r| r.is_of(repo, scale_set_id))
             .cloned()
             .collect()
     }
 
-    /// How many Actions runners of a scale set have a job to do or wait for one.
-    pub fn active(&self, scale_set_id: i64) -> usize {
+    /// How many Actions runners of a repository's scale set have a job to do or wait for one.
+    pub fn active(&self, repo: &str, scale_set_id: i64) -> usize {
         self.lock()
             .values()
-            .filter(|r| r.scale_set_id == scale_set_id && r.done.is_none())
+            .filter(|r| r.is_of(repo, scale_set_id) && r.done.is_none())
             .count()
     }
 }

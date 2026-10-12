@@ -118,10 +118,11 @@ pub trait Hosts: Send + Sync {
     /// machine go.
     fn out_of_memory(&self, handle: &str) -> impl Future<Output = OutOfMemory> + Send;
 
-    /// How many jobs GitHub still counts as assigned to Actions runners of this scale set whose machines are gone:
-    /// a job was started on each, GitHub has not said how it ended, and the registration still stands (GitHub
-    /// keeps it while it counts the job). The scaler starts no machine in their place: there is no job to take.
-    fn lost_with_job(&self, _scale_set_id: i64) -> usize {
+    /// How many jobs GitHub still counts as assigned to Actions runners of this repository's scale set whose
+    /// machines are gone: a job was started on each, GitHub has not said how it ended, and the registration still
+    /// stands (GitHub keeps it while it counts the job). The scaler starts no machine in their place: there is no
+    /// job to take.
+    fn lost_with_job(&self, _repo: &str, _scale_set_id: i64) -> usize {
         0
     }
 }
@@ -139,8 +140,8 @@ impl<T: Hosts> Hosts for std::sync::Arc<T> {
         (**self).registration_unsure(name);
     }
 
-    fn lost_with_job(&self, scale_set_id: i64) -> usize {
-        (**self).lost_with_job(scale_set_id)
+    fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {
+        (**self).lost_with_job(repo, scale_set_id)
     }
 
     fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send {
