@@ -101,6 +101,11 @@ pub struct Record {
     /// removed, by this Runner or the one that starts after it. Records written before it existed ask nothing.
     #[serde(default)]
     pub ask_github: bool,
+    /// Why the Runner removes the registration at GitHub, written before it asks: `surplus` for an idle Actions runner
+    /// it gives up, `no job` for a machine that ended and of which GitHub twice said it was idle. From then on GitHub
+    /// not having the registration says nothing of a job; GitHub saying it is busy still does, and clears this.
+    #[serde(default)]
+    pub removing: Option<String>,
 }
 
 impl Record {

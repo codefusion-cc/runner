@@ -23,12 +23,12 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::machines::{JobReport, Machines, Reports, Snapshot};
+use crate::machines::{JobReport, Machines, Reports, Snapshot, Verdict};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
-use crate::scaler::{Scaler, ScalerConfig};
+use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
-use crate::traits::{EventKind, Hosts, Slots};
+use crate::traits::{EventKind, Events, Hosts, Slots};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -760,9 +760,17 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 && let Some(id) = registration.runner_id
             {
                 match client.runner_busy(id).await {
-                    // Registered and idle: the Actions runner never took a job.
-                    Ok(Some(false)) => {}
-                    Ok(None | Some(true)) => shared.machines.ran_unheard(&registration.runner),
+                    Ok(busy) => match shared.machines.asked(&registration.runner, busy) {
+                        Verdict::Ran | Verdict::NoJob => {}
+                        Verdict::AskAgain => {
+                            shared
+                                .refused
+                                .lock()
+                                .expect("refused")
+                                .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                            continue;
+                        }
+                    },
                     Err(error) => {
                         tracing::warn!(runner = %registration.runner, %error, "GitHub could not say whether a gone machine ran a job; it is asked again");
                         shared
@@ -784,7 +792,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             };
             let removed = match id {
                 Ok(None) => Ok(()),
+                // A 404 says nothing here: the client tries a removal again when its answer was lost. A refusal for
+                // a job (422) says one started, whatever was believed of this machine.
                 Ok(Some(id)) => match client.remove_runner(id).await {
+                    Err(error) if error.status() == Some(422) => {
+                        shared.machines.ran_unheard(&registration.runner);
+                        Err(error)
+                    }
                     Err(error) if !error.is_not_found() => Err(error),
                     _ => Ok(()),
                 },
@@ -1229,9 +1243,15 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     set = %name, id = set.id, %repo, labels = %labels.join(","), size = size.label(),
                     "a scale set at GitHub"
                 );
+                let registry = SetRegistry {
+                    client: client.clone(),
+                    scale_set_id: set.id,
+                };
+                let machines = shared.machines.clone();
+                let events: Arc<dyn Events> = machines.clone();
+                reconcile(&registry, &shared.roster, &events, &repo, set.id, shared.clock.as_ref()).await;
                 let session = client.open_session(set.id, &shared.config.machine).await?;
                 tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
-                let machines = shared.machines.clone();
                 let slots: Arc<dyn Slots> = machines.clone();
                 let mut scaler = Scaler::new(
                     ScalerConfig {
@@ -1241,10 +1261,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         size,
                     },
                     session.clone(),
-                    SetRegistry {
-                        client: client.clone(),
-                        scale_set_id: set.id,
-                    },
+                    registry,
                     machines.clone(),
                     slots,
                     shared.roster.clone(),

@@ -366,6 +366,7 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
         busy: false,
         adopted: true,
         done: None,
+        removing: false,
         job: None,
     });
     // The two idle jobs were cancelled: only the busy Actions runner's job is assigned.
@@ -800,6 +801,7 @@ async fn a_message_that_names_a_runner_of_another_scale_set_leaves_that_runner_a
         busy: false,
         adopted: false,
         done: None,
+        removing: false,
         job: None,
     });
     h.scaler
@@ -959,6 +961,7 @@ fn of_another_repository(h: &Harness, name: &str, ticket: Option<Ticket>, age: D
         busy: ticket.is_some(),
         adopted: false,
         done: None,
+        removing: false,
         job: None,
     }
 }

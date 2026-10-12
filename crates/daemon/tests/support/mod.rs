@@ -260,6 +260,10 @@ impl Hosts for Spy {
         self.machines.registration_unsure(name);
     }
 
+    fn removing(&self, name: &str, why: &str) {
+        self.machines.removing(name, why);
+    }
+
     async fn start(&self, spec: RunnerSpec) -> Result<String, HostError> {
         let seen = (spec.name.clone(), spec.runner_id, spec.ticket);
         let handle = self.machines.start(spec).await?;

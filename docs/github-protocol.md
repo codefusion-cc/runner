@@ -45,14 +45,15 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
 | The counts never name a job GitHub holds | every probe | Seen |
 | A session that ends or is forgotten takes its pending messages with it, and messages queued while there is none are lost | D kept one across a delete | GitHub was kinder in D; one sample is no promise, so the fake drops them |
 | A refresh (`PATCH`) brings no counts | C | Seen |
-| An assignment never acquired is taken back after 5 minutes as `JobCompleted` `canceled` | J2, the mini at 18:57:52 | Seen |
-| The REST view of an Actions runner says whether it is busy, and 404 once it is gone | H | Seen for an idle one; `busy: true` for a running job is GitHub's documented meaning, not probed |
+| An assignment never acquired is taken back after 5 minutes as `JobCompleted` `canceled`, and queued again | J2, the mini at 18:57:52 | Seen; that it is queued again is inferred from J2, where it was handed out again at once |
+| The REST view of an Actions runner says whether it is busy, and 404 once it is gone | H | Seen for an idle one; `busy: true` for a running job is GitHub's documented meaning, not probed. How fresh it is was not probed: the fake can answer one read behind (`set_rest_stale`), never from before the registration's own answer |
 
 ## What follows for the Runner
 
 - No call of the Runner makes GitHub hand over a job it holds. A Mac whose room comes back gets the job only at
   GitHub's next look: the next job queued or ended in the repository, or GitHub's own, which can take minutes.
 - A message lost with a session cannot be asked for again. The Runner asks the REST view of each Actions runner it
-  believes holds or awaits a job when a session opens (`Scaler::reconcile`), and asks again before it removes the
-  registration of a machine that ended unheard (`Service::sweep`). The result of a job whose `JobCompleted` was lost
-  cannot be read without the App permission `actions: read`.
+  believes awaits a job before a session opens (`reconcile`), and before it removes the registration of a machine
+  that ended unheard (`Service::sweep`) or of a surplus Actions runner. What each answer proves, and what is written
+  before what is done, is `docs/job-state.md`. The result of a job whose `JobCompleted` was lost cannot be read
+  without the App permission `actions: read`.

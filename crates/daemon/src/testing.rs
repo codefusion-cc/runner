@@ -11,7 +11,7 @@ use cf_host_macos::FakeHost;
 use cf_vmhost::{End, Ended, JobRequest, JobState, Stage};
 
 use crate::machines::{JobReport, MachineConfig, MachineParts, Machines, Reports};
-use crate::records::Store;
+use crate::records::{MemoryStore, Record, Store};
 use crate::roster::Roster;
 use crate::traits::{Events, JobEvent};
 use crate::vms::{Seen, VmError, Vms};
@@ -440,6 +440,88 @@ pub fn pass(machines: &TestMachines, seconds: u64) {
     for _ in 0..seconds {
         machines.with_host(|host| host.pass(Millis::secs(1)));
         machines.tick();
+    }
+}
+
+/// Records in memory at which a test can make the daemon die between any two writes: the `n`th write from
+/// [`CrashingStore::crash_at`] on is the daemon's last, kept or lost with it, and no write after it is kept until
+/// [`CrashingStore::revive`]. `on_crash` runs at that moment, while the writer waits: whatever else the dead daemon
+/// could still do (talk to GitHub, queue a report) is for the test to stop there.
+#[derive(Default)]
+pub struct CrashingStore {
+    records: MemoryStore,
+    crash: Mutex<Crash>,
+}
+
+#[derive(Default)]
+struct Crash {
+    /// Writes left before the crash, and whether the last one is kept.
+    armed: Option<(usize, bool)>,
+    dead: bool,
+    on_crash: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl CrashingStore {
+    /// The `writes`th write from now is the last; `kept`: whether it is written before the daemon dies.
+    pub fn crash_at(&self, writes: usize, kept: bool, on_crash: impl Fn() + Send + Sync + 'static) {
+        let mut crash = self.crash.lock().expect("crash");
+        if crash.armed.is_none() && !crash.dead {
+            crash.armed = Some((writes.max(1), kept));
+            crash.on_crash = Some(Box::new(on_crash));
+        }
+    }
+
+    /// Whether a crash is set and has not come yet.
+    pub fn armed(&self) -> bool {
+        self.crash.lock().expect("crash").armed.is_some()
+    }
+
+    /// Whether the daemon died at a write.
+    pub fn crashed(&self) -> bool {
+        self.crash.lock().expect("crash").dead
+    }
+
+    /// No crash any more: the daemon that starts next writes again, and one that was set and did not come is off.
+    pub fn revive(&self) {
+        *self.crash.lock().expect("crash") = Crash::default();
+    }
+
+    /// Writes with `apply` unless the daemon is dead, counting the write towards the crash. The crash holds the
+    /// lock until `on_crash` returned, so a write of another thread meanwhile finds the daemon dead.
+    fn write(&self, apply: impl FnOnce()) {
+        let mut crash = self.crash.lock().expect("crash");
+        match crash.armed {
+            _ if crash.dead => {}
+            None => apply(),
+            Some((left, kept)) if left > 1 => {
+                crash.armed = Some((left - 1, kept));
+                apply();
+            }
+            Some((_, kept)) => {
+                crash.armed = None;
+                crash.dead = true;
+                if kept {
+                    apply();
+                }
+                if let Some(on_crash) = &crash.on_crash {
+                    on_crash();
+                }
+            }
+        }
+    }
+}
+
+impl Store for CrashingStore {
+    fn save(&self, record: &Record) {
+        self.write(|| self.records.save(record));
+    }
+
+    fn remove(&self, job: &str) {
+        self.write(|| self.records.remove(job));
+    }
+
+    fn load(&self) -> Vec<Record> {
+        self.records.load()
     }
 }
 

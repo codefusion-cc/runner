@@ -449,6 +449,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             busy: false,
             adopted: false,
             done: None,
+            removing: false,
             job: None,
         });
         tracing::info!(runner = %name, "Actions runner started");
@@ -457,8 +458,14 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
 
     /// Removes up to `n` Actions runners that waited past [`IDLE_GRACE`] for a job that never came, such as one
     /// cancelled before it started. Busy, finished and adopted Actions runners are left alone.
+    ///
+    /// GitHub is asked first: one that is busy, or gone although the Runner never set out to remove it, took a job
+    /// whose start was not heard. The removal is written down before GitHub is asked to remove it, so that GitHub not
+    /// having the registration afterwards says nothing of a job, here or in the Runner that starts after this one; a
+    /// removal GitHub refuses because of a job (422) is a start as well (`docs/job-state.md`).
     async fn retire_surplus(&mut self, mut n: usize) {
-        for runner in self.roster.runners(&self.config.repo, self.config.scale_set_id) {
+        let (repo, set) = (self.config.repo.clone(), self.config.scale_set_id);
+        for runner in self.roster.runners(&repo, set) {
             if n == 0 {
                 return;
             }
@@ -470,12 +477,31 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             if runner.busy || runner.adopted || runner.done.is_some() || age < IDLE_GRACE {
                 continue;
             }
+            if !runner.removing {
+                match self.registry.runner_busy(runner.runner_id).await {
+                    Ok(Some(false)) => {}
+                    Ok(Some(true) | None) => {
+                        self.took_job(&runner.name);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::info!(runner = %runner.name, error = %e, "GitHub could not say whether a surplus Actions runner is idle; asked again later");
+                        continue;
+                    }
+                }
+                self.hosts.removing(&runner.name, "surplus");
+                self.roster.mark_removing(&runner.name);
+            }
             match self.registry.remove_runner(runner.runner_id).await {
                 Ok(()) => {}
-                // Gone from the service already: only its machine is left to remove.
+                // Gone from the service already, by this removal: only its machine is left to remove.
                 Err(e) if e.is_not_found() => {}
+                Err(e) if e.status() == Some(422) => {
+                    self.took_job(&runner.name);
+                    continue;
+                }
                 Err(e) => {
-                    // It may have just taken a job; try again on a later poll.
+                    // Whether GitHub removed it is not known; the removal stays written down and is tried again.
                     tracing::info!(runner = %runner.name, error = %e, "surplus Actions runner not removed");
                     continue;
                 }
@@ -483,12 +509,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             n -= 1;
             // Its registration is removed, so it takes no job and no longer counts. The machine keeps its slot
             // until whoever watches the machines sees it gone.
-            self.roster.mark_done(
-                &self.config.repo,
-                self.config.scale_set_id,
-                &runner.name,
-                self.clock.now(),
-            );
+            self.roster.mark_done(&repo, set, &runner.name, self.clock.now());
             match self.hosts.stop(&runner.handle).await {
                 Ok(()) => tracing::info!(runner = %runner.name, "surplus Actions runner removed"),
                 Err(e) => {
@@ -496,6 +517,18 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 }
             }
         }
+    }
+
+    /// GitHub says an Actions runner of this scale set took a job whose start was not heard.
+    fn took_job(&self, runner: &str) {
+        start_unheard(
+            &self.roster,
+            self.events.as_ref(),
+            &self.config.repo,
+            self.config.scale_set_id,
+            runner,
+            self.clock.now(),
+        );
     }
 
     /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone
@@ -521,9 +554,6 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
 impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
     async fn scale(&mut self, message: Option<&Message>) -> Result<usize, Error> {
         if let Some(message) = message {
-            if is_opening(message) {
-                self.reconcile().await;
-            }
             self.handle(message).await?;
         }
         // After the Actions runners started: a job assigned late still finds the slot promised to it.
@@ -543,77 +573,83 @@ fn heard(started_at: Option<OffsetDateTime>, now: OffsetDateTime) -> (String, i6
     )
 }
 
-/// The message a session starts with: GitHub's counts and nothing else.
-fn is_opening(message: &Message) -> bool {
-    message.id == 0
-        && message.statistics.is_some()
-        && message.available.is_empty()
-        && message.assigned.is_empty()
-        && message.started.is_empty()
-        && message.completed.is_empty()
+/// GitHub says an Actions runner took a job whose start the Runner did not hear: it is marked busy, and the start
+/// goes to whoever hears of jobs. Which job it was, GitHub's REST view does not say.
+fn start_unheard(
+    roster: &Roster,
+    events: Option<&Arc<dyn Events>>,
+    repo: &str,
+    scale_set_id: i64,
+    runner: &str,
+    now: SystemTime,
+) {
+    roster.mark_busy(
+        repo,
+        scale_set_id,
+        runner,
+        JobInfo {
+            repo: repo.to_string(),
+            name: String::new(),
+            workflow: String::new(),
+            run_id: 0,
+            started: now,
+        },
+    );
+    tracing::info!(%runner, "GitHub says the Actions runner took a job whose start was not heard");
+    if let Some(events) = events {
+        events.job(&JobEvent {
+            kind: EventKind::Started,
+            runner: runner.to_string(),
+            repo: repo.to_string(),
+            job: String::new(),
+            workflow: String::new(),
+            run_id: 0,
+            event: String::new(),
+            queued_at: None,
+            started_at: None,
+            at: OffsetDateTime::from(now),
+            result: String::new(),
+            out_of_memory: false,
+        });
+    }
 }
 
-impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
-    /// A session opened, and whatever the one before it left unread may be gone: GitHub may drop a session's pending
-    /// messages with it, and drops those queued while there is none (`docs/github-protocol.md`). Before anything else,
-    /// each Actions runner this scale set has here is held against GitHub's own record of it. One that has a job
-    /// started it; one GitHub no longer has ran its job to the end, as a one-job Actions runner unregisters itself
-    /// then. A start or end that came with the lost messages is thereby heard as the session opens. The end's result
-    /// came only with its message: the job's report waits for it as for any other, then goes without it.
-    async fn reconcile(&mut self) {
-        let (repo, set) = (self.config.repo.clone(), self.config.scale_set_id);
-        for runner in self.roster.runners(&repo, set) {
-            if runner.done.is_some() {
-                continue;
-            }
-            let busy = match self.registry.runner_busy(runner.runner_id).await {
-                Ok(busy) => busy,
-                Err(error) => {
-                    tracing::warn!(
-                        runner = %runner.name, %error,
-                        "GitHub could not say whether an Actions runner has a job; a start or end it lost with a session is heard only if it comes again"
-                    );
-                    continue;
-                }
-            };
-            if busy == Some(false) {
-                continue;
-            }
-            if !runner.busy {
-                let now = self.clock.now();
-                self.roster.mark_busy(
-                    &repo,
-                    set,
-                    &runner.name,
-                    JobInfo {
-                        repo: repo.clone(),
-                        name: String::new(),
-                        workflow: String::new(),
-                        run_id: 0,
-                        started: now,
-                    },
+/// Before a scale set's session opens: whatever the session before it left unread may be gone, since GitHub drops a
+/// session's pending messages with it and those queued while there is none (`docs/github-protocol.md`). Each Actions
+/// runner of the scale set that waits for a job here is held against GitHub's REST view of it, and one that is busy
+/// took a job whose start was not heard.
+///
+/// It runs before the session opens, so the counts the session opens with are from after every answer acted on here:
+/// a job that ends meanwhile is not in them (`docs/job-state.md`, rule 1). Only `busy: true` moves anything. An idle
+/// answer is one moment's, and one that the Actions runner is gone is left to its machine's end and the sweep, which
+/// know whether the Runner removed it itself.
+pub async fn reconcile<R: Registry>(
+    registry: &R,
+    roster: &Roster,
+    events: &Arc<dyn Events>,
+    repo: &str,
+    scale_set_id: i64,
+    clock: &dyn Clock,
+) {
+    for runner in roster.runners(repo, scale_set_id) {
+        if runner.busy || runner.done.is_some() {
+            continue;
+        }
+        match registry.runner_busy(runner.runner_id).await {
+            Ok(Some(true)) => start_unheard(
+                roster,
+                Some(events),
+                repo,
+                scale_set_id,
+                &runner.name,
+                clock.now(),
+            ),
+            Ok(Some(false) | None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    runner = %runner.name, %error,
+                    "GitHub could not say whether an Actions runner has a job; a start it lost with a session is heard when the machine ends"
                 );
-                tracing::info!(runner = %runner.name, "GitHub says the Actions runner took a job whose start was not heard");
-                if let Some(events) = &self.events {
-                    events.job(&JobEvent {
-                        kind: EventKind::Started,
-                        runner: runner.name.clone(),
-                        repo: repo.clone(),
-                        job: String::new(),
-                        workflow: String::new(),
-                        run_id: 0,
-                        event: String::new(),
-                        queued_at: None,
-                        started_at: None,
-                        at: self.now(),
-                        result: String::new(),
-                        out_of_memory: false,
-                    });
-                }
-            }
-            if busy.is_none() {
-                self.roster.mark_done(&repo, set, &runner.name, self.clock.now());
-                tracing::info!(runner = %runner.name, "GitHub no longer has the Actions runner: its job is over, though its end was not heard");
             }
         }
     }

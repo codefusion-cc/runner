@@ -11,15 +11,16 @@ use std::time::Duration;
 
 use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
-use cf_daemon::testing::{FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
+use cf_daemon::testing::{CrashingStore, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
-    Console, HostExtras, MemoryStore, Nudge, OutboxReports, Roster, Service, ServiceConfig, ServiceParts,
+    Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
+    ServiceConfig, ServiceParts,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
-use cf_ghapp::{Http, RetryPolicy};
+use cf_ghapp::{Clock as _, Http, RetryPolicy};
 use cf_host_macos::{Battery, FakeHost};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
@@ -36,6 +37,12 @@ struct Rig {
     github: FakeGithub,
     console: FakeConsole,
     parts: TestParts,
+    /// The Runner's wall clock, which the scalers read.
+    clock: Arc<TestClock>,
+    /// The records, at which the Runner can be made to die ([`Rig::crash_at`]).
+    store: Arc<CrashingStore>,
+    /// Whether the Runner died at a write: nothing it reports after that reaches the outbox.
+    dead: Arc<AtomicBool>,
     machines: Arc<TestMachines>,
     service: Arc<TestService>,
     outbox: Arc<Outbox>,
@@ -81,18 +88,23 @@ impl Rig {
         .expect("enrolled");
         let folder = tempfile::tempdir().expect("folder");
         let outbox = Arc::new(Outbox::open(folder.path().join("outbox.json"), OUTBOX_CAPACITY));
+        let clock = Arc::new(TestClock::default());
+        let store = Arc::new(CrashingStore::default());
+        let dead = Arc::new(AtomicBool::new(false));
         let parts = TestParts {
             vms: FakeVms::default(),
-            store: Arc::new(MemoryStore::default()),
+            store: store.clone(),
             roster: Arc::new(Roster::new()),
-            clock: Arc::new(TestClock::default()),
+            clock: clock.clone(),
             reports: Arc::new(ReportLog::default()),
             settings: settings_for(machines),
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
             bell: Arc::new(Nudge::default()),
         };
-        parts.reports.forward_to(Arc::new(OutboxReports(outbox.clone())));
+        parts
+            .reports
+            .forward_to(Arc::new(Gated(dead.clone(), OutboxReports(outbox.clone()))));
         let machines = parts.machines(None);
         let battery = Arc::new(Mutex::new(None));
         let mut rig = Rig {
@@ -108,6 +120,9 @@ impl Rig {
             github,
             console,
             parts,
+            clock,
+            store,
+            dead,
             machines,
             outbox,
             token: enrolled.token,
@@ -140,10 +155,20 @@ impl Rig {
         }
     }
 
-    /// The Runner's process dies and a new one starts: nothing is closed at GitHub, the vm-hosts go on.
+    /// The Runner's process dies and a new one starts: nothing is closed at GitHub, the vm-hosts go on. One that died
+    /// at a write already ([`Rig::crash_at`]) is only started again.
     async fn restart(&mut self) {
         self.stop_pump().await;
         self.service.kill();
+        if self.store.crashed() {
+            // The listeners end at their next wait; until then GitHub and the vm-hosts keep refusing them.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.parts.vms.fail_start(0);
+            self.parts.vms.ignore_stops(false);
+        }
+        self.store.revive();
+        self.dead.store(false, Ordering::Relaxed);
+        self.github.set_down(false);
         let host = self.machines.with_host(|host| host.clone());
         self.parts.roster = Arc::new(Roster::new());
         self.parts.bell = Arc::new(Nudge::default());
@@ -151,9 +176,10 @@ impl Rig {
             self.folder.path().join("outbox.json"),
             OUTBOX_CAPACITY,
         ));
-        self.parts
-            .reports
-            .forward_to(Arc::new(OutboxReports(self.outbox.clone())));
+        self.parts.reports.forward_to(Arc::new(Gated(
+            self.dead.clone(),
+            OutboxReports(self.outbox.clone()),
+        )));
         self.machines = self.parts.restored(host);
         self.service = Arc::new(service(
             &self.github,
@@ -166,6 +192,30 @@ impl Rig {
         ));
         pass(&self.machines, 61);
         self.pump();
+    }
+
+    /// The Runner dies at its `writes`th write from now, before or after it is `kept`: from that moment nothing it does
+    /// reaches GitHub, the vm-hosts or the console's outbox, as for a process that is gone.
+    fn crash_at(&self, writes: usize, kept: bool) {
+        let (dead, github, vms) = (self.dead.clone(), self.github.clone(), self.parts.vms.clone());
+        self.store.crash_at(writes, kept, move || {
+            dead.store(true, Ordering::Relaxed);
+            github.set_down(true);
+            vms.fail_start(usize::MAX);
+            vms.ignore_stops(true);
+        });
+    }
+
+    /// Time passes on the Runner's clock and on GitHub's alike.
+    fn later(&self, time: Duration) {
+        self.clock.advance(time);
+        let ahead = self
+            .clock
+            .now()
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        self.github
+            .set_clock_offset(i64::try_from(ahead.as_secs()).unwrap_or(i64::MAX));
     }
 
     /// Queues a job once the Mac's last two polls offered room, so GitHub hands it over at once.
@@ -226,6 +276,17 @@ impl Rig {
         until("no record", || self.parts.store.load().is_empty()).await;
         until("no report waits", || self.outbox.is_empty()).await;
         assert_eq!(self.parts.vms.files(), Vec::<String>::new());
+    }
+}
+
+/// Reports that reach the outbox while the Runner lives.
+struct Gated(Arc<AtomicBool>, OutboxReports);
+
+impl Reports for Gated {
+    fn job(&self, report: JobReport) {
+        if !self.0.load(Ordering::Relaxed) {
+            self.1.job(report);
+        }
     }
 }
 
@@ -1523,6 +1584,18 @@ enum Happens {
     AckFails(u8),
     /// The Runner's process dies and starts again.
     Restart,
+    /// The Runner dies at one of its next writes to its records, the write kept or lost with it, and starts again
+    /// at the next step: between any two of its stored steps.
+    Crash(u8, bool),
+    /// GitHub's REST view of Actions runners answers one read behind, or as it is.
+    RestStale(bool),
+    /// GitHub's REST view of Actions runners fails this many times, past the HTTP retries at most twice.
+    RestFails(u8),
+    /// Five minutes pass for GitHub and the Runner: an assignment no Actions runner took is taken back, and an idle
+    /// Actions runner is surplus.
+    FiveMinutes,
+    /// The Runner is uninstalled, whatever it is in the middle of. The last step.
+    Uninstall,
     /// Tens of milliseconds pass.
     Wait(u8),
 }
@@ -1548,6 +1621,11 @@ fn happens() -> impl Strategy<Value = Happens> {
             .prop_map(|(i, lost)| Happens::LostWith(i, lost)),
         1 => any::<u8>().prop_map(Happens::AckFails),
         1 => Just(Happens::Restart),
+        2 => (any::<u8>(), any::<bool>()).prop_map(|(at, kept)| Happens::Crash(at, kept)),
+        2 => any::<bool>().prop_map(Happens::RestStale),
+        2 => any::<u8>().prop_map(Happens::RestFails),
+        1 => Just(Happens::FiveMinutes),
+        1 => Just(Happens::Uninstall),
         3 => (1u8..30).prop_map(Happens::Wait),
     ]
 }
@@ -1571,16 +1649,24 @@ fn pick<T: Clone>(items: &[T], n: u8) -> Option<T> {
     (!items.is_empty()).then(|| items[usize::from(n) % items.len()].clone())
 }
 
-/// What happened to `jobs` that the Runner can be held to: the jobs it was ever assigned.
-fn assigned(rig: &Rig, jobs: &[i64], ours: &mut BTreeSet<i64>) {
-    for &job in jobs {
-        if matches!(
-            rig.github.job_state(job),
-            Some(JobState::Acquired(_) | JobState::Running(_))
-        ) {
-            ours.insert(job);
-        }
+/// The Runner died, or dies: it starts again, and opens every scale set's session anew.
+async fn start_again(rig: &mut Rig, sets: &[i64], causes: &mut [usize]) {
+    rig.restart().await;
+    for (at, set) in sets.iter().enumerate() {
+        rig.github.lose_session(*set);
+        causes[at] += 1;
     }
+    rig.service.discover().await;
+}
+
+/// Machines started may never outnumber the jobs GitHub handed to this Mac, each hand-out counted.
+fn one_machine_per_assignment(rig: &Rig) -> Result<(), TestCaseError> {
+    let (started, assigned) = (rig.parts.vms.started().len(), rig.github.assignments());
+    prop_assert!(
+        started <= assigned,
+        "{started} machines for {assigned} jobs handed to this Mac"
+    );
+    Ok(())
 }
 
 async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
@@ -1597,12 +1683,14 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     let short = rig.parts.settings.away.floor_bytes + (1 << 30);
     let sets: Vec<i64> = rig.github.scale_sets().iter().map(|s| s.id).collect();
     let mut jobs: Vec<i64> = vec![];
-    let mut ours = BTreeSet::new();
+    let mut uninstall = false;
     // The Actions runners that ran a job, and for each scale set what may open its session again.
     let mut ran = BTreeSet::new();
     let mut causes = vec![1usize; sets.len()];
     for step in script {
-        assigned(&rig, &jobs, &mut ours);
+        if rig.store.crashed() {
+            start_again(&mut rig, &sets, &mut causes).await;
+        }
         let running = |jobs: &[i64]| -> Vec<String> {
             rig.standing()
                 .into_iter()
@@ -1703,31 +1791,73 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                     causes[at] += 1;
                 }
             }
-            Happens::Restart => {
-                rig.restart().await;
-                for (at, set) in sets.iter().enumerate() {
-                    rig.github.lose_session(*set);
-                    causes[at] += 1;
+            Happens::Restart => start_again(&mut rig, &sets, &mut causes).await,
+            Happens::Crash(at, kept) => rig.crash_at(1 + usize::from(at % 8), kept),
+            Happens::RestStale(stale) => rig.github.set_rest_stale(stale),
+            Happens::RestFails(times) => {
+                for repo in [REPO, SECOND] {
+                    rig.github.fail(
+                        &format!("GET /repos/{repo}/actions/runners/"),
+                        Reply::status_json(502, &json!({"message": "bad gateway"})),
+                        1 + usize::from(times % 6),
+                    );
                 }
-                rig.service.discover().await;
             }
+            Happens::FiveMinutes => {
+                rig.github.pass(Duration::from_secs(301));
+                rig.later(Duration::from_secs(301));
+            }
+            Happens::Uninstall => uninstall = true,
             Happens::Wait(tens) => {
                 tokio::time::sleep(Duration::from_millis(u64::from(tens) * 10)).await;
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assigned(&rig, &jobs, &mut ours);
-        let started = rig.parts.vms.started().len();
-        prop_assert!(
-            started <= ours.len(),
-            "{started} machines for {} jobs assigned here",
-            ours.len()
-        );
+        one_machine_per_assignment(&rig)?;
         let opens = session_opens(&rig);
         prop_assert!(
             opens.iter().zip(&causes).all(|(opened, may)| opened <= may),
             "sessions opened {opens:?} times, with cause for {causes:?}"
         );
+        if uninstall {
+            break;
+        }
+    }
+    if rig.store.crashed() {
+        start_again(&mut rig, &sets, &mut causes).await;
+    }
+    // A crash that has not come does not come now.
+    rig.store.revive();
+
+    if uninstall {
+        // GitHub ends the jobs of Actions runners that went away, in its own time.
+        let github = rig.github.clone();
+        let all = jobs.clone();
+        let ends = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for job in all {
+                if let Some(JobState::Running(runner)) = github.job_state(job) {
+                    github.complete_job(&runner, "failed");
+                }
+            }
+        });
+        let left = rig.service.retire(Duration::from_secs(8), false).await;
+        ends.await.expect("GitHub ends the jobs");
+        prop_assert!(left.is_empty(), "the uninstall left {left:?}");
+        prop_assert!(
+            rig.github.runners().is_empty(),
+            "registrations left: {:?}",
+            rig.github.runners()
+        );
+        prop_assert!(
+            rig.parts.store.load().is_empty(),
+            "records left: {:?}",
+            rig.parts.store.load()
+        );
+        all_heard(&rig, &ran).await?;
+        rig.stop_pump().await;
+        rig.service.kill();
+        return Ok(());
     }
 
     // Room for every machine: what waits at GitHub moves at each of GitHub's looks, until the slots are full.
@@ -1740,7 +1870,6 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             .count()
     };
     loop {
-        assigned(&rig, &jobs, &mut ours);
         let (before, standing) = (waiting(&rig), rig.standing().len());
         if before == 0 || standing >= slots {
             break;
@@ -1758,29 +1887,26 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    let started = rig.parts.vms.started().len();
-    prop_assert!(
-        started <= ours.len(),
-        "{started} machines for {} jobs assigned here",
-        ours.len()
-    );
+    one_machine_per_assignment(&rig)?;
 
     // Every job that ran here is at the console, started and ended, however many of GitHub's messages were lost.
     for runner in running(&rig, &jobs) {
         rig.github.complete_job(&runner, "succeeded");
         rig.parts.vms.end(job_name(&runner), End::Ok);
     }
+    all_heard(&rig, &ran).await?;
+    rig.stop_pump().await;
+    rig.service.kill();
+    Ok(())
+}
+
+/// Every job that ran here reaches the console, its start and its end, each once.
+async fn all_heard(rig: &Rig, ran: &BTreeSet<String>) -> Result<(), TestCaseError> {
     let heard_from = std::time::Instant::now();
     loop {
-        let events = rig.events();
         let unheard: Vec<&String> = ran
             .iter()
-            .filter(|runner| {
-                !events.iter().any(|(id, _)| *id == format!("{runner}/started"))
-                    || !events
-                        .iter()
-                        .any(|(id, end)| *id == format!("{runner}/completed") && !end.is_null())
-            })
+            .filter(|runner| heard(rig, runner) != (true, true))
             .collect();
         if unheard.is_empty() {
             break;
@@ -1791,8 +1917,35 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    rig.stop_pump().await;
-    rig.service.kill();
+    let events = rig.events();
+    for (id, _) in &events {
+        prop_assert_eq!(
+            events.iter().filter(|(other, _)| other == id).count(),
+            1,
+            "{} reached the console twice",
+            id
+        );
+    }
+    let started: BTreeSet<&str> = events
+        .iter()
+        .filter_map(|(id, _)| id.strip_suffix("/started"))
+        .collect();
+    let ended: BTreeSet<&str> = events
+        .iter()
+        .filter_map(|(id, _)| id.strip_suffix("/completed"))
+        .collect();
+    prop_assert_eq!(
+        &started,
+        &ended,
+        "a start without its end, or an end without its start"
+    );
+    for runner in &started {
+        prop_assert!(
+            ran.contains(*runner),
+            "{} never ran a job, yet the console heard of one",
+            runner
+        );
+    }
     Ok(())
 }
 
@@ -1955,4 +2108,280 @@ async fn a_job_github_holds_back_for_ever_opens_no_session_again() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(rig.github.job_state(held), Some(JobState::Available));
     assert_eq!(session_opens(&rig), vec![1]);
+}
+
+/// Whether the console has the job's start, and its end, of this Actions runner.
+fn heard(rig: &Rig, runner: &str) -> (bool, bool) {
+    let events = rig.events();
+    (
+        events.iter().any(|(id, _)| *id == format!("{runner}/started")),
+        events
+            .iter()
+            .any(|(id, end)| *id == format!("{runner}/completed") && !end.is_null()),
+    )
+}
+
+/// Keeps the scale set's session from opening again, as a GitHub that is away for a while does.
+fn no_session_for_a_while(rig: &Rig, set: i64) {
+    rig.github.fail(
+        &format!("POST /svc/_apis/runtime/runnerscalesets/{set}/sessions"),
+        Reply::status_json(503, &json!({"message": "busy"})),
+        10_000,
+    );
+}
+
+/// GPT, scaler.rs:525: a session opens with counts that name a running job, and the job ends right after them: at
+/// the Runner's first look at GitHub once the session is open, the REST view or the first poll. The counts are from
+/// before the end: no second machine starts for a job that is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_that_ends_as_a_session_opens_gets_no_second_machine_from_the_opening_counts() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    until("the start at the console", || heard(&rig, &runner).0).await;
+    let set = rig.github.scale_sets()[0].id;
+    for first_look in [
+        "GET /repos/org/app/actions/runners/".to_string(),
+        format!("GET /svc/_apis/runtime/runnerscalesets/{set}/messages"),
+    ] {
+        let runner = runner.clone();
+        rig.github.before(&first_look, move |github| {
+            if github.scale_sets().iter().any(|s| s.has_session) {
+                github.complete_job(&runner, "succeeded");
+            }
+        });
+    }
+    rig.github.lose_session(set);
+    until("the job over at GitHub", || {
+        !rig.github.runners().contains(&runner)
+    })
+    .await;
+    until("a session again", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(rig.parts.vms.started().len(), 1, "one job, one machine");
+}
+
+/// GPT, scaler.rs:582: a job is cancelled before its Actions runner took it, the surplus Actions runner is removed
+/// at GitHub, and the Runner dies before the machine is gone. The Runner that starts next finds the registration
+/// gone: its own removal, not a job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surplus_removed_just_before_the_runner_died_is_not_taken_for_a_job_by_the_next() {
+    let mut rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let job = rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    rig.parts.vms.ignore_stops(true);
+    rig.parts.vms.unkillable(job_name(&runner), true);
+    rig.github.cancel_job(job);
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    until("the surplus registration removed", || {
+        rig.github.runners().is_empty()
+    })
+    .await;
+    let removals = |rig: &Rig| {
+        rig.github
+            .requests()
+            .iter()
+            .filter(|r| r.line.starts_with("DELETE") && r.line.contains("distributedtask/pools/0/agents/"))
+            .count()
+    };
+    let stops = |rig: &Rig| {
+        rig.parts
+            .vms
+            .stopped()
+            .iter()
+            .filter(|(job, ..)| *job == job_name(&runner))
+            .count()
+    };
+    until("the Runner's own stop, which the machine ignores", || {
+        stops(&rig) > 0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (removed_before, stopped_before) = (removals(&rig), stops(&rig));
+    rig.restart().await;
+    let set = rig.github.scale_sets()[0].id;
+    rig.github.lose_session(set);
+    rig.service.discover().await;
+    until("a session again", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    until(
+        "the next Runner to finish the removal it found written down",
+        || removals(&rig) > removed_before,
+    )
+    .await;
+    until("the machine stopped once its registration is gone", || {
+        stops(&rig) > stopped_before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(heard(&rig, &runner), (false, false), "no job ran there");
+    rig.parts.vms.ignore_stops(false);
+    rig.parts.vms.unkillable(job_name(&runner), false);
+    until("the surplus machine gone", || rig.standing().is_empty()).await;
+    until("no record", || rig.parts.store.load().is_empty()).await;
+    assert_eq!(heard(&rig, &runner), (false, false), "no job ran there");
+}
+
+/// GPT, service.rs:764: a job's start and end go with a session, its machine ends, and the REST view answers one
+/// read behind: idle, as registered. The registration is gone when the Runner removes it. The job ran, and the
+/// console hears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_idle_answer_does_not_hide_a_job_whose_messages_were_lost() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    let set = rig.github.scale_sets()[0].id;
+    rig.github.set_rest_stale(true);
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    rig.github.complete_job(&runner, "succeeded");
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the start and end at the console", || {
+        heard(&rig, &runner) == (true, true)
+    })
+    .await;
+}
+
+/// GPT, machines.rs:968: a job's start and end go with a session, its machine ends, and an uninstall begins before
+/// the Runner asked GitHub, whose REST view fails for a moment. The start the REST view then shows brings its end
+/// with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uninstall_that_finds_a_lost_job_reports_its_end_as_well_as_its_start() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    let set = rig.github.scale_sets()[0].id;
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    rig.github.complete_job(&runner, "succeeded");
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the machine to be gone", || rig.standing().is_empty()).await;
+    rig.github.fail(
+        "GET /repos/org/app/actions/runners/",
+        Reply::status_json(502, &json!({"message": "bad gateway"})),
+        PAST_RETRIES,
+    );
+    let left = rig.service.retire(Duration::from_secs(6), false).await;
+    assert_eq!(left, Vec::<String>::new());
+    assert_eq!(heard(&rig, &runner), (true, true), "{:?}", rig.events());
+}
+
+/// A job is cancelled before its Actions runner took it, and the surplus machine is removed and gone. Its guest came
+/// up and GitHub never said a word of a job, but the Runner removed it itself: GitHub is not asked about it once the
+/// wait is over, since its 404 is the Runner's own removal, and no job reaches the console.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surplus_removed_and_gone_is_never_taken_for_a_job_that_went_unheard() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let job = rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    rig.github.cancel_job(job);
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    until("the surplus machine gone", || rig.standing().is_empty()).await;
+    rig.later(RESULT_WAIT + Duration::from_secs(1));
+    until("no record", || rig.parts.store.load().is_empty()).await;
+    assert_eq!(heard(&rig, &runner), (false, false), "no job ran there");
+}
+
+/// A job's start and end go with a session and its machine ends. The REST view says idle twice, wrongly, and
+/// GitHub refuses to remove the Actions runner, since it still holds a job there: that refusal is a job, and the
+/// console hears its start and its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_github_refuses_for_a_job_is_a_job_whatever_the_rest_view_said() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    let set = rig.github.scale_sets()[0].id;
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    rig.github.fail(
+        "GET /repos/org/app/actions/runners/",
+        Reply::status_json(
+            200,
+            &json!({"id": 1, "name": runner, "busy": false, "status": "offline"}),
+        ),
+        10_000,
+    );
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the machine to be gone", || rig.standing().is_empty()).await;
+    for _ in 0..3 {
+        rig.later(RESULT_WAIT + Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    until("the start and end at the console", || {
+        heard(&rig, &runner) == (true, true)
+    })
+    .await;
+}
+
+/// A surplus Actions runner takes a job between the Runner's look at the REST view and its removal, and GitHub
+/// refuses the removal. The job is the Runner's to hear: its start reaches the console, a Runner that starts next
+/// leaves the machine to its job, and its end follows when the machine is done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surplus_that_takes_a_job_as_it_is_removed_keeps_its_machine_and_its_job() {
+    let mut rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let job = rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    rig.github.cancel_job(job);
+    rig.github.fail(
+        "distributedtask/pools/0/agents/",
+        Reply::status_json(422, &json!({"message": "the runner still has a job"})),
+        1,
+    );
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    until("the start at the console", || heard(&rig, &runner).0).await;
+    rig.restart().await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(rig.standing(), vec![runner.clone()], "the machine keeps its job");
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the machine to be gone", || rig.standing().is_empty()).await;
+    for _ in 0..3 {
+        rig.later(RESULT_WAIT + Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    until("the end at the console", || heard(&rig, &runner) == (true, true)).await;
+}
+
+/// A job's start goes with a session GitHub forgets, and its machine goes on with the job. When a session opens
+/// again, the console hears the start while the job runs, not only once its machine is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_lost_with_a_session_is_heard_when_the_next_one_opens() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    let set = rig.github.scale_sets()[0].id;
+    rig.github.fail(
+        &format!("POST /svc/_apis/runtime/runnerscalesets/{set}/sessions"),
+        Reply::status_json(503, &json!({"message": "busy"})),
+        2,
+    );
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    until("a session again", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    until("the start at the console", || heard(&rig, &runner).0).await;
+    assert_eq!(rig.standing(), vec![runner], "heard while the job runs");
 }

@@ -81,6 +81,8 @@ struct Job {
     display_name: String,
     run_id: i64,
     state: JobState,
+    /// When it was last handed to a scale set, on the queue's clock ([`State::queue_now`]).
+    assigned_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +211,18 @@ struct State {
     hooks: Vec<(String, Hook)>,
     log: Vec<Logged>,
     base: String,
+    /// How long a test let pass on the queue's clock beyond the real time ([`FakeGithub::pass`]).
+    passed: i64,
+    /// Every Actions runner ever registered, by ID, removed or not.
+    registered: HashMap<i64, Runner>,
+    /// Whether the REST view of an Actions runner answers one read behind ([`FakeGithub::set_rest_stale`]).
+    rest_stale: bool,
+    /// What the REST view of each Actions runner said at its last read: busy or not, `None` once removed.
+    rest_seen: HashMap<i64, Option<bool>>,
+    /// Whether every request is dropped unanswered and changes nothing ([`FakeGithub::set_down`]).
+    down: bool,
+    /// How often a job was handed to a scale set, the same job again after a take-back included.
+    assignments: usize,
 }
 
 struct Inner {
@@ -268,6 +282,11 @@ fn json_error(status: u16, kind: &str, message: &str) -> Reply {
 impl State {
     fn now(&self) -> i64 {
         epoch_now() + self.clock_offset
+    }
+
+    /// The clock of the queue's own timeouts: the real time plus what a test let pass.
+    fn queue_now(&self) -> i64 {
+        epoch_now() + self.passed
     }
 
     fn token(&mut self, prefix: &str) -> String {
@@ -396,6 +415,12 @@ impl FakeGithub {
                 hooks: vec![],
                 log: vec![],
                 base: String::new(),
+                passed: 0,
+                registered: HashMap::new(),
+                rest_stale: false,
+                rest_seen: HashMap::new(),
+                down: false,
+                assignments: 0,
             }),
             notify: Notify::new(),
         });
@@ -461,6 +486,30 @@ impl FakeGithub {
     /// Changes how long a long poll waits.
     pub fn set_poll_timeout(&self, timeout: Duration) {
         self.lock().opts.poll_timeout = timeout;
+    }
+
+    /// Lets time pass on the queue's clock: an assignment no Actions runner took within [`TAKE_BACK_AFTER`] is taken
+    /// back. Tokens and sessions keep the real time.
+    pub fn pass(&self, time: Duration) {
+        let mut st = self.lock();
+        st.passed += i64::try_from(time.as_secs()).unwrap_or(i64::MAX);
+        if take_back(&mut st) {
+            look_at_the_queue(&mut st);
+        }
+        drop(st);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Makes the REST view of an Actions runner answer one read behind: what the read before it saw, and for the
+    /// first read the view as the registration left it (registered, idle). Off, it answers what is true now.
+    pub fn set_rest_stale(&self, stale: bool) {
+        self.lock().rest_stale = stale;
+    }
+
+    /// Takes the fake down: every request is dropped unanswered and changes nothing, as for a client whose process
+    /// died. Up again with `false`.
+    pub fn set_down(&self, down: bool) {
+        self.lock().down = down;
     }
 
     // ---- faults and hooks ----
@@ -529,6 +578,7 @@ impl FakeGithub {
             display_name: display_name.to_string(),
             run_id: 7000 + st.next_job,
             state: JobState::Available,
+            assigned_at: 0,
         };
         let id = job.request_id;
         let sets = if st.opts.auto_assign {
@@ -554,7 +604,10 @@ impl FakeGithub {
     /// GitHub looks at its queue by itself, as it does at times nobody can predict: every scale set with a session
     /// gets the queued jobs its polls have room for.
     pub fn github_looks(&self) {
-        look_at_the_queue(&mut self.lock());
+        let mut st = self.lock();
+        take_back(&mut st);
+        look_at_the_queue(&mut st);
+        drop(st);
         self.inner.notify.notify_waiters();
     }
 
@@ -572,6 +625,9 @@ impl FakeGithub {
     /// The Actions runner with this name takes its job and starts it.
     pub fn start_job(&self, runner_name: &str) {
         let mut st = self.lock();
+        if take_back(&mut st) {
+            look_at_the_queue(&mut st);
+        }
         let Some(runner) = st.runners.iter().find(|r| r.name == runner_name).cloned() else {
             return;
         };
@@ -680,6 +736,12 @@ impl FakeGithub {
         })
     }
 
+    /// How often a job was handed to a scale set: once per job, and once more for each take-back that was handed out
+    /// again.
+    pub fn assignments(&self) -> usize {
+        self.lock().assignments
+    }
+
     /// A job's state.
     pub fn job_state(&self, request_id: i64) -> Option<JobState> {
         self.lock()
@@ -702,6 +764,9 @@ impl FakeGithub {
     // ---- the server ----
 
     async fn handle(&self, req: Request) -> Reply {
+        if self.lock().down {
+            return Reply::Drop;
+        }
         let line = req.line();
         let hook = {
             let mut st = self.lock();
@@ -844,17 +909,24 @@ impl FakeGithub {
                 let name = format!("{owner}/{repo}");
                 let id: i64 = id.parse().unwrap_or(0);
                 self.with_installation(&req, |st| {
-                    let runner = st.runners.iter().find(|r| {
-                        r.id == id && st.scale_sets.iter().any(|s| s.id == r.scale_set && s.repo == name)
+                    let Some(runner) = st
+                        .registered
+                        .get(&id)
+                        .filter(|r| st.scale_sets.iter().any(|s| s.id == r.scale_set && s.repo == name))
+                        .cloned()
+                    else {
+                        return Reply::status_json(404, &json!({"message": "Not Found"}));
+                    };
+                    let now = st.runners.iter().any(|r| r.id == id).then(|| {
+                        st.jobs
+                            .iter()
+                            .any(|j| matches!(&j.state, JobState::Running(n) if *n == runner.name))
                     });
-                    match runner {
-                        Some(r) => {
-                            let busy = st
-                                .jobs
-                                .iter()
-                                .any(|j| matches!(&j.state, JobState::Running(n) if *n == r.name));
-                            Reply::json(&json!({"id": r.id, "name": r.name, "status": "online", "busy": busy}))
-                        }
+                    let before = st.rest_seen.insert(id, now).unwrap_or(Some(false));
+                    match if st.rest_stale { before } else { now } {
+                        Some(busy) => Reply::json(
+                            &json!({"id": runner.id, "name": runner.name, "status": "online", "busy": busy}),
+                        ),
                         None => Reply::status_json(404, &json!({"message": "Not Found"})),
                     }
                 })
@@ -1122,6 +1194,34 @@ impl FakeGithub {
     }
 }
 
+/// How long GitHub leaves a job with a scale set whose Actions runner does not take it. Seen: probe J2 and the Mac
+/// mini at 18:57:52 (`docs/github-protocol.md`).
+pub const TAKE_BACK_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Takes back every assignment no Actions runner took within [`TAKE_BACK_AFTER`]: the scale set hears a
+/// `JobCompleted` `canceled` with no Actions runner, and the job waits in the queue again for GitHub's next look
+/// (inferred: in J2 it was assigned again at once with the job queued next). Says whether one was taken back; the
+/// caller looks at the queue then, as a take-back is a queue event.
+fn take_back(st: &mut State) -> bool {
+    let now = st.queue_now();
+    let after = i64::try_from(TAKE_BACK_AFTER.as_secs()).unwrap_or(i64::MAX);
+    let mut took = false;
+    for i in 0..st.jobs.len() {
+        let JobState::Acquired(set) = st.jobs[i].state else {
+            continue;
+        };
+        if now - st.jobs[i].assigned_at < after {
+            continue;
+        }
+        took = true;
+        st.jobs[i].state = JobState::Available;
+        let job = st.jobs[i].clone();
+        let msg = st.job_message("JobCompleted", &job, json!({"result": "canceled"}));
+        st.push(set, vec![msg]);
+    }
+    took
+}
+
 /// What the service does when something happens in its queue: every scale set with a session gets the queued jobs
 /// its newest poll has room for.
 fn look_at_the_queue(st: &mut State) {
@@ -1165,6 +1265,8 @@ fn assign(st: &mut State, id: i64) {
         }
         room -= 1;
         st.jobs[i].state = JobState::Acquired(id);
+        st.jobs[i].assigned_at = st.queue_now();
+        st.assignments += 1;
         let job = st.jobs[i].clone();
         let msg = st.job_message("JobAssigned", &job, json!({}));
         st.push(id, vec![msg]);
@@ -1371,6 +1473,8 @@ fn acquire_jobs(st: &mut State, id: i64, req: &Request) -> Reply {
         };
         if st.jobs[i].state == JobState::Available {
             st.jobs[i].state = JobState::Acquired(id);
+            st.jobs[i].assigned_at = st.queue_now();
+            st.assignments += 1;
             got.push(rid);
             let job = st.jobs[i].clone();
             let msg = st.job_message("JobAssigned", &job, json!({}));
@@ -1394,11 +1498,13 @@ fn generate_jit(st: &mut State, id: i64, req: &Request) -> Reply {
     }
     st.next_runner += 1;
     let rid = st.next_runner;
-    st.runners.push(Runner {
+    let runner = Runner {
         id: rid,
         name: name.clone(),
         scale_set: id,
-    });
+    };
+    st.registered.insert(rid, runner.clone());
+    st.runners.push(runner);
     Reply::json(&json!({
         "runner": {"id": rid, "name": name, "runnerScaleSetId": id},
         "encodedJITConfig": b64url(format!("jit-config-for-{name}").as_bytes()),

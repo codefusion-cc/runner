@@ -104,6 +104,11 @@ pub trait Hosts: Send + Sync {
     /// Whoever removes left-over registrations looks for it by name.
     fn registration_unsure(&self, name: &str);
 
+    /// The registration of that name is about to be removed at GitHub, for `why`. Written down before GitHub is asked
+    /// (`docs/job-state.md`): once it is, GitHub not having the registration says nothing of a job, here or in the
+    /// Runner that starts after this one.
+    fn removing(&self, name: &str, why: &str);
+
     /// Starts a machine for the Actions runner and returns its handle. After an error no machine stands and the
     /// slot is still the caller's: the host removed what it had begun before it answers. After a success the slot
     /// is the machine's, and goes back when the machine is gone.
@@ -139,6 +144,10 @@ impl<T: Hosts> Hosts for std::sync::Arc<T> {
 
     fn registration_unsure(&self, name: &str) {
         (**self).registration_unsure(name);
+    }
+
+    fn removing(&self, name: &str, why: &str) {
+        (**self).removing(name, why);
     }
 
     fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {

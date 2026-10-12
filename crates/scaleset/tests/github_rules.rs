@@ -111,3 +111,89 @@ async fn polls_with_room_assign_nothing_until_github_looks() {
     h.fake.github_looks();
     assert_eq!(h.fake.job_state(job), Some(JobState::Acquired(set.id)));
 }
+
+// Probe J2 and the Mac mini at 18:57:52: a job assigned to a scale set whose Actions runner never took it came back
+// after five minutes as `JobCompleted` `canceled`, and was handed out again.
+#[tokio::test]
+async fn an_assignment_no_actions_runner_takes_within_five_minutes_is_taken_back() {
+    let h = harness_with(honest(), fast(), Duration::from_secs(5)).await;
+    let (set, session) = with_session(&h).await;
+    session.poll(0, 1).await.unwrap();
+    session.poll(0, 1).await.unwrap();
+    let job = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    let assigned = session.poll(0, 0).await.unwrap().expect("the assignment");
+    assert_eq!(assigned.assigned.len(), 1);
+    session.poll(assigned.id, 0).await.unwrap();
+    let jit = h
+        .client
+        .generate_jit_config(set.id, "mac-a-late", "_work")
+        .await
+        .unwrap();
+
+    // The queue's clock is the wall clock plus what passed: a margin wide enough for a slow machine.
+    h.fake
+        .pass(cf_fake_github::TAKE_BACK_AFTER - Duration::from_secs(30));
+    assert_eq!(h.fake.job_state(job), Some(JobState::Acquired(set.id)), "not yet");
+    h.fake.pass(Duration::from_secs(30));
+    assert_eq!(
+        h.fake.job_state(job),
+        Some(JobState::Available),
+        "back in the queue: the polls offer no room for it"
+    );
+    let taken_back = session
+        .poll(assigned.id, 0)
+        .await
+        .unwrap()
+        .expect("the take-back");
+    assert_eq!(taken_back.completed.len(), 1);
+    assert_eq!(taken_back.completed[0].result, "canceled");
+    assert_eq!(
+        taken_back.completed[0].runner_name, "",
+        "no Actions runner had it"
+    );
+
+    h.fake.start_job(&jit.runner.name);
+    assert_eq!(
+        h.fake.job_state(job),
+        Some(JobState::Available),
+        "an Actions runner that comes late gets nothing"
+    );
+}
+
+// The REST view is a snapshot. The fake can answer one read behind, never from before the registration's answer.
+#[tokio::test]
+async fn a_stale_rest_view_answers_what_the_read_before_saw() {
+    let h = harness_with(honest(), fast(), Duration::from_secs(5)).await;
+    let (set, session) = with_session(&h).await;
+    session.poll(0, 1).await.unwrap();
+    session.poll(0, 1).await.unwrap();
+    h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    let jit = h
+        .client
+        .generate_jit_config(set.id, "mac-a-stale", "_work")
+        .await
+        .unwrap();
+    let id = jit.runner.id;
+    h.fake.start_job(&jit.runner.name);
+    h.fake.set_rest_stale(true);
+    assert_eq!(
+        h.client.runner_busy(id).await.unwrap(),
+        Some(false),
+        "as registered"
+    );
+    assert_eq!(h.client.runner_busy(id).await.unwrap(), Some(true));
+    h.fake.complete_job(&jit.runner.name, "succeeded");
+    assert_eq!(
+        h.client.runner_busy(id).await.unwrap(),
+        Some(true),
+        "one read behind"
+    );
+    assert_eq!(h.client.runner_busy(id).await.unwrap(), None);
+    h.fake.set_rest_stale(false);
+    assert_eq!(h.client.runner_busy(id).await.unwrap(), None);
+    assert_eq!(
+        h.client.runner_busy(9999).await.unwrap(),
+        None,
+        "never registered"
+    );
+}

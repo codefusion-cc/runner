@@ -139,6 +139,17 @@ pub trait Reports: Send + Sync {
     fn job(&self, report: JobReport);
 }
 
+/// What follows from GitHub's answer about a machine that is gone with no word of a job ([`Machines::asked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// A job ran: its start is reported, its end follows, and the registration may go.
+    Ran,
+    /// Idle, once: GitHub is asked again at a later sweep, and the registration stays until then.
+    AskAgain,
+    /// No job ran, and that is written down: the registration may go.
+    NoJob,
+}
+
 /// A registration at GitHub that has to go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
@@ -238,6 +249,9 @@ struct Job {
     unregister: bool,
     /// The end a restored slot is reported with, when its machine was not there any more.
     restored_end: Option<EndKind>,
+    /// GitHub's REST view said the Actions runner of this machine, gone with no word of a job, was idle: once more at a
+    /// later sweep, and it ran none ([`Machines::asked`]).
+    idle_seen: bool,
 }
 
 struct Inner<H> {
@@ -426,6 +440,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                         ended_at: Some(now.elapsed),
                         unregister: true,
                         restored_end: None,
+                        idle_seen: false,
                     },
                 );
                 self.settle(&mut inner, &name, now);
@@ -466,6 +481,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 }
                 None => EndKind::GuestLost,
             });
+            // The Runner before set out to remove its registration: what GitHub answers to that, the sweep hears,
+            // and the machine stops once the registration is gone.
+            let removing = alive && record.removing.is_some();
             if alive {
                 tracing::info!(runner = %record.runner, job = %name, "a machine of the Runner before was adopted");
                 self.roster.adopt(Runner {
@@ -478,7 +496,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     started: UNIX_EPOCH + Duration::from_secs(u64::try_from(record.created_at).unwrap_or(0)),
                     busy: record.github.is_some(),
                     adopted: true,
-                    done: None,
+                    done: removing.then(|| self.clock.now()),
+                    removing,
                     job: record.github.as_ref().map(|g| JobInfo {
                         repo: g.repo.clone(),
                         name: g.job.clone(),
@@ -502,8 +521,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     life,
                     last: state,
                     ended_at: None,
-                    unregister: false,
+                    unregister: removing,
                     restored_end,
+                    idle_seen: false,
                 },
             );
             self.apply(&mut inner, &name, now, effects);
@@ -936,8 +956,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let oom = job.record.oom;
         let runner = job.record.runner.clone();
         tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
-        let retired = self.roster.remove(&runner).is_some_and(|r| r.done.is_some());
-        job.record.ask_github = came_up && job.record.github.is_none() && !retired;
+        self.roster.remove(&runner);
+        job.record.ask_github = came_up && job.record.github.is_none() && job.record.removing.is_none();
         self.store.save(&job.record);
         self.vms.clean(name);
         if oom {
@@ -1025,9 +1045,39 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             .collect()
     }
 
-    /// GitHub no longer had the registration of a machine that is gone and never heard of a job: its one-job
-    /// Actions runner removed it, so a job ran there, and its start and end went with a session of GitHub's. The job
-    /// is reported as one whose end GitHub never told, by what the Mac knows of it.
+    /// What GitHub's REST view said of the Actions runner of a machine that is gone with no word of a job
+    /// ([`Registration::ask_github`]): busy, idle, or `None` for gone. Says what follows (`docs/job-state.md`).
+    ///
+    /// Busy means a job started. Gone means the same: the Runner never set out to remove this registration (it would
+    /// not be asked about otherwise), and a one-job Actions runner removes its own once its job is over. Idle is
+    /// evidence only for its moment, which may lie before the machine went: the job is reported as none only when
+    /// a second read, at a later sweep, says idle again, and that verdict is written down before the registration is
+    /// removed.
+    pub fn asked(&self, runner: &str, busy: Option<bool>) -> Verdict {
+        if busy != Some(false) {
+            self.ran_unheard(runner);
+            return Verdict::Ran;
+        }
+        let mut inner = self.lock();
+        let Some(job) = inner
+            .jobs
+            .get_mut(job_name(runner))
+            .filter(|job| job.record.runner == runner && job.record.ask_github)
+        else {
+            return Verdict::NoJob;
+        };
+        if !std::mem::replace(&mut job.idle_seen, true) {
+            return Verdict::AskAgain;
+        }
+        tracing::info!(%runner, "GitHub says twice that the Actions runner of a gone machine is idle: it ran no job");
+        job.record.ask_github = false;
+        job.record.removing = Some("no job".into());
+        self.store.save(&job.record);
+        Verdict::NoJob
+    }
+
+    /// GitHub says an Actions runner of a machine whose start nobody heard took a job: busy, gone by itself, or a
+    /// removal refused for its job. The job is reported as one whose end GitHub never told, by what the Mac knows.
     pub fn ran_unheard(&self, runner: &str) {
         let known = {
             let inner = self.lock();
@@ -1045,7 +1095,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let Some((repo, at)) = known else {
             return;
         };
-        tracing::info!(%runner, "GitHub no longer has the registration: its Actions runner ran a job whose start and end were not heard");
+        tracing::info!(%runner, "GitHub says the Actions runner ran a job whose start and end were not heard");
         Events::job(
             self,
             &JobEvent {
@@ -1077,7 +1127,12 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             && job.record.runner == runner
         {
             job.record.unregistered = true;
+            let stands = job.record.ended.is_none();
             self.store.save(&job.record);
+            // An Actions runner whose registration is gone takes no job: its machine has nothing left to wait for.
+            if stands {
+                self.feed(&mut inner, &name, now, Event::Stop);
+            }
             self.settle(&mut inner, &name, now);
         }
     }
@@ -1341,6 +1396,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: true,
             oom: false,
             ask_github: false,
+            removing: None,
         };
         self.store.save(&record);
         self.lock().intents.insert(name.to_string(), (record, false));
@@ -1355,6 +1411,18 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
     fn registration_unsure(&self, name: &str) {
         if let Some((_, stale)) = self.lock().intents.get_mut(name) {
             *stale = true;
+        }
+    }
+
+    fn removing(&self, name: &str, why: &str) {
+        let mut inner = self.lock();
+        if let Some(job) = inner
+            .jobs
+            .get_mut(job_name(name))
+            .filter(|job| job.record.runner == name)
+        {
+            job.record.removing = Some(why.to_string());
+            self.store.save(&job.record);
         }
     }
 
@@ -1434,6 +1502,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: false,
             oom: false,
             ask_github: false,
+            removing: None,
         };
         // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
         self.store.save(&record);
@@ -1460,6 +1529,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
                 ended_at: None,
                 unregister: false,
                 restored_end: None,
+                idle_seen: false,
             },
         );
         Ok(name)
@@ -1522,8 +1592,14 @@ impl<H: Host + Send, V: Vms> Events for Machines<H, V> {
             github.completed_at = Some(event.at.unix_timestamp());
             job.record.oom |= event.out_of_memory;
         }
+        // A start is evidence that beats an intent: a removal written down for an Actions runner that took a job is
+        // void (it is busy, so GitHub refused it or it never happened).
+        job.record.removing = None;
         if !job.record.start_reported {
             job.record.start_reported = true;
+            // Settled as having had no job, by a path that could not wait for GitHub (an uninstall): no completion went
+            // out, since one needs a reported start, so the end is reported once from here on.
+            job.record.end_reported &= job.record.ended.is_none();
             self.reports.job(JobReport {
                 id: format!("{}/started", job.record.runner),
                 kind: EventKind::Started,
