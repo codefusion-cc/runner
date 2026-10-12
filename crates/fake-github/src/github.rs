@@ -23,12 +23,25 @@ pub struct Options {
     pub admin_token_ttl: Duration,
     /// How long a session's message queue token lives.
     pub session_token_ttl: Duration,
-    /// Like the real service, assign queued jobs to scale sets by themselves: they arrive as `JobAssigned` and never
-    /// as `JobAvailable`. As the real service, it looks at its queue only when something happens there (a job is
-    /// queued, a job ends, a session takes its first poll), and then gives each scale set with a session as many
-    /// jobs as the newest poll's `x-scalesetmaxcapacity` leaves room for. A poll that brings more room assigns
-    /// nothing by itself: 2026-10-12 a Mac offered room for 13 minutes while 7 jobs it serves stayed queued, until
-    /// a new job was queued. Off, every job is only offered and has to be acquired.
+    /// Assign queued jobs to scale sets as the real service does, and never more kindly: they arrive as `JobAssigned`,
+    /// never as `JobAvailable`. Off, every job is only offered and has to be acquired. The rules, each beside what was
+    /// seen at GitHub (the probes ran 2026-10-12 against a throwaway repository, `docs/github-protocol.md`):
+    ///
+    /// - It looks at its queue when a job is queued, ends, is cancelled or is taken elsewhere. Seen: probes E, I and
+    ///   J2 (a job queued, or one GitHub took back, and waiting jobs were assigned within a second); the Mac mini's
+    ///   log at 18:52:50 (a job queued, a burst of assignments). That an end makes it look is inferred from the log.
+    /// - It looks at no other time unless a test says so ([`FakeGithub::github_looks`]). Seen: GitHub also looks by
+    ///   itself, sometimes within 30 s of room (probes J1, I2), sometimes after 2.5 minutes (A, G), sometimes not in
+    ///   3 minutes (J2, J3), and not for 13 minutes on the mini (18:39 to 18:52). Nothing the Runner does makes it
+    ///   look: not a session opened (probes E, F), not a scale set updated (I1), not an Actions runner registered
+    ///   (J1 to J3).
+    /// - It gives each scale set with a session as many jobs as the smaller room of its last two polls' `x-scalesetmaxcapacity`
+    ///   leaves. Seen: probe E assigned against the poll before the newest, probe J1 against the newest alone; the
+    ///   smaller is no kinder than either. Inferred: which poll GitHub reads.
+    /// - The counts never name a job it holds: `totalAvailableJobs` stays 0. Seen: every count in every probe.
+    /// - A session that ends, or that it forgets, takes its pending messages with it. Seen: probe D kept one across
+    ///   a session's end. Kinder than the fake, which does not; the Runner must not lean on it.
+    /// - A refresh of a session (`PATCH`) brings no counts. Seen: probe C (`"statistics": null`).
     pub auto_assign: bool,
 }
 
@@ -99,10 +112,10 @@ struct ScaleSet {
     /// How many polls came for it. Only the newest is served: the one before it was given up by its listener,
     /// whose closed connection ends it at the service, and offers nothing any more.
     polls: u64,
-    /// The room the newest poll said the scale set has, which the service assigns against.
+    /// The room the newest poll said the scale set has.
     capacity: Option<usize>,
-    /// A session opened and has not polled yet: its first poll makes the service look at the queue.
-    fresh: bool,
+    /// The room the poll before it said: the service assigns against the smaller.
+    previous_capacity: Option<usize>,
     deleted: bool,
 }
 
@@ -174,8 +187,6 @@ struct Stats {
 struct State {
     opts: Options,
     /// Whether a session's first poll makes the service look at its queue; see
-    /// [`FakeGithub::set_assign_at_session_open`].
-    assign_at_session_open: bool,
     clock_offset: i64,
     next: u32,
     repos: BTreeMap<String, Repo>,
@@ -275,7 +286,9 @@ impl State {
         let mut s = Stats::default();
         for job in &self.jobs {
             match &job.state {
-                JobState::Available if matches(&set.labels, &job.labels) && job.repo == set.repo => {
+                JobState::Available
+                    if !self.opts.auto_assign && matches(&set.labels, &job.labels) && job.repo == set.repo =>
+                {
                     s.available += 1
                 }
                 JobState::Acquired(sid) if *sid == id => s.assigned += 1,
@@ -305,11 +318,15 @@ impl State {
         })
     }
 
+    /// Queues a message for the scale set's session. With no session there is nobody to keep it for: it is lost, as
+    /// a session's pending messages are when it ends.
     fn push(&mut self, set_id: i64, batch: Vec<Value>) {
         if let Some(set) = self.scale_set(set_id) {
             set.next_message += 1;
             let id = set.next_message;
-            set.queue.push_back(Msg { id, batch });
+            if set.session.is_some() {
+                set.queue.push_back(Msg { id, batch });
+            }
         }
     }
 
@@ -359,7 +376,6 @@ impl FakeGithub {
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 opts,
-                assign_at_session_open: true,
                 clock_offset: 0,
                 next: 0,
                 repos: BTreeMap::new(),
@@ -445,13 +461,6 @@ impl FakeGithub {
         self.lock().opts.poll_timeout = timeout;
     }
 
-    /// Whether a new session's first poll makes the service look at its queue (on at the start). The 2026-10-12
-    /// logs show a job assigned a second after its scale set's session opened, nothing more: off is the service
-    /// that does not, which a session opened again then cannot move.
-    pub fn set_assign_at_session_open(&self, on: bool) {
-        self.lock().assign_at_session_open = on;
-    }
-
     // ---- faults and hooks ----
 
     /// Answers the next `times` requests whose `METHOD path` contains `matcher` with `reply`, before anything else.
@@ -496,10 +505,11 @@ impl FakeGithub {
         }
     }
 
-    /// Forgets a scale set's session on the service: the next poll finds none.
+    /// Forgets a scale set's session on the service, with its pending messages: the next poll finds none.
     pub fn lose_session(&self, scale_set: i64) {
         if let Some(s) = self.lock().scale_set(scale_set) {
             s.session = None;
+            s.queue.clear();
         }
         self.inner.notify.notify_waiters();
     }
@@ -537,6 +547,13 @@ impl FakeGithub {
         drop(st);
         self.inner.notify.notify_waiters();
         id
+    }
+
+    /// GitHub looks at its queue by itself, as it does at times nobody can predict: every scale set with a session
+    /// gets the queued jobs its polls have room for.
+    pub fn github_looks(&self) {
+        look_at_the_queue(&mut self.lock());
+        self.inner.notify.notify_waiters();
     }
 
     /// Another Actions runner takes the job before this one's scale sets do.
@@ -922,6 +939,7 @@ impl FakeGithub {
                     return self.admin(&bearer, |st, _| match st.scale_set(id) {
                         Some(s) if s.session.as_ref().is_some_and(|x| x.id == sid) => {
                             s.session = None;
+                            s.queue.clear();
                             Reply::empty(204)
                         }
                         _ => json_error(404, "SessionNotFoundException", "session not found"),
@@ -1028,14 +1046,10 @@ impl FakeGithub {
             let mine = st.scale_set(id).map(|set| {
                 set.polls += 1;
                 if authorized {
-                    set.capacity = capacity;
+                    set.previous_capacity = std::mem::replace(&mut set.capacity, capacity);
                 }
                 set.polls
             });
-            let fresh = authorized && st.scale_set(id).is_some_and(|set| std::mem::take(&mut set.fresh));
-            if fresh && st.assign_at_session_open {
-                assign(&mut st, id);
-            }
             mine
         };
         loop {
@@ -1096,9 +1110,13 @@ fn assign(st: &mut State, id: i64) {
         return;
     };
     let (labels, repo) = (set.labels.clone(), set.repo.clone());
-    let Some(capacity) = set.capacity.filter(|_| set.session.is_some()) else {
+    let (Some(newest), Some(before)) = (set.capacity, set.previous_capacity) else {
         return;
     };
+    if set.session.is_none() {
+        return;
+    }
+    let capacity = newest.min(before);
     let mut room = capacity.saturating_sub(st.stats(id).assigned);
     let wanted: Vec<usize> = (0..st.jobs.len())
         .filter(|&i| {
@@ -1224,7 +1242,7 @@ fn create_scale_set(st: &mut State, req: &Request, repo: &str) -> Reply {
         next_message: 0,
         polls: 0,
         capacity: None,
-        fresh: false,
+        previous_capacity: None,
         deleted: false,
     });
     let s = st.scale_sets.last().expect("just pushed");
@@ -1250,11 +1268,13 @@ fn update_scale_set(st: &mut State, id: i64, req: &Request) -> Reply {
     }
 }
 
-fn session_json(st: &State, set_id: i64, s: &Session) -> Value {
+/// A session as the service sends it. Only an opening brings the counts.
+fn session_json(st: &State, set_id: i64, s: &Session, opening: bool) -> Value {
     json!({
         "sessionId": s.id, "ownerName": s.owner,
         "messageQueueUrl": st.queue_at.clone().unwrap_or_else(|| format!("{}/svc/_apis/runtime/runnerscalesets/{}/messages", st.base, set_id)),
-        "messageQueueAccessToken": s.token, "statistics": st.stats_json(set_id),
+        "messageQueueAccessToken": s.token,
+        "statistics": if opening { st.stats_json(set_id) } else { Value::Null },
     })
 }
 
@@ -1284,8 +1304,8 @@ fn create_session(st: &mut State, id: i64, req: &Request) -> Reply {
     };
     set.session = Some(session.clone());
     set.capacity = None;
-    set.fresh = true;
-    Reply::json(&session_json(st, id, &session))
+    set.previous_capacity = None;
+    Reply::json(&session_json(st, id, &session, true))
 }
 
 fn refresh_session(st: &mut State, id: i64, sid: &str) -> Reply {
@@ -1301,7 +1321,7 @@ fn refresh_session(st: &mut State, id: i64, sid: &str) -> Reply {
             s.expired = false;
             s.expires_at = now + ttl;
             let s = s.clone();
-            Reply::json(&session_json(st, id, &s))
+            Reply::json(&session_json(st, id, &s, false))
         }
         _ => json_error(404, "SessionNotFoundException", "session not found"),
     }

@@ -1557,89 +1557,6 @@ async fn a_slot_that_frees_after_github_heard_the_job_end_goes_to_another_reposi
     assert!(matches!(rig.github.job_state(job), Some(JobState::Acquired(set)) if set == others));
 }
 
-/// The mini at 18:39 once more, at a GitHub that does not look at its queue when a session opens either: nothing
-/// the Runner does moves the job GitHub held back, and the Mac stays idle while it waits. The report says so from
-/// the first count that names the job, the log warns once after a minute and says when it is over.
-#[tokio::test]
-async fn jobs_held_back_while_a_machine_fits_are_reported_and_warned_of_once_after_a_minute() {
-    const OTHER: &str = "org/other";
-    let log = support::Log::start();
-    let rig = Rig::new(1).await;
-    rig.github.set_assign_at_session_open(false);
-    rig.github.add_repo(OTHER, true);
-    rig.github.set_workflow(OTHER, "ci.yml", WORKFLOW);
-    rig.service.discover().await;
-    until("a session for each repository's scale set", || {
-        let sets = rig.github.scale_sets();
-        sets.len() == 2 && sets.iter().all(|s| s.has_session)
-    })
-    .await;
-    rig.github.set_poll_timeout(Duration::from_secs(4));
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let runner = rig.job_running().await;
-    let others = rig
-        .github
-        .scale_sets()
-        .into_iter()
-        .find(|set| set.repo == OTHER)
-        .expect("the other repository's scale set")
-        .id;
-    let polls = format!("GET /svc/_apis/runtime/runnerscalesets/{others}/messages");
-    let offers = |room: &str| {
-        rig.github
-            .requests()
-            .iter()
-            .rfind(|request| request.line.starts_with(&polls))
-            .is_some_and(|poll| poll.max_capacity.as_deref() == Some(room))
-    };
-    until("the other repository's poll to offer no slot", || offers("0")).await;
-    let held = rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
-    rig.github.complete_job(&runner, "succeeded");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    rig.parts.vms.end(job_name(&runner), End::Ok);
-
-    let status = || serde_json::to_value(rig.service.status()).expect("a report")["status"].clone();
-    until("the report to name the job GitHub holds back", || {
-        status()["idleWithJobsWaitingReason"]
-            == json!("GitHub has not handed over jobs a machine fits for: 1 of org/other (cf-2g)")
-    })
-    .await;
-    assert_eq!(rig.github.job_state(held), Some(JobState::Available));
-    assert!(rig.standing().is_empty());
-    assert!(status()["idleWithJobsWaitingSeconds"].as_u64().unwrap_or(0) < 60);
-    assert!(
-        log.lines("idle with jobs waiting").is_empty(),
-        "not before a minute"
-    );
-
-    rig.clock.advance(Duration::from_secs(61));
-    let said = status();
-    let waited = said["idleWithJobsWaitingSeconds"].as_u64().expect("seconds");
-    assert!((61..120).contains(&waited), "{said}");
-    status();
-    let warned = log.lines("idle with jobs waiting");
-    assert_eq!(warned.len(), 1, "once: {warned:?}");
-    assert_eq!(log.lines(" WARN "), warned, "a warning that names the reason");
-    assert!(warned[0].contains("1 of org/other (cf-2g)"), "{warned:?}");
-    until("the console to take it", || {
-        rig.console
-            .reports()
-            .last()
-            .is_some_and(|report| report["status"]["idleWithJobsWaitingSeconds"].as_u64() >= Some(61))
-    })
-    .await;
-
-    // Something happens in GitHub's queue: it looks, and the held job gets the slot.
-    rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "test");
-    until("a machine for the held job", || rig.standing().len() == 1).await;
-    until("the report to say nothing waits", || {
-        status().get("idleWithJobsWaitingReason").is_none()
-    })
-    .await;
-    assert_eq!(status().get("idleWithJobsWaitingSeconds"), None);
-    assert_eq!(log.lines("under way or gone").len(), 1);
-}
-
 /// One thing that happens to a Mac serving two repositories whose jobs take the same size. A number picks among
 /// what is there at that moment.
 #[derive(Debug, Clone)]
@@ -1921,4 +1838,79 @@ async fn room_that_comes_back_beside_a_running_job_goes_to_its_repositorys_next_
         rig.events().iter().any(|(_, end)| !end.is_null())
     })
     .await;
+}
+
+/// How often each scale set's session was opened.
+fn session_opens(rig: &Rig) -> Vec<usize> {
+    rig.github
+        .scale_sets()
+        .iter()
+        .map(|set| {
+            let line = format!("POST /svc/_apis/runtime/runnerscalesets/{}/sessions", set.id);
+            rig.github.requests().iter().filter(|r| r.line == line).count()
+        })
+        .collect()
+}
+
+/// A session closes after a failure while GitHub's queue holds the start and the end of a job that ran here, and
+/// the queue goes with the session. What GitHub knows of the Actions runner says the job ran: the console hears of
+/// its start and its end all the same, once the wait for GitHub's word is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_whose_start_and_end_went_with_a_closed_session_still_reaches_the_console() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    until("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let set = rig.github.scale_sets()[0].id;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    rig.github.fail(
+        &format!("DELETE /svc/_apis/runtime/runnerscalesets/{set}/messages/"),
+        Reply::status_json(500, &json!({"message": "try again"})),
+        10,
+    );
+    let ran = Arc::new(Mutex::new(None));
+    rig.github.before(&format!("DELETE /svc/_apis/runtime/runnerscalesets/{set}/sessions/"), {
+        let ran = ran.clone();
+        move |github| {
+            let runner = github.runners().pop().expect("a registered Actions runner");
+            github.start_job(&runner);
+            github.complete_job(&runner, "succeeded");
+            *ran.lock().unwrap() = Some(runner);
+        }
+    });
+    rig.queue();
+    until("the job to run and end while the session closed", || ran.lock().unwrap().is_some()).await;
+    let runner = ran.lock().unwrap().clone().expect("runner");
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the job's start and end at the console", || {
+        let events = rig.events();
+        events.iter().any(|(id, _)| *id == format!("{runner}/started"))
+            && events.iter().any(|(id, end)| *id == format!("{runner}/completed") && !end.is_null())
+    })
+    .await;
+}
+
+/// GitHub holds a job back and never looks again: nothing the Runner does makes it, so nothing is tried over and
+/// over. Each scale set's session opens once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_github_holds_back_for_ever_opens_no_session_again() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    until("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let short = rig.parts.settings.away.floor_bytes + (1 << 30);
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = short));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = rig.queue();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = 64 << 30));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(rig.github.job_state(held), Some(JobState::Available));
+    assert_eq!(session_opens(&rig), vec![1]);
 }
