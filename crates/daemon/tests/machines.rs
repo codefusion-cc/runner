@@ -1198,9 +1198,15 @@ fn room_that_went_or_came_back_with_the_macs_memory_is_told_at_the_next_look_and
     );
 
     // Memory that comes and goes ends the polls every five seconds at most.
+    assert_eq!(
+        w.m.open_slots(SIZE),
+        2,
+        "the listeners asked again and offer the room"
+    );
     set(short);
     pass(&w.m, 1);
     assert_eq!(nudges(&w), before + 3);
+    assert_eq!(w.m.open_slots(SIZE), 0);
     set(64 * GIB);
     pass(&w.m, 4);
     assert_eq!(
@@ -1212,6 +1218,7 @@ fn room_that_went_or_came_back_with_the_macs_memory_is_told_at_the_next_look_and
     assert_eq!(nudges(&w), before + 4, "and then");
 
     // Room that went and came back within the wait is what the listeners heard: nothing is owed for it.
+    assert_eq!(w.m.open_slots(SIZE), 2);
     set(short);
     pass(&w.m, 2);
     set(64 * GIB);
@@ -1284,4 +1291,129 @@ fn a_mac_its_own_machines_fill_and_a_closed_mac_are_not_said_to_be_short_of_memo
     assert_eq!(w.m.open_slots(SIZE), 0);
     assert_eq!(w.m.short_of(SIZE), None, "closed: the Mac says why itself");
     assert_eq!(log.lines("of this size"), Vec::<String>::new());
+}
+
+#[test]
+fn room_one_listener_heard_is_gone_is_still_told_to_those_whose_polls_offer_it() {
+    // Many scale sets of one size share the Mac, each with a poll of its own. One that asks again in the wait
+    // after the listeners were last told hears what is true now; that must not pass for what the others heard.
+    let w = World::new(2);
+    let short = memory_for_no_machine(&w);
+    let set = |bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
+    assert_eq!(w.m.open_slots(SIZE), 2);
+    let before = nudges(&w);
+    set(short);
+    pass(&w.m, 1);
+    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(
+        w.m.open_slots(SIZE),
+        0,
+        "every listener asks again and offers nothing"
+    );
+
+    // Room comes back within the wait, and one listener, whose poll ended by itself, hears of it.
+    set(64 * GIB);
+    pass(&w.m, 1);
+    assert_eq!(
+        nudges(&w),
+        before + 1,
+        "within five seconds of the last time: not yet"
+    );
+    assert_eq!(w.m.open_slots(SIZE), 2);
+    pass(&w.m, 4);
+    assert_eq!(
+        nudges(&w),
+        before + 2,
+        "the others still offer nothing while there is room: they are told"
+    );
+    assert_eq!(
+        w.m.open_slots(SIZE),
+        2,
+        "every listener asks again and offers the room"
+    );
+
+    // The same with room that goes: the others still offer a slot that is gone, and a job GitHub assigns to it
+    // waits in line here.
+    set(short);
+    pass(&w.m, 1);
+    assert_eq!(
+        nudges(&w),
+        before + 2,
+        "within five seconds of the last time: not yet"
+    );
+    assert_eq!(
+        w.m.open_slots(SIZE),
+        0,
+        "one listener asks and hears that the room is gone"
+    );
+    pass(&w.m, 4);
+    assert_eq!(
+        nudges(&w),
+        before + 3,
+        "the others still offer the slot: they are told"
+    );
+    assert_eq!(w.m.open_slots(SIZE), 0);
+    pass(&w.m, 10);
+    assert_eq!(nudges(&w), before + 3, "and once");
+}
+
+#[test]
+fn a_bell_rung_for_another_reason_leaves_nothing_owed_to_the_listeners() {
+    // A slot given back rings every bell: each listener asks again, and what it heard before counts no more. A
+    // look must not ring again for it.
+    let w = World::new(1);
+    assert_eq!(w.m.open_slots(SIZE), 1);
+    let ticket = w.m.reserve(SIZE).expect("a slot");
+    assert_eq!(w.m.open_slots(SIZE), 0);
+    let before = nudges(&w);
+    w.m.release(ticket);
+    assert_eq!(nudges(&w), before + 1, "the slot is back: the listeners are told");
+    assert_eq!(w.m.open_slots(SIZE), 1);
+    pass(&w.m, 10);
+    assert_eq!(
+        nudges(&w),
+        before + 1,
+        "they heard of it: no look tells them again"
+    );
+}
+
+#[tokio::test]
+async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it() {
+    // One machine runs and the Mac's memory carries no second, although its cap would: that is a Mac full of its
+    // own machines, which are there to see, and not one whose other programs leave no room.
+    let mut w = World::new(2);
+    let log = Log::start();
+    let floor = w.parts.settings.away.floor_bytes;
+    let machine = w.parts.settings.host_bytes(SIZE);
+    let set = |w: &World, bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
+    let runner = w.running().await;
+    // What is still to come for the machine that runs, and the floor, leave a second one a gigabyte too little.
+    set(&w, floor + machine + GIB);
+    pass(&w.m, 1);
+    assert_eq!(w.m.open_slots(SIZE), 0);
+    assert_eq!(w.m.room(SIZE), 0);
+    assert_eq!(
+        w.m.short_of(SIZE),
+        None,
+        "without its own machine a second would fit"
+    );
+    // The machine has taken most of its memory from the Mac: the same holds.
+    let held = 1536 * MIB;
+    w.parts.vms.usage(job_name(&runner), held, 0);
+    set(&w, floor + machine + GIB - held);
+    pass(&w.m, 2);
+    assert_eq!(w.m.open_slots(SIZE), 0);
+    assert_eq!(
+        w.m.short_of(SIZE),
+        None,
+        "what its own machine holds is not what else runs on the Mac"
+    );
+    assert_eq!(log.lines("of this size"), Vec::<String>::new());
+
+    // The Mac's other programs take more: with what the machine holds given back, no machine would fit now.
+    set(&w, floor + 256 * MIB);
+    pass(&w.m, 1);
+    assert_eq!(w.m.open_slots(SIZE), 0);
+    assert_eq!(w.m.short_of(SIZE), Some("memory"));
+    assert_eq!(log.lines("of this size").len(), 1);
 }
