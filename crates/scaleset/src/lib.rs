@@ -17,8 +17,8 @@ mod types;
 pub use client::{ACTIONS_HOST, ScaleSetClient};
 pub use error::Error;
 pub use listener::{
-    Backoff, Look, MAX_RETRY_AFTER, SESSION_EXISTS_WAIT, Scaler, Shutdown, ShutdownTrigger, listen,
-    listen_nudged, shutdown, supervise,
+    Backoff, MAX_RETRY_AFTER, SESSION_EXISTS_WAIT, Scaler, Shutdown, ShutdownTrigger, listen, listen_nudged,
+    shutdown, supervise,
 };
 pub use session::MessageSession;
 pub use types::{

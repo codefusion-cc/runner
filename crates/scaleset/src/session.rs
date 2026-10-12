@@ -20,7 +20,6 @@ struct State {
 struct Inner {
     client: ScaleSetClient,
     scale_set_id: i64,
-    owner: String,
     initial: Statistics,
     state: Mutex<State>,
 }
@@ -56,17 +55,11 @@ fn lost(error: Error) -> Error {
 }
 
 impl MessageSession {
-    pub(crate) fn new(
-        client: ScaleSetClient,
-        scale_set_id: i64,
-        owner: &str,
-        info: SessionInfo,
-    ) -> MessageSession {
+    pub(crate) fn new(client: ScaleSetClient, scale_set_id: i64, info: SessionInfo) -> MessageSession {
         MessageSession {
             inner: Arc::new(Inner {
                 client,
                 scale_set_id,
-                owner: owner.to_string(),
                 initial: info.statistics.unwrap_or_default(),
                 state: Mutex::new(State {
                     session_id: info.session_id,
@@ -92,7 +85,7 @@ impl MessageSession {
         (s.session_id.clone(), s.queue_url.clone(), s.token.clone())
     }
 
-    async fn refresh(&self) -> Result<Option<Statistics>, Error> {
+    async fn refresh(&self) -> Result<(), Error> {
         let (session_id, _, _) = self.snapshot();
         let info = self
             .inner
@@ -104,14 +97,7 @@ impl MessageSession {
         if !info.message_queue_url.is_empty() {
             s.queue_url = info.message_queue_url;
         }
-        Ok(info.statistics)
-    }
-
-    /// The scale set's counts now, when the service gives them. They otherwise come only with a message: a scale
-    /// set the service sends nothing keeps the counts of its last one, and a job another machine took since is still
-    /// counted. The session and its queue stay; its token is a new one.
-    pub async fn recount(&self) -> Result<Option<Statistics>, Error> {
-        self.refresh().await
+        Ok(())
     }
 
     /// Sends the request `url` names for the session as it is now. A token the service refuses is replaced once and
@@ -209,31 +195,6 @@ impl MessageSession {
             }
         }
         Ok(got)
-    }
-
-    /// Ends the session at the service and opens a new one in its place, which every clone uses from then on.
-    /// Returns the scale set's counts at the new session's start. The service looks at its queued jobs when a session
-    /// opens, and not when a poll offers more room than the one before, so this is how a scale set that got room
-    /// while nothing happened at GitHub gets its queued jobs. What the old session's queue still held is lost: the
-    /// counts say what is assigned. A session the service no longer has is no error here.
-    pub async fn reopen(&self) -> Result<Statistics, Error> {
-        match self.close().await {
-            Ok(()) => {}
-            Err(error) if error.status() == Some(404) => {}
-            Err(error) => return Err(error),
-        }
-        let fresh = self
-            .inner
-            .client
-            .open_session(self.inner.scale_set_id, &self.inner.owner)
-            .await?;
-        let (session_id, queue_url, token) = fresh.snapshot();
-        *self.inner.state.lock().expect("session state") = State {
-            session_id,
-            queue_url,
-            token,
-        };
-        Ok(fresh.initial_statistics())
     }
 
     /// Ends the session on the service, so the next one of this machine opens without waiting for this one to

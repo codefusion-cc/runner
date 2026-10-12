@@ -15,29 +15,6 @@ pub trait Scaler: Send {
     /// sends it again. Returns how many Actions runners the machine would take now, which the next wait carries to the
     /// service. An error ends the session without acknowledging the message.
     fn scale(&mut self, message: Option<&Message>) -> impl Future<Output = Result<usize, Error>> + Send;
-
-    /// Whether the session is to be opened again or the counts fetched, asked after every [`Scaler::scale`]:
-    /// `Some((ZERO, look))` now, `Some((d, look))` in `d` unless the scaler is asked again before, `None` neither.
-    /// The service looks at a scale set's queued jobs when a job is queued or ends and when a session opens, never
-    /// because a wait carries more room than the one before: room that came while nothing happened at GitHub
-    /// reaches its queued jobs only through a new session. What a look brings comes to [`Scaler::scale`] as a
-    /// message with only `statistics`; a scaler that keeps saying `Some((ZERO, _))` is asked again after it.
-    fn renew(&mut self) -> Option<(Duration, Look)> {
-        None
-    }
-}
-
-/// What a [`Scaler`] asks of the session besides its next message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Look {
-    /// End the session and open a new one: the service looks at the scale set's queued jobs. What the old session's
-    /// queue still held is lost.
-    Reopen,
-    /// [`Look::Reopen`], once a wait ended by itself and brought nothing: the queue was empty then, and the messages
-    /// of a job that runs (its start, its end) are not lost with it.
-    ReopenBetweenMessages,
-    /// Fetch the scale set's counts, which otherwise come only with a message; the session and its queue stay.
-    Recount,
 }
 
 /// Asks [`listen`] and [`supervise`] to stop.
@@ -101,52 +78,18 @@ pub async fn listen_nudged(
         .scale(Some(&Message::initial(session.initial_statistics())))
         .await?;
     let mut handled = 0i64;
-    // The last wait ran out by itself and brought nothing.
-    let mut quiet = false;
     loop {
         if stop.is_set() {
             return Ok(());
         }
-        let renew_at = match scaler.renew() {
-            Some((after, look))
-                if after.is_zero()
-                    && (look == Look::Reopen || look == Look::ReopenBetweenMessages && quiet) =>
-            {
-                tracing::debug!(
-                    scale_set = session.scale_set_id(),
-                    "room GitHub has not looked at: the session is opened again"
-                );
-                let statistics = session.reopen().await?;
-                handled = 0;
-                capacity = scaler.scale(Some(&Message::initial(statistics))).await?;
-                continue;
-            }
-            Some((after, Look::Recount)) if after.is_zero() => {
-                let counted = session.recount().await?;
-                capacity = scaler.scale(counted.map(Message::initial).as_ref()).await?;
-                continue;
-            }
-            // Not before the queue is seen empty: the wait runs its course.
-            Some((after, Look::ReopenBetweenMessages)) if after.is_zero() => None,
-            Some((after, _)) => Some(tokio::time::Instant::now() + after),
-            None => None,
-        };
-        let renewal = async {
-            match renew_at {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
-        let (polled, by_itself) = tokio::select! {
+        let polled = tokio::select! {
             biased;
             () = stop.wait() => return Ok(()),
             // The wait is given up; a message it was about to bring stays in the session's queue and comes with
             // the next one.
-            () = nudge.notified() => (None, false),
-            () = renewal => (None, false),
-            polled = session.poll(handled, capacity) => (polled?, true),
+            () = nudge.notified() => None,
+            polled = session.poll(handled, capacity) => polled?,
         };
-        quiet = by_itself && polled.is_none();
         match polled {
             None => capacity = scaler.scale(None).await?,
             Some(message) if message.id > 0 && message.id <= handled => {

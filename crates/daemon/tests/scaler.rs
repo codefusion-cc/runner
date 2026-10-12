@@ -9,7 +9,7 @@ use cf_daemon::testing::{pass, settings_for};
 use cf_daemon::{Claim, EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Runner, Slots, Ticket};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{JobState, Options};
-use cf_scaleset::{JobBase, JobCompleted, JobStarted, Look, Message, Scaler as _, Statistics};
+use cf_scaleset::{JobBase, JobCompleted, JobStarted, Message, Scaler as _, Statistics};
 use support::*;
 
 fn names(h: &Harness) -> Vec<String> {
@@ -428,9 +428,12 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
         },
     )
     .await;
+    // GitHub hands a job out at its queue event, against room two polls showed it.
+    h.fake.set_poll_timeout(std::time::Duration::from_millis(100));
+    for _ in 0..2 {
+        assert_eq!(h.session.poll(0, 1).await.expect("poll"), None);
+    }
     let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
-    let offered = next_message(&h, 1).await;
-    h.scaler.scale(Some(&offered)).await.unwrap();
     let assigned = next_message(&h, 1).await;
     assert_eq!(assigned.statistics.unwrap().assigned(), 1);
     h.scaler.scale(Some(&assigned)).await.unwrap();
@@ -1016,207 +1019,4 @@ async fn another_repositorys_idle_runner_under_the_same_number_is_not_retired_as
     assert_eq!(h.roster.active("org/other", h.set.id), 1);
     // Nor does a word about a runner of that name in this repository touch it.
     assert!(!h.roster.mark_done(REPO, h.set.id, "mac-b-theirs", h.clock_now()));
-}
-
-// GitHub gives out queued jobs when something happens in its queue (a job queued or ended, a session opened), against
-// the room each scale set's poll offered then; more room in a later poll gets nothing. Room that comes while the
-// scale set has nothing on this machine is therefore shown to GitHub with a new session, once: asked for until the
-// new session's counts come.
-#[tokio::test]
-async fn room_that_comes_back_while_the_scale_set_has_nothing_here_asks_once_for_a_new_session() {
-    let mut h = harness(1).await;
-    h.slots.set_open(false);
-    assert_eq!(h.scaler.scale(Some(&stats(0))).await.unwrap(), 0);
-    h.clock.advance(Duration::from_secs(1));
-    assert_eq!(h.scaler.renew(), None, "no room, nothing to show or count");
-    h.slots.set_open(true);
-    assert_eq!(h.scaler.scale(None).await.unwrap(), 1);
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Reopen)));
-    assert_eq!(
-        h.scaler.renew(),
-        Some((Duration::ZERO, Look::Reopen)),
-        "still, while no session opened"
-    );
-    h.scaler.scale(Some(&stats(0))).await.unwrap();
-    assert!(
-        matches!(h.scaler.renew(), Some((after, Look::Recount)) if after > Duration::ZERO),
-        "asked for once; the counts are fetched in their time"
-    );
-    assert_eq!(h.scaler.scale(Some(&stats(0))).await.unwrap(), 1);
-    assert!(
-        matches!(h.scaler.renew(), Some((_, Look::Recount))),
-        "room offered before is no news to GitHub"
-    );
-}
-
-#[tokio::test]
-async fn the_first_ask_of_a_new_session_wants_no_other_however_much_room_there_is() {
-    let mut h = harness(2).await;
-    h.clock.advance(Duration::from_secs(1));
-    assert_eq!(h.scaler.scale(Some(&stats(0))).await.unwrap(), 1);
-    assert!(
-        matches!(h.scaler.renew(), Some((_, Look::Recount))),
-        "the session's opening made GitHub look"
-    );
-}
-
-// Memory that comes and goes every few seconds must not open sessions every few seconds: a session that opened a
-// moment ago is opened again only when it is old enough, and then without another ask in between.
-#[tokio::test]
-async fn a_session_opened_a_moment_ago_is_opened_again_when_it_is_old_enough() {
-    let mut h = harness(1).await;
-    h.slots.set_open(false);
-    h.scaler.scale(Some(&stats(0))).await.unwrap();
-    h.slots.set_open(true);
-    h.scaler.scale(None).await.unwrap();
-    let Some((wait, Look::Reopen)) = h.scaler.renew() else {
-        panic!("a new session, later")
-    };
-    assert!(
-        wait > Duration::ZERO && wait <= Duration::from_millis(200),
-        "{wait:?}"
-    );
-    h.clock.advance(Duration::from_millis(250));
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Reopen)));
-}
-
-#[tokio::test]
-async fn room_that_went_again_before_the_renewal_asks_for_nothing() {
-    let mut h = harness(1).await;
-    h.slots.set_open(false);
-    h.scaler.scale(Some(&stats(0))).await.unwrap();
-    h.slots.set_open(true);
-    h.scaler.scale(None).await.unwrap();
-    assert!(h.scaler.renew().is_some());
-    h.slots.set_open(false);
-    h.scaler.scale(None).await.unwrap();
-    h.clock.advance(Duration::from_secs(1));
-    assert_eq!(h.scaler.renew(), None);
-}
-
-// A scale set with a job here hears GitHub when that job ends, which may be an hour away. Its session opens again
-// for room GitHub has not seen, between messages, so that the running job's start and end are not lost with the
-// old queue; its counts come with its messages, and none are fetched.
-#[tokio::test]
-async fn a_scale_set_with_a_job_here_opens_its_session_again_between_messages_when_room_comes() {
-    let mut h = harness(2).await;
-    h.scaler.scale(Some(&stats(1))).await.unwrap();
-    assert_eq!(h.hosts.started().len(), 1);
-    h.clock.advance(Duration::from_secs(1));
-    h.slots.set_open(false);
-    h.scaler.scale(None).await.unwrap();
-    h.slots.set_open(true);
-    assert_eq!(h.scaler.scale(None).await.unwrap(), 2);
-    assert_eq!(
-        h.scaler.renew(),
-        Some((Duration::ZERO, Look::ReopenBetweenMessages))
-    );
-    h.scaler.scale(Some(&stats(1))).await.unwrap();
-    assert_eq!(h.scaler.renew(), None, "seen; no count while a job runs");
-}
-
-fn holding(available: i64) -> Message {
-    Message::initial(Statistics {
-        total_available_jobs: available,
-        ..Statistics::default()
-    })
-}
-
-// A scale set GitHub sends nothing keeps the counts of its last message. While it could take a job it fetches them
-// in their time, and only then: a count each time the scaler is asked would be a call per poll.
-#[tokio::test]
-async fn a_scale_set_that_could_take_a_job_fetches_its_counts_in_their_time() {
-    let mut h = harness(1).await;
-    h.scaler.scale(Some(&stats(0))).await.unwrap();
-    let Some((wait, Look::Recount)) = h.scaler.renew() else {
-        panic!("a count, later")
-    };
-    assert!(
-        wait > Duration::from_millis(300) && wait <= Duration::from_millis(400),
-        "{wait:?}"
-    );
-    h.clock.advance(Duration::from_millis(450));
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Recount)));
-    let Some((wait, Look::Recount)) = h.scaler.renew() else {
-        panic!("the next count, later")
-    };
-    assert!(wait > Duration::from_millis(300), "{wait:?}");
-}
-
-// Fresh counts that name a job GitHub holds back while one fits: whatever left the room unseen, the session opens
-// again. Its first poll is what GitHub hands the held jobs out against, so each that fits has a slot promised for
-// it; a slot no assignment took goes back after OPENING_HOLD, for every scale set's next poll.
-#[tokio::test]
-async fn counts_that_name_a_job_github_holds_back_while_one_fits_open_the_session_again_with_its_slot_promised()
- {
-    let mut h = harness(2).await;
-    h.scaler.scale(Some(&stats(0))).await.unwrap();
-    h.clock.advance(Duration::from_millis(450));
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Recount)));
-    assert_eq!(
-        h.scaler.scale(Some(&holding(2))).await.unwrap(),
-        1,
-        "a count promises nothing"
-    );
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Reopen)));
-
-    assert_eq!(
-        h.scaler.scale(Some(&holding(2))).await.unwrap(),
-        2,
-        "the first poll shows GitHub both held jobs"
-    );
-    assert_eq!(
-        h.slots.open_slots(SIZE),
-        0,
-        "and no other scale set offers their slots"
-    );
-    let Some((wait, Look::Recount)) = h.scaler.renew() else {
-        panic!("the promises go back in their time")
-    };
-    assert!(
-        wait > Duration::ZERO && wait <= cf_daemon::OPENING_HOLD,
-        "{wait:?}"
-    );
-    h.clock.advance(Duration::from_millis(100));
-    assert_eq!(
-        h.scaler.scale(None).await.unwrap(),
-        2,
-        "kept while GitHub may still answer"
-    );
-
-    h.clock.advance(cf_daemon::OPENING_HOLD);
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Recount)));
-    assert_eq!(h.scaler.scale(Some(&holding(2))).await.unwrap(), 1);
-    assert_eq!(
-        h.slots.open_slots(SIZE),
-        2,
-        "no assignment came: the slots are free again"
-    );
-    assert_eq!(h.scaler.renew(), Some((Duration::ZERO, Look::Reopen)));
-
-    h.scaler.scale(Some(&holding(0))).await.unwrap();
-    assert!(
-        matches!(h.scaler.renew(), Some((_, Look::Recount))),
-        "nothing held back, nothing to open"
-    );
-    h.slots.set_open(false);
-    h.scaler.scale(Some(&holding(1))).await.unwrap();
-    h.clock.advance(Duration::from_secs(1));
-    assert_eq!(h.scaler.renew(), None, "no room, nothing held back from it");
-}
-
-// The held jobs GitHub hands out against the first poll take the slots promised to them.
-#[tokio::test]
-async fn held_jobs_assigned_to_the_first_poll_start_on_the_slots_promised_to_them() {
-    let mut h = harness(2).await;
-    assert_eq!(h.scaler.scale(Some(&holding(2))).await.unwrap(), 2);
-    let mut assigned = holding(0);
-    assigned.statistics.as_mut().expect("counts").total_assigned_jobs = 2;
-    assigned.id = 1;
-    assert_eq!(h.scaler.scale(Some(&assigned)).await.unwrap(), 2);
-    assert_eq!(h.hosts.started().len(), 2);
-    h.clock.advance(cf_daemon::OPENING_HOLD * 2);
-    assert_eq!(h.scaler.scale(None).await.unwrap(), 2);
-    assert_eq!(h.hosts.started().len(), 2, "nothing given back from under them");
-    assert_eq!(h.scaler.renew(), None);
 }

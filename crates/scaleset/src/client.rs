@@ -348,7 +348,7 @@ impl ScaleSetClient {
             }
             return Err(refused);
         }
-        Ok(MessageSession::new(self.clone(), scale_set_id, owner, info))
+        Ok(MessageSession::new(self.clone(), scale_set_id, info))
     }
 
     /// Asks the service for a new token for a session.
@@ -468,6 +468,16 @@ impl ScaleSetClient {
             .value
             .into_iter()
             .find(|r| r.name == name))
+    }
+
+    /// Whether a registered Actions runner of the repository has a job, by GitHub's own record; `None` when GitHub no
+    /// longer has it, as after a one-job Actions runner's job.
+    pub async fn runner_busy(&self, runner_id: i64) -> Result<Option<bool>, Error> {
+        Ok(self
+            .inner
+            .app
+            .runner_busy(self.inner.installation, &self.inner.repo, runner_id)
+            .await?)
     }
 
     /// Removes a registered Actions runner. An Actions runner with a job refuses (the service answers 422); one that is

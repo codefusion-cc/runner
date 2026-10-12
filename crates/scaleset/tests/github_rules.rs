@@ -44,8 +44,16 @@ async fn a_session_that_ends_takes_its_pending_messages_with_it() {
     assert_eq!(h.fake.job_state(job), Some(JobState::Acquired(set.id)));
     session.close().await.unwrap();
     let session = h.client.open_session(set.id, "mac-a").await.unwrap();
-    assert_eq!(session.poll(0, 1).await.unwrap(), None, "the assignment is gone with the old queue");
-    assert_eq!(session.initial_statistics().total_assigned_jobs, 1, "the counts still name it");
+    assert_eq!(
+        session.poll(0, 1).await.unwrap(),
+        None,
+        "the assignment is gone with the old queue"
+    );
+    assert_eq!(
+        session.initial_statistics().total_assigned_jobs,
+        1,
+        "the counts still name it"
+    );
 }
 
 // Every count in the probes said `totalAvailableJobs: 0` while a job waited unassigned.
@@ -69,11 +77,23 @@ async fn a_queue_event_assigns_against_the_smaller_room_of_the_last_two_polls() 
     session.poll(0, 0).await.unwrap();
     session.poll(0, 1).await.unwrap();
     let first = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
-    assert_eq!(h.fake.job_state(first), Some(JobState::Available), "the poll before offered none");
+    assert_eq!(
+        h.fake.job_state(first),
+        Some(JobState::Available),
+        "the poll before offered none"
+    );
     session.poll(0, 1).await.unwrap();
     let second = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "test");
-    assert_eq!(h.fake.job_state(first), Some(JobState::Acquired(set.id)), "the oldest first");
-    assert_eq!(h.fake.job_state(second), Some(JobState::Available), "room for one");
+    assert_eq!(
+        h.fake.job_state(first),
+        Some(JobState::Acquired(set.id)),
+        "the oldest first"
+    );
+    assert_eq!(
+        h.fake.job_state(second),
+        Some(JobState::Available),
+        "room for one"
+    );
 }
 
 // Probes A, G, I2, J1 and J3: with no event, GitHub sometimes assigned within half a minute of room, sometimes not

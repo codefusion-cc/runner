@@ -150,6 +150,9 @@ pub struct Registration {
     pub scale_set_id: i64,
     /// `owner/name`.
     pub repo: String,
+    /// The machine is gone and nobody heard whether its Actions runner took a job: before the registration is
+    /// removed, GitHub is asked whether it still has it, and [`Machines::ran_unheard`] told when it does not.
+    pub ask_github: bool,
 }
 
 /// One machine, for a report.
@@ -917,15 +920,26 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             wall_ms: summary.map(|s| s.wall_ms),
             message: vm_end.and_then(|e| e.message.clone()),
         });
+        // Only a guest that came up can have run an Actions runner: one that booted now, or one written down as up
+        // before this Runner started.
+        let came_up = ran_job
+            || job.record.ended.as_ref().is_some_and(|e| e.boot_ms.is_some())
+            || job.record.slot.is_some_and(|slot| {
+                matches!(
+                    slot.saved().phase,
+                    Phase::Idle | Phase::Running | Phase::Finishing
+                )
+            });
         job.record.slot = Some(job.life.saved().into());
         job.ended_at = Some(now.elapsed);
         job.unregister = true;
         let oom = job.record.oom;
         let runner = job.record.runner.clone();
         tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
+        let retired = self.roster.remove(&runner).is_some_and(|r| r.done.is_some());
+        job.record.ask_github = came_up && job.record.github.is_none() && !retired;
         self.store.save(&job.record);
         self.vms.clean(name);
-        self.roster.remove(&runner);
         if oom {
             inner.recent_oom.push_back(runner);
             if inner.recent_oom.len() > 64 {
@@ -949,6 +963,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
             let result = job.record.github.as_ref().and_then(|g| g.result.clone());
             if result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
+                return false;
+            }
+            if job.record.github.is_none() && job.record.ask_github && !job.record.unregistered && !deaf {
                 return false;
             }
             if let Some(github) = job.record.github.clone() {
@@ -980,25 +997,72 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// [`Machines::unregistered`].
     pub fn registrations_to_remove(&self) -> Vec<Registration> {
         let inner = self.lock();
-        let of = |record: &Record| Registration {
+        let now = inner.host.now();
+        let of = |record: &Record, ask_github: bool| Registration {
             runner: record.runner.clone(),
             runner_id: record.runner_id,
             scale_set_id: record.scale_set_id,
             repo: record.repo.clone(),
+            ask_github,
         };
         inner
             .jobs
             .values()
             .filter(|job| job.unregister && !job.record.unregistered)
-            .map(|job| of(&job.record))
+            .filter_map(|job| {
+                let unheard = job.record.ask_github && job.record.github.is_none();
+                let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
+                // GitHub's word may still come: its messages say a job started up to a minute late.
+                (!unheard || inner.deaf || duration(waited) >= RESULT_WAIT).then(|| of(&job.record, unheard))
+            })
             .chain(
                 inner
                     .intents
                     .values()
                     .filter(|(_, stale)| *stale)
-                    .map(|(record, _)| of(record)),
+                    .map(|(record, _)| of(record, false)),
             )
             .collect()
+    }
+
+    /// GitHub no longer had the registration of a machine that is gone and never heard of a job: its one-job
+    /// Actions runner removed it, so a job ran there, and its start and end went with a session of GitHub's. The job
+    /// is reported as one whose end GitHub never told, by what the Mac knows of it.
+    pub fn ran_unheard(&self, runner: &str) {
+        let known = {
+            let inner = self.lock();
+            inner
+                .jobs
+                .get(job_name(runner))
+                .filter(|job| job.record.runner == runner && job.record.github.is_none())
+                .map(|job| {
+                    (
+                        job.record.repo.clone(),
+                        job.record.ended.as_ref().map_or(0, |e| e.at),
+                    )
+                })
+        };
+        let Some((repo, at)) = known else {
+            return;
+        };
+        tracing::info!(%runner, "GitHub no longer has the registration: its Actions runner ran a job whose start and end were not heard");
+        Events::job(
+            self,
+            &JobEvent {
+                kind: EventKind::Started,
+                runner: runner.to_string(),
+                repo,
+                job: String::new(),
+                workflow: String::new(),
+                run_id: 0,
+                event: String::new(),
+                queued_at: None,
+                started_at: None,
+                at: time::OffsetDateTime::from_unix_timestamp(at).unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+                result: String::new(),
+                out_of_memory: false,
+            },
+        );
     }
 
     /// GitHub no longer has a registration of this name.
@@ -1276,6 +1340,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             ended: None,
             end_reported: true,
             oom: false,
+            ask_github: false,
         };
         self.store.save(&record);
         self.lock().intents.insert(name.to_string(), (record, false));
@@ -1303,10 +1368,11 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
                     && record.repo.eq_ignore_ascii_case(repo)
                     && record.ended.is_some()
                     && !record.unregistered
-                    && record
-                        .github
-                        .as_ref()
-                        .is_some_and(|github| github.result.is_none())
+                    && match &record.github {
+                        Some(github) => github.result.is_none(),
+                        // Its start went unheard: GitHub may count its job as assigned until the sweep asked.
+                        None => record.ask_github,
+                    }
             })
             .count()
     }
@@ -1367,6 +1433,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             ended: None,
             end_reported: false,
             oom: false,
+            ask_github: false,
         };
         // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
         self.store.save(&record);

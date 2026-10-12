@@ -83,11 +83,6 @@ pub struct ServiceConfig {
     /// The first and the longest wait after a listener failed, and how long one must work for the wait to start
     /// small again.
     pub backoff: (Duration, Duration, Duration),
-    /// The least time between two openings of a scale set's session for room GitHub has not seen.
-    pub renew_after: Duration,
-    /// How often a scale set with nothing here that could take a job fetches GitHub's counts, and the least time
-    /// between two openings of its session while they name jobs GitHub holds back.
-    pub recheck_after: Duration,
 }
 
 impl ServiceConfig {
@@ -111,8 +106,6 @@ impl ServiceConfig {
                 Duration::from_secs(300),
                 Duration::from_secs(300),
             ),
-            renew_after: crate::scaler::RENEW_AFTER,
-            recheck_after: crate::scaler::RECHECK_AFTER,
         }
     }
 }
@@ -242,8 +235,8 @@ struct Stall {
     warned: bool,
 }
 
-/// How long jobs may wait while the Mac could run them before the log warns. A job reaches a Mac that offers room
-/// within a poll, and one GitHub did not look at within the scaler's renewal; a minute is far past both.
+/// How long jobs handed to this Mac may wait while nothing runs here before the log warns. A machine starts within
+/// seconds when one fits; a minute is far past that.
 pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
 
 /// The Runner's service on one Mac.
@@ -763,6 +756,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .insert(registration.runner, Instant::now() + shared.config.sweep_again);
                 continue;
             };
+            if registration.ask_github
+                && let Some(id) = registration.runner_id
+            {
+                match client.runner_busy(id).await {
+                    // Registered and idle: the Actions runner never took a job.
+                    Ok(Some(false)) => {}
+                    Ok(None | Some(true)) => shared.machines.ran_unheard(&registration.runner),
+                    Err(error) => {
+                        tracing::warn!(runner = %registration.runner, %error, "GitHub could not say whether a gone machine ran a job; it is asked again");
+                        shared
+                            .refused
+                            .lock()
+                            .expect("refused")
+                            .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                        continue;
+                    }
+                }
+            }
             let id = match registration.runner_id {
                 Some(id) => Ok(Some(id)),
                 // Registered or not, nobody heard: GitHub is asked by name.
@@ -800,48 +811,22 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
     }
 
-    /// What keeps jobs this Mac serves waiting while it could run them, when some do: jobs GitHub holds although a
-    /// machine of their size fits (GitHub hands a job over only when something happens in its queue, see
-    /// [`cf_scaleset::Scaler::renew`]), or jobs that wait while nothing runs here at all. GitHub's counts are a
-    /// scale set's as of its last message or count; a job queued since is seen with the next one, within
-    /// [`crate::RECHECK_AFTER`] for a scale set that could take it.
+    /// Why jobs GitHub handed to this Mac wait while nothing runs here, when they do. Jobs GitHub still holds are
+    /// not seen: its counts never name them (`totalAvailableJobs` is 0 in every count the probes of 2026-10-12 saw),
+    /// and only it decides when to hand them over (`docs/github-protocol.md`).
     fn stall_reason(&self, sets: &[SetState], snapshot: &Snapshot) -> Option<String> {
         let shared = &self.shared;
         if *shared.console_paused.lock().expect("paused") {
             return None;
         }
-        let mut held = Vec::new();
-        let mut waiting = snapshot.waiting;
-        let mut short = None;
-        for set in sets.iter().filter(|set| set.never.is_none()) {
-            let available = set
-                .statistics
-                .as_ref()
-                .map_or(0, |s| usize::try_from(s.total_available_jobs).unwrap_or(0));
-            if available == 0 {
-                continue;
-            }
-            waiting += available;
-            // Slots a scaler promised for a session's first poll count as room: nothing else holds them.
-            let promised_only =
-                snapshot.machines.is_empty() && snapshot.open && shared.machines.short_of(set.size).is_none();
-            if shared.machines.room(set.size) > 0 || promised_only {
-                held.push(format!("{available} of {} ({})", set.repo, set.size.label()));
-            } else {
-                short = short.or_else(|| shared.machines.short_of(set.size));
-            }
-        }
-        if !held.is_empty() {
-            return Some(format!(
-                "GitHub has not handed over jobs a machine fits for: {}",
-                held.join(", ")
-            ));
-        }
-        if waiting == 0 || !snapshot.machines.is_empty() {
+        if snapshot.waiting == 0 || !snapshot.machines.is_empty() {
             return None;
         }
         let why = if snapshot.open {
-            short.unwrap_or("no machine of their size fits").to_string()
+            sets.iter()
+                .find_map(|set| shared.machines.short_of(set.size))
+                .unwrap_or("no machine of their size fits")
+                .to_string()
         } else {
             snapshot.reason.clone()
         };
@@ -1266,8 +1251,6 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     shared.clock.clone(),
                 )
                 .with_events(machines.clone())
-                .with_renew_after(shared.config.renew_after)
-                .with_recheck_after(shared.config.recheck_after)
                 .with_out_of_memory_check({
                     let machines = machines.clone();
                     Arc::new(move |runner| machines.was_out_of_memory(runner))
@@ -1315,9 +1298,5 @@ impl<S: cf_scaleset::Scaler, F: Fn() + Send + Sync> cf_scaleset::Scaler for Watc
         let capacity = self.0.scale(message).await;
         (self.1)();
         capacity
-    }
-
-    fn renew(&mut self) -> Option<(Duration, cf_scaleset::Look)> {
-        self.0.renew()
     }
 }

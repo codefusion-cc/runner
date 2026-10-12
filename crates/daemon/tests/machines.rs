@@ -951,7 +951,7 @@ fn a_pause_and_a_drain_tell_the_polls_in_flight_once() {
 #[tokio::test]
 async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() {
     let mut w = World::new(3);
-    // One dies before any job came to it: GitHub counts nothing for it.
+    // One dies before any word of a job came for it.
     let idle = w.start().await;
     w.parts.vms.die(job_name(&idle));
     // Two die under their jobs.
@@ -962,6 +962,10 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     w.parts.vms.die(job_name(&second));
     pass(&w.m, 2);
     assert_eq!(w.parts.vms.standing(), Vec::<String>::new());
+    // A start can go with a session of GitHub's: the one that died idle counts until GitHub was asked about it.
+    assert_eq!(w.m.lost_with_job(REPO, SET), 3);
+    w.registered.remove(&idle);
+    w.m.unregistered(&idle);
     assert_eq!(w.m.lost_with_job(REPO, SET), 2, "GitHub still counts both jobs");
     assert_eq!(w.m.lost_with_job(REPO, SET + 1), 0, "and for this scale set only");
     assert_eq!(

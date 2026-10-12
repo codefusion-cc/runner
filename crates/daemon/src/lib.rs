@@ -34,9 +34,7 @@ pub use machines::{
 };
 pub use records::{DiskStore, Ending, GithubJob, MemoryStore, Record, SavedSlot, Store};
 pub use roster::{JobInfo, Roster, Runner};
-pub use scaler::{
-    IDLE_GRACE, OPENING_HOLD, PROMISE_TTL, RECHECK_AFTER, RENEW_AFTER, Scaler, ScalerConfig, WasOutOfMemory,
-};
+pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory};
 pub use service::{
     Console, HostExtras, LoggedReports, Nudge, OutboxReports, STALL_WARN_AFTER, Service, ServiceConfig,
     ServiceParts, SetState, iso, job_event,

@@ -120,8 +120,9 @@ pub trait Hosts: Send + Sync {
 
     /// How many jobs GitHub still counts as assigned to Actions runners of this repository's scale set whose
     /// machines are gone: a job was started on each, GitHub has not said how it ended, and the registration still
-    /// stands (GitHub keeps it while it counts the job). The scaler starts no machine in their place: there is no
-    /// job to take.
+    /// stands (GitHub keeps it while it counts the job), or a guest came up and went with no word from GitHub, which
+    /// may count a job of it until the sweep asked. The scaler starts no machine in their place: there is no job to
+    /// take.
     fn lost_with_job(&self, _repo: &str, _scale_set_id: i64) -> usize {
         0
     }
@@ -170,6 +171,9 @@ pub trait Registry: Send + Sync {
 
     /// Removes a registered Actions runner; one with a job refuses.
     fn remove_runner(&self, runner_id: i64) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Whether a registered Actions runner has a job, by GitHub's own record; `None` when GitHub no longer has it.
+    fn runner_busy(&self, runner_id: i64) -> impl Future<Output = Result<Option<bool>, Error>> + Send;
 }
 
 /// Which kind of job event.

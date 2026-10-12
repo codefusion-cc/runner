@@ -95,6 +95,12 @@ pub struct Record {
     pub end_reported: bool,
     /// Whether a process of the job was stopped for memory.
     pub oom: bool,
+    /// The machine is gone and GitHub never said its Actions runner took a job, nor did the Runner retire it: whether
+    /// a job ran is GitHub's to say, by whether the registration is still there (a one-job Actions runner removes
+    /// its own once its job is over). Asked once the wait for GitHub's word is over, before the registration is
+    /// removed, by this Runner or the one that starts after it. Records written before it existed ask nothing.
+    #[serde(default)]
+    pub ask_github: bool,
 }
 
 impl Record {

@@ -308,6 +308,28 @@ impl GitHubApp {
         Ok(Secret::new(parsed.token))
     }
 
+    /// Whether a registered Actions runner of a repository has a job, by GitHub's own record. `None` when GitHub no
+    /// longer has it: a one-job Actions runner unregisters itself once its job is over.
+    pub async fn runner_busy(
+        &self,
+        installation: i64,
+        repo: &str,
+        runner_id: i64,
+    ) -> Result<Option<bool>, Error> {
+        #[derive(Deserialize)]
+        struct RunnerState {
+            busy: bool,
+        }
+        let path = format!("/repos/{repo}/actions/runners/{runner_id}");
+        match self.as_installation(installation, Method::GET, &path).await {
+            Ok(response) => Ok(Some(
+                self.decode::<RunnerState>("Actions runner", &response)?.busy,
+            )),
+            Err(Error::Status(s)) if s.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The next page's address from a `Link` header. Only pages on the same API are followed: a header must not
     /// send the token elsewhere.
     fn next_page(&self, response: &Response) -> Option<String> {

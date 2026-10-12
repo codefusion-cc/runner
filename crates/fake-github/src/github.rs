@@ -287,7 +287,9 @@ impl State {
         for job in &self.jobs {
             match &job.state {
                 JobState::Available
-                    if !self.opts.auto_assign && matches(&set.labels, &job.labels) && job.repo == set.repo =>
+                    if !self.opts.auto_assign
+                        && matches(&set.labels, &job.labels)
+                        && job.repo == set.repo =>
                 {
                     s.available += 1
                 }
@@ -665,6 +667,19 @@ impl FakeGithub {
         self.lock().runners.iter().map(|r| r.name.clone()).collect()
     }
 
+    /// Whether a scale set with a session offered room beyond the jobs it holds in both of its last two polls: a
+    /// job queued now goes to it at once.
+    pub fn offers_room(&self) -> bool {
+        let st = self.lock();
+        st.scale_sets.iter().any(|s| {
+            !s.deleted
+                && s.session.is_some()
+                && s.capacity
+                    .zip(s.previous_capacity)
+                    .is_some_and(|(newest, before)| newest.min(before) > st.stats(s.id).assigned)
+        })
+    }
+
     /// A job's state.
     pub fn job_state(&self, request_id: i64) -> Option<JobState> {
         self.lock()
@@ -821,6 +836,27 @@ impl FakeGithub {
                     let exp = st.now() + 3600;
                     st.registration_tokens.insert(token.clone(), (exp, name.clone()));
                     Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
+                })
+            }
+            // Probe H, 2026-10-12: `busy` and `status` for an Actions runner registered for a scale set, by the ID its
+            // registration gave; 404 once it is removed.
+            ("GET", ["repos", owner, repo, "actions", "runners", id]) => {
+                let name = format!("{owner}/{repo}");
+                let id: i64 = id.parse().unwrap_or(0);
+                self.with_installation(&req, |st| {
+                    let runner = st.runners.iter().find(|r| {
+                        r.id == id && st.scale_sets.iter().any(|s| s.id == r.scale_set && s.repo == name)
+                    });
+                    match runner {
+                        Some(r) => {
+                            let busy = st
+                                .jobs
+                                .iter()
+                                .any(|j| matches!(&j.state, JobState::Running(n) if *n == r.name));
+                            Reply::json(&json!({"id": r.id, "name": r.name, "status": "online", "busy": busy}))
+                        }
+                        None => Reply::status_json(404, &json!({"message": "Not Found"})),
+                    }
                 })
             }
             ("POST", ["actions", "runner-registration"]) => self.runner_registration(&req),
@@ -1043,14 +1079,13 @@ impl FakeGithub {
                 .scale_set(id)
                 .and_then(|set| set.session.as_ref())
                 .is_some_and(|s| s.token == bearer);
-            let mine = st.scale_set(id).map(|set| {
+            st.scale_set(id).map(|set| {
                 set.polls += 1;
                 if authorized {
                     set.previous_capacity = std::mem::replace(&mut set.capacity, capacity);
                 }
                 set.polls
-            });
-            mine
+            })
         };
         loop {
             let notified = self.inner.notify.notified();
