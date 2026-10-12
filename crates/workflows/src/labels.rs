@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_yaml_ng::Value;
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::expression::{evaluate, is_pool_expression};
 use crate::size::is_size_label;
@@ -79,10 +79,10 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
         if content.len() > MAX_FILE_BYTES {
             continue;
         }
-        let Ok(doc) = serde_yaml_ng::from_slice::<Value>(content) else {
+        let Ok(doc) = serde_saphyr::from_slice::<Node>(content) else {
             continue;
         };
-        let Some(jobs) = doc.get("jobs").and_then(Value::as_mapping) else {
+        let Some(Node::Mapping(jobs)) = doc.get("jobs") else {
             continue;
         };
         for job in jobs.values() {
@@ -92,12 +92,12 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
             // The reusable workflow runs in this repository, on the Actions runner its input names.
             let uses = job
                 .get("uses")
-                .and_then(Value::as_str)
+                .and_then(Node::as_str)
                 .is_some_and(|u| !u.is_empty());
             let input = job
                 .get("with")
                 .and_then(|w| w.get("runs-on"))
-                .and_then(Value::as_str);
+                .and_then(Node::as_str);
             if let (true, Some(input)) = (uses, input)
                 && is_pool_expression(input)
             {
@@ -116,21 +116,124 @@ fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> String {
         .unwrap_or_else(|| POOL_LABEL.to_string())
 }
 
-/// A scalar's text as the YAML file spells it, as far as a label goes.
-fn scalar(node: &Value) -> Option<String> {
-    match node {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Null => Some(String::new()),
-        _ => None,
+/// A node of a workflow file, as far as labels go: a scalar keeps the text YAML gives it, and a mapping's keys are
+/// their text too, so that `1:` and `true:` are keys like any other.
+#[derive(Debug, Clone, PartialEq)]
+enum Node {
+    Null,
+    Scalar(String),
+    Sequence(Vec<Node>),
+    Mapping(BTreeMap<String, Node>),
+}
+
+impl Node {
+    fn get(&self, key: &str) -> Option<&Node> {
+        match self {
+            Node::Mapping(map) => map.get(key),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Node::Scalar(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A scalar's text, as far as a label goes; a key's text.
+    fn text(&self) -> Option<String> {
+        match self {
+            Node::Scalar(s) => Some(s.clone()),
+            Node::Null => Some(String::new()),
+            _ => None,
+        }
     }
 }
 
-fn label_set(node: &Value, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(NodeVisitor)
+    }
+}
+
+struct NodeVisitor;
+
+impl<'de> Visitor<'de> for NodeVisitor {
+    type Value = Node;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any YAML node")
+    }
+
+    fn visit_unit<E>(self) -> Result<Node, E> {
+        Ok(Node::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Node, E> {
+        Ok(Node::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Node, D::Error> {
+        Node::deserialize(deserializer)
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_i128<E>(self, v: i128) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_u128<E>(self, v: u128) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Node, E> {
+        Ok(Node::Scalar(v.to_string()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Node, E> {
+        Ok(Node::Scalar(v))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Node, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Node::Sequence(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
+        let mut nodes = BTreeMap::new();
+        while let Some((key, value)) = map.next_entry::<Node, Node>()? {
+            // A key that is itself a sequence or a mapping names nothing a workflow reads.
+            if let Some(key) = key.text() {
+                nodes.insert(key, value);
+            }
+        }
+        Ok(Node::Mapping(nodes))
+    }
+}
+
+fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
     let labels: Vec<String> = match node {
-        Value::Sequence(items) => items.iter().map(scalar).collect::<Option<_>>()?,
-        Value::Mapping(map) => {
+        Node::Sequence(items) => items.iter().map(Node::text).collect::<Option<_>>()?,
+        Node::Mapping(map) => {
             // `runs-on: {group: …, labels: …}`: an Actions runner group is an organization feature these Actions
             // runners are not in.
             if map.contains_key("group") {
@@ -138,7 +241,7 @@ fn label_set(node: &Value, vars: &BTreeMap<String, String>) -> Option<LabelSet> 
             }
             return label_set(map.get("labels")?, vars);
         }
-        other => vec![scalar(other)?],
+        other => vec![other.text()?],
     };
 
     let mut set = Vec::with_capacity(labels.len());
