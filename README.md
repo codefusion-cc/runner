@@ -43,7 +43,9 @@ ran, each in a machine that was gone when the job ended. What is there:
   GitHub's 2 GB asset limit. `image install` verifies a release in a folder of its own before a machine boots from
   it, and refuses one older than the newest it has accepted,
 - reports to the CodeFusion Console: the Mac's state every minute, and each job's start and end within a second
-  or two. While the console is away up to 500 job events wait in a file and arrive later, each once.
+  or two. While the console is away up to 500 job events wait in a file and arrive later, each once. Jobs that
+  wait while a machine of their size fits are in the report with how long and why, and warned of in the log after
+  a minute.
 
 `docs/MAP.md` says where things are and how a job's machine is put together.
 

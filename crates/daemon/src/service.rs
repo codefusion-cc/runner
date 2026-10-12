@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::machines::{JobReport, Machines, Reports};
+use crate::machines::{JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig};
@@ -83,6 +83,11 @@ pub struct ServiceConfig {
     /// The first and the longest wait after a listener failed, and how long one must work for the wait to start
     /// small again.
     pub backoff: (Duration, Duration, Duration),
+    /// The least time between two openings of a scale set's session for room GitHub has not seen.
+    pub renew_after: Duration,
+    /// How often a scale set with nothing here that could take a job fetches GitHub's counts, and the least time
+    /// between two openings of its session while they name jobs GitHub holds back.
+    pub recheck_after: Duration,
 }
 
 impl ServiceConfig {
@@ -106,6 +111,8 @@ impl ServiceConfig {
                 Duration::from_secs(300),
                 Duration::from_secs(300),
             ),
+            renew_after: crate::scaler::RENEW_AFTER,
+            recheck_after: crate::scaler::RECHECK_AFTER,
         }
     }
 }
@@ -223,7 +230,21 @@ struct Shared<H, V> {
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
     told: Mutex<(u64, bool)>,
+    /// Jobs that wait while the Mac could run them, since the first look that saw them.
+    stall: Mutex<Option<Stall>>,
 }
+
+/// Jobs this Mac serves that wait while it could run them.
+#[derive(Debug)]
+struct Stall {
+    since: SystemTime,
+    /// Whether the log warned of them.
+    warned: bool,
+}
+
+/// How long jobs may wait while the Mac could run them before the log warns. A job reaches a Mac that offers room
+/// within a poll, and one GitHub did not look at within the scaler's renewal; a minute is far past both.
+pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
 
 /// The Runner's service on one Mac.
 pub struct Service<H, V> {
@@ -342,6 +363,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 refused: Mutex::new(BTreeMap::new()),
                 console_paused: Mutex::new(false),
                 told: Mutex::new((0, false)),
+                stall: Mutex::new(None),
             }),
         }
     }
@@ -778,6 +800,82 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
     }
 
+    /// What keeps jobs this Mac serves waiting while it could run them, when some do: jobs GitHub holds although a
+    /// machine of their size fits (GitHub hands a job over only when something happens in its queue, see
+    /// [`cf_scaleset::Scaler::renew`]), or jobs that wait while nothing runs here at all. GitHub's counts are a
+    /// scale set's as of its last message or count; a job queued since is seen with the next one, within
+    /// [`crate::RECHECK_AFTER`] for a scale set that could take it.
+    fn stall_reason(&self, sets: &[SetState], snapshot: &Snapshot) -> Option<String> {
+        let shared = &self.shared;
+        if *shared.console_paused.lock().expect("paused") {
+            return None;
+        }
+        let mut held = Vec::new();
+        let mut waiting = snapshot.waiting;
+        let mut short = None;
+        for set in sets.iter().filter(|set| set.never.is_none()) {
+            let available = set
+                .statistics
+                .as_ref()
+                .map_or(0, |s| usize::try_from(s.total_available_jobs).unwrap_or(0));
+            if available == 0 {
+                continue;
+            }
+            waiting += available;
+            // Slots a scaler promised for a session's first poll count as room: nothing else holds them.
+            let promised_only =
+                snapshot.machines.is_empty() && snapshot.open && shared.machines.short_of(set.size).is_none();
+            if shared.machines.room(set.size) > 0 || promised_only {
+                held.push(format!("{available} of {} ({})", set.repo, set.size.label()));
+            } else {
+                short = short.or_else(|| shared.machines.short_of(set.size));
+            }
+        }
+        if !held.is_empty() {
+            return Some(format!(
+                "GitHub has not handed over jobs a machine fits for: {}",
+                held.join(", ")
+            ));
+        }
+        if waiting == 0 || !snapshot.machines.is_empty() {
+            return None;
+        }
+        let why = if snapshot.open {
+            short.unwrap_or("no machine of their size fits").to_string()
+        } else {
+            snapshot.reason.clone()
+        };
+        Some(format!("nothing runs and no job starts: {why}"))
+    }
+
+    /// For how long jobs have waited while the Mac could run them, and why it believes they do: warns once when
+    /// that passes [`STALL_WARN_AFTER`], and says when it is over.
+    fn watch_stall(&self, sets: &[SetState], snapshot: &Snapshot) -> (u64, Option<String>) {
+        let now = self.shared.clock.now();
+        let reason = self.stall_reason(sets, snapshot);
+        let mut stall = self.shared.stall.lock().expect("stall");
+        let Some(reason) = reason else {
+            if let Some(over) = stall.take().filter(|over| over.warned) {
+                let seconds = now.duration_since(over.since).unwrap_or_default().as_secs();
+                tracing::info!(
+                    seconds,
+                    "the jobs that waited while the Mac was idle are under way or gone"
+                );
+            }
+            return (0, None);
+        };
+        let stall = stall.get_or_insert(Stall {
+            since: now,
+            warned: false,
+        });
+        let waited = now.duration_since(stall.since).unwrap_or_default();
+        if waited >= STALL_WARN_AFTER && !stall.warned {
+            stall.warned = true;
+            tracing::warn!(seconds = waited.as_secs(), %reason, "idle with jobs waiting");
+        }
+        (waited.as_secs(), Some(reason))
+    }
+
     /// What the console is told now, without the job events.
     pub fn status(&self) -> Report {
         let shared = &self.shared;
@@ -813,6 +911,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             }
         });
         let paused = *shared.console_paused.lock().expect("paused");
+        let (idle_with_jobs_waiting_seconds, idle_with_jobs_waiting_reason) =
+            self.watch_stall(&sets, &snapshot);
         // A Mac the budget calls open takes no job while what runs on it leaves no memory for even the smallest
         // size it serves: the console hears that it is closed and what for, in the budget's word.
         let no_room = sets
@@ -846,6 +946,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 discovery_error: self.discovery_error().map(|error| cut(error, STATUS_TEXT_MAX)),
                 update: None,
                 not_serving: shared.not_serving.lock().expect("not serving").clone(),
+                idle_with_jobs_waiting_seconds,
+                idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
+                    .map(|reason| cut(reason, STATUS_TEXT_MAX)),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)
@@ -1068,6 +1171,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // A job that was queued, started or ended is on the console's page within a moment, not with
                 // the next report in its turn.
                 _ = news.tick() => {
+                    self.watch_stall(&self.sets(), &self.shared.machines.snapshot());
                     if self.has_news() {
                         let next = self.report().await;
                         report.as_mut().reset(tokio::time::Instant::now() + next);
@@ -1162,6 +1266,8 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     shared.clock.clone(),
                 )
                 .with_events(machines.clone())
+                .with_renew_after(shared.config.renew_after)
+                .with_recheck_after(shared.config.recheck_after)
                 .with_out_of_memory_check({
                     let machines = machines.clone();
                     Arc::new(move |runner| machines.was_out_of_memory(runner))
@@ -1209,5 +1315,9 @@ impl<S: cf_scaleset::Scaler, F: Fn() + Send + Sync> cf_scaleset::Scaler for Watc
         let capacity = self.0.scale(message).await;
         (self.1)();
         capacity
+    }
+
+    fn renew(&mut self) -> Option<(Duration, cf_scaleset::Look)> {
+        self.0.renew()
     }
 }

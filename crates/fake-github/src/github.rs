@@ -23,9 +23,12 @@ pub struct Options {
     pub admin_token_ttl: Duration,
     /// How long a session's message queue token lives.
     pub session_token_ttl: Duration,
-    /// Like the real service, assign queued jobs to a scale set by themselves while its long poll says it has room
-    /// (`x-scalesetmaxcapacity` above the jobs it has): they arrive as `JobAssigned` and never as `JobAvailable`.
-    /// Off, every job is only offered and has to be acquired.
+    /// Like the real service, assign queued jobs to scale sets by themselves: they arrive as `JobAssigned` and never
+    /// as `JobAvailable`. As the real service, it looks at its queue only when something happens there (a job is
+    /// queued, a job ends, a session takes its first poll), and then gives each scale set with a session as many
+    /// jobs as the newest poll's `x-scalesetmaxcapacity` leaves room for. A poll that brings more room assigns
+    /// nothing by itself: 2026-10-12 a Mac offered room for 13 minutes while 7 jobs it serves stayed queued, until
+    /// a new job was queued. Off, every job is only offered and has to be acquired.
     pub auto_assign: bool,
 }
 
@@ -96,6 +99,10 @@ struct ScaleSet {
     /// How many polls came for it. Only the newest is served: the one before it was given up by its listener,
     /// whose closed connection ends it at the service, and offers nothing any more.
     polls: u64,
+    /// The room the newest poll said the scale set has, which the service assigns against.
+    capacity: Option<usize>,
+    /// A session opened and has not polled yet: its first poll makes the service look at the queue.
+    fresh: bool,
     deleted: bool,
 }
 
@@ -132,6 +139,8 @@ pub struct Logged {
     pub body: String,
     /// The `x-scalesetmaxcapacity` header of polls.
     pub max_capacity: Option<String>,
+    /// The `lastMessageId` of polls.
+    pub last_message_id: Option<String>,
 }
 
 /// A scale set as the service has it.
@@ -164,6 +173,9 @@ struct Stats {
 
 struct State {
     opts: Options,
+    /// Whether a session's first poll makes the service look at its queue; see
+    /// [`FakeGithub::set_assign_at_session_open`].
+    assign_at_session_open: bool,
     clock_offset: i64,
     next: u32,
     repos: BTreeMap<String, Repo>,
@@ -347,6 +359,7 @@ impl FakeGithub {
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 opts,
+                assign_at_session_open: true,
                 clock_offset: 0,
                 next: 0,
                 repos: BTreeMap::new(),
@@ -432,6 +445,13 @@ impl FakeGithub {
         self.lock().opts.poll_timeout = timeout;
     }
 
+    /// Whether a new session's first poll makes the service look at its queue (on at the start). The 2026-10-12
+    /// logs show a job assigned a second after its scale set's session opened, nothing more: off is the service
+    /// that does not, which a session opened again then cannot move.
+    pub fn set_assign_at_session_open(&self, on: bool) {
+        self.lock().assign_at_session_open = on;
+    }
+
     // ---- faults and hooks ----
 
     /// Answers the next `times` requests whose `METHOD path` contains `matcher` with `reply`, before anything else.
@@ -499,7 +519,11 @@ impl FakeGithub {
             state: JobState::Available,
         };
         let id = job.request_id;
-        let sets = st.eligible_sets(&job);
+        let sets = if st.opts.auto_assign {
+            vec![]
+        } else {
+            st.eligible_sets(&job)
+        };
         for set in sets {
             let msg = st.job_message(
                 "JobAvailable",
@@ -509,6 +533,7 @@ impl FakeGithub {
             st.push(set, vec![msg]);
         }
         st.jobs.push(job);
+        look_at_the_queue(&mut st);
         drop(st);
         self.inner.notify.notify_waiters();
         id
@@ -516,9 +541,12 @@ impl FakeGithub {
 
     /// Another Actions runner takes the job before this one's scale sets do.
     pub fn take_job(&self, request_id: i64) {
-        if let Some(j) = self.lock().jobs.iter_mut().find(|j| j.request_id == request_id) {
+        let mut st = self.lock();
+        if let Some(j) = st.jobs.iter_mut().find(|j| j.request_id == request_id) {
             j.state = JobState::TakenElsewhere;
         }
+        look_at_the_queue(&mut st);
+        drop(st);
         self.inner.notify.notify_waiters();
     }
 
@@ -570,6 +598,7 @@ impl FakeGithub {
             json!({"result": result, "runnerId": runner.id, "runnerName": runner.name}),
         );
         st.push(runner.scale_set, vec![msg]);
+        look_at_the_queue(&mut st);
         drop(st);
         self.inner.notify.notify_waiters();
     }
@@ -590,6 +619,7 @@ impl FakeGithub {
             JobState::Available => st.jobs[i].state = JobState::Completed("canceled".into()),
             _ => {}
         }
+        look_at_the_queue(&mut st);
         drop(st);
         self.inner.notify.notify_waiters();
     }
@@ -648,6 +678,7 @@ impl FakeGithub {
                 authorization: req.header("authorization").map(String::from),
                 body: String::from_utf8_lossy(&req.body).to_string(),
                 max_capacity: req.header("x-scalesetmaxcapacity").map(String::from),
+                last_message_id: req.query("lastMessageId").map(String::from),
             });
             st.hooks
                 .iter()
@@ -988,10 +1019,25 @@ impl FakeGithub {
             .unwrap_or(0);
         let capacity: Option<usize> = req.header("x-scalesetmaxcapacity").and_then(|v| v.parse().ok());
         let deadline = tokio::time::Instant::now() + self.lock().opts.poll_timeout;
-        let mine = self.lock().scale_set(id).map(|set| {
-            set.polls += 1;
-            set.polls
-        });
+        let mine = {
+            let mut st = self.lock();
+            let authorized = st
+                .scale_set(id)
+                .and_then(|set| set.session.as_ref())
+                .is_some_and(|s| s.token == bearer);
+            let mine = st.scale_set(id).map(|set| {
+                set.polls += 1;
+                if authorized {
+                    set.capacity = capacity;
+                }
+                set.polls
+            });
+            let fresh = authorized && st.scale_set(id).is_some_and(|set| std::mem::take(&mut set.fresh));
+            if fresh && st.assign_at_session_open {
+                assign(&mut st, id);
+            }
+            mine
+        };
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
@@ -999,9 +1045,6 @@ impl FakeGithub {
             let answer = self.session_auth(id, bearer, |st| {
                 if st.scale_set(id).map(|set| set.polls) != mine {
                     return Reply::empty(202);
-                }
-                if let Some(room) = capacity {
-                    auto_assign(st, id, room);
                 }
                 let front = st
                     .scale_sets
@@ -1030,9 +1073,22 @@ impl FakeGithub {
     }
 }
 
-/// Assigns queued jobs to the scale set up to `capacity` Actions runners, as the service does for a poll that says it
-/// has room: the offers for them are withdrawn and a `JobAssigned` replaces each.
-fn auto_assign(st: &mut State, id: i64, capacity: usize) {
+/// What the service does when something happens in its queue: every scale set with a session gets the queued jobs
+/// its newest poll has room for.
+fn look_at_the_queue(st: &mut State) {
+    let ids: Vec<i64> = st
+        .scale_sets
+        .iter()
+        .filter(|s| !s.deleted && s.session.is_some())
+        .map(|s| s.id)
+        .collect();
+    for id in ids {
+        assign(st, id);
+    }
+}
+
+/// Assigns queued jobs to the scale set up to the capacity of its newest poll: a `JobAssigned` for each.
+fn assign(st: &mut State, id: i64) {
     if !st.opts.auto_assign {
         return;
     }
@@ -1040,6 +1096,9 @@ fn auto_assign(st: &mut State, id: i64, capacity: usize) {
         return;
     };
     let (labels, repo) = (set.labels.clone(), set.repo.clone());
+    let Some(capacity) = set.capacity.filter(|_| set.session.is_some()) else {
+        return;
+    };
     let mut room = capacity.saturating_sub(st.stats(id).assigned);
     let wanted: Vec<usize> = (0..st.jobs.len())
         .filter(|&i| {
@@ -1054,13 +1113,6 @@ fn auto_assign(st: &mut State, id: i64, capacity: usize) {
         room -= 1;
         st.jobs[i].state = JobState::Acquired(id);
         let job = st.jobs[i].clone();
-        if let Some(set) = st.scale_set(id) {
-            set.queue.retain(|m| {
-                !m.batch
-                    .iter()
-                    .any(|v| v["messageType"] == "JobAvailable" && v["runnerRequestId"] == job.request_id)
-            });
-        }
         let msg = st.job_message("JobAssigned", &job, json!({}));
         st.push(id, vec![msg]);
     }
@@ -1171,6 +1223,8 @@ fn create_scale_set(st: &mut State, req: &Request, repo: &str) -> Reply {
         queue: VecDeque::new(),
         next_message: 0,
         polls: 0,
+        capacity: None,
+        fresh: false,
         deleted: false,
     });
     let s = st.scale_sets.last().expect("just pushed");
@@ -1229,6 +1283,8 @@ fn create_session(st: &mut State, id: i64, req: &Request) -> Reply {
         expires_at: now + ttl,
     };
     set.session = Some(session.clone());
+    set.capacity = None;
+    set.fresh = true;
     Reply::json(&session_json(st, id, &session))
 }
 

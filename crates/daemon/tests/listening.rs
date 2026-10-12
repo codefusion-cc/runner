@@ -47,7 +47,10 @@ async fn a_job_the_closed_machine_refused_waits_at_github_and_is_taken_once_the_
     until("a runner for the job", || h.hosts.started().len() == 1).await;
     assert_eq!(h.fake.runners().len(), 1);
     assert!(
-        polls_with_room("1") >= 1,
+        h.fake
+            .requests()
+            .iter()
+            .any(|r| r.max_capacity.as_deref().is_some_and(|room| room != "0")),
         "the machine offers its free slot once it is open"
     );
 

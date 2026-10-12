@@ -207,6 +207,14 @@ pub struct Status {
     /// Why the Mac serves no repository, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_serving: Option<String>,
+    /// For how many seconds jobs the Mac serves have waited while a machine of their size fits on it, or while it
+    /// runs nothing at all; 0 (and left out) while none wait so. A few seconds are normal: GitHub hands a job over
+    /// within a poll. Over a minute the Mac is idle while work waits for it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub idle_with_jobs_waiting_seconds: u64,
+    /// What the Runner believes keeps those jobs from starting, while they wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_with_jobs_waiting_reason: Option<String>,
     /// Its scale sets, at most 500.
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
@@ -441,4 +449,9 @@ pub struct Answer {
     pub report_every: u64,
     /// Commands to run. They come again with every answer until a report carries their result.
     pub commands: Vec<Command>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }

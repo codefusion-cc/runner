@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use cf_ghapp::Clock;
-use cf_scaleset::{Error, JobBase, Message, Statistics};
+use cf_scaleset::{Error, JobBase, Look, Message, Statistics};
 use time::OffsetDateTime;
 
 use crate::names::runner_name;
@@ -17,6 +17,21 @@ pub const IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
 /// How long a slot stays promised to an acquired job the service has not assigned. The Go manager's reservations
 /// ran out after the same two minutes.
 pub const PROMISE_TTL: Duration = Duration::from_secs(2 * 60);
+
+/// The least time between two openings of one scale set's session for room GitHub has not seen
+/// ([`Scaler::with_renew_after`] changes it). Memory that comes and goes may open the Mac every few seconds; GitHub
+/// gets to look at the queue at most this often for it.
+pub const RENEW_AFTER: Duration = Duration::from_secs(15);
+
+/// How often a scale set that has nothing on this machine while a machine of its size fits fetches GitHub's counts
+/// ([`Scaler::with_recheck_after`] changes it). They otherwise come only with a message, and a scale set GitHub
+/// sends nothing keeps the counts of its last one. Counts that name jobs GitHub holds back open the session again,
+/// no sooner than this after it last opened: the second line behind [`RENEW_AFTER`], for whatever left room unseen.
+pub const RECHECK_AFTER: Duration = Duration::from_secs(30);
+
+/// How long the slots promised for a new session's first poll stay promised without an assignment. GitHub answers
+/// that poll within a round trip; a bell that ends it first is followed by the next poll at once.
+pub const OPENING_HOLD: Duration = Duration::from_secs(2);
 
 /// How often an Actions runner whose name is taken is registered again under another.
 const NAME_TRIES: usize = 3;
@@ -74,6 +89,28 @@ pub struct Scaler<J, R, H> {
     /// How many Actions runners the scale set's assigned jobs need now: the service's count, less the jobs that ended
     /// since without a new one. None before the first report.
     wanted: Option<usize>,
+    /// Whether the last capacity carried room for one more job; none before the first.
+    offered_room: Option<bool>,
+    /// Room came while the scale set had nothing on this machine, and GitHub has not looked at its queue since: it
+    /// looks when a job is queued or ends and when a session opens, not when a poll offers more room.
+    unseen_room: bool,
+    /// The scale set has nothing on this machine.
+    idle: bool,
+    /// And a machine of its size fits.
+    idle_with_room: bool,
+    /// And GitHub's last counts name jobs it holds for the scale set.
+    held_back: bool,
+    /// When the session last opened, by the clock.
+    opened: SystemTime,
+    /// When GitHub's counts last came, by the clock.
+    counted: SystemTime,
+    /// The counts asked for last came by a count, not by a session that opened.
+    counting: bool,
+    /// The slots promised to held-back jobs for a new session's first poll, and since when.
+    opening: Vec<Ticket>,
+    opening_since: SystemTime,
+    renew_after: Duration,
+    recheck_after: Duration,
 }
 
 impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
@@ -94,7 +131,6 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             hosts,
             slots,
             roster,
-            clock,
             events: None,
             was_out_of_memory: None,
             promised: vec![],
@@ -102,7 +138,34 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             never: Arc::new(Mutex::new(None)),
             last: Arc::new(Mutex::new(None)),
             wanted: None,
+            offered_room: None,
+            unseen_room: false,
+            idle: true,
+            idle_with_room: false,
+            held_back: false,
+            opened: clock.now(),
+            counted: clock.now(),
+            counting: false,
+            opening: vec![],
+            opening_since: clock.now(),
+            renew_after: RENEW_AFTER,
+            recheck_after: RECHECK_AFTER,
+            clock,
         }
+    }
+
+    /// The least time between two openings of the session for room GitHub has not seen; [`RENEW_AFTER`] unless
+    /// set.
+    pub fn with_renew_after(mut self, after: Duration) -> Self {
+        self.renew_after = after;
+        self
+    }
+
+    /// How often counts are fetched while the scale set has nothing here and one fits, and the least time between
+    /// two openings of the session while they name jobs GitHub holds back; [`RECHECK_AFTER`] unless set.
+    pub fn with_recheck_after(mut self, after: Duration) -> Self {
+        self.recheck_after = after;
+        self
     }
 
     /// Where job events go.
@@ -511,22 +574,94 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// assign this machine several times the jobs it can run while other machines stay idle. One at a time, a burst
     /// still fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
     pub fn capacity(&self) -> usize {
-        self.active()
-            + self.waiting.len()
-            + self.promised.len()
-            + self.slots.open_slots(self.config.size).min(1)
+        self.offer().0
+    }
+
+    /// [`Scaler::capacity`], and whether it carries room for one more job.
+    fn offer(&self) -> (usize, bool) {
+        let room = self.slots.open_slots(self.config.size) > 0;
+        (
+            self.active() + self.waiting.len() + self.promised.len() + usize::from(room),
+            room,
+        )
+    }
+
+    /// Keeps track of room GitHub has not seen. Its polls offered none, and now one fits: GitHub gave the scale
+    /// set's queued jobs out when they were queued, against the room offered then, and does not look again until
+    /// something happens at GitHub. Nothing may happen there for a long time (2026-10-12: 13 minutes of an idle Mac
+    /// with 7 of its jobs queued; a job that runs here may run for an hour).
+    fn watch_room(&mut self, room: bool) {
+        let idle = self.active() == 0 && self.waiting.is_empty() && self.promised.is_empty();
+        if !room {
+            self.unseen_room = false;
+        } else if self.offered_room == Some(false) {
+            self.unseen_room = true;
+        }
+        self.idle = idle;
+        self.offered_room = Some(room);
+        let available = self
+            .last
+            .lock()
+            .expect("statistics")
+            .as_ref()
+            .is_some_and(|stats| stats.total_available_jobs > 0);
+        self.idle_with_room = room && idle;
+        self.held_back = room && available && self.promised.is_empty();
     }
 }
 
 impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
     async fn scale(&mut self, message: Option<&Message>) -> Result<usize, Error> {
+        let counting = std::mem::take(&mut self.counting);
         if let Some(message) = message {
+            if message.statistics.is_some() {
+                self.counted = self.clock.now();
+            }
             self.handle(message).await?;
+            if let (Some(stats), false) = (&message.statistics, counting)
+                && message.id == 0
+                && message.assigned.is_empty()
+            {
+                // A session opened, and GitHub looks at the queue against its first poll.
+                self.unseen_room = false;
+                self.held_back = false;
+                self.opened = self.clock.now();
+                self.promise_held(stats);
+            }
         }
         // After the Actions runners started: a job assigned late still finds the slot promised to it.
         self.converge().await?;
+        self.give_back_unopened();
         self.expire_promises();
-        Ok(self.capacity())
+        let (capacity, room) = self.offer();
+        self.watch_room(room);
+        Ok(capacity)
+    }
+
+    fn renew(&mut self) -> Option<(Duration, Look)> {
+        // Slots promised for a first poll go back in their time, whether or not a poll ends then.
+        let (after, since, look) = if !self.opening.is_empty() {
+            (OPENING_HOLD, self.opening_since, Look::Recount)
+        } else if self.unseen_room {
+            (self.renew_after, self.opened, self.reopen())
+        } else if self.held_back {
+            (self.recheck_after, self.opened, self.reopen())
+        } else if self.idle_with_room {
+            (self.recheck_after, self.counted, Look::Recount)
+        } else {
+            return None;
+        };
+        let now = self.clock.now();
+        let age = now.duration_since(since).unwrap_or(Duration::ZERO);
+        if age < after {
+            return Some((after - age, look));
+        }
+        // A session opened again says so with its counts.
+        if look == Look::Recount {
+            self.counting = true;
+            self.counted = now;
+        }
+        Some((Duration::ZERO, look))
     }
 }
 
@@ -541,6 +676,59 @@ fn heard(started_at: Option<OffsetDateTime>, now: OffsetDateTime) -> (String, i6
 }
 
 impl<J, R, H> Scaler<J, R, H> {
+    /// A session opened: GitHub hands out the queued jobs it holds for the scale set against its first poll, and only
+    /// then. A slot is promised to each the counts name that fits, so that poll shows GitHub all of them and no other
+    /// scale set offers the same slots. One more slot a poll would get one job each time something happens at
+    /// GitHub (2026-10-12 tests: two slots free after memory came back, two jobs queued; one ran, one waited).
+    fn promise_held(&mut self, stats: &Statistics) {
+        let held = usize::try_from(stats.total_available_jobs).unwrap_or(0);
+        for _ in 0..held {
+            let Ok(ticket) = self.slots.reserve(self.config.size) else {
+                break;
+            };
+            self.promised.push(Promise {
+                ticket,
+                since: self.clock.now(),
+            });
+            self.opening.push(ticket);
+        }
+        self.opening_since = self.clock.now();
+    }
+
+    /// The slots promised for a session's first poll that no assignment took within [`OPENING_HOLD`] are free
+    /// again, for this scale set's next poll and every other one's.
+    fn give_back_unopened(&mut self) {
+        let promised = &self.promised;
+        self.opening
+            .retain(|ticket| promised.iter().any(|promise| promise.ticket == *ticket));
+        let held = self
+            .clock
+            .now()
+            .duration_since(self.opening_since)
+            .unwrap_or(Duration::ZERO);
+        if self.opening.is_empty() || held < OPENING_HOLD {
+            return;
+        }
+        let (slots, opening) = (&self.slots, std::mem::take(&mut self.opening));
+        self.promised.retain(|promise| {
+            let unused = opening.contains(&promise.ticket);
+            if unused {
+                slots.release(promise.ticket);
+            }
+            !unused
+        });
+    }
+
+    /// How the session is opened again: at once while the scale set has nothing here, between messages while a job
+    /// runs, so that its start and its end are heard.
+    fn reopen(&self) -> Look {
+        if self.idle {
+            Look::Reopen
+        } else {
+            Look::ReopenBetweenMessages
+        }
+    }
+
     fn give_back(&mut self, promises: std::ops::Range<usize>) {
         for promise in self.promised.drain(promises) {
             self.slots.release(promise.ticket);

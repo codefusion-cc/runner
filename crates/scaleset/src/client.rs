@@ -348,7 +348,7 @@ impl ScaleSetClient {
             }
             return Err(refused);
         }
-        Ok(MessageSession::new(self.clone(), scale_set_id, info))
+        Ok(MessageSession::new(self.clone(), scale_set_id, owner, info))
     }
 
     /// Asks the service for a new token for a session.

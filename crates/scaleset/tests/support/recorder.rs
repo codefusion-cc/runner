@@ -1,10 +1,16 @@
 //! A scaler that writes down what it is given, and can be told to wait or to fail.
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use cf_scaleset::{Error, Message, Scaler, Statistics};
+use cf_scaleset::{Error, Look, Message, Scaler, Statistics};
 use tokio::sync::Notify;
+
+/// What [`Scaler::renew`] answers.
+pub type Renewal = Option<(Duration, Look)>;
 
 #[derive(Debug, Clone)]
 pub enum Seen {
@@ -22,13 +28,17 @@ pub struct Recorder {
     pub gate: Option<Arc<Notify>>,
     /// Signalled when a message has arrived (before the gate).
     pub arrived: Arc<Notify>,
-    pub capacity: usize,
+    pub capacity: Arc<AtomicUsize>,
+    /// What `renew` answers, one each time it is asked; `None` once they are used up.
+    pub renewals: Arc<Mutex<VecDeque<Renewal>>>,
+    /// How often `renew` was asked.
+    pub asked: Arc<AtomicUsize>,
 }
 
 impl Recorder {
     pub fn new(capacity: usize) -> Recorder {
         Recorder {
-            capacity,
+            capacity: Arc::new(AtomicUsize::new(capacity)),
             ..Recorder::default()
         }
     }
@@ -52,7 +62,7 @@ impl Scaler for Recorder {
         let fail_on = self.fail_on.clone();
         let gate = self.gate.clone();
         let arrived = self.arrived.clone();
-        let capacity = self.capacity;
+        let capacity = self.capacity.load(Ordering::SeqCst);
         let message = message.cloned();
         async move {
             match message {
@@ -81,5 +91,10 @@ impl Scaler for Recorder {
             }
             Ok(capacity)
         }
+    }
+
+    fn renew(&mut self) -> Renewal {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.renewals.lock().unwrap().pop_front().flatten()
     }
 }

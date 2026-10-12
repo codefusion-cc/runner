@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use cf_fake_github::Options;
 use cf_fake_github::httpd::Reply;
 use cf_ghapp::RetryPolicy;
-use cf_scaleset::{Backoff, Error, ScaleSet, listen, listen_nudged, shutdown, supervise};
+use cf_scaleset::{Backoff, Error, Look, ScaleSet, listen, listen_nudged, shutdown, supervise};
 use serde_json::json;
 use support::recorder::{Recorder, Seen};
 use support::*;
@@ -676,4 +676,255 @@ async fn a_worker_waiting_to_try_again_stops_at_once_when_asked() {
     trigger.trigger();
     task.await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+fn auto_assign() -> Options {
+    Options {
+        auto_assign: true,
+        ..Options::default()
+    }
+}
+
+/// How often the scale set's sessions were opened (`POST`) or ended (`DELETE`).
+fn session_calls(h: &Harness, method: &str, set: &ScaleSet) -> usize {
+    let opened = format!("/runnerscalesets/{}/sessions", set.id);
+    h.fake
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.line.starts_with(method)
+                && (r.line.ends_with(&opened) || r.line.contains(&format!("{opened}/")))
+        })
+        .count()
+}
+
+fn initials(seen: &Recorder) -> usize {
+    seen.seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| matches!(s, Seen::Initial(_)))
+        .count()
+}
+
+// GitHub gives a scale set its queued jobs when something happens in its queue and when a session opens, against the
+// room of the newest wait; a wait that brings more room gets nothing by itself. A scaler that asks for a new
+// session gets one in place, its counts at the start, and the job GitHub held back, read from the new queue's start.
+#[tokio::test]
+async fn a_scaler_that_asks_for_a_new_session_gets_one_in_place_and_the_job_github_held_back() {
+    use cf_fake_github::JobState;
+    let h = harness_with(auto_assign(), fast(), Duration::from_secs(10)).await;
+    let (set, session) = with_session(&h).await;
+    h.fake.set_poll_timeout(Duration::from_secs(30));
+    let nudge = Arc::new(Notify::new());
+    let mut scaler = Recorder::new(1);
+    let seen = scaler.clone();
+    let (trigger, stop) = shutdown();
+    let task = tokio::spawn({
+        let (session, nudge) = (session.clone(), nudge.clone());
+        async move { listen_nudged(&session, &mut scaler, stop, &nudge).await }
+    });
+    until("the first wait", || polls(&h) == 1).await;
+    let first = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    until("the first job's assignment", || seen.messages().len() == 1).await;
+    let held = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "test");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        h.fake.job_state(held),
+        Some(JobState::Available),
+        "no room was offered for it"
+    );
+
+    seen.capacity.store(2, Ordering::SeqCst);
+    let before = polls(&h);
+    nudge.notify_one();
+    until("a wait with room", || polls(&h) > before).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.fake.job_state(held),
+        Some(JobState::Available),
+        "the fake assigned on a wait"
+    );
+
+    let requests = h.fake.requests().len();
+    seen.renewals
+        .lock()
+        .unwrap()
+        .push_back(Some((Duration::ZERO, Look::Reopen)));
+    nudge.notify_one();
+    until("the held job's assignment", || seen.messages().len() == 2).await;
+    assert_eq!(h.fake.job_state(held), Some(JobState::Acquired(set.id)));
+    assert_eq!(h.fake.job_state(first), Some(JobState::Acquired(set.id)));
+    assert_eq!(session_calls(&h, "POST", &set), 2);
+    assert_eq!(session_calls(&h, "DELETE", &set), 1);
+    assert_eq!(initials(&seen), 2, "the new session's counts reach the scaler");
+    let first_poll = h.fake.requests()[requests..]
+        .iter()
+        .find(|r| r.line.starts_with(&poll_line(&set)))
+        .cloned()
+        .expect("a poll of the new session");
+    assert_eq!(
+        first_poll.last_message_id, None,
+        "the new session's queue is read from its start"
+    );
+    trigger.trigger();
+    task.await.unwrap().unwrap();
+}
+
+// A scaler that wants a new session only later (it opened one a moment ago) is asked again when that time comes,
+// although nothing ends the wait before.
+#[tokio::test]
+async fn a_renewal_asked_for_later_comes_then_without_waiting_for_the_poll_to_run_out() {
+    let h = harness_with(auto_assign(), fast(), Duration::from_secs(10)).await;
+    let (set, session) = with_session(&h).await;
+    h.fake.set_poll_timeout(Duration::from_secs(30));
+    let mut scaler = Recorder::new(1);
+    let seen = scaler.clone();
+    seen.renewals.lock().unwrap().extend([
+        Some((Duration::from_millis(300), Look::Reopen)),
+        Some((Duration::ZERO, Look::Reopen)),
+    ]);
+    let (trigger, stop) = shutdown();
+    let begun = Instant::now();
+    let task = tokio::spawn({
+        let session = session.clone();
+        async move { listen(&session, &mut scaler, stop).await }
+    });
+    until("the session opened again", || {
+        session_calls(&h, "POST", &set) == 2
+    })
+    .await;
+    let took = begun.elapsed();
+    assert!(
+        took >= Duration::from_millis(300),
+        "renewed before its time: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "renewed only when the poll ran out: {took:?}"
+    );
+    assert!(seen.asked.load(Ordering::SeqCst) >= 2);
+    trigger.trigger();
+    task.await.unwrap().unwrap();
+}
+
+// The session GitHub already forgot is no obstacle: the new one opens all the same.
+#[tokio::test]
+async fn a_renewal_of_a_session_github_lost_opens_a_new_one() {
+    let h = harness_with(auto_assign(), fast(), Duration::from_secs(10)).await;
+    let (set, session) = with_session(&h).await;
+    h.fake.lose_session(set.id);
+    let statistics = session.reopen().await.expect("a new session");
+    assert_eq!(statistics.total_assigned_jobs, 0);
+    assert!(
+        h.fake
+            .scale_sets()
+            .iter()
+            .any(|s| s.id == set.id && s.has_session)
+    );
+    assert!(
+        session.poll(0, 1).await.is_ok(),
+        "the clone polls the new session"
+    );
+}
+
+// A scale set GitHub sends nothing keeps the counts of its last message: a job queued since, which GitHub held back,
+// is not in them. A scaler that asks for the counts gets them fresh, and the session, its queue and the place read
+// in it stay.
+#[tokio::test]
+async fn a_scaler_that_asks_for_the_counts_gets_them_fresh_and_keeps_its_session() {
+    let h = harness_with(auto_assign(), fast(), Duration::from_secs(10)).await;
+    let (set, session) = with_session(&h).await;
+    h.fake.set_poll_timeout(Duration::from_secs(30));
+    let nudge = Arc::new(Notify::new());
+    let mut scaler = Recorder::new(1);
+    let seen = scaler.clone();
+    let (trigger, stop) = shutdown();
+    let task = tokio::spawn({
+        let (session, nudge) = (session.clone(), nudge.clone());
+        async move { listen_nudged(&session, &mut scaler, stop, &nudge).await }
+    });
+    until("the first wait", || polls(&h) == 1).await;
+    h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    until("the job's assignment", || seen.messages().len() == 1).await;
+    seen.capacity.store(0, Ordering::SeqCst);
+    let before = polls(&h);
+    nudge.notify_one();
+    until("a wait without room", || polls(&h) > before).await;
+    h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "test");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let available = |seen: &Recorder| {
+        seen.seen.lock().unwrap().iter().rev().find_map(|s| match s {
+            Seen::Initial(stats) => Some(stats.total_available_jobs),
+            _ => None,
+        })
+    };
+    assert_eq!(available(&seen), Some(0), "the counts at the start");
+
+    let requests = h.fake.requests().len();
+    seen.renewals
+        .lock()
+        .unwrap()
+        .push_back(Some((Duration::ZERO, Look::Recount)));
+    nudge.notify_one();
+    until("fresh counts", || initials(&seen) == 2).await;
+    assert_eq!(available(&seen), Some(1), "the held job is counted");
+    assert_eq!(session_calls(&h, "POST", &set), 1, "no new session");
+    assert_eq!(session_calls(&h, "DELETE", &set), 0);
+    assert_eq!(session_calls(&h, "PATCH", &set), 1);
+    until("a wait after the count", || {
+        h.fake.requests()[requests..]
+            .iter()
+            .any(|r| r.line.starts_with(&poll_line(&set)))
+    })
+    .await;
+    let next = h.fake.requests()[requests..]
+        .iter()
+        .find(|r| r.line.starts_with(&poll_line(&set)))
+        .cloned()
+        .expect("a poll");
+    assert_eq!(
+        next.last_message_id.as_deref(),
+        Some("1"),
+        "the queue is read on from where it was"
+    );
+    trigger.trigger();
+    task.await.unwrap().unwrap();
+}
+
+// A scale set with a job running asks for its new session between messages: not while a wait was given up (its
+// queue may hold the job's start or end), only once one ran out by itself with nothing.
+#[tokio::test]
+async fn a_new_session_between_messages_waits_for_a_wait_that_runs_out_empty() {
+    let h = harness_with(auto_assign(), fast(), Duration::from_secs(10)).await;
+    let (set, session) = with_session(&h).await;
+    h.fake.set_poll_timeout(Duration::from_millis(300));
+    let nudge = Arc::new(Notify::new());
+    let mut scaler = Recorder::new(1);
+    let seen = scaler.clone();
+    seen.renewals
+        .lock()
+        .unwrap()
+        .extend((0..10_000).map(|_| Some((Duration::ZERO, Look::ReopenBetweenMessages))));
+    let (trigger, stop) = shutdown();
+    let task = tokio::spawn({
+        let (session, nudge) = (session.clone(), nudge.clone());
+        async move { listen_nudged(&session, &mut scaler, stop, &nudge).await }
+    });
+    for _ in 0..16 {
+        nudge.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(polls(&h) >= 4, "the waits went on");
+    assert_eq!(
+        session_calls(&h, "POST", &set),
+        1,
+        "no new session while every wait was given up"
+    );
+    until("a new session after a wait that ran out", || {
+        session_calls(&h, "POST", &set) >= 2
+    })
+    .await;
+    trigger.trigger();
+    task.await.unwrap().unwrap();
 }

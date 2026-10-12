@@ -406,6 +406,8 @@ pub fn scaler_of(parts: &Parts<'_>) -> TestScaler {
         parts.clock.clone(),
     )
     .with_events(Arc::new(Both(parts.events.clone(), parts.slots.machines.clone())))
+    .with_renew_after(std::time::Duration::from_millis(200))
+    .with_recheck_after(std::time::Duration::from_millis(400))
     .with_out_of_memory_check({
         let machines = parts.slots.machines.clone();
         Arc::new(move |runner| machines.was_out_of_memory(runner))
