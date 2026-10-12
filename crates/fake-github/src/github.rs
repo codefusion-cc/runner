@@ -93,6 +93,9 @@ struct ScaleSet {
     session: Option<Session>,
     queue: VecDeque<Msg>,
     next_message: i64,
+    /// How many polls came for it. Only the newest is served: the one before it was given up by its listener,
+    /// whose closed connection ends it at the service, and offers nothing any more.
+    polls: u64,
     deleted: bool,
 }
 
@@ -985,11 +988,18 @@ impl FakeGithub {
             .unwrap_or(0);
         let capacity: Option<usize> = req.header("x-scalesetmaxcapacity").and_then(|v| v.parse().ok());
         let deadline = tokio::time::Instant::now() + self.lock().opts.poll_timeout;
+        let mine = self.lock().scale_set(id).map(|set| {
+            set.polls += 1;
+            set.polls
+        });
         loop {
             let notified = self.inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let answer = self.session_auth(id, bearer, |st| {
+                if st.scale_set(id).map(|set| set.polls) != mine {
+                    return Reply::empty(202);
+                }
                 if let Some(room) = capacity {
                     auto_assign(st, id, room);
                 }
@@ -1160,6 +1170,7 @@ fn create_scale_set(st: &mut State, req: &Request, repo: &str) -> Reply {
         session: None,
         queue: VecDeque::new(),
         next_message: 0,
+        polls: 0,
         deleted: false,
     });
     let s = st.scale_sets.last().expect("just pushed");

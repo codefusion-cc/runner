@@ -181,6 +181,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         for started in &message.started {
             let event = self.event(EventKind::Started, &started.runner_name, &started.job, "");
             self.roster.mark_busy(
+                &self.config.repo,
                 self.config.scale_set_id,
                 &started.runner_name,
                 JobInfo {
@@ -206,10 +207,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         for done in &message.completed {
             let mut event = self.event(EventKind::Completed, &done.runner_name, &done.job, &done.result);
             event.out_of_memory = self.out_of_memory(&done.runner_name).await;
-            if self
-                .roster
-                .mark_done(self.config.scale_set_id, &done.runner_name, self.clock.now())
-            {
+            if self.roster.mark_done(
+                &self.config.repo,
+                self.config.scale_set_id,
+                &done.runner_name,
+                self.clock.now(),
+            ) {
                 finished += 1;
             }
             tracing::info!(runner = %done.runner_name, job = %done.job.job_display_name, result = %done.result, "job completed");
@@ -439,6 +442,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             name: name.clone(),
             handle,
             runner_id,
+            repo: self.config.repo.clone(),
             scale_set_id: self.config.scale_set_id,
             ticket: Some(ticket),
             started: self.clock.now(),
@@ -454,7 +458,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// Removes up to `n` Actions runners that waited past [`IDLE_GRACE`] for a job that never came, such as one
     /// cancelled before it started. Busy, finished and adopted Actions runners are left alone.
     async fn retire_surplus(&mut self, mut n: usize) {
-        for runner in self.roster.runners(self.config.scale_set_id) {
+        for runner in self.roster.runners(&self.config.repo, self.config.scale_set_id) {
             if n == 0 {
                 return;
             }
@@ -479,8 +483,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             n -= 1;
             // Its registration is removed, so it takes no job and no longer counts. The machine keeps its slot
             // until whoever watches the machines sees it gone.
-            self.roster
-                .mark_done(self.config.scale_set_id, &runner.name, self.clock.now());
+            self.roster.mark_done(
+                &self.config.repo,
+                self.config.scale_set_id,
+                &runner.name,
+                self.clock.now(),
+            );
             match self.hosts.stop(&runner.handle).await {
                 Ok(()) => tracing::info!(runner = %runner.name, "surplus Actions runner removed"),
                 Err(e) => {
@@ -493,7 +501,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone
     /// under a job GitHub has not let go of.
     fn active(&self) -> usize {
-        self.roster.active(self.config.scale_set_id) + self.hosts.lost_with_job(self.config.scale_set_id)
+        let (repo, id) = (self.config.repo.as_str(), self.config.scale_set_id);
+        self.roster.active(repo, id) + self.hosts.lost_with_job(repo, id)
     }
 
     /// How many Actions runners this scale set may have at once right now, which every wait carries to the service:

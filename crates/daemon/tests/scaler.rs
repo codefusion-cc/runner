@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use cf_daemon::testing::{pass, settings_for};
-use cf_daemon::{EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Runner, Slots};
+use cf_daemon::{Claim, EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Runner, Slots, Ticket};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{JobState, Options};
 use cf_scaleset::{JobBase, JobCompleted, JobStarted, Message, Scaler as _, Statistics};
@@ -344,6 +344,7 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
     let all = h.hosts.started();
     let busy = all[0].0.clone();
     h.roster.mark_busy(
+        REPO,
         h.set.id,
         &busy,
         JobInfo {
@@ -358,6 +359,7 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
         name: "adopted".into(),
         handle: "adopted".into(),
         runner_id: 99,
+        repo: REPO.into(),
         scale_set_id: h.set.id,
         ticket: None,
         started: h.clock_now() - Duration::from_secs(3600),
@@ -747,7 +749,7 @@ async fn a_completed_job_without_new_counts_gets_no_second_runner() {
         "the runner of a job still assigned was retired"
     );
     assert_eq!(
-        h.roster.active(h.set.id),
+        h.roster.active(REPO, h.set.id),
         1,
         "the second job still has its runner"
     );
@@ -788,6 +790,7 @@ async fn a_message_that_names_a_runner_of_another_scale_set_leaves_that_runner_a
         name: "mac-b-theirs".into(),
         handle: "vm-theirs".into(),
         runner_id: 9,
+        repo: REPO.into(),
         scale_set_id: h.set.id + 1,
         ticket: None,
         started: h.clock_now(),
@@ -857,7 +860,7 @@ async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
         vec![ticket],
         "the slot of a machine that may still stand was given to the next job"
     );
-    assert_eq!(h.roster.active(h.set.id), 0, "it waits for no job any more");
+    assert_eq!(h.roster.active(REPO, h.set.id), 0, "it waits for no job any more");
     assert!(
         h.roster.get(&name).is_some(),
         "whoever watches the machines still finds it"
@@ -934,4 +937,83 @@ async fn the_log_names_a_jobs_start_by_githubs_time_and_says_how_late_its_word_c
             ),
         ]
     );
+}
+
+// --- two repositories whose scale sets have the same number --------------------------------------------------------
+
+/// An Actions runner this Mac has for another repository's scale set, which GitHub gave the number this one has:
+/// GitHub counts scale sets within a repository. The Air and the mini, 2026-10-12: four repositories' scale sets
+/// were number 6 on one and number 7 on the other.
+fn of_another_repository(h: &Harness, name: &str, ticket: Option<Ticket>, age: Duration) -> Runner {
+    Runner {
+        name: name.into(),
+        handle: name.into(),
+        runner_id: 9,
+        repo: "org/other".into(),
+        scale_set_id: h.set.id,
+        ticket,
+        started: h.clock_now() - age,
+        busy: ticket.is_some(),
+        adopted: false,
+        done: None,
+        job: None,
+    }
+}
+
+#[tokio::test]
+async fn another_repositorys_runner_under_the_same_number_is_not_offered_to_github_as_room() {
+    let mut h = harness(1).await;
+    let Claim::Start(ticket) = h.machines.claim(SIZE, None) else {
+        panic!("the Mac has a slot");
+    };
+    h.roster.add(of_another_repository(
+        &h,
+        "mac-b-theirs",
+        Some(ticket),
+        Duration::ZERO,
+    ));
+    let capacity = h.scaler.scale(Some(&stats(0))).await.unwrap();
+    assert_eq!(
+        capacity, 0,
+        "the Mac is full: GitHub must not be told this scale set takes a job"
+    );
+}
+
+#[tokio::test]
+async fn a_job_assigned_while_another_repository_has_a_runner_under_the_same_number_gets_its_own() {
+    let mut h = harness(2).await;
+    let Claim::Start(ticket) = h.machines.claim(SIZE, None) else {
+        panic!("the Mac has a slot");
+    };
+    h.roster.add(of_another_repository(
+        &h,
+        "mac-b-theirs",
+        Some(ticket),
+        Duration::ZERO,
+    ));
+    let capacity = h.scaler.scale(Some(&stats(1))).await.unwrap();
+    assert_eq!(
+        h.hosts.started().len(),
+        1,
+        "the assigned job has no Actions runner"
+    );
+    assert_eq!(capacity, 1, "its own Actions runner, and no room beside the two");
+    assert_eq!(h.roster.active(REPO, h.set.id), 1);
+    assert_eq!(h.roster.active("org/other", h.set.id), 1);
+}
+
+#[tokio::test]
+async fn another_repositorys_idle_runner_under_the_same_number_is_not_retired_as_surplus() {
+    let mut h = harness(2).await;
+    h.roster.add(of_another_repository(
+        &h,
+        "mac-b-theirs",
+        None,
+        IDLE_GRACE + Duration::from_secs(1),
+    ));
+    h.scaler.scale(Some(&stats(0))).await.unwrap();
+    assert!(h.hosts.stopped().is_empty(), "{:?}", h.hosts.stopped());
+    assert_eq!(h.roster.active("org/other", h.set.id), 1);
+    // Nor does a word about a runner of that name in this repository touch it.
+    assert!(!h.roster.mark_done(REPO, h.set.id, "mac-b-theirs", h.clock_now()));
 }

@@ -422,7 +422,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     continue;
                 }
                 self.close(&set.name).await;
-                if shared.roster.active(set.id) == 0 {
+                if shared.roster.active(&repo, set.id) == 0 {
                     match client.delete_scale_set(set.id).await {
                         Ok(()) => {
                             tracing::info!(%repo, set = %set.name, "a scale set nothing asks for was deleted")
@@ -813,13 +813,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             }
         });
         let paused = *shared.console_paused.lock().expect("paused");
+        // A Mac the budget calls open takes no job while what runs on it leaves no memory for even the smallest
+        // size it serves: the console hears that it is closed and what for, in the budget's word.
+        let no_room = sets
+            .iter()
+            .map(|set| set.size)
+            .min_by_key(|size| size.index())
+            .and_then(|smallest| shared.machines.short_of(smallest));
+        let (open, reason) = match no_room {
+            Some(why) => (false, Some(why.to_string())),
+            None => (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone())),
+        };
         Report {
             status: Status {
                 machine: shared.config.machine.clone(),
                 version: shared.config.version.clone(),
                 updated_at: iso(now),
-                open: snapshot.open,
-                reason: (!snapshot.open).then(|| snapshot.reason.clone()),
+                open,
+                reason,
                 // Of the commonest size, under the limits in force.
                 max_jobs: settings.side_by_side(&snapshot.budget.limits, Size::G4),
                 paused,

@@ -190,6 +190,31 @@ pub struct Snapshot {
     pub waiting: usize,
 }
 
+/// How soon after a look told the listeners of room the Mac lost a look tells them again. Room that comes and goes
+/// with the Mac's memory ends every poll in flight each time it goes; this is how often at most.
+const TELL_AGAIN_AFTER: Millis = Millis::secs(5);
+
+/// How soon after the log said that no machine of a size fits it says so again.
+const SAY_AGAIN_AFTER: Millis = Millis::mins(1);
+
+/// What the polls in flight may be offering GitHub. A poll carries the room its scale set had when it began, for
+/// most of a minute, and GitHub assigns against that number without asking again: a slot that is gone meanwhile,
+/// taken by another scale set or by whatever else runs on the Mac, must end the polls that still offer it, or its
+/// job is assigned here and waits in line while another Mac has room.
+#[derive(Default)]
+struct Offer {
+    /// The sizes a listener was told there is room for since the listeners were last told that it went.
+    offered: [bool; 4],
+    /// A look found room gone that a poll may offer, and the listeners have not been told yet.
+    owed: bool,
+    /// When a look last told the listeners.
+    told: Option<Millis>,
+    /// What the log last said keeps a machine of each size from starting on the open Mac; nothing while one fits.
+    short: [Option<&'static str>; 4],
+    /// When the log last said so.
+    said: [Option<Millis>; 4],
+}
+
 struct Job {
     record: Record,
     /// The budget's slot while the machine holds memory.
@@ -232,6 +257,8 @@ struct Inner<H> {
     /// Whether the Mac took new jobs at the last look, and the budget's word for why not: a change is a line in
     /// the log.
     door: Option<(bool, &'static str)>,
+    /// What the polls in flight may be offering GitHub.
+    offer: Offer,
 }
 
 /// The Mac's slots and machines. The scalers see it as [`Slots`], [`Hosts`] and [`Events`]; the daemon's loop
@@ -317,6 +344,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 asleep,
                 looked: None,
                 door: None,
+                offer: Offer::default(),
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -434,6 +462,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     name: record.runner.clone(),
                     handle: name.clone(),
                     runner_id: record.runner_id.unwrap_or(0),
+                    repo: record.repo.clone(),
                     scale_set_id: record.scale_set_id,
                     ticket: slot,
                     started: UNIX_EPOCH + Duration::from_secs(u64::try_from(record.created_at).unwrap_or(0)),
@@ -542,6 +571,18 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let observed = inner.budget.observe(now, reading);
         Self::door(&mut inner, now);
         let mut nudge = false;
+        if Self::withdrawn(&mut inner, now) {
+            inner.offer.owed = true;
+        }
+        let may_tell = inner
+            .offer
+            .told
+            .is_none_or(|told| now.elapsed.since(told) >= TELL_AGAIN_AFTER);
+        if inner.offer.owed && may_tell {
+            inner.offer.owed = false;
+            inner.offer.told = Some(now.elapsed);
+            nudge = true;
+        }
         for slot in observed.expired {
             inner.grants.remove(&slot);
             inner.breaker.unused();
@@ -613,6 +654,45 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
 
     /// Writes a line when the Mac starts or stops taking new jobs, or stops for another reason than before. Without
     /// it a job that waits leaves nothing in the log, and nobody who reads it can tell whether the Runner listens.
+    /// Whether room is gone that a poll in flight may be offering GitHub: a size a listener was told fits, of which
+    /// no machine fits now. Asked once per loss: the size counts as offered again when a listener next hears of room.
+    fn withdrawn(inner: &mut Inner<H>, now: Now) -> bool {
+        if !inner.offer.offered.contains(&true) {
+            return false;
+        }
+        let free = inner.budget.free(now);
+        let mut gone = false;
+        for size in Size::ALL {
+            let offered = &mut inner.offer.offered[size.index()];
+            if *offered && free.of(size) == 0 {
+                *offered = false;
+                gone = true;
+            }
+        }
+        gone
+    }
+
+    /// What keeps one more machine of this size from starting now although the Mac takes jobs and has slots left,
+    /// in the budget's word: `memory`, when what runs on the Mac leaves too little. Nothing while a machine fits,
+    /// while the Mac is closed (it says why itself), and while its machines use up its slots (they are there to
+    /// see).
+    pub fn short_of(&self, size: Size) -> Option<&'static str> {
+        let mut inner = self.lock();
+        let now = inner.host.now();
+        self.holds(&mut inner, now);
+        Self::shortage(&inner, now, size)
+    }
+
+    fn shortage(inner: &Inner<H>, now: Now, size: Size) -> Option<&'static str> {
+        if inner.budget.level(now) != Level::Open {
+            return None;
+        }
+        match inner.budget.fits(now, size) {
+            Ok(()) | Err(cf_budget::Refusal::Full { .. } | cf_budget::Refusal::Cpus { .. }) => None,
+            Err(refusal) => Some(refusal.name()),
+        }
+    }
+
     fn door(inner: &mut Inner<H>, now: Now) {
         let status = inner.budget.status(now);
         let open = status.level == Level::Open;
@@ -1017,6 +1097,11 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         match inner.budget.claim(now, size) {
             Ok(grant) => {
                 inner.grants.insert(grant.slot, grant);
+                let told = Self::withdrawn(&mut inner, now);
+                drop(inner);
+                if told {
+                    (self.nudge)();
+                }
                 Ok(grant.slot)
             }
             Err(refusal) => {
@@ -1051,7 +1136,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             }
             inner.grants.remove(&ticket);
         }
-        match inner.budget.assign(now, size) {
+        let claim = match inner.budget.assign(now, size) {
             Assigned::Start(grant) => {
                 inner.breaker.admit(now.elapsed);
                 inner.grants.insert(grant.slot, grant);
@@ -1064,8 +1149,16 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
                     why: why.name().to_string(),
                 }
             }
-            Assigned::Never(refusal) => Claim::Never(refusal.name().to_string()),
+            Assigned::Never(refusal) => return Claim::Never(refusal.name().to_string()),
+        };
+        // The slot this job took, or the next one that opens and is now the waiting job's, is one the other scale
+        // sets' polls may still offer.
+        let told = Self::withdrawn(&mut inner, now);
+        drop(inner);
+        if told {
+            (self.nudge)();
         }
+        claim
     }
 
     fn ready(&self, ticket: Ticket) -> bool {
@@ -1092,7 +1185,31 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         let mut inner = self.lock();
         let now = inner.host.now();
         self.holds(&mut inner, now);
-        inner.budget.free(now).of(size) as usize
+        let free = inner.budget.free(now).of(size) as usize;
+        let at = size.index();
+        if free > 0 {
+            inner.offer.offered[at] = true;
+            if inner.offer.short[at].take().is_some() {
+                tracing::info!(size = size.label(), "a machine of this size fits again");
+            }
+            return free;
+        }
+        // A closed Mac said why when it closed. An open one that has no room for this size takes none of its jobs
+        // and would say nothing: GitHub keeps them for another Mac, or until there is room here.
+        let may_say = inner.offer.said[at].is_none_or(|said| now.elapsed.since(said) >= SAY_AGAIN_AFTER);
+        if let Some(why) = Self::shortage(&inner, now, size)
+            && may_say
+            && inner.offer.short[at] != Some(why)
+        {
+            inner.offer.short[at] = Some(why);
+            inner.offer.said[at] = Some(now.elapsed);
+            tracing::info!(
+                size = size.label(),
+                why,
+                "the Mac is open, but no machine of this size fits now: its jobs stay at GitHub"
+            );
+        }
+        0
     }
 
     fn state(&self) -> (bool, String) {
@@ -1146,13 +1263,14 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
         }
     }
 
-    fn lost_with_job(&self, scale_set_id: i64) -> usize {
+    fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {
         self.lock()
             .jobs
             .values()
             .filter(|job| {
                 let record = &job.record;
                 record.scale_set_id == scale_set_id
+                    && record.repo == repo
                     && record.ended.is_some()
                     && !record.unregistered
                     && record
