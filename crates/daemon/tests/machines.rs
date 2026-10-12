@@ -1161,7 +1161,8 @@ fn a_slot_no_poll_was_told_of_ends_no_poll() {
 }
 
 #[test]
-fn room_the_macs_other_programs_took_ends_the_polls_at_the_next_look_and_then_every_five_seconds_at_most() {
+fn room_that_went_or_came_back_with_the_macs_memory_is_told_at_the_next_look_and_every_five_seconds_at_most()
+{
     let w = World::new(2);
     let short = memory_for_no_machine(&w);
     let set = |bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
@@ -1172,34 +1173,73 @@ fn room_the_macs_other_programs_took_ends_the_polls_at_the_next_look_and_then_ev
 
     set(short);
     pass(&w.m, 1);
-    assert_eq!(nudges(&w), before + 1, "told at the first look that sees it");
+    assert_eq!(
+        nudges(&w),
+        before + 1,
+        "room went: told at the first look that sees it"
+    );
     assert_eq!(w.m.open_slots(SIZE), 0);
     pass(&w.m, 10);
     assert_eq!(nudges(&w), before + 1, "and once");
 
-    // The memory comes and goes: a listener hears of room again, and it is gone at the next look.
+    // The polls now offer nothing: room that comes back must end them too, or the Mac idles for the rest of a poll.
     set(64 * GIB);
-    pass(&w.m, 1);
-    assert_eq!(w.m.open_slots(SIZE), 2);
-    set(short);
     pass(&w.m, 1);
     assert_eq!(
         nudges(&w),
         before + 2,
-        "five seconds after the last time: told at once"
+        "room came back: told at the first look that sees it"
     );
-    set(64 * GIB);
-    pass(&w.m, 1);
-    assert_eq!(w.m.open_slots(SIZE), 2);
-    set(short);
-    pass(&w.m, 3);
+    pass(&w.m, 10);
     assert_eq!(
         nudges(&w),
         before + 2,
+        "and once, also while no listener has asked again"
+    );
+
+    // Memory that comes and goes ends the polls every five seconds at most.
+    set(short);
+    pass(&w.m, 1);
+    assert_eq!(nudges(&w), before + 3);
+    set(64 * GIB);
+    pass(&w.m, 4);
+    assert_eq!(
+        nudges(&w),
+        before + 3,
         "within five seconds of the last time: not yet"
     );
+    pass(&w.m, 1);
+    assert_eq!(nudges(&w), before + 4, "and then");
+
+    // Room that went and came back within the wait is what the listeners heard: nothing is owed for it.
+    set(short);
     pass(&w.m, 2);
-    assert_eq!(nudges(&w), before + 3, "and then, although nothing changed since");
+    set(64 * GIB);
+    pass(&w.m, 10);
+    assert_eq!(nudges(&w), before + 4);
+}
+
+#[test]
+fn a_size_no_listener_asked_about_and_a_pause_the_listeners_heard_of_ring_no_bell_at_a_look() {
+    let w = World::new(2);
+    let before = nudges(&w);
+    w.m.with_host(|host| host.set(|r| r.available_bytes = w.parts.settings.away.floor_bytes + GIB));
+    pass(&w.m, 10);
+    assert_eq!(nudges(&w), before, "no poll offers anything");
+
+    let w = World::new(2);
+    assert_eq!(w.m.open_slots(SIZE), 2);
+    let before = nudges(&w);
+    w.m.pause(true);
+    assert_eq!(nudges(&w), before + 1);
+    // The listeners ask again at once and hear that nothing fits.
+    assert_eq!(w.m.open_slots(SIZE), 0);
+    pass(&w.m, 10);
+    assert_eq!(
+        nudges(&w),
+        before + 1,
+        "the pause told them: a look does not tell them again"
+    );
 }
 
 #[test]

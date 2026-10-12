@@ -190,28 +190,30 @@ pub struct Snapshot {
     pub waiting: usize,
 }
 
-/// How soon after a look told the listeners of room the Mac lost a look tells them again. Room that comes and goes
-/// with the Mac's memory ends every poll in flight each time it goes; this is how often at most.
+/// How soon after a look told the listeners that the Mac's room changed a look tells them again. Room that comes
+/// and goes with the Mac's memory ends every poll in flight each time; this is how often at most.
 const TELL_AGAIN_AFTER: Millis = Millis::secs(5);
 
-/// How soon after the log said that no machine of a size fits it says so again.
+/// How soon after the log said that no machine of a size fits it may say so again: memory that comes and goes
+/// writes a line a minute at most.
 const SAY_AGAIN_AFTER: Millis = Millis::mins(1);
 
-/// What the polls in flight may be offering GitHub. A poll carries the room its scale set had when it began, for
-/// most of a minute, and GitHub assigns against that number without asking again: a slot that is gone meanwhile,
-/// taken by another scale set or by whatever else runs on the Mac, must end the polls that still offer it, or its
-/// job is assigned here and waits in line while another Mac has room.
+/// What the polls in flight offer GitHub. A poll carries the room its scale set had when it began, for most of a
+/// minute, and GitHub assigns against that number without asking again. A slot that is gone meanwhile, taken by
+/// another scale set or by whatever else runs on the Mac, must end the polls that still offer it, or its job is
+/// assigned here and waits in line while another Mac has room; room that came back must end the polls that offer
+/// none, or its job waits at GitHub while this Mac is idle.
 #[derive(Default)]
 struct Offer {
-    /// The sizes a listener was told there is room for since the listeners were last told that it went.
-    offered: [bool; 4],
-    /// A look found room gone that a poll may offer, and the listeners have not been told yet.
-    owed: bool,
+    /// What the listeners last heard of each size: whether a machine of it fits. Nothing for a size no listener
+    /// asked about.
+    heard: [Option<bool>; 4],
     /// When a look last told the listeners.
     told: Option<Millis>,
     /// What the log last said keeps a machine of each size from starting on the open Mac; nothing while one fits.
     short: [Option<&'static str>; 4],
-    /// When the log last said so.
+    /// When the log last said so, which stays when a machine fits again: it is what [`SAY_AGAIN_AFTER`] counts
+    /// from.
     said: [Option<Millis>; 4],
 }
 
@@ -571,15 +573,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let observed = inner.budget.observe(now, reading);
         Self::door(&mut inner, now);
         let mut nudge = false;
-        if Self::withdrawn(&mut inner, now) {
-            inner.offer.owed = true;
-        }
+        // What the listeners heard of the Mac's room and what is true now are compared at every look, so nothing
+        // is owed to them from a look before: room that went and came back within the wait rings no bell.
         let may_tell = inner
             .offer
             .told
             .is_none_or(|told| now.elapsed.since(told) >= TELL_AGAIN_AFTER);
-        if inner.offer.owed && may_tell {
-            inner.offer.owed = false;
+        if may_tell && Self::room_changed(&mut inner, now, false) {
             inner.offer.told = Some(now.elapsed);
             nudge = true;
         }
@@ -652,24 +652,23 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
-    /// Writes a line when the Mac starts or stops taking new jobs, or stops for another reason than before. Without
-    /// it a job that waits leaves nothing in the log, and nobody who reads it can tell whether the Runner listens.
-    /// Whether room is gone that a poll in flight may be offering GitHub: a size a listener was told fits, of which
-    /// no machine fits now. Asked once per loss: the size counts as offered again when a listener next hears of room.
-    fn withdrawn(inner: &mut Inner<H>, now: Now) -> bool {
-        if !inner.offer.offered.contains(&true) {
-            return false;
-        }
-        let free = inner.budget.free(now);
-        let mut gone = false;
+    /// Whether the Mac's room is not what the listeners last heard, for a size they asked about, and takes what is
+    /// true now for heard: whoever asks tells them. With `lost_only`, only room that is gone counts, which is what
+    /// taking a slot can change.
+    fn room_changed(inner: &mut Inner<H>, now: Now, lost_only: bool) -> bool {
+        let mut changed = false;
         for size in Size::ALL {
-            let offered = &mut inner.offer.offered[size.index()];
-            if *offered && free.of(size) == 0 {
-                *offered = false;
-                gone = true;
+            let at = size.index();
+            let fits = inner.budget.fits(now, size).is_ok();
+            match inner.offer.heard[at] {
+                Some(heard) if heard != fits && (heard || !lost_only) => {
+                    inner.offer.heard[at] = Some(fits);
+                    changed = true;
+                }
+                _ => {}
             }
         }
-        gone
+        changed
     }
 
     /// What keeps one more machine of this size from starting now although the Mac takes jobs and has slots left,
@@ -683,6 +682,15 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         Self::shortage(&inner, now, size)
     }
 
+    /// How many more machines of this size fit now, for a report: unlike [`Slots::open_slots`] it tells no listener
+    /// of room and writes nothing to the log, since no poll is offering what a report reads.
+    pub fn room(&self, size: Size) -> usize {
+        let mut inner = self.lock();
+        let now = inner.host.now();
+        self.holds(&mut inner, now);
+        inner.budget.free(now).of(size) as usize
+    }
+
     fn shortage(inner: &Inner<H>, now: Now, size: Size) -> Option<&'static str> {
         if inner.budget.level(now) != Level::Open {
             return None;
@@ -693,6 +701,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// Writes a line when the Mac starts or stops taking new jobs, or stops for another reason than before. Without
+    /// it a job that waits leaves nothing in the log, and nobody who reads it can tell whether the Runner listens.
     fn door(inner: &mut Inner<H>, now: Now) {
         let status = inner.budget.status(now);
         let open = status.level == Level::Open;
@@ -1097,7 +1107,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         match inner.budget.claim(now, size) {
             Ok(grant) => {
                 inner.grants.insert(grant.slot, grant);
-                let told = Self::withdrawn(&mut inner, now);
+                let told = Self::room_changed(&mut inner, now, true);
                 drop(inner);
                 if told {
                     (self.nudge)();
@@ -1153,7 +1163,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         };
         // The slot this job took, or the next one that opens and is now the waiting job's, is one the other scale
         // sets' polls may still offer.
-        let told = Self::withdrawn(&mut inner, now);
+        let told = Self::room_changed(&mut inner, now, true);
         drop(inner);
         if told {
             (self.nudge)();
@@ -1187,8 +1197,8 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         self.holds(&mut inner, now);
         let free = inner.budget.free(now).of(size) as usize;
         let at = size.index();
+        inner.offer.heard[at] = Some(free > 0);
         if free > 0 {
-            inner.offer.offered[at] = true;
             if inner.offer.short[at].take().is_some() {
                 tracing::info!(size = size.label(), "a machine of this size fits again");
             }
@@ -1270,7 +1280,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             .filter(|job| {
                 let record = &job.record;
                 record.scale_set_id == scale_set_id
-                    && record.repo == repo
+                    && record.repo.eq_ignore_ascii_case(repo)
                     && record.ended.is_some()
                     && !record.unregistered
                     && record

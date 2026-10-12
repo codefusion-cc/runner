@@ -1395,7 +1395,22 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
     .await;
     let runner = rig.standing().remove(0);
     rig.github.start_job(&runner);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let others = rig
+        .github
+        .scale_sets()
+        .into_iter()
+        .find(|set| set.repo == OTHER)
+        .expect("the other repository's scale set")
+        .id;
+    until("the other repository's poll to offer no slot any more", || {
+        let polls = format!("GET /svc/_apis/runtime/runnerscalesets/{others}/messages");
+        rig.github
+            .requests()
+            .iter()
+            .rfind(|request| request.line.starts_with(&polls))
+            .is_some_and(|poll| poll.max_capacity.as_deref() == Some("0"))
+    })
+    .await;
     let job = rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(

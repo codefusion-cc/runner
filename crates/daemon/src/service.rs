@@ -854,7 +854,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         name: set.name.clone(),
                         id: set.id,
                         labels: set.labels.iter().take(MAX_LABELS).cloned().collect(),
-                        capacity: u32::try_from(shared.machines.open_slots(set.size)).unwrap_or(u32::MAX),
+                        capacity: u32::try_from(shared.machines.room(set.size)).unwrap_or(u32::MAX),
                         waiting: set.statistics.as_ref().map_or(0, |s| {
                             u32::try_from(s.total_available_jobs.max(0)).unwrap_or(u32::MAX)
                         }),

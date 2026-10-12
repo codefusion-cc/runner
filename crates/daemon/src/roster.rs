@@ -50,7 +50,7 @@ pub struct Runner {
 impl Runner {
     /// Whether it belongs to this repository's scale set of this number.
     pub fn is_of(&self, repo: &str, scale_set_id: i64) -> bool {
-        self.scale_set_id == scale_set_id && self.repo == repo
+        self.scale_set_id == scale_set_id && self.repo.eq_ignore_ascii_case(repo)
     }
 }
 
