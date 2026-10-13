@@ -288,9 +288,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-netlink"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+]
+
+[[package]]
 name = "cf-nft"
 version = "0.1.0"
 dependencies = [
+ "cf-netlink",
  "libc",
  "proptest",
 ]
@@ -356,6 +365,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-vmm-ch"
+version = "0.1.0"
+dependencies = [
+ "cf-host-linux",
+ "cf-netlink",
+ "cf-nft",
+ "cf-secret",
+ "cf-vmhost",
+ "cf-vmm",
+ "libc",
+ "proptest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "cf-vmm-vz"
 version = "0.1.0"
 dependencies = [
@@ -401,6 +427,7 @@ dependencies = [
  "cf-secret",
  "cf-vmhost",
  "cf-vmm",
+ "cf-vmm-ch",
  "cf-vmm-vz",
  "ed25519-dalek",
  "libc",
@@ -2249,9 +2276,11 @@ dependencies = [
  "cf-fake-github",
  "cf-ghapp",
  "cf-guest-proto",
+ "cf-host-linux",
  "cf-image",
  "cf-scaleset",
  "cf-secret",
+ "cf-vmm-ch",
  "ed25519-dalek",
  "flate2",
  "proptest",

@@ -8,13 +8,19 @@
 //!   before the task ends. `--guest` is where the kernel and initramfs are (default `target/guest`).
 //! - `kernel check`: whether our copy of the pinned kernel package and Alpine still give it, and whether Alpine has
 //!   a newer one. Fails when our copy does not.
-//! - `build`: the guest, then the release binary, ad hoc signed with the entitlement.
+//! - `cloud-hypervisor`: the pinned Linux monitor into `target/vmm-programs`, where `cf-vmm-ch` embeds it.
+//! - `cloud-hypervisor check`: whether our copy of the pinned monitor and the project's release still give it, and
+//!   whether the project has a newer one. Fails when our copy does not.
+//! - `build`: the guest, then the release binary: on macOS ad hoc signed with the entitlement, on Linux with the
+//!   monitor in it.
 
+mod cloud_hypervisor;
 mod cpio;
 mod guest;
 mod it;
 mod kernel;
 mod keys;
+mod pinned;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -43,7 +49,8 @@ fn run(args: &[String]) -> Result<()> {
         Some("kernel") if args.get(1).map(String::as_str) == Some("check") => {
             kernel::check(&root, &args[2..])
         }
-        _ => Err("tasks: keygen, guest, release, build, it, kernel check".into()),
+        Some("cloud-hypervisor") => cloud_hypervisor::run(&root, &args[1..]),
+        _ => Err("tasks: keygen, guest, release, build, it, kernel check, cloud-hypervisor [check]".into()),
     }
 }
 
@@ -56,6 +63,9 @@ fn no_options(args: &[String]) -> Result<()> {
 
 fn build(root: &Path) -> Result<()> {
     guest::build(root)?;
+    if cfg!(target_os = "linux") {
+        cloud_hypervisor::fetch(root)?;
+    }
     run_command(Command::new(cargo()).current_dir(root).args([
         "build",
         "--release",
@@ -63,6 +73,10 @@ fn build(root: &Path) -> Result<()> {
         "codefusion-runner",
     ]))?;
     let binary = root.join("target/release/codefusion-runner");
+    if !cfg!(target_os = "macos") {
+        println!("built {}", binary.display());
+        return Ok(());
+    }
     run_command(
         Command::new("codesign")
             .args(["--force", "--sign", "-", "--entitlements"])

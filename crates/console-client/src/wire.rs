@@ -232,8 +232,8 @@ pub struct SizeStatus {
     pub size: String,
     /// How many more fit now; -1 for a size the Mac never runs.
     pub free: i64,
-    /// Why none fits, while none does: `never`, `memory`, `full`, `cpus`, `assigned-first`, or why the Mac is closed
-    /// (`paused`, `calming` and the like).
+    /// Why none fits, while none does: `never`, `memory`, `full`, `cpus`, `assigned-first`, `making-room` (room is
+    /// made for a larger size), or why the Mac is closed (`paused`, `calming` and the like).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
     /// For `memory`, and `full` for memory its own machines hold (not the cap): the memory the Mac must have available

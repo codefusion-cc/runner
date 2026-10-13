@@ -18,8 +18,10 @@ const USAGE: &str = "usage: codefusion-runner
   daemon --config <file>                the service (what the agent runs)
   image verify <folder> --version <v>
   image install <folder> --version <v> --state-dir <folder>
-  vm --state-dir <folder>               the vm-host of one job
-  boot-proof [--memory-mb N] [--timeout-s N, at most 3600]";
+  vm --state-dir <folder> [--host-cpus <list>]
+                                        the vm-host of one job; on Linux --host-cpus are the CPUs its
+                                        machine runs on (such as 4-7), by default the fastest
+  boot-proof [--memory-mb N] [--timeout-s N, at most 3600] [--host-cpus <list>]";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -38,7 +40,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--state-dir",
             state,
         ] => install(folder, version, state),
-        ["vm", "--state-dir", state] => vm_host(state),
+        ["vm", "--state-dir", state] => vm_host(state, None),
+        ["vm", "--state-dir", state, "--host-cpus", cpus] => vm_host(state, Some(cpus)),
         [
             command @ ("daemon" | "enroll" | "check" | "install" | "uninstall"),
             "--config",
@@ -97,29 +100,32 @@ fn service(_command: &str, _config: &str, _options: &[&str]) -> Result<(), Strin
     Err("the service runs on macOS only".into())
 }
 
-#[cfg(target_os = "macos")]
-fn vm_host(state: &str) -> Result<(), String> {
-    crate::vm::host(state)
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn vm_host(state: &str, cpus: Option<&str>) -> Result<(), String> {
+    let host = crate::vm::Host {
+        cpus: cpus.map(String::from),
+    };
+    crate::vm::host(state, &host)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn vm_host(_state: &str) -> Result<(), String> {
-    Err("a vm-host runs on macOS only".into())
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn vm_host(_state: &str, _cpus: Option<&str>) -> Result<(), String> {
+    Err("a vm-host runs on macOS and Linux only".into())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn boot_proof(options: &[&str]) -> Result<(), String> {
     let mut memory_mb = 1024u64;
     let mut timeout = 60u64;
+    let mut cpus = None;
     let mut iter = options.iter();
     while let Some(option) = iter.next() {
-        let value = iter
-            .next()
-            .and_then(|value| value.parse::<u64>().ok())
-            .ok_or(USAGE)?;
+        let value = iter.next().ok_or(USAGE)?;
+        let number = || value.parse::<u64>().map_err(|_| USAGE.to_string());
         match *option {
-            "--memory-mb" => memory_mb = value,
-            "--timeout-s" => timeout = value,
+            "--memory-mb" => memory_mb = number()?,
+            "--timeout-s" => timeout = number()?,
+            "--host-cpus" => cpus = Some(*value),
             _ => return Err(USAGE.into()),
         }
     }
@@ -130,10 +136,16 @@ fn boot_proof(options: &[&str]) -> Result<(), String> {
     let memory_bytes = memory_mb
         .checked_mul(1024 * 1024)
         .ok_or("--memory-mb is too large")?;
-    crate::vm::boot_proof(memory_bytes, std::time::Duration::from_secs(timeout))
+    crate::vm::boot_proof(
+        memory_bytes,
+        std::time::Duration::from_secs(timeout),
+        &crate::vm::Host {
+            cpus: cpus.map(String::from),
+        },
+    )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn boot_proof(_options: &[&str]) -> Result<(), String> {
-    Err("the boot proof runs on macOS only".into())
+    Err("the boot proof runs on macOS and Linux only".into())
 }

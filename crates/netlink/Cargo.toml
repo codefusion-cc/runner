@@ -1,0 +1,16 @@
+[package]
+name = "cf-netlink"
+description = "Netlink as any of its protocols has it: messages and attributes, and on Linux a socket that sends requests and reads the kernel's answers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

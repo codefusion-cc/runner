@@ -1,4 +1,4 @@
-//! The networks this Mac is in, which a job's machine is told to keep its job from: the guest's own list of
+//! The networks this host is in, which a job's machine is told to keep its job from: the guest's own list of
 //! private ranges does not know a local network or a VPN with other addresses.
 
 /// An IPv4 network as `(network, prefix length)`.

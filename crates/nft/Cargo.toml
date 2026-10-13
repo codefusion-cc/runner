@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+cf-netlink = { path = "../netlink" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 

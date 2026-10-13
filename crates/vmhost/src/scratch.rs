@@ -119,8 +119,12 @@ pub fn template(
     Ok(path)
 }
 
-/// Copies a template to a job's own disk. On APFS the copy shares every block until the job writes.
+/// Copies a template to a job's own disk, readable by this user alone, in place of whatever `to` held. On APFS, and
+/// on Linux where the file system shares blocks (btrfs, XFS), the copy shares every block until the job writes. On
+/// another Linux file system only the template's data is copied and its holes stay holes, so a formatted disk of
+/// many gigabytes costs the few megabytes its file system wrote.
 pub fn copy(template: &Path, to: &Path) -> Result<(), String> {
+    let _ = fs::remove_file(to);
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -135,8 +139,93 @@ pub fn copy(template: &Path, to: &Path) -> Result<(), String> {
             }
         }
     }
-    // Another file system: a real copy, which is slow and as large as the template is on disk.
-    fs::copy(template, to)
-        .map(drop)
-        .map_err(|error| say("the job's disk", error))
+    copy_data(template, to).map_err(|error| say("the job's disk", error))
+}
+
+/// A copy that shares the template's blocks where the file system can, and otherwise holds its data only.
+fn copy_data(template: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let from = fs::File::open(template)?;
+    let out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)?;
+    let copied = shared(&from, &out).or_else(|_| sparse_copy(&from, &out));
+    if copied.is_err() {
+        drop(out);
+        let _ = fs::remove_file(to);
+    }
+    copied
+}
+
+/// The template's blocks shared with the copy, on a file system that can.
+#[cfg(target_os = "linux")]
+fn shared(from: &fs::File, out: &fs::File) -> std::io::Result<()> {
+    // SAFETY: FICLONE takes the source's descriptor as its argument; both are open for the call.
+    if unsafe { libc::ioctl(out.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// clonefile, the Mac's way, was tried already.
+#[cfg(not(target_os = "linux"))]
+fn shared(_from: &fs::File, _out: &fs::File) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Copies the template's data and leaves its holes: each range `SEEK_DATA` finds up to the hole `SEEK_HOLE` finds
+/// after it, then the length. A file system without those calls has its whole file as data.
+pub fn sparse_copy(from: &fs::File, out: &fs::File) -> std::io::Result<()> {
+    let length = from.metadata()?.len();
+    let mut at = 0;
+    while at < length {
+        let Some(data) = seek(from, at, libc::SEEK_DATA)? else {
+            break;
+        };
+        let hole = seek(from, data, libc::SEEK_HOLE)?.unwrap_or(length).min(length);
+        copy_range(from, out, data, hole)?;
+        at = hole;
+    }
+    // No sync: the copy is one job's disk, and a host that goes down mid-job ends the job anyway.
+    out.set_len(length)
+}
+
+/// Where `lseek` with `whence` goes from `offset`, or `None` when no data follows (`ENXIO`). A file system that does
+/// not know `whence` has data everywhere and its only hole at the end.
+fn seek(file: &fs::File, offset: u64, whence: libc::c_int) -> std::io::Result<Option<u64>> {
+    let at =
+        libc::off_t::try_from(offset).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: lseek takes no pointers; the descriptor is open for the call.
+    let found = unsafe { libc::lseek(file.as_raw_fd(), at, whence) };
+    if found >= 0 {
+        return Ok(Some(found as u64));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENXIO) => Ok(None),
+        Some(libc::EINVAL) if whence == libc::SEEK_DATA => Ok(Some(offset)),
+        Some(libc::EINVAL) => Ok(Some(file.metadata()?.len())),
+        _ => Err(error),
+    }
+}
+
+/// Copies the bytes from `start` up to `end` to the same place in `out`.
+fn copy_range(from: &fs::File, out: &fs::File, start: u64, end: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let mut buffer = vec![0u8; (1 << 20).min((end - start) as usize)];
+    let mut at = start;
+    while at < end {
+        let wanted = buffer.len().min((end - at) as usize);
+        let read = from.read_at(&mut buffer[..wanted], at)?;
+        if read == 0 {
+            // The template got shorter while it was copied: what is gone stays a hole.
+            break;
+        }
+        out.write_all_at(&buffer[..read], at)?;
+        at += read as u64;
+    }
+    Ok(())
 }

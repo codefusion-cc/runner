@@ -52,6 +52,10 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
 
 - No call of the Runner makes GitHub hand over a job it holds. A Mac whose room comes back gets the job only at
   GitHub's next look: the next job queued or ended in the repository, or GitHub's own, which can take minutes.
+- GitHub hands a job only to a scale set whose polls show room, and takes back one that waits in line unacquired after
+  five minutes. A larger size on a Mac that keeps running smaller jobs would never show room, and its job never come.
+  So the Runner makes room for it (`making.rs`): smaller sizes are held back while it waits, and its scale set offers a
+  place in line while GitHub has the job back, or after its polls found no room for ten minutes.
 - A message lost with a session cannot be asked for again. The Runner asks the REST view of each Actions runner it
   believes awaits a job before a session opens (`reconcile`), and before it removes the registration of a machine
   that ended unheard (`Service::sweep`). A removal's own answer is evidence too: 204 only for a registration that held

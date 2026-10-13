@@ -1,8 +1,8 @@
 //! Tables as one nf_tables transaction. Each match is written as `nft` writes it (`tests/nft.rs`).
 
 use crate::netlink::{
-    LONGEST_PAYLOAD, NLA_F_NESTED, NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, attribute, message,
-    nested,
+    LONGEST_PAYLOAD, NLA_F_NESTED, NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, attribute,
+    attribute_str, message, nested,
 };
 use crate::{Batch, Chain, Error, Family, Hook, IPV4, Load, Match, Rule, TCP, Table, UDP, Verdict, mask};
 
@@ -62,12 +62,6 @@ pub(crate) fn family_number(family: Family) -> u8 {
     }
 }
 
-fn text(to: &mut Vec<u8>, kind: u16, value: &str) {
-    let mut bytes = value.as_bytes().to_vec();
-    bytes.push(0);
-    attribute(to, kind, &bytes);
-}
-
 /// nf_tables' numbers are big-endian.
 fn number(to: &mut Vec<u8>, kind: u16, value: u32) {
     attribute(to, kind, &value.to_be_bytes());
@@ -77,7 +71,7 @@ fn number(to: &mut Vec<u8>, kind: u16, value: u32) {
 fn expression(to: &mut Vec<u8>, name: &str, fill: impl FnOnce(&mut Vec<u8>)) {
     // NFTA_LIST_ELEM { NFTA_EXPR_NAME, NFTA_EXPR_DATA }
     nested(to, 1, |element| {
-        text(element, 1, name);
+        attribute_str(element, 1, name);
         nested(element, 2, fill);
     });
 }
@@ -312,17 +306,17 @@ impl Builder {
     fn chain(&mut self, table: &Table, chain: &Chain) -> Result<(), Error> {
         let family = family_number(table.family);
         self.nftables(NFT_MSG_NEWCHAIN, NLM_F_CREATE, family, |body| {
-            text(body, 1, &table.name); // NFTA_CHAIN_TABLE
-            text(body, 3, &chain.name); // NFTA_CHAIN_NAME
+            attribute_str(body, 1, &table.name); // NFTA_CHAIN_TABLE
+            attribute_str(body, 3, &chain.name); // NFTA_CHAIN_NAME
             nested(body, 4, |hook| {
                 number(hook, 1, hook_number(chain.hook)); // NFTA_HOOK_HOOKNUM
                 number(hook, 2, 0); // NFTA_HOOK_PRIORITY: the filter priority
                 if let Hook::Ingress(device) = chain.hook {
-                    text(hook, 3, device.name()); // NFTA_HOOK_DEV
+                    attribute_str(hook, 3, device.name()); // NFTA_HOOK_DEV
                 }
             });
             number(body, 5, verdict_code(chain.policy)); // NFTA_CHAIN_POLICY
-            text(body, 7, FILTER); // NFTA_CHAIN_TYPE
+            attribute_str(body, 7, FILTER); // NFTA_CHAIN_TYPE
         });
         for (index, rule) in chain.rules.iter().enumerate() {
             let mut expressions = Vec::new();
@@ -344,8 +338,8 @@ impl Builder {
                 });
             }
             self.nftables(NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, family, |body| {
-                text(body, 1, &table.name); // NFTA_RULE_TABLE
-                text(body, 2, &chain.name); // NFTA_RULE_CHAIN
+                attribute_str(body, 1, &table.name); // NFTA_RULE_TABLE
+                attribute_str(body, 2, &chain.name); // NFTA_RULE_CHAIN
                 attribute(body, 4 | NLA_F_NESTED, &expressions); // NFTA_RULE_EXPRESSIONS
             });
         }
@@ -374,7 +368,7 @@ pub fn batch(tables: &[Table], load: Load) -> Result<Batch, Error> {
             NLM_F_CREATE,
             family_number(table.family),
             |body| {
-                text(body, 1, &table.name); // NFTA_TABLE_NAME
+                attribute_str(body, 1, &table.name); // NFTA_TABLE_NAME
             },
         );
         for chain in &table.chains {

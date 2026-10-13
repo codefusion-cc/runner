@@ -1,0 +1,36 @@
+[package]
+name = "cf-vmm-ch"
+description = "The virtual machine monitor on Linux: cloud-hypervisor under KVM, one process per machine, in a cgroup and a sandbox of its own, with pasta for its network."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cf-host-linux = { path = "../host-linux" }
+cf-netlink = { path = "../netlink" }
+cf-nft = { path = "../nft" }
+cf-secret = { path = "../secret" }
+cf-vmm = { path = "../vmm" }
+libc.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+cf-vmhost = { path = "../vmhost" }
+proptest.workspace = true
+tempfile.workspace = true
+
+# The sandbox it runs must be the only thread of its process, which a test harness is not.
+[[test]]
+name = "monitor_root"
+harness = false
+
+[[test]]
+name = "kvm"
+harness = false
+
+[lints]
+workspace = true

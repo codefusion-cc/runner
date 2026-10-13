@@ -931,13 +931,18 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if snapshot.waiting == 0 || !snapshot.machines.is_empty() {
             return None;
         }
-        let why = if snapshot.open {
-            sets.iter()
-                .find_map(|set| snapshot.short_of(set.size))
-                .unwrap_or("no machine of their size fits")
-                .to_string()
-        } else {
-            snapshot.reason.clone()
+        // A Mac with jobs in line is closed to the next one for them; what keeps the first of them, which goes before
+        // the others, is what the console needs: memory, or room made for another size.
+        let why = match snapshot.budget.closed_by {
+            None | Some(cf_budget::Refusal::AssignedFirst { .. }) => snapshot
+                .budget
+                .waiting
+                .first()
+                .and_then(|waiter| waiter.why)
+                .map(|why| why.name())
+                .or_else(|| sets.iter().find_map(|set| snapshot.short_of(set.size)))
+                .unwrap_or("no machine of their size fits"),
+            Some(closed) => closed.name(),
         };
         Some(format!("nothing runs and no job starts: {why}"))
     }

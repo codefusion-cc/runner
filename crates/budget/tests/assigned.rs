@@ -7,26 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use cf_budget::{
-    Assigned, Budget, Free, GIB, Grant, Held, Hold, HostFacts, HostReading, Level, Millis, Mode, Origin,
-    Pressure, Refusal, Settings, Size, SlotId, Trouble, UnknownSlot, Waiting,
+    Assigned, Budget, Free, GIB, Held, Hold, HostFacts, HostReading, Level, Millis, Mode, Origin, Pressure,
+    Refusal, Settings, Size, SlotId, Trouble, UnknownSlot, Waiting,
 };
 use common::*;
 
 const OVERHEAD: u64 = Settings::VM_HOST_OVERHEAD;
-
-fn waits(assigned: Assigned) -> (SlotId, Refusal) {
-    match assigned {
-        Assigned::Waits { slot, why } => (slot, why),
-        other => panic!("expected a job that waits, got {other:?}"),
-    }
-}
-
-fn starts(assigned: Assigned) -> Grant {
-    match assigned {
-        Assigned::Start(grant) => grant,
-        other => panic!("expected a job that starts, got {other:?}"),
-    }
-}
 
 #[test]
 fn on_an_open_mac_an_assigned_job_starts_at_once_and_its_slot_never_runs_out() {

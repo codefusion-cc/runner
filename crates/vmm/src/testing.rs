@@ -97,7 +97,7 @@ impl FakeVmm {
         *self.stops.lock().unwrap()
     }
 
-    /// What of the Mac's memory each machine of this monitor holds from now on ([`Vm::resident`]); `None`, the
+    /// What of the host's memory each machine of this monitor holds from now on ([`Vm::resident`]); `None`, the
     /// start, when it cannot be told.
     pub fn hold(&self, bytes: Option<u64>) {
         *self.resident.lock().unwrap() = bytes;
