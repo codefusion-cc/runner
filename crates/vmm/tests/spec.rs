@@ -173,3 +173,13 @@ fn a_machine_that_takes_no_stop_says_so_and_runs_until_it_is_let_go() {
     vm.kill();
     assert_eq!(vm.wait(Duration::from_secs(5)), Some(VmExit::Stopped));
 }
+
+#[test]
+fn the_guest_is_told_to_hide_sme_from_its_programs() {
+    assert!(cf_vmm::COMMAND_LINE.split(' ').any(|word| word == "arm64.nosme"));
+}
+
+#[test]
+fn a_panicking_guest_kernel_restarts_at_once_rather_than_hanging() {
+    assert!(cf_vmm::COMMAND_LINE.split(' ').any(|word| word == "panic=-1"));
+}

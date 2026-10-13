@@ -8,26 +8,7 @@
 //! [`policy`] is the rules; `cf_nft::decide` says what they do with a packet and is what the tests hold against the
 //! specification; [`netlink`] is the same rules for the kernel.
 
-use cf_nft::{Batch, Chain, Family, Hook, Ip, Load, Match, Rule, TCP, Table, UDP, Verdict, network};
-
-/// The private and special ranges a job does not reach: `(network, prefix length)`.
-pub const BLOCKED: &[(Ip, u8)] = &[
-    ([10, 0, 0, 0], 8),
-    ([172, 16, 0, 0], 12),
-    ([192, 168, 0, 0], 16),
-    ([169, 254, 0, 0], 16),
-    // Carrier-grade NAT, which is where Tailscale's addresses are.
-    ([100, 64, 0, 0], 10),
-    // "This network", and the two ranges set aside for use inside one machine or site: protocol assignments
-    // (where a Mac on an IPv6-only network has its translated address) and benchmarking (where proxies and VPNs
-    // on a Mac put their made-up addresses).
-    ([0, 0, 0, 0], 8),
-    ([192, 0, 0, 0], 24),
-    ([198, 18, 0, 0], 15),
-    // Multicast (mDNS on the Mac's network) and the reserved block with the broadcast address.
-    ([224, 0, 0, 0], 4),
-    ([240, 0, 0, 0], 4),
-];
+use cf_nft::{BLOCKED, Batch, Chain, Family, Hook, Ip, Load, Match, Rule, TCP, Table, UDP, Verdict, network};
 
 /// The whole firewall.
 #[derive(Debug, Clone, PartialEq, Eq)]

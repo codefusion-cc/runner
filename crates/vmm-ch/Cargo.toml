@@ -1,0 +1,19 @@
+[package]
+name = "cf-vmm-ch"
+description = "The virtual machine monitor on Linux: cloud-hypervisor under KVM, one process per machine, in a cgroup and a sandbox of its own, with pasta for its network."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cf-nft = { path = "../nft" }
+cf-vmm = { path = "../vmm" }
+libc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

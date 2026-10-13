@@ -44,6 +44,26 @@ pub fn network(address: Ip, prefix: u8) -> Ip {
     (u32::from_be_bytes(address) & mask(prefix)).to_be_bytes()
 }
 
+/// The private and special IPv4 ranges a job does not reach, neither from inside its machine nor through the host:
+/// `(network, prefix length)`.
+pub const BLOCKED: &[(Ip, u8)] = &[
+    ([10, 0, 0, 0], 8),
+    ([172, 16, 0, 0], 12),
+    ([192, 168, 0, 0], 16),
+    ([169, 254, 0, 0], 16),
+    // Carrier-grade NAT, which is where Tailscale's addresses are.
+    ([100, 64, 0, 0], 10),
+    // "This network", and the two ranges set aside for use inside one machine or site: protocol assignments
+    // (where a host on an IPv6-only network has its translated address) and benchmarking (where proxies and VPNs
+    // on a host put their made-up addresses).
+    ([0, 0, 0, 0], 8),
+    ([192, 0, 0, 0], 24),
+    ([198, 18, 0, 0], 15),
+    // Multicast (mDNS on the local network) and the reserved block with the broadcast address.
+    ([224, 0, 0, 0], 4),
+    ([240, 0, 0, 0], 4),
+];
+
 /// The name of a network device as the kernel keeps it: 1 to 15 bytes, padded with zeros to 16.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Interface([u8; 16]);

@@ -17,6 +17,15 @@ use std::time::Duration;
 pub use exit::ExitCell;
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 
+/// The guest kernel's command line, the same under every monitor. `console=hvc0` is the virtio console the monitor
+/// writes to the console file. `quiet` keeps the kernel's own lines off the console; `panic=-1` restarts a guest
+/// whose kernel panics, which closes the channel, and the host takes a closed channel for a lost guest at once (a
+/// monitor that would boot the guest again ends the machine instead). `arm64.nosme` hides SME from the guest's
+/// programs (the kernel clears the SME and SME2 feature registers, so `/proc/cpuinfo` and `getauxval` stop listing
+/// them): on an M5 the guest's CPU reports it, but Chromium's code that uses it dies with SIGILL (a camera in
+/// Playwright's Chromium crashed its video capture). The guest reports no SVE, so `arm64.nosve` is not needed.
+pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 arm64.nosme";
+
 /// Why the monitor could not do what was asked.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VmmError {

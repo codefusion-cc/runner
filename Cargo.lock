@@ -356,6 +356,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-vmm-ch"
+version = "0.1.0"
+dependencies = [
+ "cf-nft",
+ "cf-vmm",
+ "libc",
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
 name = "cf-vmm-vz"
 version = "0.1.0"
 dependencies = [
