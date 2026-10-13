@@ -82,7 +82,7 @@ jobs:
         run: |
           restricted="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
           echo "kernel.apparmor_restrict_unprivileged_userns: $restricted"
-          if false; then
+          if [ "$restricted" = 1 ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - run: cargo clippy --locked $LINUX_CRATES --all-targets -j4 -- -D warnings
