@@ -49,7 +49,9 @@ pub fn network(address: Ip, prefix: u8) -> Ip {
 pub struct Interface([u8; 16]);
 
 impl Interface {
-    /// A name the kernel would give a device: 1 to 15 bytes, not `.` or `..`, with no NUL, `/`, `:` or white space.
+    /// A name the kernel would give a device: 1 to 15 bytes, not `.` or `..`, with no NUL, `/`, `:` or byte the
+    /// kernel's `isspace` takes for white space (the vertical tab and 0xa0 among them, so a UTF-8 character that holds
+    /// that byte too).
     pub fn new(name: &str) -> Result<Self, Error> {
         let bytes = name.as_bytes();
         let valid = !bytes.is_empty()
@@ -58,7 +60,7 @@ impl Interface {
             && name != ".."
             && !bytes
                 .iter()
-                .any(|byte| matches!(byte, 0 | b'/' | b':') || byte.is_ascii_whitespace());
+                .any(|byte| matches!(byte, 0 | b'/' | b':' | 0x0b | 0xa0) || byte.is_ascii_whitespace());
         if !valid {
             return Err(Error::Interface(name.to_string()));
         }
@@ -135,7 +137,8 @@ pub struct Packet {
     pub ether_type: u16,
     /// The device it came in through; none on an output hook.
     pub in_interface: Option<Interface>,
-    /// On the loopback device.
+    /// On the loopback device: in through it on an input hook, out through it on an output hook. A packet whose
+    /// `in_interface` is `lo` is in through loopback, as the kernel sees it; `decide` takes both fields as given.
     pub loopback: bool,
     /// The IPv4 destination (only looked at for IPv4).
     pub dest: Ip,
@@ -242,7 +245,8 @@ pub fn apply(batch: &Batch) -> Result<(), Error> {
 }
 
 /// The tables the kernel holds in this process's network namespace, read back with [`read`]: a table, chain or
-/// rule this crate cannot have written is an [`Error::Unreadable`].
+/// rule this crate cannot have written is an [`Error::Unreadable`], and rules that changed between the listings of
+/// tables, chains and rules are [`Error::Interrupted`].
 #[cfg(target_os = "linux")]
 pub fn list() -> Result<Vec<Table>, Error> {
     let socket = netlink::Socket::open(libc::NETLINK_NETFILTER)?;
@@ -253,6 +257,17 @@ pub fn list() -> Result<Vec<Table>, Error> {
         encode::NFT_MSG_GETRULE,
     ] {
         answers.extend(socket.dump(&encode::dump_request(kind))?);
+    }
+    // nf_tables puts the generation of the rules it lists in each message's resource id: one generation across the
+    // three listings is one set of rules.
+    // A broken message is left to `read`, which says what is wrong with it.
+    let mut generations = netlink::messages(&answers)
+        .flatten()
+        .map(|message| message.body.get(2..4));
+    if let Some(first) = generations.next()
+        && generations.any(|other| other != first)
+    {
+        return Err(Error::Interrupted);
     }
     read(&answers)
 }

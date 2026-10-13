@@ -188,6 +188,10 @@ fn a_device_name_is_one_the_kernel_could_give() {
         "a\nb",
         "a\0b",
         &"é".repeat(8),
+        // The kernel's isspace also takes the vertical tab and 0xa0, which "à" and a no-break space hold.
+        "a\x0bb",
+        "tà0",
+        "a\u{a0}b",
     ] {
         assert!(matches!(Interface::new(bad), Err(Error::Interface(_))), "{bad:?}");
     }
@@ -425,6 +429,24 @@ fn a_batch_is_one_transaction_with_an_answer_for_each_change() {
         );
         assert_eq!(read(&written.bytes).unwrap(), tables);
     }
+    // A rule's expressions are one attribute of at most 65535 bytes: the most conditions, each the longest there is,
+    // still read back, and one more is refused instead of written with a length that wrapped.
+    let longest = |conditions: usize| {
+        let when = vec![
+            Match::DestIn {
+                network: [10, 0, 0, 0],
+                prefix: 8
+            };
+            conditions
+        ];
+        table(Family::Inet, Hook::Output, vec![rule(&when, Verdict::Drop)])
+    };
+    let most = batch(&[longest(256)], Load::Add).unwrap();
+    assert_eq!(read(&most.bytes).unwrap(), [longest(256)]);
+    assert!(matches!(
+        batch(&[longest(257)], Load::Add),
+        Err(Error::Rule { rule: 0, .. })
+    ));
     // No tables at all is a transaction that changes nothing, or removes everything.
     assert_eq!(batch(&[], Load::Add).unwrap().acknowledged, 0);
     assert_eq!(batch(&[], Load::Replace).unwrap().acknowledged, 1);
@@ -476,6 +498,89 @@ fn a_network_reads_back_as_its_prefix_and_rules_written_elsewhere_are_not_read()
     cf_nft::netlink::attribute(&mut body, 1, b"t\0");
     cf_nft::netlink::message(&mut one_table, 0x0a02, 1, 1, &body);
     assert!(matches!(read(&one_table), Err(Error::Unreadable(_))));
+}
+
+/// The place of a byte pattern in `bytes`, which holds it once.
+fn place_of(bytes: &[u8], pattern: &[u8]) -> usize {
+    let mut places = (0..bytes.len()).filter(|&at| bytes[at..].starts_with(pattern));
+    let at = places.next().unwrap();
+    assert_eq!(places.next(), None, "{pattern:?} more than once");
+    at
+}
+
+#[test]
+fn what_the_crate_does_not_write_is_not_read_as_its_own() {
+    // A dormant table holds rules its chains never run: not the firewall it looks like.
+    let table_with_flags = |flags: u32| {
+        let mut body = vec![1, 0, 0, 0];
+        cf_nft::netlink::attribute(&mut body, 1, b"t\0");
+        cf_nft::netlink::attribute(&mut body, 2, &flags.to_be_bytes());
+        let mut bytes = Vec::new();
+        cf_nft::netlink::message(&mut bytes, 0x0a00, 0x405, 1, &body);
+        bytes
+    };
+    assert_eq!(read(&table_with_flags(0)).unwrap().len(), 1, "nft says flags 0");
+    for flags in [1, 2] {
+        assert!(
+            matches!(read(&table_with_flags(flags)), Err(Error::Unreadable(_))),
+            "{flags}"
+        );
+    }
+
+    // "ct state established,related" on another register is another rule. The number after each name's
+    // NFTA_EXPR_DATA is the register: the comparison's source, the bitwise's source and destination.
+    let established = batch(
+        &[table(
+            Family::Inet,
+            Hook::Input,
+            vec![rule(&[Match::Established], Verdict::Accept)],
+        )],
+        Load::Add,
+    )
+    .unwrap()
+    .bytes;
+    assert_eq!(
+        read(&established).unwrap()[0].chains[0].rules[0].when,
+        [Match::Established]
+    );
+    let cmp = place_of(&established, b"cmp\0");
+    let bitwise = place_of(&established, b"bitwise\0");
+    for register in [cmp + 4 + 4 + 7, bitwise + 8 + 4 + 7, bitwise + 8 + 4 + 8 + 7] {
+        let mut changed = established.clone();
+        assert_eq!(changed[register], 1);
+        changed[register] = 2;
+        assert!(matches!(read(&changed), Err(Error::Unreadable(_))), "{register}");
+    }
+
+    // A rule a batch puts first, or in another rule's place, is not the last rule of its chain.
+    let two = batch(
+        &[table(
+            Family::Inet,
+            Hook::Output,
+            vec![
+                rule(&[Match::Protocol(TCP)], Verdict::Drop),
+                rule(&[], Verdict::Accept),
+            ],
+        )],
+        Load::Add,
+    )
+    .unwrap()
+    .bytes;
+    let mut at = 0;
+    let mut rules = Vec::new();
+    while at < two.len() {
+        if u16::from_ne_bytes([two[at + 4], two[at + 5]]) == 0x0a06 {
+            rules.push(at);
+        }
+        at += (u32::from_ne_bytes(two[at..at + 4].try_into().unwrap()) as usize).next_multiple_of(4);
+    }
+    let flags = |bytes: &[u8], at: usize| u16::from_ne_bytes([bytes[at + 6], bytes[at + 7]]);
+    for change in [|flags: u16| flags & !0x800, |flags: u16| flags | 0x100] {
+        let mut changed = two.clone();
+        let new = change(flags(&changed, rules[1])).to_ne_bytes();
+        changed[rules[1] + 6..rules[1] + 8].copy_from_slice(&new);
+        assert!(matches!(read(&changed), Err(Error::Unreadable(_))));
+    }
 }
 
 /// The netlink form run as the kernel runs it, for one packet: a test's own reading of the expressions, apart from

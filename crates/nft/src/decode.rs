@@ -10,8 +10,15 @@ use crate::encode::{
     NFT_META_OIF, NFT_META_PROTOCOL, NFT_MSG_DELTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWRULE, NFT_MSG_NEWTABLE,
     NFT_PAYLOAD_NETWORK_HEADER, NFT_PAYLOAD_TRANSPORT_HEADER, NFT_REG_1, NFT_REG_VERDICT,
 };
-use crate::netlink::{NLMSG_DONE, attributes, messages};
+use crate::netlink::{NLM_F_APPEND, NLM_F_REQUEST, NLMSG_DONE, attributes, messages};
 use crate::{Chain, Error, Family, Hook, IPV4, Interface, Match, Rule, Table, Verdict};
+
+/// Replaces the rule a request names, from the kernel's `netlink.h`.
+const NLM_F_REPLACE: u16 = 0x100;
+/// A rule's place by the handle of another, from `nf_tables.h`.
+const NFTA_RULE_POSITION: u16 = 6;
+/// A rule's place by the id of another in the same batch.
+const NFTA_RULE_POSITION_ID: u16 = 10;
 
 fn unreadable(problem: impl Into<String>) -> Error {
     Error::Unreadable(problem.into())
@@ -249,6 +256,9 @@ fn condition(expressions: &[Expression<'_>], family: Family) -> Result<(Match, u
         let states = CT_ESTABLISHED_OR_RELATED.to_ne_bytes();
         let masked = expressions.get(1).is_some_and(|bitwise| {
             bitwise.is("bitwise")
+                && bitwise.on_register_1(1)
+                && bitwise.on_register_1(2)
+                && bitwise.data.number(3).ok() == Some(4)
                 && bitwise.data.value(4).is_ok_and(|mask| mask == states)
                 && bitwise.data.value(5).is_ok_and(|xor| xor == [0; 4])
                 && bitwise
@@ -258,6 +268,7 @@ fn condition(expressions: &[Expression<'_>], family: Family) -> Result<(Match, u
         });
         let not_zero = expressions.get(2).is_some_and(|compare| {
             compare.is("cmp")
+                && compare.on_register_1(1)
                 && compare.data.number(2).ok() == Some(NFT_CMP_NEQ)
                 && compare.data.value(3).is_ok_and(|value| value == [0; 4])
         });
@@ -332,6 +343,10 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Table>, Error> {
             .iter()
             .position(|table| table.family == family && table.name == table_name);
         match (kind, table) {
+            // A flag such as dormant (its chains see nothing) is a table this crate does not write.
+            (NFT_MSG_NEWTABLE, _) if attributes.get(2).is_some() && attributes.number(2)? != 0 => {
+                return Err(unreadable(format!("table {table_name:?} has flags")));
+            }
             (NFT_MSG_NEWTABLE, None) => tables.push(Table {
                 family,
                 name: table_name.to_string(),
@@ -362,6 +377,17 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Table>, Error> {
             }
             (NFT_MSG_NEWRULE, Some(table)) => {
                 let name = attributes.text(2)?;
+                // A request that does not add at the end, after every rule before it, puts the rule elsewhere.
+                let request = message.flags & NLM_F_REQUEST != 0;
+                let elsewhere = message.flags & NLM_F_APPEND == 0
+                    || message.flags & NLM_F_REPLACE != 0
+                    || attributes.get(NFTA_RULE_POSITION).is_some()
+                    || attributes.get(NFTA_RULE_POSITION_ID).is_some();
+                if request && elsewhere {
+                    return Err(unreadable(format!(
+                        "a rule of chain {name:?} that is not added at its end"
+                    )));
+                }
                 let rule = rule(family, &attributes.nested(4)?)?;
                 tables[table]
                     .chains

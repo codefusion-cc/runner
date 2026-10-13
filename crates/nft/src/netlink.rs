@@ -182,7 +182,9 @@ mod socket {
             Ok(())
         }
 
-        /// Sends a request for a listing and returns every message of the answer before its end.
+        /// Sends a request for a listing and returns every message of the answer before its end. A listing the
+        /// kernel ended with an error, or that changed while it was written (said on any message, its end included),
+        /// is an error, never a part of it.
         pub fn dump(&self, request: &[u8]) -> Result<Vec<u8>, Error> {
             self.send(request)?;
             let mut buffer = vec![0u8; BUFFER];
@@ -190,10 +192,13 @@ mod socket {
             loop {
                 for message in messages(self.receive(&mut buffer)?) {
                     let message = message.map_err(Error::Unreadable)?;
+                    if message.flags & NLM_F_DUMP_INTR != 0 {
+                        return Err(Error::Interrupted);
+                    }
                     match message.kind {
-                        NLMSG_DONE => return Ok(listing),
+                        // The end carries the listing's own error code, 0 when it is whole.
+                        NLMSG_DONE => return refusal(&message).map(|()| listing),
                         NLMSG_ERROR => refusal(&message)?,
-                        _ if message.flags & NLM_F_DUMP_INTR != 0 => return Err(Error::Interrupted),
                         _ => super::message(
                             &mut listing,
                             message.kind,
@@ -236,7 +241,7 @@ mod socket {
         }
     }
 
-    /// An error message's verdict: an acknowledgement, or the refusal of the message it names.
+    /// An error message's or a listing end's verdict: an acknowledgement, or the refusal of the message it names.
     fn refusal(message: &super::Message<'_>) -> Result<(), Error> {
         let code = message
             .body

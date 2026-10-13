@@ -201,8 +201,15 @@ fn check_name(what: &str, name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The most conditions in one rule. A rule's expressions are one attribute, whose length netlink keeps in 16 bits;
+/// the longest condition takes 244 bytes, so 256 of them and the verdict fit.
+const MOST_CONDITIONS: usize = 256;
+
 /// Why a rule in this chain would not do what it says, if it would not.
 fn rule_problem(family: Family, hook: Hook, rule: &Rule) -> Option<&'static str> {
+    if rule.when.len() > MOST_CONDITIONS {
+        return Some("more conditions than one rule holds");
+    }
     let receives = !matches!(hook, Hook::Output);
     let sends = matches!(hook, Hook::Output | Hook::Forward);
     let mut transport = false;
