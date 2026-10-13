@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use cf_budget::{GIB, Pressure, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{Claim, EventKind, Hosts, RESULT_WAIT, Seen, Slots, Ticket, Vms};
+use cf_daemon::{Claim, EventKind, RESULT_WAIT, Seen, Slots, Ticket, Vms};
 use cf_vmhost::End;
 use proptest::prelude::*;
 use support::world::World;
@@ -253,7 +253,7 @@ async fn apply(w: &mut World, model: &mut Model, op: Op) {
         }
         Op::Stop(i) => {
             if let Some(runner) = pick(&standing(w, model), i) {
-                let _ = w.m.stop(job_name(&runner)).await;
+                w.m.stop(job_name(&runner));
             }
         }
         Op::StopAll => w.m.stop_all(),

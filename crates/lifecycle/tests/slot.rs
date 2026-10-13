@@ -229,8 +229,9 @@ fn a_process_that_survives_sigkill_is_killed_again_and_its_memory_kept() {
     let mut slot = idle();
     slot.on(s(100), Event::Heartbeat);
     assert_eq!(slot.on(Millis(121_999), Event::Tick), []);
+    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
     assert_eq!(
-        slot.on(s(122), Event::Tick),
+        slot.on(s(122), Event::Stop),
         [Effect::StopVm { grace: Millis::ZERO }]
     );
     assert_eq!(
@@ -254,6 +255,48 @@ fn a_process_that_survives_sigkill_is_killed_again_and_its_memory_kept() {
     assert_eq!(
         slot.on(s(9000), Event::VmExited),
         [Effect::Unregister, Effect::Release, ended(End::NoJob, false)]
+    );
+}
+
+/// An idle Actions runner past its limit may have a job whose start went unheard: its VM is not stopped on that
+/// belief. Its registration is removed first; GitHub removing it is what stops the VM, as one that had no job.
+#[test]
+fn an_idle_runner_past_its_limit_is_unregistered_and_its_vm_stops_only_when_told() {
+    let mut slot = idle();
+    slot.on(s(100), Event::Heartbeat);
+    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
+    assert_eq!(slot.phase(), Phase::Idle);
+    for second in 123..130 {
+        slot.on(s(second), Event::Heartbeat);
+        assert_eq!(
+            slot.on(s(second), Event::Tick),
+            [],
+            "asked once, and the VM stands"
+        );
+    }
+    assert_eq!(
+        slot.on(s(130), Event::Stop),
+        [Effect::StopVm { grace: Millis::ZERO }]
+    );
+    assert_eq!(
+        slot.on(s(131), Event::VmExited),
+        [Effect::Unregister, Effect::Release, ended(End::NoJob, false)]
+    );
+}
+
+/// GitHub refuses to remove an idle Actions runner past its limit, for a job whose start went unheard: the job runs
+/// on, and it is the job's end that is reported, not "no job".
+#[test]
+fn a_job_heard_after_the_idle_limit_runs_and_ends_as_a_job() {
+    let mut slot = idle();
+    slot.on(s(100), Event::Heartbeat);
+    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
+    assert_eq!(slot.on(s(123), Event::JobStarted), []);
+    assert_eq!(slot.phase(), Phase::Running);
+    assert_eq!(slot.on(s(124), Event::JobCompleted), []);
+    assert_eq!(
+        slot.on(s(125), Event::VmExited),
+        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
     );
 }
 

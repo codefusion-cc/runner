@@ -122,7 +122,9 @@ pub enum Effect {
     StopVm { grace: Millis },
     /// Send the vm-host's process group SIGKILL.
     KillVm,
-    /// Remove the Actions runner's registration at GitHub if it is still there.
+    /// Remove the Actions runner's registration at GitHub if it is still there. Sent when the slot ends, and when an
+    /// idle Actions runner waited past its limit: that VM stands until it is told to stop, once GitHub removed the
+    /// registration, or until it hears its job started after all.
     Unregister,
     /// Give the slot's memory back to the budget and delete its scratch disk. The VM's process is gone.
     Release,
@@ -439,7 +441,10 @@ impl Slot {
                 self.deadline = Some(now.plus(self.limits.kill_again));
             }
 
-            (Phase::Idle, Event::JobStarted) => self.run(now),
+            (Phase::Idle, Event::JobStarted) => {
+                self.end = None;
+                self.run(now);
+            }
             // The job is over, so it had started: its start was lost on the way.
             (Phase::Idle, Event::JobCompleted) => {
                 self.ran_job = true;
@@ -451,8 +456,15 @@ impl Slot {
             (Phase::Idle | Phase::Running, Event::Tick) if due(self.heartbeat) => {
                 self.kill(now, End::GuestLost, out)
             }
-            (Phase::Idle, Event::Tick) if due(self.deadline) => self.stop(now, End::NoJob, Millis::ZERO, out),
-            (Phase::Idle, Event::Stop) => self.stop(now, End::Stopped, Millis::ZERO, out),
+            // No job came, as far as the Runner heard: its start may have gone unheard, so the VM is not stopped on
+            // that belief. The registration is removed first, and GitHub's answer decides: removed, and the stop
+            // that follows ends a slot that had no job; refused for a job, and the job is the Actions runner's.
+            (Phase::Idle, Event::Tick) if due(self.deadline) => {
+                self.end = Some(End::NoJob);
+                self.deadline = None;
+                out.push(Effect::Unregister);
+            }
+            (Phase::Idle, Event::Stop) => self.stop(now, self.end.unwrap_or(End::Stopped), Millis::ZERO, out),
             (Phase::Idle, Event::Evict(cause)) => self.stop(now, evicted(cause), Millis::ZERO, out),
             (Phase::Idle | Phase::Running, Event::Slept(_)) if long_sleep => {
                 self.stop(now, End::HostSlept, Millis::ZERO, out);

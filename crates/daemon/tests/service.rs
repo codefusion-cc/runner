@@ -21,6 +21,7 @@ use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Clock as _, Http, RetryPolicy};
+use cf_guest_proto::StopReason;
 use cf_host_macos::{Battery, FakeHost};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
@@ -1566,8 +1567,10 @@ enum Happens {
     Started(u8),
     /// A running job ends: GitHub hears it before its machine goes, or after.
     Completed(u8, bool),
-    /// A job is cancelled, waiting at GitHub or assigned here.
-    Cancelled(u8),
+    /// A job is cancelled, assigned here or waiting at GitHub.
+    Cancelled(u8, bool),
+    /// Every job that waits, at GitHub or assigned here, is cancelled: runs a newer push replaces, say.
+    WaitingCancelled,
     /// An Actions runner of another Mac takes a job that waits at GitHub.
     TakenElsewhere(u8),
     /// What else runs on the Mac leaves room for no machine, or for all.
@@ -1591,9 +1594,13 @@ enum Happens {
     RestStale(bool),
     /// GitHub's REST view of Actions runners fails this many times, past the HTTP retries at most twice.
     RestFails(u8),
-    /// Five minutes pass for GitHub and the Runner: an assignment no Actions runner took is taken back, and an idle
-    /// Actions runner is surplus.
-    FiveMinutes,
+    /// Five to eleven minutes pass for GitHub, the Runner and its machines: an assignment no Actions runner took is
+    /// taken back, an idle Actions runner is surplus, and a machine that waits for a job past its idle time is
+    /// stopped.
+    Minutes(u8),
+    /// GitHub fails every removal of an Actions runner, and keeps the registration, from now on while jobs come and
+    /// go; or it removes them again.
+    RemovalsFail(bool),
     /// The Runner is uninstalled, whatever it is in the middle of. The last step.
     Uninstall,
     /// Tens of milliseconds pass.
@@ -1612,21 +1619,45 @@ fn happens() -> impl Strategy<Value = Happens> {
         6 => any::<bool>().prop_map(Happens::Queued),
         4 => any::<u8>().prop_map(Happens::Started),
         5 => (any::<u8>(), any::<bool>()).prop_map(|(i, first)| Happens::Completed(i, first)),
-        1 => any::<u8>().prop_map(Happens::Cancelled),
+        4 => (any::<u8>(), any::<bool>()).prop_map(|(n, assigned)| Happens::Cancelled(n, assigned)),
         1 => any::<u8>().prop_map(Happens::TakenElsewhere),
+        1 => Just(Happens::WaitingCancelled),
         2 => any::<bool>().prop_map(Happens::Memory),
-        2 => Just(Happens::GithubLooks),
+        4 => Just(Happens::GithubLooks),
         1 => any::<u8>().prop_map(Happens::SessionLost),
-        2 => (any::<u8>(), prop_oneof![Just(Lost::Start), Just(Lost::End), Just(Lost::Both)])
+        4 => (any::<u8>(), prop_oneof![Just(Lost::Start), Just(Lost::End), Just(Lost::Both)])
             .prop_map(|(i, lost)| Happens::LostWith(i, lost)),
         1 => any::<u8>().prop_map(Happens::AckFails),
         1 => Just(Happens::Restart),
         2 => (any::<u8>(), any::<bool>()).prop_map(|(at, kept)| Happens::Crash(at, kept)),
         2 => any::<bool>().prop_map(Happens::RestStale),
         2 => any::<u8>().prop_map(Happens::RestFails),
-        1 => Just(Happens::FiveMinutes),
+        3 => any::<u8>().prop_map(Happens::Minutes),
+        3 => any::<bool>().prop_map(Happens::RemovalsFail),
         1 => Just(Happens::Uninstall),
         3 => (1u8..30).prop_map(Happens::Wait),
+    ]
+}
+
+/// What moves an Actions runner's registration toward its removal, and what can go wrong on the way: the steps
+/// that matter for whether a job that ran on a machine the Runner gives up is heard, without the ones that only
+/// dilute them.
+fn happens_around_removals() -> impl Strategy<Value = Happens> {
+    prop_oneof![
+        4 => any::<bool>().prop_map(Happens::Queued),
+        4 => Just(Happens::GithubLooks),
+        1 => any::<u8>().prop_map(Happens::Started),
+        1 => (any::<u8>(), any::<bool>()).prop_map(|(i, first)| Happens::Completed(i, first)),
+        2 => any::<u8>().prop_map(|n| Happens::Cancelled(n, true)),
+        2 => Just(Happens::WaitingCancelled),
+        3 => any::<u8>().prop_map(Happens::Minutes),
+        3 => any::<bool>().prop_map(Happens::RemovalsFail),
+        3 => (any::<u8>(), prop_oneof![Just(Lost::Start), Just(Lost::End), Just(Lost::Both)])
+            .prop_map(|(i, lost)| Happens::LostWith(i, lost)),
+        1 => any::<bool>().prop_map(Happens::RestStale),
+        1 => any::<u8>().prop_map(Happens::RestFails),
+        1 => (any::<u8>(), any::<bool>()).prop_map(|(at, kept)| Happens::Crash(at, kept)),
+        2 => (1u8..30).prop_map(Happens::Wait),
     ]
 }
 
@@ -1645,6 +1676,9 @@ const PAST_RETRIES: usize = 3;
 
 const SECOND: &str = "org/second";
 
+/// What GitHub's removal of an Actions runner is asked at.
+const REMOVAL: &str = "distributedtask/pools/0/agents/";
+
 fn pick<T: Clone>(items: &[T], n: u8) -> Option<T> {
     (!items.is_empty()).then(|| items[usize::from(n) % items.len()].clone())
 }
@@ -1657,6 +1691,44 @@ async fn start_again(rig: &mut Rig, sets: &[i64], causes: &mut [usize]) {
         causes[at] += 1;
     }
     rig.service.discover().await;
+}
+
+/// What is stored of a machine never disagrees with itself, whenever the Runner dies: a record that says GitHub's
+/// job started on it does not say its machine still waits for one.
+fn stored_facts_agree(rig: &Rig) -> Result<(), TestCaseError> {
+    for record in rig.parts.store.load() {
+        let waits = record
+            .slot
+            .as_ref()
+            .is_some_and(|s| s.saved().phase == cf_lifecycle::Phase::Idle);
+        prop_assert!(
+            !(record.github.is_some() && record.ended.is_none() && waits),
+            "{} is stored with GitHub's job and a machine that waits for one",
+            record.runner
+        );
+    }
+    Ok(())
+}
+
+/// The Runner never stops the machine of a job that runs as if nobody needed it: a job's machine goes when the job
+/// ends, or for a cause (memory, disk, its time, the Mac's sleep).
+fn no_running_job_stopped(rig: &Rig, jobs: &[i64]) -> Result<(), TestCaseError> {
+    let standing = rig.standing();
+    let stopped = rig.parts.vms.stopped();
+    for runner in running(rig, jobs) {
+        let name = job_name(&runner);
+        let cancelled = stopped
+            .iter()
+            .any(|(job, reason, _)| *job == name && *reason == StopReason::Cancelled);
+        let for_cause = stopped
+            .iter()
+            .any(|(job, reason, _)| *job == name && *reason != StopReason::Cancelled);
+        prop_assert!(
+            standing.contains(&runner) || !cancelled || for_cause,
+            "the machine of {runner}, whose job runs, was stopped as unneeded"
+        );
+    }
+    Ok(())
 }
 
 /// Machines started may never outnumber the jobs GitHub handed to this Mac, each hand-out counted.
@@ -1687,8 +1759,11 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     // The Actions runners that ran a job, and for each scale set what may open its session again.
     let mut ran = BTreeSet::new();
     let mut causes = vec![1usize; sets.len()];
+    // Whether the Runner died losing its last write, and whether the crash armed now would.
+    let (mut lost_write, mut crash_loses) = (false, false);
     for step in script {
         if rig.store.crashed() {
+            lost_write |= crash_loses;
             start_again(&mut rig, &sets, &mut causes).await;
         }
         let running = |jobs: &[i64]| -> Vec<String> {
@@ -1739,9 +1814,18 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                     }
                 }
             }
-            Happens::Cancelled(n) => {
-                let waiting = in_state(|s| matches!(s, JobState::Available | JobState::Acquired(_)));
+            Happens::Cancelled(n, assigned) => {
+                let waiting = if assigned {
+                    in_state(|s| matches!(s, JobState::Acquired(_)))
+                } else {
+                    in_state(|s| *s == JobState::Available)
+                };
                 if let Some(job) = pick(&waiting, n) {
+                    rig.github.cancel_job(job);
+                }
+            }
+            Happens::WaitingCancelled => {
+                for job in in_state(|s| matches!(s, JobState::Available | JobState::Acquired(_))) {
                     rig.github.cancel_job(job);
                 }
             }
@@ -1792,7 +1876,10 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                 }
             }
             Happens::Restart => start_again(&mut rig, &sets, &mut causes).await,
-            Happens::Crash(at, kept) => rig.crash_at(1 + usize::from(at % 8), kept),
+            Happens::Crash(at, kept) => {
+                crash_loses = !kept;
+                rig.crash_at(1 + usize::from(at % 8), kept);
+            }
             Happens::RestStale(stale) => rig.github.set_rest_stale(stale),
             Happens::RestFails(times) => {
                 for repo in [REPO, SECOND] {
@@ -1803,10 +1890,16 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                     );
                 }
             }
-            Happens::FiveMinutes => {
-                rig.github.pass(Duration::from_secs(301));
-                rig.later(Duration::from_secs(301));
+            Happens::Minutes(n) => {
+                let time = Duration::from_secs(60 * (5 + u64::from(n % 7)) + 1);
+                rig.github.pass(time);
+                rig.later(time);
+                pass(&rig.machines, time.as_secs());
             }
+            Happens::RemovalsFail(true) => rig
+                .github
+                .fail_until_recovered(REMOVAL, Reply::status_json(500, &json!({"message": "try again"}))),
+            Happens::RemovalsFail(false) => rig.github.recover(REMOVAL),
             Happens::Uninstall => uninstall = true,
             Happens::Wait(tens) => {
                 tokio::time::sleep(Duration::from_millis(u64::from(tens) * 10)).await;
@@ -1814,6 +1907,8 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         one_machine_per_assignment(&rig)?;
+        no_running_job_stopped(&rig, &jobs)?;
+        stored_facts_agree(&rig)?;
         let opens = session_opens(&rig);
         prop_assert!(
             opens.iter().zip(&causes).all(|(opened, may)| opened <= may),
@@ -1824,9 +1919,11 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         }
     }
     if rig.store.crashed() {
+        lost_write |= crash_loses;
         start_again(&mut rig, &sets, &mut causes).await;
     }
-    // A crash that has not come does not come now.
+    // GitHub removes Actions runners again, and a crash that has not come does not come now.
+    rig.github.recover(REMOVAL);
     rig.store.revive();
 
     if uninstall {
@@ -1854,7 +1951,7 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             "records left: {:?}",
             rig.parts.store.load()
         );
-        all_heard(&rig, &ran).await?;
+        all_heard(&rig, &ran, lost_write).await?;
         rig.stop_pump().await;
         rig.service.kill();
         return Ok(());
@@ -1894,14 +1991,14 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         rig.github.complete_job(&runner, "succeeded");
         rig.parts.vms.end(job_name(&runner), End::Ok);
     }
-    all_heard(&rig, &ran).await?;
+    all_heard(&rig, &ran, lost_write).await?;
     rig.stop_pump().await;
     rig.service.kill();
     Ok(())
 }
 
 /// Every job that ran here reaches the console, its start and its end, each once.
-async fn all_heard(rig: &Rig, ran: &BTreeSet<String>) -> Result<(), TestCaseError> {
+async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost_write: bool) -> Result<(), TestCaseError> {
     let heard_from = std::time::Instant::now();
     loop {
         let unheard: Vec<&String> = ran
@@ -1939,9 +2036,13 @@ async fn all_heard(rig: &Rig, ran: &BTreeSet<String>) -> Result<(), TestCaseErro
         &ended,
         "a start without its end, or an end without its start"
     );
+    // Accepted, and only this: GitHub removed a registration at the Runner's request and the Runner died before it
+    // wrote that answer down. The next Runner finds it gone with no word that no job ran there and reports a job
+    // (`docs/job-state.md`): one too many, never one lost.
+    let removed = rig.github.removed_at_request();
     for runner in &started {
         prop_assert!(
-            ran.contains(*runner),
+            ran.contains(*runner) || (lost_write && removed.iter().any(|r| r == runner)),
             "{} never ran a job, yet the console heard of one",
             runner
         );
@@ -1960,7 +2061,7 @@ fn running(rig: &Rig, jobs: &[i64]) -> Vec<String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 24, failure_persistence: None, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 32, failure_persistence: None, ..ProptestConfig::default() })]
 
     /// Whatever happens in whatever order, over long runs: no job gets two machines; a session opens again only
     /// when GitHub forgot it, it failed, or the Runner started again, so no state makes the Runner open sessions
@@ -1978,6 +2079,21 @@ proptest! {
             .build()
             .expect("a runtime")
             .block_on(live(slots, script))?;
+    }
+
+    /// The same, for what happens around the removal of an Actions runner's registration: a removal GitHub fails
+    /// or answers late, a job that comes to an Actions runner the Runner meant to remove, its messages lost, the
+    /// Runner dying between its writes.
+    #[test]
+    fn around_removals_every_job_that_ran_is_heard_and_no_running_job_is_stopped(
+        script in proptest::collection::vec(happens_around_removals(), 1..40),
+    ) {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(live(2, script))?;
     }
 }
 
@@ -2165,8 +2281,8 @@ async fn a_job_that_ends_as_a_session_opens_gets_no_second_machine_from_the_open
 }
 
 /// GPT, scaler.rs:582: a job is cancelled before its Actions runner took it, the surplus Actions runner is removed
-/// at GitHub, and the Runner dies before the machine is gone. The Runner that starts next finds the registration
-/// gone: its own removal, not a job.
+/// at GitHub, and the Runner dies before the machine is gone. The Runner that starts next finds GitHub's answer to
+/// that removal written down: it stops the machine without asking again, and takes nothing for a job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_surplus_removed_just_before_the_runner_died_is_not_taken_for_a_job_by_the_next() {
     let mut rig = Rig::new(1).await;
@@ -2211,16 +2327,16 @@ async fn a_surplus_removed_just_before_the_runner_died_is_not_taken_for_a_job_by
         rig.github.scale_sets().iter().any(|s| s.has_session)
     })
     .await;
-    until(
-        "the next Runner to finish the removal it found written down",
-        || removals(&rig) > removed_before,
-    )
-    .await;
-    until("the machine stopped once its registration is gone", || {
+    until("the machine stopped by the next Runner", || {
         stops(&rig) > stopped_before
     })
     .await;
     tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        removals(&rig),
+        removed_before,
+        "GitHub's answer was written down: nothing to remove again"
+    );
     assert_eq!(heard(&rig, &runner), (false, false), "no job ran there");
     rig.parts.vms.ignore_stops(false);
     rig.parts.vms.unkillable(job_name(&runner), false);
@@ -2384,4 +2500,157 @@ async fn a_start_lost_with_a_session_is_heard_when_the_next_one_opens() {
     .await;
     until("the start at the console", || heard(&rig, &runner).0).await;
     assert_eq!(rig.standing(), vec![runner], "heard while the job runs");
+}
+
+/// Sol, machines.rs:1614: the Runner dies as it writes GitHub's word that a job started. That word and what it does to
+/// the machine's lifecycle are one write, and a record an older Runner left with the two apart (the job started, the
+/// lifecycle idle) is read by its one fact: the job runs. The machine is not stopped as idle while its job runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_that_dies_as_it_hears_a_start_leaves_the_job_its_machine() {
+    let mut rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    until("the machine up and waiting", || {
+        rig.parts.store.load().iter().any(|r| {
+            r.slot
+                .as_ref()
+                .is_some_and(|s| s.saved().phase == cf_lifecycle::Phase::Idle)
+        })
+    })
+    .await;
+    rig.crash_at(1, true);
+    rig.github.start_job(&runner);
+    until("the Runner to die at its write", || rig.store.crashed()).await;
+    let stored = rig.parts.store.load();
+    assert!(
+        stored.iter().any(|r| r.github.is_some()
+            && r.slot
+                .as_ref()
+                .is_some_and(|s| s.saved().phase == cf_lifecycle::Phase::Running)),
+        "the write that was kept: {stored:?}"
+    );
+    // What a Runner from before this rule could have left: the job's start, and a lifecycle still idle.
+    for mut record in stored {
+        if let Some(slot) = record.slot.as_mut() {
+            let mut saved = slot.saved();
+            saved.phase = cf_lifecycle::Phase::Idle;
+            *slot = saved.into();
+        }
+        rig.parts.store.save(&record);
+    }
+    rig.restart().await;
+    until("the job's start read as a running job", || {
+        rig.parts.store.load().iter().any(|r| {
+            r.slot
+                .as_ref()
+                .is_some_and(|s| s.saved().phase == cf_lifecycle::Phase::Running)
+        })
+    })
+    .await;
+    pass(&rig.machines, 11 * 60);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.standing(),
+        vec![runner.clone()],
+        "the machine of a running job stands"
+    );
+    assert!(
+        !rig.parts
+            .vms
+            .stopped()
+            .iter()
+            .any(|(job, ..)| *job == job_name(&runner)),
+        "stops: {:?}",
+        rig.parts.vms.stopped()
+    );
+}
+
+/// Found by the generated sequences: a job's start goes with a session and the machine waits past its idle limit.
+/// The Runner believes it idle, but does not stop it on that belief: it removes the registration first, GitHub
+/// refuses for the job that runs there, and the job is heard and runs to its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_machine_past_its_idle_limit_whose_start_was_lost_keeps_its_job() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    let set = rig.github.scale_sets()[0].id;
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    pass(&rig.machines, 11 * 60);
+    until("GitHub's refusal heard as the job's start", || {
+        heard(&rig, &runner).0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.standing(),
+        vec![runner.clone()],
+        "the machine of a running job stands"
+    );
+    assert!(
+        !rig.parts
+            .vms
+            .stopped()
+            .iter()
+            .any(|(job, ..)| *job == job_name(&runner)),
+        "stops: {:?}",
+        rig.parts.vms.stopped()
+    );
+    rig.github.complete_job(&runner, "succeeded");
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the job's end at the console", || {
+        heard(&rig, &runner) == (true, true)
+    })
+    .await;
+}
+
+/// Sol, machines.rs:960: the removal of a surplus Actions runner fails at GitHub, which keeps the registration. A
+/// job comes, the Actions runner takes it, and its start and end go with the session; the job ends and the Actions
+/// runner removes its own registration. A removal the Runner meant to make is not GitHub's word that no job ran:
+/// the console hears the job's start and its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surplus_whose_removal_failed_and_that_then_ran_a_job_is_heard() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let job = rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    rig.github.cancel_job(job);
+    rig.github.fail(
+        "distributedtask/pools/0/agents/",
+        Reply::status_json(500, &json!({"message": "try again"})),
+        PAST_RETRIES,
+    );
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    until("the removal to fail", || {
+        rig.github.count("distributedtask/pools/0/agents/") >= PAST_RETRIES
+    })
+    .await;
+    let next = rig.queue().await;
+    until("the Actions runner to be needed again", || {
+        rig.github.job_state(next) == Some(JobState::Acquired(rig.github.scale_sets()[0].id))
+    })
+    .await;
+    let set = rig.github.scale_sets()[0].id;
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    assert_eq!(
+        rig.github.job_state(next),
+        Some(JobState::Running(runner.clone()))
+    );
+    rig.github.complete_job(&runner, "succeeded");
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    until("the machine to be gone", || rig.standing().is_empty()).await;
+    for _ in 0..3 {
+        rig.later(RESULT_WAIT + Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    until("no record", || rig.parts.store.load().is_empty()).await;
+    assert_eq!(heard(&rig, &runner), (true, true), "{:?}", rig.events());
 }

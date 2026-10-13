@@ -480,7 +480,7 @@ async fn an_idle_machine_that_is_retired_reports_no_job() {
     let mut w = World::new(1);
     let runner = w.start().await;
     pass(&w.m, 3);
-    w.m.stop(job_name(&runner)).await.expect("stop");
+    w.m.stop(job_name(&runner));
     pass(&w.m, 2);
     assert_eq!(w.reports(), []);
     w.assert_nothing_left();
@@ -918,7 +918,7 @@ async fn a_stop_in_the_moment_the_mac_wakes_is_not_put_off_by_the_time_it_slept(
     // The Mac sleeps for a few minutes and wakes; before the daemon's next look at it, the scaler retires the
     // machine. The time to its forced end runs from now, not from now plus the sleep.
     w.m.with_host(|host| host.sleep(Millis::mins(4)));
-    w.m.stop(&job).await.expect("stop");
+    w.m.stop(&job);
     pass(&w.m, 40);
     assert_eq!(w.parts.vms.killed(), [job.as_str()]);
     assert_eq!(w.slots(), 0);
@@ -965,7 +965,7 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     // A start can go with a session of GitHub's: the one that died idle counts until GitHub was asked about it.
     assert_eq!(w.m.lost_with_job(REPO, SET), 3);
     w.registered.remove(&idle);
-    w.m.unregistered(&idle);
+    w.m.unregistered(&idle, true);
     assert_eq!(w.m.lost_with_job(REPO, SET), 2, "GitHub still counts both jobs");
     assert_eq!(w.m.lost_with_job(REPO, SET + 1), 0, "and for this scale set only");
     assert_eq!(
@@ -977,7 +977,7 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     w.github(EventKind::Completed, &first, "failed");
     assert_eq!(w.m.lost_with_job(REPO, SET), 1);
     w.registered.remove(&second);
-    w.m.unregistered(&second);
+    w.m.unregistered(&second, false);
     assert_eq!(w.m.lost_with_job(REPO, SET), 0);
     w.assert_nothing_left();
 }

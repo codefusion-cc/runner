@@ -137,8 +137,9 @@ impl World {
     /// What the service does every few seconds: GitHub removes the registrations the machines name.
     pub fn sweep(&mut self) {
         for registration in self.m.registrations_to_remove() {
-            self.registered.remove(&registration.runner);
-            self.m.unregistered(&registration.runner);
+            // GitHub answers a removal of what it has; one gone already is a 404.
+            let there = self.registered.remove(&registration.runner);
+            self.m.unregistered(&registration.runner, there);
         }
     }
 

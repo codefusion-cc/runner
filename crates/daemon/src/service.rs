@@ -28,7 +28,7 @@ use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
-use crate::traits::{EventKind, Events, Hosts, Slots};
+use crate::traits::{EventKind, Events, Slots};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -790,28 +790,30 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .await
                     .map(|found| found.map(|runner| runner.id)),
             };
+            // Ok(true): GitHub removed it at this request, so it held no job. Ok(false): it was gone already, which
+            // proves nothing of a job (`Machines::unregistered`). A refusal for a job (422) says one started, whatever
+            // was believed of this machine.
             let removed = match id {
-                Ok(None) => Ok(()),
-                // A 404 says nothing here: the client tries a removal again when its answer was lost. A refusal for
-                // a job (422) says one started, whatever was believed of this machine.
+                Ok(None) => Ok(false),
                 Ok(Some(id)) => match client.remove_runner(id).await {
                     Err(error) if error.status() == Some(422) => {
                         shared.machines.ran_unheard(&registration.runner);
                         Err(error)
                     }
-                    Err(error) if !error.is_not_found() => Err(error),
-                    _ => Ok(()),
+                    Err(error) if error.is_not_found() => Ok(false),
+                    Err(error) => Err(error),
+                    Ok(()) => Ok(true),
                 },
                 Err(error) => Err(error),
             };
             match removed {
-                Ok(()) => {
+                Ok(removed_idle) => {
                     shared
                         .refused
                         .lock()
                         .expect("refused")
                         .remove(&registration.runner);
-                    shared.machines.unregistered(&registration.runner);
+                    shared.machines.unregistered(&registration.runner, removed_idle);
                 }
                 Err(error) => {
                     tracing::warn!(runner = %registration.runner, %error, "a registration could not be removed; it is tried again");
@@ -1121,10 +1123,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !stands {
                     return (false, format!("{name} is not on this Mac"));
                 }
-                match self.shared.machines.stop(crate::names::job_name(name)).await {
-                    Ok(()) => (true, format!("{name} is being stopped")),
-                    Err(error) => (false, error.to_string()),
-                }
+                self.shared.machines.stop(crate::names::job_name(name));
+                (true, format!("{name} is being stopped"))
             }
             kind => (false, format!("this Runner does not do `{kind}` yet")),
         }

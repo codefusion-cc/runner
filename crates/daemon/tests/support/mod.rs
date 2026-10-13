@@ -113,8 +113,7 @@ struct Seen {
     withdrawn: Vec<Ticket>,
     claimed: usize,
     started: Vec<(String, i64, Ticket)>,
-    stopped: Vec<String>,
-    fail_stop: usize,
+    retired: Vec<String>,
     unanswered: bool,
 }
 
@@ -178,17 +177,13 @@ impl Spy {
         self.seen().started.clone()
     }
 
-    /// The Actions runners whose machine was asked to stop.
-    pub fn stopped(&self) -> Vec<String> {
-        self.seen().stopped.clone()
+    /// The Actions runners the scaler retired as surplus.
+    pub fn retired(&self) -> Vec<String> {
+        self.seen().retired.clone()
     }
 
     pub fn fail_start(&self, n: usize) {
         self.machines.vms().fail_start(n);
-    }
-
-    pub fn fail_stop(&self, n: usize) {
-        self.seen().fail_stop = n;
     }
 
     pub fn mark_out_of_memory(&self, runner: &str) {
@@ -260,8 +255,13 @@ impl Hosts for Spy {
         self.machines.registration_unsure(name);
     }
 
-    fn removing(&self, name: &str, why: &str) {
-        self.machines.removing(name, why);
+    fn retire(&self, name: &str) {
+        self.seen().retired.push(name.to_string());
+        self.machines.retire(name);
+    }
+
+    fn retiring(&self, name: &str) -> bool {
+        self.machines.retiring(name)
     }
 
     async fn start(&self, spec: RunnerSpec) -> Result<String, HostError> {
@@ -269,24 +269,6 @@ impl Hosts for Spy {
         let handle = self.machines.start(spec).await?;
         self.seen().started.push(seen);
         Ok(handle)
-    }
-
-    async fn stop(&self, handle: &str) -> Result<(), HostError> {
-        let name = self
-            .seen()
-            .started
-            .iter()
-            .find(|(name, _, _)| job_name(name) == handle)
-            .map_or(handle.to_string(), |(name, _, _)| name.clone());
-        {
-            let mut seen = self.seen();
-            if seen.fail_stop > 0 {
-                seen.fail_stop -= 1;
-                return Err(HostError("the machine did not stop".into()));
-            }
-            seen.stopped.push(name);
-        }
-        self.machines.stop(handle).await
     }
 
     async fn out_of_memory(&self, handle: &str) -> OutOfMemory {

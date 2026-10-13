@@ -200,6 +200,8 @@ struct State {
     scale_sets: Vec<ScaleSet>,
     jobs: Vec<Job>,
     runners: Vec<Runner>,
+    /// Actions runners whose registration a DELETE removed, by name.
+    removed_at_request: Vec<String>,
     next_runner: i64,
     next_job: i64,
     faults: Vec<Fault>,
@@ -406,6 +408,7 @@ impl FakeGithub {
                 scale_sets: vec![],
                 jobs: vec![],
                 runners: vec![],
+                removed_at_request: vec![],
                 next_runner: 100,
                 next_job: 1000,
                 faults: vec![],
@@ -521,6 +524,17 @@ impl FakeGithub {
             reply,
             remaining: times,
         });
+    }
+
+    /// Answers every request whose `METHOD path` contains `matcher` with `reply` from now on, for as long as GitHub
+    /// is in that state, until [`FakeGithub::recover`].
+    pub fn fail_until_recovered(&self, matcher: &str, reply: Reply) {
+        self.fail(matcher, reply, usize::MAX);
+    }
+
+    /// Ends every fault set for requests whose `METHOD path` contains `matcher`.
+    pub fn recover(&self, matcher: &str) {
+        self.lock().faults.retain(|fault| fault.matcher != matcher);
     }
 
     /// Handles the next `times` requests whose `METHOD path` contains `matcher` and then drops the connection, so
@@ -721,6 +735,11 @@ impl FakeGithub {
     /// The names of the Actions runners currently registered.
     pub fn runners(&self) -> Vec<String> {
         self.lock().runners.iter().map(|r| r.name.clone()).collect()
+    }
+
+    /// The Actions runners whose registration a DELETE removed (answered 204), not their own end after a job.
+    pub fn removed_at_request(&self) -> Vec<String> {
+        self.lock().removed_at_request.clone()
     }
 
     /// Whether a scale set with a session offered room beyond the jobs it holds in both of its last two polls: a
@@ -1106,6 +1125,7 @@ impl FakeGithub {
                     return json_error(422, "JobStillRunningException", "the runner still has a job");
                 }
                 st.runners.retain(|r| r.id != id);
+                st.removed_at_request.push(name);
                 Reply::empty(204)
             });
         }

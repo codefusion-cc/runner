@@ -104,19 +104,17 @@ pub trait Hosts: Send + Sync {
     /// Whoever removes left-over registrations looks for it by name.
     fn registration_unsure(&self, name: &str);
 
-    /// The registration of that name is about to be removed at GitHub, for `why`. Written down before GitHub is asked
-    /// (`docs/job-state.md`): once it is, GitHub not having the registration says nothing of a job, here or in the
-    /// Runner that starts after this one.
-    fn removing(&self, name: &str, why: &str);
+    /// The Actions runner of that name is not needed: its registration is to be removed, and its machine stopped once
+    /// GitHub removed it (`docs/job-state.md`). Nothing is written; a Runner that dies first retires it again.
+    fn retire(&self, name: &str);
+
+    /// Whether the Actions runner of that name is retiring: its removal is asked for and GitHub has not answered.
+    fn retiring(&self, name: &str) -> bool;
 
     /// Starts a machine for the Actions runner and returns its handle. After an error no machine stands and the
     /// slot is still the caller's: the host removed what it had begun before it answers. After a success the slot
     /// is the machine's, and goes back when the machine is gone.
     fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send;
-
-    /// Asks a machine to stop; one that is gone already is stopped. The machine goes away, and its slot with it,
-    /// in its own time. After an error the machine stands as before.
-    fn stop(&self, handle: &str) -> impl Future<Output = Result<(), HostError>> + Send;
 
     /// Whether the machine lost a process because it had used up its memory. `Unknown` when nobody can say (the
     /// vm-host does not answer, the machine's state is gone), never `No`: the scaler then asks whoever watched the
@@ -146,8 +144,12 @@ impl<T: Hosts> Hosts for std::sync::Arc<T> {
         (**self).registration_unsure(name);
     }
 
-    fn removing(&self, name: &str, why: &str) {
-        (**self).removing(name, why);
+    fn retire(&self, name: &str) {
+        (**self).retire(name);
+    }
+
+    fn retiring(&self, name: &str) -> bool {
+        (**self).retiring(name)
     }
 
     fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {
@@ -156,10 +158,6 @@ impl<T: Hosts> Hosts for std::sync::Arc<T> {
 
     fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send {
         (**self).start(spec)
-    }
-
-    fn stop(&self, handle: &str) -> impl Future<Output = Result<(), HostError>> + Send {
-        (**self).stop(handle)
     }
 
     fn out_of_memory(&self, handle: &str) -> impl Future<Output = OutOfMemory> + Send {

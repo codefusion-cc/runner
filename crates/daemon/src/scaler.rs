@@ -371,7 +371,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         }
         *self.never.lock().expect("never") = None;
         if active > assigned {
-            self.retire_surplus(active - assigned).await;
+            self.retire_surplus(active - assigned);
         }
         Ok(())
     }
@@ -449,86 +449,37 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             busy: false,
             adopted: false,
             done: None,
-            removing: false,
             job: None,
         });
         tracing::info!(runner = %name, "Actions runner started");
         Ok(())
     }
 
-    /// Removes up to `n` Actions runners that waited past [`IDLE_GRACE`] for a job that never came, such as one
-    /// cancelled before it started. Busy, finished and adopted Actions runners are left alone.
+    /// Retires up to `n` Actions runners that waited past [`IDLE_GRACE`] for a job that never came, such as one
+    /// cancelled before it started. Busy, finished and adopted Actions runners are left alone, and those already
+    /// retiring count.
     ///
-    /// GitHub is asked first: one that is busy, or gone although the Runner never set out to remove it, took a job
-    /// whose start was not heard. The removal is written down before GitHub is asked to remove it, so that GitHub not
-    /// having the registration afterwards says nothing of a job, here or in the Runner that starts after this one; a
-    /// removal GitHub refuses because of a job (422) is a start as well (`docs/job-state.md`).
-    async fn retire_surplus(&mut self, mut n: usize) {
+    /// The scaler only asks: the sweep removes the registration, the one place that removes any, and GitHub's answer
+    /// decides. Removed, and the machine stops as one that had no job; refused for a job (422) or gone already (404),
+    /// and the job is heard, since a one-job Actions runner removes its own registration once its job is over
+    /// (`docs/job-state.md`). Nothing is written until GitHub answered.
+    fn retire_surplus(&mut self, n: usize) {
         let (repo, set) = (self.config.repo.clone(), self.config.scale_set_id);
-        for runner in self.roster.runners(&repo, set) {
-            if n == 0 {
-                return;
-            }
-            let age = self
-                .clock
-                .now()
-                .duration_since(runner.started)
-                .unwrap_or(Duration::ZERO);
-            if runner.busy || runner.adopted || runner.done.is_some() || age < IDLE_GRACE {
-                continue;
-            }
-            if !runner.removing {
-                match self.registry.runner_busy(runner.runner_id).await {
-                    Ok(Some(false)) => {}
-                    Ok(Some(true) | None) => {
-                        self.took_job(&runner.name);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::info!(runner = %runner.name, error = %e, "GitHub could not say whether a surplus Actions runner is idle; asked again later");
-                        continue;
-                    }
-                }
-                self.hosts.removing(&runner.name, "surplus");
-                self.roster.mark_removing(&runner.name);
-            }
-            match self.registry.remove_runner(runner.runner_id).await {
-                Ok(()) => {}
-                // Gone from the service already, by this removal: only its machine is left to remove.
-                Err(e) if e.is_not_found() => {}
-                Err(e) if e.status() == Some(422) => {
-                    self.took_job(&runner.name);
-                    continue;
-                }
-                Err(e) => {
-                    // Whether GitHub removed it is not known; the removal stays written down and is tried again.
-                    tracing::info!(runner = %runner.name, error = %e, "surplus Actions runner not removed");
-                    continue;
-                }
-            }
-            n -= 1;
-            // Its registration is removed, so it takes no job and no longer counts. The machine keeps its slot
-            // until whoever watches the machines sees it gone.
-            self.roster.mark_done(&repo, set, &runner.name, self.clock.now());
-            match self.hosts.stop(&runner.handle).await {
-                Ok(()) => tracing::info!(runner = %runner.name, "surplus Actions runner removed"),
-                Err(e) => {
-                    tracing::warn!(runner = %runner.name, error = %e, "could not stop a surplus Actions runner's machine");
-                }
-            }
+        let runners = self.roster.runners(&repo, set);
+        let retiring = runners.iter().filter(|r| self.hosts.retiring(&r.name)).count();
+        let now = self.clock.now();
+        let idle = runners.iter().filter(|runner| {
+            let age = now.duration_since(runner.started).unwrap_or(Duration::ZERO);
+            !(runner.busy
+                || runner.adopted
+                || runner.done.is_some()
+                || age < IDLE_GRACE
+                || self.hosts.retiring(&runner.name))
+        });
+        for runner in idle.take(n.saturating_sub(retiring)) {
+            tracing::info!(runner = %runner.name, "surplus Actions runner retired");
+            self.hosts.retire(&runner.name);
         }
-    }
-
-    /// GitHub says an Actions runner of this scale set took a job whose start was not heard.
-    fn took_job(&self, runner: &str) {
-        start_unheard(
-            &self.roster,
-            self.events.as_ref(),
-            &self.config.repo,
-            self.config.scale_set_id,
-            runner,
-            self.clock.now(),
-        );
     }
 
     /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone

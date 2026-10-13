@@ -43,8 +43,6 @@ pub struct Runner {
     pub adopted: bool,
     /// When its job completed, or its registration was removed: its machine goes away shortly after.
     pub done: Option<SystemTime>,
-    /// Its removal at GitHub is written down ([`crate::Hosts::removing`]): GitHub not having it says nothing of a job.
-    pub removing: bool,
     /// The job it took.
     pub job: Option<JobInfo>,
 }
@@ -101,7 +99,6 @@ impl Roster {
             && r.is_of(repo, scale_set_id)
         {
             r.busy = true;
-            r.removing = false;
             r.job = Some(job);
         }
     }
@@ -115,13 +112,6 @@ impl Roster {
                 true
             }
             _ => false,
-        }
-    }
-
-    /// Records that the removal of an Actions runner's registration is written down.
-    pub fn mark_removing(&self, name: &str) {
-        if let Some(r) = self.lock().get_mut(name) {
-            r.removing = true;
         }
     }
 
