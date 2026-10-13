@@ -4,28 +4,30 @@
 //! `cargo run -p cf-host-linux --example host-probe [the state folder]`
 
 use std::path::Path;
+use std::process::ExitCode;
 
-use cf_budget::{Budget, Host, HostError, Settings};
+use cf_budget::{Budget, GIB, Host, HostError, Settings, Size};
 use cf_host_linux::{LinuxHost, battery, boot_time, fast_cpus, load, model, reading};
 
-fn main() -> std::process::ExitCode {
+fn main() -> ExitCode {
     let disk = std::env::args().nth(1).unwrap_or_else(|| "/".into());
-    let root = Path::new("/");
-    let result = (|| {
-        let host = LinuxHost::new(Path::new(&disk))?;
-        let facts = host.facts()?;
-        let now = host.now();
-        let raw = host.raw()?;
-        let reading = reading(now, &raw)?;
-        Ok::<_, HostError>((host, facts, now, raw, reading))
-    })();
-    let (host, facts, now, raw, reading) = match result {
-        Ok(all) => all,
+    match probe(&disk) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("cannot read this host: {error}");
-            return std::process::ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-    };
+    }
+}
+
+fn probe(disk: &str) -> Result<(), HostError> {
+    let root = Path::new("/");
+    let host = LinuxHost::new(Path::new(disk))?;
+    let facts = host.facts()?;
+    let now = host.now();
+    let raw = host.raw()?;
+    let reading = reading(now, &raw)?;
+    let memory = &raw.memory;
     let fast = fast_cpus(root).unwrap_or_default();
 
     println!(
@@ -42,12 +44,12 @@ fn main() -> std::process::ExitCode {
     println!("monotonic ms / boottime ms {} / {}", now.awake.0, now.elapsed.0);
     println!(
         "MemAvailable               {} ({:.2} GiB)",
-        raw.available_bytes,
-        gib(raw.available_bytes)
+        memory.available_bytes,
+        gib(memory.available_bytes)
     );
     println!(
         "SwapTotal / SwapFree       {} / {} (used {})",
-        raw.swap_total_bytes, raw.swap_free_bytes, reading.swap_used_bytes
+        memory.swap_total_bytes, memory.swap_free_bytes, reading.swap_used_bytes
     );
     println!("pswpout                    {}", raw.swapouts);
     match raw.memory_pressure {
@@ -92,36 +94,32 @@ fn main() -> std::process::ExitCode {
     println!("load                       {:?}", load(root));
     println!("btime                      {:?}", boot_time(root));
 
-    let fast_cores = u32::try_from(fast.len()).unwrap_or(0);
-    let settings = Settings::for_headless(facts, fast_cores);
+    let settings = Settings::for_headless(facts, u32::try_from(fast.len()).unwrap_or(0));
     let Ok(mut budget) = Budget::new(settings.clone()) else {
-        eprintln!("the headless settings do not fit this host");
-        return std::process::ExitCode::SUCCESS;
+        println!("headless: the settings do not fit this host");
+        return Ok(());
     };
     budget.observe(now, Some(reading));
-    let status = budget.status(now);
+    let limits = budget.status(now).limits;
     println!(
         "headless: cap {:.2} GiB, floor {:.2} GiB, {} CPUs, vCPUs {:?}; above the floor now: {:.2} GiB",
-        gib(status.limits.cap_bytes),
-        gib(status.limits.floor_bytes),
-        status.limits.cpus,
+        gib(limits.cap_bytes),
+        gib(limits.floor_bytes),
+        limits.cpus,
         settings.vcpus,
-        gib(reading.available_bytes.saturating_sub(status.limits.floor_bytes)),
+        gib(reading.available_bytes.saturating_sub(limits.floor_bytes)),
     );
-    for size in cf_budget::Size::ALL {
-        println!(
-            "  {}: {}",
-            size.label(),
-            match settings.can_run(size) {
-                Ok(()) => format!("{} side by side", settings.side_by_side(&settings.away, size)),
-                Err(refusal) => format!("never ({refusal:?})"),
-            }
-        );
+    for size in Size::ALL {
+        let fits = match settings.can_run(size) {
+            Ok(()) => format!("{} side by side", settings.side_by_side(&settings.away, size)),
+            Err(refusal) => format!("never ({refusal:?})"),
+        };
+        println!("  {}: {fits}", size.label());
     }
-    std::process::ExitCode::SUCCESS
+    Ok(())
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn gib(bytes: u64) -> f64 {
-    bytes as f64 / cf_budget::GIB as f64
+    bytes as f64 / GIB as f64
 }

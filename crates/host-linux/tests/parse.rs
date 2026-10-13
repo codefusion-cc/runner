@@ -1,6 +1,8 @@
 //! The text formats: what the kernel writes comes back as the numbers it wrote, anything else as no answer, and no
 //! input makes a parser panic.
 
+mod common;
+
 use cf_budget::{Pressure, Thermal};
 use cf_host_linux::parse::{
     self, CpuTicks, Meminfo, Psi, boot_id, btime, cpu_list, cpu_ticks, loadavg, meminfo, millidegrees, psi,
@@ -230,8 +232,7 @@ proptest! {
 
     #[test]
     fn a_process_start_is_found_whatever_its_name(name in "\\PC{0,40}", ticks in any::<u64>(), pid in 1..u32::MAX) {
-        let stat = format!("{pid} ({name}) S 1 {pid} {pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 3 0 {ticks} 123 456 7\n");
-        prop_assert_eq!(start_ticks(&stat), Some(ticks));
+        prop_assert_eq!(start_ticks(&common::stat_of(pid, &name, ticks)), Some(ticks));
     }
 
     #[test]

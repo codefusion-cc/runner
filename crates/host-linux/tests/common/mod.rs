@@ -80,14 +80,8 @@ impl Tree {
             } else {
                 ("1024\n", "0x00000000414fd0b0\n")
             };
-            tree.file(
-                &format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"),
-                capacity,
-            );
-            tree.file(
-                &format!("/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1"),
-                midr,
-            );
+            tree.capacity(cpu, capacity);
+            tree.midr(cpu, midr);
         }
         tree.zone(
             0,
@@ -151,6 +145,19 @@ impl Tree {
             self.file(&format!("{zone}/trip_point_{trip}_temp"), &format!("{at}\n"));
             self.file(&format!("{zone}/trip_point_{trip}_hyst"), "2000\n");
         }
+    }
+
+    /// A CPU's `cpu_capacity`.
+    pub fn capacity(&self, cpu: u32, value: &str) {
+        self.file(&format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"), value);
+    }
+
+    /// A CPU's `midr_el1`.
+    pub fn midr(&self, cpu: u32, value: &str) {
+        self.file(
+            &format!("/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1"),
+            value,
+        );
     }
 
     /// A power supply with these files.

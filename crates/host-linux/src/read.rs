@@ -16,7 +16,8 @@ pub(crate) fn text(root: &Path, path: &str) -> io::Result<String> {
 }
 
 fn bytes(root: &Path, path: &str) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+    // What the kernel writes here is a few kB at most, and its files give no size to start from.
+    let mut bytes = Vec::with_capacity(4096);
     File::open(under(root, path))?
         .take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
@@ -31,7 +32,7 @@ pub(crate) fn under(root: &Path, path: &str) -> PathBuf {
     root.join(path.trim_start_matches('/'))
 }
 
-fn call(what: &'static str, error: &io::Error) -> HostError {
+pub(crate) fn call(what: &'static str, error: &io::Error) -> HostError {
     HostError::Call {
         what,
         code: error.raw_os_error().map_or(-1, i64::from),
@@ -48,10 +49,8 @@ pub(crate) fn meminfo(root: &Path) -> Result<Meminfo, HostError> {
 }
 
 pub(crate) fn swapouts(root: &Path) -> Result<u64, HostError> {
-    parse::vmstat(&needed(root, "/proc/vmstat")?, "pswpout").ok_or(HostError::Implausible {
-        what: "pswpout of /proc/vmstat",
-        value: "missing".into(),
-    })
+    parse::vmstat(&needed(root, "/proc/vmstat")?, "pswpout")
+        .ok_or_else(|| parse::implausible("pswpout of /proc/vmstat", "missing"))
 }
 
 /// `/proc/pressure/memory`; `None` when the kernel has no such file or refuses to read it (PSI built in but off).
@@ -110,7 +109,9 @@ pub(crate) fn zones(root: &Path) -> Vec<Zone> {
         .collect()
 }
 
-/// The power supplies the kernel knows; none on a host without any.
+/// The power supplies of the host; none on a host without any. A device's own battery (`scope` is `Device`) is
+/// left out unread past its scope, since reading its state can wake the device. Each supply is read for what its
+/// kind has: an outside supply its `online`, a battery its `present`, `status` and `capacity`.
 pub(crate) fn supplies(root: &Path) -> Vec<Supply> {
     let folder = "/sys/class/power_supply";
     entries(root, folder, "")
@@ -126,14 +127,28 @@ pub(crate) fn supplies(root: &Path) -> Vec<Supply> {
                 Some("0") => Some(false),
                 _ => None,
             };
-            Some(Supply {
-                battery: file("type")? == "Battery",
-                system: file("scope").is_none_or(|scope| scope != "Device"),
-                online: flag("online"),
-                present: flag("present"),
-                status: file("status"),
-                capacity: file("capacity").and_then(|percent| percent.parse().ok()),
-                name,
+            let battery = file("type")? == "Battery";
+            if file("scope").as_deref() == Some("Device") {
+                return None;
+            }
+            Some(if battery {
+                Supply {
+                    battery,
+                    online: None,
+                    present: flag("present"),
+                    status: file("status"),
+                    capacity: file("capacity").and_then(|percent| percent.parse().ok()),
+                    name,
+                }
+            } else {
+                Supply {
+                    battery,
+                    online: flag("online"),
+                    present: None,
+                    status: None,
+                    capacity: None,
+                    name,
+                }
             })
         })
         .collect()
@@ -145,10 +160,7 @@ pub(crate) fn online_cpus(root: &Path) -> Result<Vec<u32>, HostError> {
     let text = needed(root, path)?;
     parse::cpu_list(&text)
         .filter(|cpus| !cpus.is_empty())
-        .ok_or_else(|| HostError::Implausible {
-            what: path,
-            value: text.trim().chars().take(64).collect(),
-        })
+        .ok_or_else(|| parse::implausible(path, &text))
 }
 
 /// The fast CPUs of this host: of the online ones, those of the kind of core with the highest `cpu_capacity`, the
@@ -273,47 +285,50 @@ fn ticks_a_second() -> u64 {
 /// program, and a number that went to another process in between is `None`, so a program and a start never come
 /// from two processes.
 pub fn process(root: &Path, pid: u32) -> Option<Process> {
-    let stat = format!("/proc/{pid}/stat");
-    process_in(
-        || text(root, &stat).ok(),
-        || std::fs::read_link(under(root, &format!("/proc/{pid}/exe"))).ok(),
-        || boot_time(root),
-    )
-}
-
-/// [`process`] from its three reads, in the order it makes them.
-fn process_in(
-    mut stat: impl FnMut() -> Option<String>,
-    program: impl FnOnce() -> Option<PathBuf>,
-    booted: impl FnOnce() -> Option<i64>,
-) -> Option<Process> {
-    let mut start = || parse::start_ticks(&stat()?);
-    let before = start()?;
-    let program = program()?;
-    if start()? != before {
-        return None;
-    }
-    let started_at = u64::try_from(booted()?)
+    let (program, started_ticks) = program_and_start(root, pid)?;
+    let started_at = u64::try_from(boot_time(root)?)
         .ok()?
-        .checked_add(before / ticks_a_second())?;
+        .checked_add(started_ticks / ticks_a_second())?;
     Some(Process {
         program,
         started_at,
-        started_ticks: before,
+        started_ticks,
     })
 }
 
 /// The program a process runs, by its full path; `None` once the process is gone. [`process`] says when it
 /// started too, which tells a number that went to another process apart.
 pub fn program_of(root: &Path, pid: u32) -> Option<PathBuf> {
-    process(root, pid).map(|process| process.program)
+    program_and_start(root, pid).map(|(program, _)| program)
+}
+
+fn program_and_start(root: &Path, pid: u32) -> Option<(PathBuf, u64)> {
+    let stat = format!("/proc/{pid}/stat");
+    program_between(
+        || text(root, &stat).ok(),
+        || std::fs::read_link(under(root, &format!("/proc/{pid}/exe"))).ok(),
+    )
+}
+
+/// The program and the start in ticks, from reads of the start before and after the program; `None` when the two
+/// starts differ, since the program may then be either process's.
+fn program_between(
+    mut stat: impl FnMut() -> Option<String>,
+    program: impl FnOnce() -> Option<PathBuf>,
+) -> Option<(PathBuf, u64)> {
+    let mut start = || parse::start_ticks(&stat()?);
+    let before = start()?;
+    let program = program()?;
+    (start()? == before).then_some((program, before))
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Process, process_in};
+    use super::program_between;
+
+    const PROGRAM: &str = "/opt/codefusion-runner/bin/codefusion-runner";
 
     fn stat(start: u64) -> String {
         format!("42 (vm) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 3 0 {start} 123 456\n")
@@ -325,27 +340,13 @@ mod tests {
     fn a_number_that_changes_hands_between_two_reads_names_no_process() {
         let answer = |starts: [u64; 2]| {
             let mut starts = starts.into_iter();
-            process_in(
-                || starts.next().map(stat),
-                || Some(PathBuf::from("/opt/codefusion-runner/bin/codefusion-runner")),
-                || Some(1_000_000),
-            )
+            program_between(|| starts.next().map(stat), || Some(PathBuf::from(PROGRAM)))
         };
         assert_eq!(answer([100, 900]), None);
         assert_eq!(answer([900, 100]), None);
-        assert_eq!(
-            answer([250, 250]),
-            Some(Process {
-                program: "/opt/codefusion-runner/bin/codefusion-runner".into(),
-                started_at: 1_000_002,
-                started_ticks: 250,
-            })
-        );
+        assert_eq!(answer([250, 250]), Some((PathBuf::from(PROGRAM), 250)));
         // Gone before the second read.
         let mut once = Some(stat(250));
-        assert_eq!(
-            process_in(|| once.take(), || Some("/bin/x".into()), || Some(1)),
-            None
-        );
+        assert_eq!(program_between(|| once.take(), || Some(PROGRAM.into())), None);
     }
 }

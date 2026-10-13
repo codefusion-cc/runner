@@ -32,8 +32,8 @@ fn the_board_reads_as_its_files_say() {
         })
     );
     let raw = host.raw().unwrap();
-    assert_eq!(raw.total_bytes, 8_129_820 * 1024);
-    assert_eq!(raw.swap_total_bytes, 4_064_908 * 1024);
+    assert_eq!(raw.memory.total_bytes, 8_129_820 * 1024);
+    assert_eq!(raw.memory.swap_total_bytes, 4_064_908 * 1024);
     assert_eq!(raw.memory_pressure, Some(Psi { some: 0, full: 0 }));
     assert_eq!(raw.zones.len(), 7);
     assert_eq!(raw.zones[0].name, "soc-thermal");
@@ -82,14 +82,11 @@ fn the_board_reads_as_its_files_say() {
 
 #[test]
 fn a_file_every_reading_needs_that_is_missing_is_an_error() {
-    for (path, what) in [
-        ("/proc/meminfo", "/proc/meminfo"),
-        ("/proc/vmstat", "/proc/vmstat"),
-    ] {
+    for path in ["/proc/meminfo", "/proc/vmstat"] {
         let tree = Tree::board();
         tree.remove(path);
         assert!(
-            matches!(read(&tree), Err(HostError::Call { what: named, code: 2 }) if named == what),
+            matches!(read(&tree), Err(HostError::Call { what, code: 2 }) if what == path),
             "{path}: {:?}",
             read(&tree)
         );
@@ -384,6 +381,31 @@ fn a_battery_with_no_word_from_a_charger_is_read_by_its_state_and_cautiously() {
         // A charge over 100% is none at all.
         assert_eq!(battery(tree.root()), None);
     }
+    // Two batteries: the page shows the first by name that says its charge.
+    tree.remove("/sys/class/power_supply");
+    tree.supply(
+        "BAT1",
+        &[("type", "Battery"), ("status", "Full"), ("capacity", "90")],
+    );
+    tree.supply(
+        "BAT0",
+        &[("type", "Battery"), ("status", "Charging"), ("capacity", "40")],
+    );
+    let first = Battery {
+        on_battery: false,
+        percent: 40,
+        charging: true,
+    };
+    assert_eq!(battery(tree.root()), Some(first));
+    tree.supply("BAT0", &[("capacity", "")]);
+    assert_eq!(
+        battery(tree.root()),
+        Some(Battery {
+            on_battery: false,
+            percent: 90,
+            charging: false
+        })
+    );
     // No supplies at all, as in a virtual machine.
     tree.remove("/sys/class/power_supply");
     assert!(!read(&tree).unwrap().on_battery);
@@ -398,10 +420,7 @@ fn the_fast_cpus_are_those_of_the_highest_capacity_among_the_online_ones() {
     assert_eq!(host(&tree).facts().unwrap().cores, 7);
     // All alike.
     for cpu in 0..8 {
-        tree.file(
-            &format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"),
-            "1024\n",
-        );
+        tree.capacity(cpu, "1024\n");
     }
     assert_eq!(fast_cpus(tree.root()), Some((0..7).collect()));
     // One that says nothing of its capacity, or nonsense: no word, so all of them.
@@ -420,15 +439,8 @@ fn the_fast_cpus_are_those_of_the_highest_capacity_among_the_online_ones() {
 #[test]
 fn the_fast_cpus_are_a_kind_of_core_not_a_clock_speed() {
     let tree = Tree::board();
-    let capacity = |cpu: u32, value: &str| {
-        tree.file(&format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"), value);
-    };
-    let midr = |cpu: u32, value: &str| {
-        tree.file(
-            &format!("/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1"),
-            value,
-        );
-    };
+    let capacity = |cpu, value| tree.capacity(cpu, value);
+    let midr = |cpu, value| tree.midr(cpu, value);
     // The second big cluster binned to a lower top speed: still the same cores, all four for CI.
     capacity(6, "1000\n");
     capacity(7, "1000\n");
@@ -478,6 +490,8 @@ fn a_process_is_told_apart_from_a_later_one_with_its_number() {
     tree.process(PID, "cat", 1, PROGRAM);
     tree.remove(&format!("/proc/{PID}/stat"));
     assert_eq!(process(tree.root(), PID), None);
+    // A link with no start to check it against names no program either.
+    assert_eq!(program_of(tree.root(), PID), None);
     tree.remove(&format!("/proc/{PID}"));
     assert_eq!(process(tree.root(), PID), None);
     assert_eq!(process(tree.root(), 0), None);
@@ -605,13 +619,9 @@ fn a_host_whose_disk_folder_is_not_there_does_not_start() {
 }
 
 #[test]
-fn readings_take_their_time_from_clocks_that_only_go_forward() {
+fn readings_take_their_time_from_the_hosts_clocks() {
+    // What the clocks do is cf-clock's to test; a reading must carry them, not a time of zero.
     let tree = Tree::board();
-    let mut host = host(&tree);
-    let first = host.read().unwrap().at;
-    let second = host.read().unwrap().at;
-    assert!(first.elapsed.0 > 0 && first.awake.0 > 0);
-    assert!(second.elapsed >= first.elapsed && second.awake >= first.awake);
-    // Suspend moves only the clock that counts it, so the one that stands still is never ahead.
-    assert!(second.awake <= second.elapsed);
+    let at = host(&tree).read().unwrap().at;
+    assert!(at.elapsed.0 > 0 && at.awake.0 > 0, "{at:?}");
 }

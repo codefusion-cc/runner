@@ -187,7 +187,7 @@ impl Settings {
             idle_after: Millis::mins(15),
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
-            vcpus: [2, (all_but_two / 2).clamp(2, 4), 4, 4],
+            vcpus: vcpus_for(all_but_two),
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),
@@ -237,13 +237,13 @@ impl Settings {
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
         let total = facts.total_bytes;
+        let mut settings = Settings::for_host(facts, Mode::Dedicated);
         let cpus = if (2..facts.cores).contains(&fast_cores) {
             fast_cores
         } else {
-            facts.cores.saturating_sub(2).max(1).min(facts.cores)
+            settings.away.cpus
         };
-        let mut settings = Settings::for_host(facts, Mode::Dedicated);
-        settings.vcpus = [2, (cpus / 2).clamp(2, 4), 4, 4];
+        settings.vcpus = vcpus_for(cpus);
         let floor = GIB + total / 32;
         let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
         let limits = Profile {
@@ -357,4 +357,10 @@ impl Settings {
     pub fn host_bytes(&self, size: Size) -> u64 {
         size.vm_bytes().saturating_add(self.vm_host_overhead_bytes)
     }
+}
+
+/// The vCPUs of each size where CI may use `cpus`: 2 for cf-2g, half of them for cf-4g (at least 2, at most 4), so
+/// that two run side by side, and 4 for the larger sizes.
+fn vcpus_for(cpus: u32) -> [u32; 4] {
+    [2, (cpus / 2).clamp(2, 4), 4, 4]
 }

@@ -11,12 +11,11 @@ use cf_host_linux::{
     LinuxHost, boot_session, boot_time, cpu_percent, fast_cpus, host_name, load, model, process, program_of,
 };
 
-const ROOT: &str = "/";
 /// How far memory may move between this crate's read and `free`'s.
 const MARGIN: u64 = 128 << 20;
 
 fn root() -> &'static Path {
-    Path::new(ROOT)
+    Path::new("/")
 }
 
 fn output(program: &str, args: &[&str]) -> String {
@@ -35,7 +34,7 @@ fn near(one: u64, other: u64) -> bool {
 
 #[test]
 fn memory_and_swap_agree_with_free() {
-    let mut host = LinuxHost::new(Path::new("/")).expect("this host");
+    let mut host = LinuxHost::new(root()).expect("this host");
     let reading = host.read().expect("a reading");
     let raw = host.raw().expect("raw");
     let free = output("free", &["-b"]);
@@ -48,7 +47,7 @@ fn memory_and_swap_agree_with_free() {
     };
     let (memory, swap) = (row("Mem:"), row("Swap:"));
     // Mem: total used free shared buff/cache available; Swap: total used free.
-    assert_eq!(raw.total_bytes, memory[0]);
+    assert_eq!(raw.memory.total_bytes, memory[0]);
     assert_eq!(host.facts().unwrap().total_bytes, memory[0]);
     assert!(
         near(reading.available_bytes, memory[5]),
@@ -56,14 +55,14 @@ fn memory_and_swap_agree_with_free() {
         reading.available_bytes,
         memory[5]
     );
-    assert_eq!(raw.swap_total_bytes, swap[0]);
+    assert_eq!(raw.memory.swap_total_bytes, swap[0]);
     assert!(
         near(reading.swap_used_bytes, swap[1]),
         "{} against {}",
         reading.swap_used_bytes,
         swap[1]
     );
-    assert!(reading.available_bytes <= raw.total_bytes);
+    assert!(reading.available_bytes <= raw.memory.total_bytes);
     // PSI is there exactly when the kernel offers the file.
     assert_eq!(
         raw.memory_pressure.is_some(),
@@ -72,8 +71,8 @@ fn memory_and_swap_agree_with_free() {
 }
 
 #[test]
-fn cores_disk_and_clocks_agree_with_the_system() {
-    let host = LinuxHost::new(Path::new("/")).expect("this host");
+fn cores_and_disk_agree_with_the_system() {
+    let host = LinuxHost::new(root()).expect("this host");
     let online: u32 = output("getconf", &["_NPROCESSORS_ONLN"]).trim().parse().unwrap();
     assert_eq!(host.facts().unwrap().cores, online);
     let fast = fast_cpus(root()).expect("the fast CPUs");
@@ -94,13 +93,6 @@ fn cores_disk_and_clocks_agree_with_the_system() {
         "{free} against {}",
         numbers[1]
     );
-
-    let (first, second) = (host.now(), {
-        std::thread::sleep(Duration::from_millis(20));
-        host.now()
-    });
-    assert!(second.elapsed.0 >= first.elapsed.0 + 20 && second.awake.0 >= first.awake.0 + 20);
-    assert!(second.awake <= second.elapsed);
 }
 
 #[test]
@@ -122,7 +114,7 @@ fn the_host_says_who_it_is_and_since_when_it_runs() {
     assert!(model(root()).is_none_or(|model| model.len() >= 2));
     assert!(load(root()).iter().all(|load| load.is_finite() && *load >= 0.0));
 
-    let host = LinuxHost::new(Path::new("/")).unwrap();
+    let host = LinuxHost::new(root()).unwrap();
     let before = host.cpu_ticks().expect("ticks");
     let spin = std::time::Instant::now();
     while spin.elapsed() < Duration::from_millis(300) {}

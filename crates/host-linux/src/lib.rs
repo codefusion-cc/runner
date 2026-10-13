@@ -21,10 +21,7 @@ mod host;
 pub mod parse;
 mod read;
 
-pub use convert::{
-    PRESSURE_CRITICAL, PRESSURE_WARNING, Raw, Supply, Trip, TripKind, Zone, battery_of, cpu_percent,
-    on_battery_of, pressure_of, reading, thermal_of,
-};
+pub use convert::{Raw, Supply, Trip, TripKind, Zone, cpu_percent, pressure_of, reading, thermal_of};
 pub use host::LinuxHost;
 pub use parse::{CpuTicks, Psi};
 pub use read::{

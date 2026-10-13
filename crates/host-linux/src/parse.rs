@@ -8,7 +8,7 @@ use cf_budget::HostError;
 pub const MAX_FILE_BYTES: usize = 1 << 20;
 
 /// The most CPUs a list may name. Linux builds for at most 8192 today.
-pub const MAX_CPUS: usize = 1 << 16;
+pub(crate) const MAX_CPUS: usize = 1 << 16;
 
 /// What is shown of a value that cannot be right.
 fn shown(text: &str) -> String {
@@ -19,7 +19,7 @@ fn shown(text: &str) -> String {
     }
 }
 
-fn implausible(what: &'static str, value: &str) -> HostError {
+pub(crate) fn implausible(what: &'static str, value: &str) -> HostError {
     HostError::Implausible {
         what,
         value: shown(value),
@@ -90,7 +90,7 @@ pub fn count(text: &str) -> Option<u64> {
 
 /// A core's design from its `midr_el1` (`0x00000000414fd0b0`): the implementer and the part number, without the
 /// variant and revision, which a core of the same design may differ in. `None` for anything but a hexadecimal number.
-pub fn midr_design(text: &str) -> Option<u64> {
+pub(crate) fn midr_design(text: &str) -> Option<u64> {
     let digits = text.trim().strip_prefix("0x")?;
     if digits.is_empty() || digits.len() > 16 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -276,7 +276,7 @@ const PLACEHOLDERS: [&str; 9] = [
 
 /// A host's model from DMI (`sys_vendor` and `product_name`), such as `Lenovo ThinkCentre M75q`: the vendor once,
 /// and what firmware leaves as a placeholder left out. `None` with neither.
-pub fn dmi_model(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
+pub(crate) fn dmi_model(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
     fn said(text: Option<&str>) -> Option<&str> {
         text.map(str::trim)
             .filter(|text| !text.is_empty() && !PLACEHOLDERS.contains(&text.to_lowercase().as_str()))

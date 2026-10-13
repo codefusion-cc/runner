@@ -8,10 +8,6 @@ use cf_budget::{Host, HostError, HostFacts, HostReading, Now};
 use crate::parse::CpuTicks;
 use crate::{Raw, read, reading};
 
-fn errno() -> i64 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0).into()
-}
-
 /// A Linux host. It only reads: nothing it does changes a setting, a file or another process.
 #[derive(Debug)]
 pub struct LinuxHost {
@@ -41,13 +37,9 @@ impl LinuxHost {
 
     /// What Linux answers now, before anything is made of it.
     pub fn raw(&self) -> Result<Raw, HostError> {
-        let memory = read::meminfo(&self.root)?;
         let stats = self.statvfs()?;
         Ok(Raw {
-            total_bytes: memory.total_bytes,
-            available_bytes: memory.available_bytes,
-            swap_total_bytes: memory.swap_total_bytes,
-            swap_free_bytes: memory.swap_free_bytes,
+            memory: read::meminfo(&self.root)?,
             swapouts: read::swapouts(&self.root)?,
             memory_pressure: read::memory_pressure(&self.root)?,
             zones: read::zones(&self.root),
@@ -74,10 +66,7 @@ impl LinuxHost {
         // SAFETY: the path ends with a NUL and `stats` is a statvfs this call may write.
         let status = unsafe { libc::statvfs(self.disk.as_ptr(), stats.as_mut_ptr()) };
         if status != 0 {
-            return Err(HostError::Call {
-                what: "statvfs",
-                code: errno(),
-            });
+            return Err(read::call("statvfs", &std::io::Error::last_os_error()));
         }
         // SAFETY: the call succeeded, so it filled the struct in.
         Ok(unsafe { stats.assume_init() })

@@ -7,8 +7,11 @@ use cf_budget::{Millis, Now};
 #[cfg(target_os = "linux")]
 const CLOCKS: (libc::clockid_t, libc::clockid_t) = (libc::CLOCK_MONOTONIC, libc::CLOCK_BOOTTIME);
 /// `CLOCK_UPTIME_RAW` stops while the Mac sleeps, `CLOCK_MONOTONIC_RAW` counts on.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const CLOCKS: (libc::clockid_t, libc::clockid_t) = (libc::CLOCK_UPTIME_RAW, libc::CLOCK_MONOTONIC_RAW);
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("cf-clock knows the clocks of Linux and macOS only");
 
 /// Both clocks now. A clock that cannot be read answers zero for both, which the budget takes as time gone
 /// backwards, so it closes the host rather than trusting a time it does not have.

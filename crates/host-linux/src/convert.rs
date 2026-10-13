@@ -1,18 +1,12 @@
 use cf_budget::{Battery, HostError, HostReading, Millis, Now, Pressure, Thermal};
 
-use crate::parse::{CpuTicks, Psi};
+use crate::parse::{CpuTicks, Meminfo, Psi};
 
 /// What Linux answered, before anything is made of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Raw {
-    /// `MemTotal` of `/proc/meminfo`.
-    pub total_bytes: u64,
-    /// `MemAvailable` of `/proc/meminfo`.
-    pub available_bytes: u64,
-    /// `SwapTotal` of `/proc/meminfo`. zram counts as swap.
-    pub swap_total_bytes: u64,
-    /// `SwapFree` of `/proc/meminfo`.
-    pub swap_free_bytes: u64,
+    /// `/proc/meminfo`. zram counts as swap.
+    pub memory: Meminfo,
     /// `pswpout` of `/proc/vmstat`: pages written to swap since the host started.
     pub swapouts: u64,
     /// `/proc/pressure/memory`; `None` on a kernel without pressure stall information (built without it, or with
@@ -73,15 +67,14 @@ impl TripKind {
     }
 }
 
-/// One power supply (`/sys/class/power_supply/*`).
+/// One power supply of the host (`/sys/class/power_supply/*`). One whose `scope` is `Device`, such as a wireless
+/// mouse's battery, powers that device and not the host, and is never read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Supply {
     /// Its folder's name, such as `BAT0` or `AC`.
     pub name: String,
     /// Whether its `type` is `Battery`. Every other type (`Mains`, `USB`, `UPS`, ...) powers the host from outside.
     pub battery: bool,
-    /// Whether it powers the host and not a device: `scope` is not `Device`, as it is for a wireless mouse's battery.
-    pub system: bool,
     /// `online` of an outside supply: whether it powers the host now.
     pub online: Option<bool>,
     /// `present` of a battery: `false` for an empty battery bay.
@@ -95,13 +88,13 @@ pub struct Supply {
 /// From this share of time with some task stalled on memory over 10 s (PSI `some avg10`, in hundredths of a
 /// percent), memory counts as under pressure: the kernel reclaims or swaps in in the way of programs a tenth of
 /// the time. Like macOS's warning, it closes new slots, and with swap growing fast it stops a job.
-pub const PRESSURE_WARNING: u32 = 10_00;
+pub(crate) const PRESSURE_WARNING: u32 = 10_00;
 
 /// From this share of time with every task stalled on memory at once (PSI `full avg10`), memory counts as
 /// critical: the host does a fifth less work than it could. Like macOS's critical level, it stops a job when it
 /// lasts ([`Settings::critical_for`](cf_budget::Settings::critical_for)). Well under the 50% to 60% at which
 /// systemd-oomd stops whole programs.
-pub const PRESSURE_CRITICAL: u32 = 20_00;
+pub(crate) const PRESSURE_CRITICAL: u32 = 20_00;
 
 /// The budget's pressure level from PSI. Without PSI it is [`Pressure::Normal`]: the budget then decides from
 /// `MemAvailable` against its floor and from swap-outs, which close new slots alone, and stops no job for memory.
@@ -152,7 +145,7 @@ pub fn thermal_of(zones: &[Zone]) -> Thermal {
 fn batteries(supplies: &[Supply]) -> impl Iterator<Item = &Supply> {
     supplies
         .iter()
-        .filter(|supply| supply.battery && supply.system && supply.present != Some(false))
+        .filter(|supply| supply.battery && supply.present != Some(false))
 }
 
 /// Whether the host runs on its battery.
@@ -161,20 +154,19 @@ fn batteries(supplies: &[Supply]) -> impl Iterator<Item = &Supply> {
 /// battery to run on. With a battery, an outside supply that is online means the mains; outside supplies that are
 /// all offline mean the battery. With no word from an outside supply, a battery that charges, is full or is not
 /// charging means the mains, and any other state (discharging, unknown, none) the battery, the cautious side.
-pub fn on_battery_of(supplies: &[Supply]) -> bool {
+pub(crate) fn on_battery_of(supplies: &[Supply]) -> bool {
     if batteries(supplies).next().is_none() {
         return false;
     }
-    let outside: Vec<Option<bool>> = supplies
+    // Any outside supply online wins over one offline, which wins over none that says: None < false < true.
+    let outside = supplies
         .iter()
-        .filter(|supply| !supply.battery && supply.system)
+        .filter(|supply| !supply.battery)
         .map(|supply| supply.online)
-        .collect();
-    if outside.contains(&Some(true)) {
-        return false;
-    }
-    if outside.contains(&Some(false)) {
-        return true;
+        .max()
+        .flatten();
+    if let Some(online) = outside {
+        return !online;
     }
     let mut states = batteries(supplies).map(|battery| battery.status.as_deref());
     !states.all(|status| matches!(status, Some("Charging" | "Full" | "Not charging")))
@@ -182,15 +174,13 @@ pub fn on_battery_of(supplies: &[Supply]) -> bool {
 
 /// The host's battery for the console's page: the first battery by name that says its charge. `None` on a host
 /// without a battery, which is not a battery at 0%.
-pub fn battery_of(supplies: &[Supply]) -> Option<Battery> {
-    let mut batteries: Vec<&Supply> = batteries(supplies).collect();
-    batteries.sort_by(|one, other| one.name.cmp(&other.name));
-    let battery = batteries
-        .into_iter()
-        .find(|battery| battery.capacity.is_some_and(|percent| percent <= 100))?;
+pub(crate) fn battery_of(supplies: &[Supply]) -> Option<Battery> {
+    let (battery, percent) = batteries(supplies)
+        .filter_map(|battery| Some((battery, battery.capacity.filter(|percent| *percent <= 100)?)))
+        .min_by(|(one, _), (other, _)| one.name.cmp(&other.name))?;
     Some(Battery {
         on_battery: on_battery_of(supplies),
-        percent: battery.capacity?,
+        percent,
         charging: battery.status.as_deref() == Some("Charging"),
     })
 }
@@ -212,21 +202,22 @@ pub fn battery_of(supplies: &[Supply]) -> Option<Battery> {
 /// - `on_battery`: [`on_battery_of`]; false on a host without a battery.
 /// - `disk_free_bytes`: `statvfs` of the state folder.
 pub fn reading(at: Now, raw: &Raw) -> Result<HostReading, HostError> {
-    if raw.available_bytes > raw.total_bytes {
+    let memory = &raw.memory;
+    if memory.available_bytes > memory.total_bytes {
         return Err(HostError::Implausible {
             what: "MemAvailable",
-            value: format!("{} bytes of {}", raw.available_bytes, raw.total_bytes),
+            value: format!("{} bytes of {}", memory.available_bytes, memory.total_bytes),
         });
     }
-    let Some(swap_used_bytes) = raw.swap_total_bytes.checked_sub(raw.swap_free_bytes) else {
+    let Some(swap_used_bytes) = memory.swap_total_bytes.checked_sub(memory.swap_free_bytes) else {
         return Err(HostError::Implausible {
             what: "SwapFree",
-            value: format!("{} bytes of {}", raw.swap_free_bytes, raw.swap_total_bytes),
+            value: format!("{} bytes of {}", memory.swap_free_bytes, memory.swap_total_bytes),
         });
     };
     Ok(HostReading {
         at,
-        available_bytes: raw.available_bytes,
+        available_bytes: memory.available_bytes,
         pressure: pressure_of(raw.memory_pressure),
         swap_used_bytes,
         swapouts: raw.swapouts,
