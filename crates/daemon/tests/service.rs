@@ -579,7 +579,10 @@ async fn two_repositories_that_ask_for_the_same_labels_each_get_their_jobs() {
 
     rig.queue().await;
     // GitHub hands a queued job only to a scale set whose polls showed room: the other repository's set too.
-    until("the other repository's set to offer room", || rig.github.offers_room(OTHER)).await;
+    until("the other repository's set to offer room", || {
+        rig.github.offers_room(OTHER)
+    })
+    .await;
     rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
     until("a machine for the job of each", || rig.standing().len() == 2).await;
     for runner in rig.standing() {
