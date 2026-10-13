@@ -669,7 +669,7 @@ chmod +x target/release/codefusion-runner"#;
 
     #[test]
     fn a_build_past_its_limit_is_ended_with_what_it_started() {
-        let mut bench = bench(&format!("sleep 30 &\necho $! > \"$MARKS/child\"\nwait"));
+        let mut bench = bench("sleep 30 &\necho $! > \"$MARKS/child\"\nwait");
         bench.update.build_limit = Duration::from_secs(1);
         let began = Instant::now();
         let said = bench.update.build().expect_err("ended");
