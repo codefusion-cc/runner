@@ -227,7 +227,10 @@ fn ci_takes_the_fast_cores_of_a_board_whose_cores_differ_and_all_but_two_of_one_
     let cpus = |cores: u32, fast: u32| Settings::for_headless(host(16 * GIB, cores), fast).away.cpus;
     assert_eq!(cpus(8, 4), 4, "four fast cores, four slow ones for the host");
     assert_eq!(cpus(8, 2), 2);
-    assert_eq!(cpus(8, 1), 1);
+    // One prime core of its own design holds no machine of 2 vCPUs: the host counts as one whose cores are alike.
+    assert_eq!(cpus(8, 1), 6);
+    assert_eq!(cpus(3, 1), 1);
+    assert_eq!(cpus(3, 2), 2);
     // All alike, or no word of which are fast: all but two.
     assert_eq!(cpus(8, 8), 6);
     assert_eq!(cpus(8, 0), 6);

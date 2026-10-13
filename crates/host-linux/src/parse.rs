@@ -88,6 +88,17 @@ pub fn count(text: &str) -> Option<u64> {
     number(text.trim())
 }
 
+/// A core's design from its `midr_el1` (`0x00000000414fd0b0`): the implementer and the part number, without the
+/// variant and revision, which a core of the same design may differ in. `None` for anything but a hexadecimal number.
+pub fn midr_design(text: &str) -> Option<u64> {
+    let digits = text.trim().strip_prefix("0x")?;
+    if digits.is_empty() || digits.len() > 16 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Implementer: bits 31 to 24; part number: bits 15 to 4.
+    Some(u64::from_str_radix(digits, 16).ok()? & 0xff00_fff0)
+}
+
 /// One counter of `/proc/vmstat`, such as `pswpout`; `None` when it is not there once as a number.
 pub fn vmstat(text: &str, name: &str) -> Option<u64> {
     let mut values = text.lines().filter_map(|line| {

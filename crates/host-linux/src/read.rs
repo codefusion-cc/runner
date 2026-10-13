@@ -55,11 +55,13 @@ pub(crate) fn swapouts(root: &Path) -> Result<u64, HostError> {
 }
 
 /// `/proc/pressure/memory`; `None` when the kernel has no such file or refuses to read it (PSI built in but off).
-/// A file that is there and says something else is an error.
+/// A file that is there and says something else, text or not, is an error.
 pub(crate) fn memory_pressure(root: &Path) -> Result<Option<Psi>, HostError> {
-    match text(root, "/proc/pressure/memory") {
+    let path = "/proc/pressure/memory";
+    match text(root, path) {
         Ok(text) => parse::psi(&text).map(Some),
-        Err(_) => Ok(None),
+        Err(error) if error.raw_os_error().is_some() => Ok(None),
+        Err(error) => Err(call(path, &error)),
     }
 }
 
@@ -149,28 +151,41 @@ pub(crate) fn online_cpus(root: &Path) -> Result<Vec<u32>, HostError> {
         })
 }
 
-/// The fast CPUs of this host: of the online ones, those of the highest `cpu_capacity`, the big cores of a
-/// big.LITTLE board (cpus 4 to 7 of an RK3588). Machines are pinned to them: a vCPU that moves between two kinds
-/// of core can make KVM refuse to run it, since its emulated PMU covers one kind. On a host whose cores are alike,
-/// or that says nothing of their capacity, all online CPUs. `None` when the online CPUs cannot be read.
+/// The fast CPUs of this host: of the online ones, those of the kind of core with the highest `cpu_capacity`, the
+/// big cores of a big.LITTLE board (cpus 4 to 7 of an RK3588). Machines are pinned to them: a vCPU that moves
+/// between two kinds of core can make KVM refuse to run it, since its emulated PMU covers one kind.
+///
+/// The kind is the core's design (`midr_el1`: implementer and part number), so cores of one design whose capacity
+/// differs only by their clock, such as two big clusters binned to different top speeds or a prime core beside
+/// others of its design, count together. Where a core's design cannot be read, the kind is its capacity. On a host
+/// whose cores are alike, or that says nothing of their capacity, all online CPUs. `None` when the online CPUs
+/// cannot be read.
 pub fn fast_cpus(root: &Path) -> Option<Vec<u32>> {
     let online = online_cpus(root).ok()?;
+    let read = |cpu: &u32, name: &str| text(root, &format!("/sys/devices/system/cpu/cpu{cpu}/{name}")).ok();
     let capacities: Option<Vec<u64>> = online
         .iter()
-        .map(|cpu| {
-            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
-            parse::count(&text(root, &path).ok()?)
-        })
+        .map(|cpu| parse::count(&read(cpu, "cpu_capacity")?))
         .collect();
     let Some(capacities) = capacities else {
         return Some(online);
     };
     let fastest = capacities.iter().copied().max()?;
+    if capacities.iter().all(|capacity| *capacity == fastest) {
+        return Some(online);
+    }
+    let designs: Option<Vec<u64>> = online
+        .iter()
+        .map(|cpu| parse::midr_design(&read(cpu, "regs/identification/midr_el1")?))
+        .collect();
+    let fastest_at = capacities.iter().position(|capacity| *capacity == fastest)?;
+    let kinds = designs.unwrap_or(capacities);
+    let kind = kinds[fastest_at];
     Some(
         online
             .into_iter()
-            .zip(capacities)
-            .filter(|(_, capacity)| *capacity == fastest)
+            .zip(kinds)
+            .filter(|(_, of)| *of == kind)
             .map(|(cpu, _)| cpu)
             .collect(),
     )
@@ -233,9 +248,14 @@ pub struct Process {
     /// The program it runs, by its full path (`/proc/<pid>/exe`). A program whose file was removed or replaced
     /// since reads with the kernel's ` (deleted)` at its end, so it never passes for the file now at that path.
     pub program: PathBuf,
-    /// When it started, in seconds since 1970: field 22 of `/proc/<pid>/stat` after `btime`. A number that went to
-    /// a later process has a later time.
+    /// When it started, in seconds since 1970: [`started_ticks`](Self::started_ticks) after `btime`, as macOS
+    /// answers it. A number that went to a later process has a later time. Linux works `btime` out from the wall
+    /// clock at each read, so a step of the clock (a board without a battery-backed clock that meets NTP) moves
+    /// this time for processes that started before it.
     pub started_at: u64,
+    /// When it started, in clock ticks since the host started (`USER_HZ`, field 22 of `/proc/<pid>/stat`). No step
+    /// of the wall clock moves it: with [`boot_session`], it names this process for good.
+    pub started_ticks: u64,
 }
 
 /// Clock ticks a second in what `/proc` shows (`USER_HZ`): 100 on every architecture the Runner is built for.
@@ -276,7 +296,11 @@ fn process_in(
     let started_at = u64::try_from(booted()?)
         .ok()?
         .checked_add(before / ticks_a_second())?;
-    Some(Process { program, started_at })
+    Some(Process {
+        program,
+        started_at,
+        started_ticks: before,
+    })
 }
 
 /// The program a process runs, by its full path; `None` once the process is gone. [`process`] says when it
@@ -314,6 +338,7 @@ mod tests {
             Some(Process {
                 program: "/opt/codefusion-runner/bin/codefusion-runner".into(),
                 started_at: 1_000_002,
+                started_ticks: 250,
             })
         );
         // Gone before the second read.

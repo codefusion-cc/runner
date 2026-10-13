@@ -74,10 +74,19 @@ impl Tree {
         tree.bytes("/proc/device-tree/model", b"Generic RK3588 Board\0");
         tree.file("/sys/devices/system/cpu/online", "0-7\n");
         for cpu in 0..8 {
-            let capacity = if cpu < 4 { "405\n" } else { "1024\n" };
+            // Cortex-A55 r2p0 and Cortex-A76 r4p0.
+            let (capacity, midr) = if cpu < 4 {
+                ("405\n", "0x00000000412fd050\n")
+            } else {
+                ("1024\n", "0x00000000414fd0b0\n")
+            };
             tree.file(
                 &format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"),
                 capacity,
+            );
+            tree.file(
+                &format!("/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1"),
+                midr,
             );
         }
         tree.zone(

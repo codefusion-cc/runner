@@ -218,16 +218,17 @@ impl Settings {
     /// gigabytes. A headless Linux host holds half a gigabyte ([`Settings::HEADLESS_HOST_USE`]); the Mac's rule
     /// would leave a 7.75 GB board 4.75 GB, one cf-4g and never two cf-2g.
     ///
-    /// `fast_cores` is how many cores the machines run on: the fast ones of a board whose cores are not all alike
-    /// (`cpu_capacity`), which machines are pinned to, so that a vCPU never moves between two kinds of core. On a
-    /// host whose cores are all alike it is all of them, or 0.
+    /// `fast_cores` is how many cores the machines run on: the fast kind of a board whose cores are not all alike,
+    /// which machines are pinned to, so that a vCPU never moves between two kinds of core. On a host whose cores are
+    /// all alike it is all of them, or 0. One fast core holds no machine (a cf-2g has 2 vCPUs), so a host with a
+    /// single prime core counts as one whose cores are alike.
     ///
     /// - Floor: 1 GB and 1/32 of the memory, for the page cache that keeps the image the machines boot from and
     ///   for what the host's programs do between two readings. 1.24 GB on 7.75 GB.
     /// - Room for machines: all memory but the floor and [`Settings::HEADLESS_HOST_USE`]. 6.0 GB on 7.75 GB.
     /// - Cap: that room less [`Settings::VM_HOST_OVERHEAD`] for each machine the CPUs let run side by side. The cap
     ///   counts sizes while each machine costs its size and the overhead, so every set of machines under the cap
-    ///   fits the room with all their overheads. 5.63 GB on 7.75 GB with 4 fast cores: one cf-4g (4.2 GB with
+    ///   fits the room with all their overheads. 5.64 GB on 7.75 GB with 4 fast cores: one cf-4g (4.2 GB with
     ///   its overhead) or two cf-2g (4.4 GB) at a time; a cf-4g beside a cf-2g (6.4 GB) never, nor a cf-6g (6.2 GB
     ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
     /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
@@ -236,7 +237,7 @@ impl Settings {
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
         let total = facts.total_bytes;
-        let cpus = if (1..facts.cores).contains(&fast_cores) {
+        let cpus = if (2..facts.cores).contains(&fast_cores) {
             fast_cores
         } else {
             facts.cores.saturating_sub(2).max(1).min(facts.cores)

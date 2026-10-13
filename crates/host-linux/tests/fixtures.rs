@@ -74,7 +74,8 @@ fn the_board_reads_as_its_files_say() {
         process(tree.root(), PID),
         Some(Process {
             program: PROGRAM.into(),
-            started_at: 1_791_890_324 + 4878
+            started_at: 1_791_890_324 + 4878,
+            started_ticks: 487_823,
         })
     );
 }
@@ -110,6 +111,14 @@ fn a_kernel_without_psi_reads_as_no_pressure_signal_not_as_zero() {
     let tree = Tree::board();
     tree.file("/proc/pressure/memory", "some avg10=oops\n");
     assert!(matches!(read(&tree), Err(HostError::Implausible { .. })));
+    // So is one that is not text, or longer than the kernel writes.
+    tree.bytes("/proc/pressure/memory", b"some avg10=\xff\n");
+    assert!(matches!(read(&tree), Err(HostError::Call { .. })));
+    tree.file(
+        "/proc/pressure/memory",
+        &"x".repeat(cf_host_linux::parse::MAX_FILE_BYTES + 1),
+    );
+    assert!(matches!(read(&tree), Err(HostError::Call { .. })));
     // A pressure file a folder stands in for cannot be read: no signal.
     let tree = Tree::board();
     tree.remove("/proc/pressure/memory");
@@ -409,6 +418,42 @@ fn the_fast_cpus_are_those_of_the_highest_capacity_among_the_online_ones() {
 }
 
 #[test]
+fn the_fast_cpus_are_a_kind_of_core_not_a_clock_speed() {
+    let tree = Tree::board();
+    let capacity = |cpu: u32, value: &str| {
+        tree.file(&format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"), value);
+    };
+    let midr = |cpu: u32, value: &str| {
+        tree.file(
+            &format!("/sys/devices/system/cpu/cpu{cpu}/regs/identification/midr_el1"),
+            value,
+        );
+    };
+    // The second big cluster binned to a lower top speed: still the same cores, all four for CI.
+    capacity(6, "1000\n");
+    capacity(7, "1000\n");
+    assert_eq!(fast_cpus(tree.root()), Some(vec![4, 5, 6, 7]));
+    // A later revision of the same design is the same kind.
+    midr(5, "0x00000000411fd0b1\n");
+    assert_eq!(fast_cpus(tree.root()), Some(vec![4, 5, 6, 7]));
+    // A prime core of another design beside them is a kind of its own.
+    midr(7, "0x00000000410fd440\n");
+    capacity(7, "1024\n");
+    capacity(4, "900\n");
+    capacity(5, "900\n");
+    capacity(6, "900\n");
+    assert_eq!(fast_cpus(tree.root()), Some(vec![7]));
+    // Where one core's design cannot be read, the kind is the capacity.
+    midr(7, "0x00000000414fd0b0\n");
+    capacity(7, "900\n");
+    capacity(4, "1024\n");
+    midr(2, "nonsense\n");
+    assert_eq!(fast_cpus(tree.root()), Some(vec![4]));
+    tree.remove("/sys/devices/system/cpu/cpu2/regs/identification/midr_el1");
+    assert_eq!(fast_cpus(tree.root()), Some(vec![4]));
+}
+
+#[test]
 fn a_process_is_told_apart_from_a_later_one_with_its_number() {
     let tree = Tree::board();
     let first = process(tree.root(), PID).unwrap();
@@ -417,6 +462,16 @@ fn a_process_is_told_apart_from_a_later_one_with_its_number() {
     let later = process(tree.root(), PID).unwrap();
     assert_eq!(later.program, first.program);
     assert_eq!(later.started_at, first.started_at + 60);
+    assert_eq!(later.started_ticks, first.started_ticks + 6000);
+    // NTP steps the clock 100 s ahead, and Linux's btime with it: the time in seconds since 1970 moves, the ticks
+    // since the start of the host do not.
+    tree.file(
+        "/proc/stat",
+        &STAT.replace("btime 1791890324", "btime 1791890424"),
+    );
+    let stepped = process(tree.root(), PID).unwrap();
+    assert_eq!(stepped.started_at, later.started_at + 100);
+    assert_eq!(stepped.started_ticks, later.started_ticks);
     // Gone: its folder, or its program's link, or its stat.
     tree.remove(&format!("/proc/{PID}/exe"));
     assert_eq!(program_of(tree.root(), PID), None);

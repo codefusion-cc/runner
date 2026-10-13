@@ -3,7 +3,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use cf_budget::{Host, HostError, HostFacts, HostReading, Millis, Now};
+use cf_budget::{Host, HostError, HostFacts, HostReading, Now};
 
 use crate::parse::CpuTicks;
 use crate::{Raw, read, reading};
@@ -11,25 +11,6 @@ use crate::{Raw, read, reading};
 fn errno() -> i64 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0).into()
 }
-
-fn clock(id: libc::clockid_t) -> Option<Millis> {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `time` is a timespec this call may write.
-    let status = unsafe { libc::clock_gettime(id, &mut time) };
-    let secs = u64::try_from(time.tv_sec).ok()?;
-    let nanos = u64::try_from(time.tv_nsec).ok()?;
-    (status == 0).then(|| Millis(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000)))
-}
-
-/// The clock that stands still while the host is suspended, and the one that does not.
-#[cfg(target_os = "linux")]
-const CLOCKS: (libc::clockid_t, libc::clockid_t) = (libc::CLOCK_MONOTONIC, libc::CLOCK_BOOTTIME);
-/// The same pair on a Mac, where this crate's tests run against folders of fixtures too.
-#[cfg(not(target_os = "linux"))]
-const CLOCKS: (libc::clockid_t, libc::clockid_t) = (libc::CLOCK_UPTIME_RAW, libc::CLOCK_MONOTONIC_RAW);
 
 /// A Linux host. It only reads: nothing it does changes a setting, a file or another process.
 #[derive(Debug)]
@@ -122,13 +103,9 @@ impl Host for LinuxHost {
         Ok(HostFacts { total_bytes, cores })
     }
 
-    /// Both clocks: `CLOCK_MONOTONIC` stands still while the host is suspended, `CLOCK_BOOTTIME` does not. A clock
-    /// that cannot be read answers zero, which the budget takes as time gone backwards and closes the host.
+    /// `CLOCK_MONOTONIC` stands still while the host is suspended, `CLOCK_BOOTTIME` does not ([`cf_clock::now`]).
     fn now(&self) -> Now {
-        match (clock(CLOCKS.0), clock(CLOCKS.1)) {
-            (Some(awake), Some(elapsed)) => Now { awake, elapsed },
-            _ => Now::default(),
-        }
+        cf_clock::now()
     }
 
     fn read(&mut self) -> Result<HostReading, HostError> {
