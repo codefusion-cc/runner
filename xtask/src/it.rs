@@ -311,18 +311,24 @@ fn machines() -> BTreeSet<u32> {
         .collect()
 }
 
+/// `pid` as `kill` is given it, or `None` for a number `kill` reads as a group of processes: 0 is the caller's own
+/// group, and what passes `i32::MAX` wraps to a negative number, which names a group or every process.
+fn pid_arg(pid: u32) -> Option<String> {
+    (pid > 0 && i32::try_from(pid).is_ok()).then(|| pid.to_string())
+}
+
 fn alive(pid: u32) -> bool {
+    let Some(pid) = pid_arg(pid) else { return false };
     Command::new("kill")
-        .args(["-0", &pid.to_string()])
+        .args(["-0", &pid])
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
 
 fn signal(pid: u32, name: &str) {
-    let _ = Command::new("kill")
-        .args([&format!("-{name}"), &pid.to_string()])
-        .status();
+    let Some(pid) = pid_arg(pid) else { return };
+    let _ = Command::new("kill").args([&format!("-{name}"), &pid]).status();
 }
 
 /// The memory a process holds, in bytes, as the system charges it: its footprint, or what `ps` says when that tool
@@ -1440,7 +1446,7 @@ step();'"#;
 
 #[cfg(test)]
 mod tests {
-    use super::ms_after;
+    use super::{ms_after, pid_arg};
 
     #[test]
     fn a_boot_time_is_read_in_its_own_unit() {
@@ -1450,5 +1456,14 @@ mod tests {
         assert_eq!(ms_after(&line("900.00µs"), "ready after "), Some(0.9));
         assert_eq!(ms_after(&line("soon"), "ready after "), None);
         assert_eq!(ms_after("nothing", "ready after "), None);
+    }
+
+    #[test]
+    fn kill_is_never_given_a_number_that_names_a_group() {
+        assert_eq!(pid_arg(0), None);
+        assert_eq!(pid_arg(1).as_deref(), Some("1"));
+        assert_eq!(pid_arg(i32::MAX as u32).as_deref(), Some("2147483647"));
+        assert_eq!(pid_arg(i32::MAX as u32 + 1), None);
+        assert_eq!(pid_arg(u32::MAX), None);
     }
 }

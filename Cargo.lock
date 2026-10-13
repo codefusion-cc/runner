@@ -2225,6 +2225,7 @@ dependencies = [
  "cf-secret",
  "ed25519-dalek",
  "flate2",
+ "proptest",
  "serde_json",
  "sha2",
  "tempfile",

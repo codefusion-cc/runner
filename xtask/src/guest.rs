@@ -14,7 +14,7 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
 use crate::cpio::{Archive, Kind};
-use crate::kernel::{APK_SHA256, APK_URL, APK_VERSION, unpack_zboot};
+use crate::kernel::{APK_SHA256, APK_VERSION, Curl, PIN, fetch, sources, unpack_zboot};
 use crate::keys::{ephemeral_key, release_key};
 use crate::{Result, cargo, run_command};
 
@@ -150,7 +150,7 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Downloads the kernel package unless cached, checks its SHA-256, unpacks it, and returns the folder.
+/// Takes the pinned kernel package from the cache or else from its sources, unpacks it, and returns the folder.
 ///
 /// A folder unpacked earlier is used as it is, without hashing it again: `target/` is trusted like the sources. A
 /// workflow that restores `target/` from a cache must therefore never sign what it builds.
@@ -161,24 +161,8 @@ fn fetch_package(cache: &Path) -> Result<PathBuf> {
     if unpacked.join("boot/vmlinuz-virt").exists() {
         return Ok(unpacked);
     }
-    let sha256 = |apk: &Path| -> Result<String> { Ok(format!("{:x}", Sha256::digest(fs::read(apk)?))) };
-    let mut actual = if apk.exists() {
-        sha256(&apk)?
-    } else {
-        String::new()
-    };
-    if actual != APK_SHA256 {
-        run_command(
-            Command::new("curl")
-                .args(["-fsSL", "--retry", "3", "-o"])
-                .arg(&apk)
-                .arg(APK_URL),
-        )?;
-        actual = sha256(&apk)?;
-    }
-    if actual != APK_SHA256 {
-        let _ = fs::remove_file(&apk);
-        return Err(format!("the kernel package has SHA-256 {actual}, expected {APK_SHA256}").into());
+    if !fs::read(&apk).is_ok_and(|bytes| PIN.check(&bytes).is_ok()) {
+        fetch(&Curl::https(), &sources(), PIN, &apk)?;
     }
     let partial = cache.join("unpack.partial");
     let _ = fs::remove_dir_all(&partial);
