@@ -1,0 +1,57 @@
+name: Pins
+
+# A build reads each pinned file from our own copy first, a release of this repository: the guest's kernel package
+# (kernel-linux-virt-<version>, since Alpine keeps only the newest build) and the Linux monitor
+# (cloud-hypervisor-<version>). Each job goes red when our copy stops giving the pinned bytes, weekly and on every
+# change to the pin, so a pin is never merged before its copy exists. It warns when the project has something newer
+# or does not answer, never red for that.
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - xtask/src/pinned.rs
+      - xtask/src/kernel.rs
+      - xtask/src/cloud_hypervisor.rs
+      - crates/vmm-ch/src/pins.rs
+      - .github/workflows/pins.yml
+  push:
+    branches: [main]
+    paths:
+      - xtask/src/pinned.rs
+      - xtask/src/kernel.rs
+      - xtask/src/cloud_hypervisor.rs
+      - crates/vmm-ch/src/pins.rs
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    name: Our copy of the pinned kernel package answers
+    runs-on: ubuntu-latest
+    # Above the sum of the check's own deadlines (5 min for each package, 1 min for the index) and the build, so a
+    # slow source ends as the check says, never at this limit.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install
+      - run: cargo xtask kernel check
+
+  cloud-hypervisor:
+    name: Our copy of the pinned cloud-hypervisor answers
+    runs-on: ubuntu-latest
+    # Above the sum of the check's own deadlines (5 min for each file, 1 min for the latest release) and the build.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install
+      - run: cargo xtask cloud-hypervisor check

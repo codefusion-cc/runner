@@ -14,8 +14,9 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
 use crate::cpio::{Archive, Kind};
-use crate::kernel::{APK_SHA256, APK_VERSION, Curl, PIN, fetch, sources, unpack_zboot};
+use crate::kernel::{APK_SHA256, APK_VERSION, PIN, WHAT, sources, unpack_zboot};
 use crate::keys::{ephemeral_key, release_key};
+use crate::pinned::{Curl, ensure};
 use crate::{Result, cargo, run_command};
 
 /// The modules the guest loads at boot, with what they need: the machine's devices, the file systems of a job's
@@ -161,9 +162,7 @@ fn fetch_package(cache: &Path) -> Result<PathBuf> {
     if unpacked.join("boot/vmlinuz-virt").exists() {
         return Ok(unpacked);
     }
-    if !fs::read(&apk).is_ok_and(|bytes| PIN.check(&bytes).is_ok()) {
-        fetch(&Curl::https(), &sources(), PIN, &apk)?;
-    }
+    ensure(&Curl::https(), &sources(), PIN, &apk, WHAT)?;
     let partial = cache.join("unpack.partial");
     let _ = fs::remove_dir_all(&partial);
     fs::create_dir_all(&partial)?;
