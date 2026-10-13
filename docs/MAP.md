@@ -32,6 +32,9 @@
 - The guest supervisor builds with `rust-lld` (see `.cargo/config.toml`), so no cross toolchain is needed.
 - What the budget sees on a Mac: `cargo run -p cf-host-macos --example host-probe`. It only reads and prints; compare
   with `vm_stat` and `sysctl kern.memorystatus_vm_pressure_level vm.swapusage`.
+- On Linux, `cargo test -p cf-nft --test kernel` applies rules in a user and network namespace of its own; with
+  `CF_REQUIRE_NAMESPACES=1` a host that does not allow that fails instead of skipping. Ubuntu 24.04 allows it only
+  with `kernel.apparmor_restrict_unprivileged_userns=0`.
 - GitHub's hosted Macs cannot boot VMs (no nested virtualization), so CI never runs `boot-proof`; it runs on a Mac.
 - Real machines: `gh release download <image tag> -R codefusion-cc/runner -D target/it/release`, then
   `cargo xtask build && cargo xtask it` (`--only oom,firewall` for some). It installs the release through the store,
