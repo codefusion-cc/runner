@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
+    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
+    Status,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_host_macos::Battery;
@@ -923,6 +924,18 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 idle_with_jobs_waiting_seconds,
                 idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
                     .map(|reason| cut(reason, STATUS_TEXT_MAX)),
+                sizes: shared
+                    .machines
+                    .rooms()
+                    .into_iter()
+                    .map(|room| SizeStatus {
+                        size: room.size.label().to_string(),
+                        free: room.free.map_or(-1, i64::from),
+                        why: room.why.map(str::to_string),
+                        need_bytes: room.need_bytes,
+                        short_bytes: room.short_bytes,
+                    })
+                    .collect(),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)

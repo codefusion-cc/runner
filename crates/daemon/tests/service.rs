@@ -404,6 +404,16 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
         json!("2026-09-21T14:13:20Z")
     );
     assert_eq!(report["activity"]["cpuPercent"], json!(12.0));
+    // Beside the machine that runs, its 4 GB of machines take one more cf-2g and no cf-4g; larger sizes, never.
+    assert_eq!(
+        report["status"]["sizes"],
+        json!([
+            {"size": "cf-2g", "free": 1},
+            {"size": "cf-4g", "free": 0, "why": "full"},
+            {"size": "cf-6g", "free": -1, "why": "never"},
+            {"size": "cf-8g", "free": -1, "why": "never"},
+        ])
+    );
 
     rig.finish(&runner, "succeeded");
     until("the end at the console", || rig.events().len() == 2).await;

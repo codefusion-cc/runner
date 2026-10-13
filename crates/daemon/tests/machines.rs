@@ -10,7 +10,9 @@ use std::time::Duration;
 use cf_budget::{GIB, MIB, Millis, Pressure, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{Answer, Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, Slots, Ticket};
+use cf_daemon::{
+    Answer, Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, SizeRoom, Slots, Ticket,
+};
 use cf_guest_proto::StopReason;
 use cf_vmhost::{End, OutOfMemory};
 use support::Log;
@@ -1552,6 +1554,117 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     assert_eq!(w.m.open_slots(SIZE), 0);
     assert_eq!(w.m.short_of(SIZE), Some("memory"));
     assert_eq!(log.lines("of this size").len(), 1);
+}
+
+// --- what each size meets, for the console ----------------------------------------------------------------------------
+
+/// What a size meets without memory figures: how many fit, `None` for never, and why.
+fn said(size: Size, free: Option<u32>, why: Option<&'static str>) -> SizeRoom {
+    SizeRoom {
+        size,
+        free,
+        why,
+        need_bytes: None,
+        short_bytes: None,
+    }
+}
+
+fn room_of(w: &World, size: Size) -> SizeRoom {
+    let rooms = w.m.rooms();
+    let mut of = rooms.iter().filter(|room| room.size == size);
+    let room = *of.next().expect("the size is said");
+    assert!(of.next().is_none(), "and said once");
+    room
+}
+
+#[test]
+fn every_size_is_said_once_with_how_many_fit_and_sizes_over_the_cap_are_never_run() {
+    // An 8 GiB Mac given to CI: a cap of 5 GiB, so never a cf-6g or cf-8g machine, whatever it has available.
+    let w = World::on(cf_budget::Settings::for_host(
+        cf_budget::HostFacts {
+            total_bytes: 8 * GIB,
+            cores: 8,
+        },
+        cf_budget::Mode::Dedicated,
+    ));
+    w.m.with_host(|host| host.set(|r| r.available_bytes = 8 * GIB));
+    pass(&w.m, 2);
+    let never = |size| said(size, None, Some("never"));
+    assert_eq!(
+        w.m.rooms(),
+        [
+            said(Size::G2, Some(2), None),
+            said(Size::G4, Some(1), None),
+            never(Size::G6),
+            never(Size::G8)
+        ]
+    );
+    // A pause closes the sizes it runs, and a size it never runs stays never.
+    w.m.pause(true);
+    assert_eq!(
+        w.m.rooms(),
+        [
+            said(Size::G2, Some(0), Some("paused")),
+            said(Size::G4, Some(0), Some("paused")),
+            never(Size::G6),
+            never(Size::G8)
+        ]
+    );
+}
+
+#[test]
+fn a_size_its_other_programs_leave_no_memory_for_says_how_much_it_needs_and_lacks() {
+    let w = World::new(2);
+    let settings = &w.parts.settings;
+    let available = memory_for_no_machine(&w);
+    w.m.with_host(|host| host.set(|r| r.available_bytes = available));
+    pass(&w.m, 1);
+    let room = room_of(&w, SIZE);
+    // One machine of its size and the floor, where it has the floor and a gigabyte.
+    let need = settings.host_bytes(SIZE) + settings.away.floor_bytes;
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (Some(0), Some("memory"), Some(need), Some(need - available))
+    );
+}
+
+#[test]
+fn a_mac_its_own_machines_fill_says_full_for_the_size() {
+    let w = World::new(1);
+    assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
+    let room = room_of(&w, SIZE);
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (Some(0), Some("full"), None, None)
+    );
+}
+
+#[tokio::test]
+async fn the_minis_second_machine_its_first_keeps_out_is_full_with_what_it_needs() {
+    // The mini of 2026-10-13 with its first cf-4g machine: a second one needs 6515 MiB available. Short of that
+    // because of the first, the Mac is full, not short of memory, and the console hears both numbers.
+    let (w, _) = mini::with_one(mini::PEAK, Some(mini::HELD)).await;
+    let available = mini::needed(mini::HELD) - GIB;
+    assert!(!mini::second_fits(&w, available));
+    let room = room_of(&w, Size::G4);
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (Some(0), Some("full"), Some(6515 * MIB), Some(GIB))
+    );
+    // Its other programs take all but 100 MiB over the floor: with what the first holds given back, a second still
+    // would not fit.
+    let available = mini::settings().away.floor_bytes + 100 * MIB;
+    assert!(!mini::second_fits(&w, available));
+    let room = room_of(&w, Size::G4);
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (
+            Some(0),
+            Some("memory"),
+            Some(6515 * MIB),
+            Some(6515 * MIB - available)
+        )
+    );
 }
 
 // --- what the Mac holds for a machine --------------------------------------------------------------------------------
