@@ -1,7 +1,7 @@
 //! The network devices of a machine's namespace, through rtnetlink: a bridge that joins pasta's tap and the
 //! guest's, both up. The kernel takes these messages from the namespace's root (the sandbox) and from nobody else.
 
-use cf_nft::netlink::{NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, attribute, message, nested};
+use cf_netlink::{NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, attribute, message, nested};
 
 /// The bridge in the namespace.
 pub const BRIDGE: &str = "br0";
@@ -75,7 +75,7 @@ pub use linux::{index, join};
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{BRIDGE, new_bridge, set_up};
-    use cf_nft::netlink::Socket;
+    use cf_netlink::Socket;
 
     /// The index of a device of the namespace.
     pub fn index(device: &str) -> Result<u32, String> {
@@ -109,7 +109,7 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cf_nft::netlink::{attributes, messages};
+    use cf_netlink::{attributes, messages};
 
     fn one(bytes: &[u8]) -> (u16, u16, u32, Vec<u8>) {
         let all: Vec<_> = messages(bytes).collect::<Result<_, _>>().unwrap();
@@ -133,7 +133,7 @@ mod tests {
         let found = attrs(&body[16..]);
         assert_eq!(found[0], (IFLA_IFNAME, b"br0\0".to_vec()));
         assert_eq!(found[1], (IFLA_MTU, 1500u32.to_ne_bytes().to_vec()));
-        assert_eq!(found[2].0 & !cf_nft::netlink::NLA_F_NESTED, IFLA_LINKINFO);
+        assert_eq!(found[2].0 & !cf_netlink::NLA_F_NESTED, IFLA_LINKINFO);
         assert_eq!(attrs(&found[2].1), vec![(IFLA_INFO_KIND, b"bridge\0".to_vec())]);
     }
 

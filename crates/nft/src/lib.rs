@@ -4,7 +4,7 @@
 //! [`Verdict`]. [`decide`] says what a chain does with a [`Packet`]: it is what tests hold a rule list against,
 //! with no kernel. [`batch`] is the same tables as one netlink transaction, written as `nft` writes them, and
 //! [`read`] turns such messages, or what the kernel lists, back into tables. [`apply`] and [`list`] talk to the
-//! kernel of the caller's network namespace (Linux only), through [`netlink::Socket`].
+//! kernel of the caller's network namespace (Linux only), through `cf-netlink`'s socket.
 //!
 //! Only what the Runner needs is here: the inet, bridge and netdev families, filter chains at priority 0, and
 //! matches on devices, the network protocol, the IPv4 destination, the transport protocol and port, and the state of
@@ -12,13 +12,12 @@
 
 mod decode;
 mod encode;
-pub mod netlink;
 
 pub use decode::read;
 pub use encode::batch;
 
+use cf_netlink as netlink;
 use std::fmt;
-use std::io;
 
 /// An IPv4 address.
 pub type Ip = [u8; 4];
@@ -270,7 +269,7 @@ pub struct Batch {
 /// the first refusal, after which the kernel holds what it held before.
 #[cfg(target_os = "linux")]
 pub fn apply(batch: &Batch) -> Result<(), Error> {
-    netlink::Socket::open(libc::NETLINK_NETFILTER)?.request(&batch.bytes, batch.acknowledged)
+    Ok(netlink::Socket::open(libc::NETLINK_NETFILTER)?.request(&batch.bytes, batch.acknowledged)?)
 }
 
 /// The tables the kernel holds in this process's network namespace, read back with [`read`]: a table, chain or
@@ -319,17 +318,20 @@ pub enum Error {
     },
     /// Messages this crate did not write, or broken ones.
     Unreadable(String),
-    /// The socket failed.
-    Io(&'static str, io::Error),
-    /// The kernel refused the message with this sequence number.
-    Refused {
-        /// The message's sequence number.
-        message: u32,
-        /// What the kernel said.
-        error: io::Error,
-    },
     /// What the kernel holds changed while it was listed.
     Interrupted,
+    /// The socket failed, or the kernel refused a message.
+    Netlink(cf_netlink::Error),
+}
+
+impl From<cf_netlink::Error> for Error {
+    fn from(error: cf_netlink::Error) -> Self {
+        match error {
+            cf_netlink::Error::Interrupted => Self::Interrupted,
+            cf_netlink::Error::Unreadable(problem) => Self::Unreadable(problem),
+            other => Self::Netlink(other),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -339,11 +341,8 @@ impl fmt::Display for Error {
             Self::Table(problem) => formatter.write_str(problem),
             Self::Rule { chain, rule, problem } => write!(formatter, "rule {rule} of {chain}: {problem}"),
             Self::Unreadable(problem) => write!(formatter, "unreadable messages: {problem}"),
-            Self::Io(what, error) => write!(formatter, "{what}: {error}"),
-            Self::Refused { message, error } => {
-                write!(formatter, "the kernel refused message {message}: {error}")
-            }
             Self::Interrupted => formatter.write_str("what the kernel holds changed while it was listed"),
+            Self::Netlink(error) => error.fmt(formatter),
         }
     }
 }

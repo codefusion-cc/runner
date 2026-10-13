@@ -410,26 +410,28 @@ mod tests {
     #[test]
     fn pasta_through_a_link_checks_the_link_and_what_it_leads_to() {
         let (links, files) = (private_dir(), private_dir());
+        let top = links.top();
+        assert_eq!(top, files.top());
         let passt = fake_pasta(files.path(), "exit 0");
         let link = links.path().join("pasta-link");
         std::os::unix::fs::symlink(&passt, &link).unwrap();
-        trusted(&link).unwrap();
-        mode(files.path(), 0o777);
-        assert!(
-            trusted(&link)
-                .unwrap_err()
-                .contains(&files.path().display().to_string())
-        );
-        mode(files.path(), 0o700);
-        mode(links.path(), 0o777);
-        assert!(
-            trusted(&link)
-                .unwrap_err()
-                .contains(&links.path().display().to_string())
-        );
-        mode(links.path(), 0o700);
+        trusted_below(&link, top).unwrap();
+        // The folder of what the link leads to, then the link's own.
+        for open in [&files, &links] {
+            mode(open.path(), 0o777);
+            let refused = trusted_below(&link, top).unwrap_err();
+            assert_eq!(
+                refused,
+                format!(
+                    "{} is not this user's and root's alone, so it cannot be trusted",
+                    open.path().display()
+                )
+            );
+            mode(open.path(), 0o700);
+            trusted_below(&link, top).unwrap();
+        }
         let dangling = links.path().join("dangling");
         std::os::unix::fs::symlink(files.path().join("gone"), &dangling).unwrap();
-        assert!(trusted(&dangling).is_err());
+        assert!(trusted_below(&dangling, top).is_err());
     }
 }

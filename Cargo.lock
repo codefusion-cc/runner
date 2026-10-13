@@ -288,9 +288,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-netlink"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+]
+
+[[package]]
 name = "cf-nft"
 version = "0.1.0"
 dependencies = [
+ "cf-netlink",
  "libc",
  "proptest",
 ]
@@ -359,6 +368,7 @@ dependencies = [
 name = "cf-vmm-ch"
 version = "0.1.0"
 dependencies = [
+ "cf-netlink",
  "cf-nft",
  "cf-vmhost",
  "cf-vmm",
