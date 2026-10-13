@@ -2988,6 +2988,7 @@ async fn an_update_waits_for_the_machine_that_stands_installs_and_is_said_once_b
             from: RUNNING.into(),
             to: NEWER.into(),
             starts: 0,
+            failed: None,
         }
     );
     until("the Runner is to end", || rig.service.restart_requested()).await;
@@ -3019,8 +3020,8 @@ async fn an_update_waits_for_the_machine_that_stands_installs_and_is_said_once_b
     assert_eq!(rig.updates.built(), 1);
 }
 
-/// A slot promised to GitHub before the update held new jobs back may still get its job: the update waits for it as
-/// for a machine that stands, and installs once it is given back.
+/// A slot promised to GitHub before the update held new jobs back may still get its job: the update waits for it,
+/// and installs once it is given back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_update_waits_for_a_slot_promised_before_it_and_installs_once_it_is_given_back() {
     let rig = Rig::new(2).await;
@@ -3030,7 +3031,9 @@ async fn an_update_waits_for_a_slot_promised_before_it_and_installs_once_it_is_g
     rig.console.queue_command("update", None);
     until("the update waits for the promised slot", || {
         last_status(&rig.console)["reason"]
-            == json!(format!("updating to {NEWER}: waiting for 1 machine to end"))
+            == json!(format!(
+                "updating to {NEWER}: waiting for 1 job that may still come"
+            ))
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3118,7 +3121,7 @@ async fn an_update_whose_machine_outlasts_its_limit_installs_nothing_and_takes_j
     assert_eq!(
         heard["message"],
         json!(format!(
-            "{NEWER} was not installed: 1 machine still stands after 4 seconds"
+            "{NEWER} was not installed: still waiting for 1 machine to end after 4 seconds"
         ))
     );
     assert_eq!(rig.updates.installed(), []);

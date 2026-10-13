@@ -48,6 +48,9 @@ pub struct Pending {
     /// How often `to` started without staying up.
     #[serde(default)]
     pub starts: u32,
+    /// Why the update ended without the program before back in place, for the Runner that starts next to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
 }
 
 /// A limit as a person says it: whole minutes, or seconds below one.
@@ -85,6 +88,12 @@ pub fn at_start(pending: Option<Pending>, running: &str) -> AtStart {
     let Some(mut pending) = pending else {
         return AtStart::Nothing;
     };
+    if let Some(message) = pending.failed {
+        return AtStart::Failed {
+            id: pending.id,
+            message,
+        };
+    }
     if pending.to == running {
         pending.starts = pending.starts.saturating_add(1);
         return if pending.starts > MAX_STARTS {
@@ -158,6 +167,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             starts,
+            failed: None,
         }
     }
 
@@ -201,7 +211,8 @@ mod tests {
                 id: "c".into(),
                 from: "a".into(),
                 to: "b".into(),
-                starts: 0
+                starts: 0,
+                failed: None,
             }))
         );
     }

@@ -168,14 +168,23 @@ impl MacUpdate {
             ));
         };
         let real = |path: &Path| std::fs::canonicalize(path).ok();
-        if real(named).is_none() || real(named) != real(&self.checkout) {
+        let named_real = real(named);
+        if let Some(external) = named_real.as_ref().filter(|real| real.starts_with("/Volumes")) {
+            return Err(format!(
+                "the build folder {} is on an external volume ({}), which a launchd agent may not open; {not}",
+                named.display(),
+                external.display()
+            ));
+        }
+        if named_real.is_none() || named_real != real(&self.checkout) {
             return Err(format!(
                 "this Runner was built in {folder}, not in its build folder {}; {not}",
                 named.display()
             ));
         }
-        // What is checked out is the source of a build: changes of its own would go in unseen.
-        let changed = self.git(&["status", "--porcelain", "--untracked-files=no"])?;
+        // What is checked out is the source of a build: changes of its own would go in unseen, and so would a new
+        // file cargo finds by itself (a `build.rs`, a `src/bin/`, a `.cargo/config.toml`).
+        let changed = self.git(&["status", "--porcelain"])?;
         if !changed.is_empty() {
             return Err(format!("{folder} has changes of its own; {not}"));
         }
@@ -341,23 +350,21 @@ pub fn guard(state_dir: &Path, installed: &Path, running: &str) -> Result<Starte
         }
         AtStart::GoBack(pending) => {
             let previous = installed.with_extension(PREVIOUS);
-            if !previous.exists() {
-                // Nothing to go back to: counting on would not change that.
-                let _ = file.remove();
-                return Err(format!(
-                    "{} did not stay up, and there is no {} to go back to",
-                    pending.to,
-                    previous.display()
-                ));
-            }
-            if let Err(error) = std::fs::rename(&previous, installed) {
-                // It would fail at every start, which launchd makes every few seconds: the update ends here.
-                let _ = file.remove();
-                return Err(format!(
-                    "{} did not stay up, and {} could not be put back: {error}",
-                    pending.to,
-                    previous.display()
-                ));
+            let back = if previous.exists() {
+                std::fs::rename(&previous, installed)
+                    .map_err(|error| format!("{} could not be put back: {error}", previous.display()))
+            } else {
+                Err(format!("there is no {} to go back to", previous.display()))
+            };
+            if let Err(why) = back {
+                // Trying again at every start, which launchd makes every few seconds, would not change that: the
+                // update ends here, and the program, started as it is, tells the console once it runs.
+                let message = format!("{} did not stay up, and {why}", pending.to);
+                file.write(&Pending {
+                    failed: Some(message.clone()),
+                    ..pending
+                })?;
+                return Err(message);
             }
             file.write(&pending)?;
             return Err(format!(
@@ -537,7 +544,10 @@ pub fn place(program: &Path, at: &Path, entitled: fn(&Path) -> Result<(), String
 
 /// Copies `from` beside `to`, and puts the copy in its place once `check` passes it.
 fn copy_checked(from: &Path, to: &Path, check: fn(&Path) -> Result<(), String>) -> Result<(), String> {
-    let fresh = to.with_extension("new");
+    // Each copy beside its own target: `codefusion-runner.prev.new` is not `codefusion-runner.new`.
+    let mut name = to.file_name().ok_or("a copy needs a file name")?.to_os_string();
+    name.push(".new");
+    let fresh = to.with_file_name(name);
     std::fs::copy(from, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
     if let Err(error) = check(&fresh) {
         let _ = std::fs::remove_file(&fresh);
@@ -675,6 +685,7 @@ chmod +x target/release/codefusion-runner"#;
                 from: self.update.running.clone(),
                 to: format!("0.1.0+{}", &self.second[..12]),
                 starts: 0,
+                failed: None,
             }
         }
     }
@@ -718,21 +729,28 @@ chmod +x target/release/codefusion-runner"#;
 
     #[test]
     fn a_checkout_with_changes_of_its_own_is_not_touched() {
-        let bench = bench(BUILDS);
-        std::fs::write(bench.update.checkout.join("Cargo.toml"), "mine").expect("file");
-        let said = bench.update.build().expect_err("refused");
-        assert_eq!(
-            said,
+        let refused = |bench: &Bench| {
             format!(
                 "{} has changes of its own; nothing was fetched or built; update by hand",
                 bench.update.checkout.display()
             )
-        );
+        };
+        let bench = bench(BUILDS);
+        std::fs::write(bench.update.checkout.join("Cargo.toml"), "mine").expect("file");
+        let said = bench.update.build().expect_err("refused");
+        assert_eq!(said, refused(&bench));
         untouched(&bench, &said);
         assert_eq!(
             std::fs::read_to_string(bench.update.checkout.join("Cargo.toml")).expect("file"),
             "mine"
         );
+
+        // A new file cargo would build by itself, though git does not know it.
+        let bench = self::bench(BUILDS);
+        std::fs::write(bench.update.checkout.join("build.rs"), "fn main() {}").expect("file");
+        let said = bench.update.build().expect_err("refused");
+        assert_eq!(said, refused(&bench));
+        untouched(&bench, &said);
     }
 
     #[test]
@@ -783,6 +801,21 @@ chmod +x target/release/codefusion-runner"#;
             );
             untouched(&bench, &said);
         }
+
+        // A folder on an external volume, however it is reached, is one a launchd agent may not open.
+        let external = bench.root.join("external");
+        std::os::unix::fs::symlink("/Volumes", &external).expect("link");
+        bench.update.build_folder = Some(external.clone());
+        let said = bench.update.build().expect_err("external");
+        assert_eq!(
+            said,
+            format!(
+                "the build folder {} is on an external volume (/Volumes), which a launchd agent may not open; \
+                 nothing was fetched or built; update by hand",
+                external.display()
+            )
+        );
+        untouched(&bench, &said);
 
         // The same folder by another way to it is the same.
         bench.update.build_folder = Some(bench.root.join("checkout/../checkout"));
@@ -837,11 +870,12 @@ chmod +x target/release/codefusion-runner"#;
     #[test]
     fn a_build_past_its_limit_is_ended_with_what_it_started() {
         let mut bench = bench("sleep 30 &\necho $! > \"$MARKS/child\"\nwait");
-        bench.update.build_limit = Duration::from_secs(1);
+        // Long enough for the niced build to write its child down on a busy Mac.
+        bench.update.build_limit = Duration::from_secs(3);
         let began = Instant::now();
         let said = bench.update.build().expect_err("ended");
-        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
-        assert_eq!(said, "the build took longer than 1 second and was ended");
+        assert!(began.elapsed() < Duration::from_secs(12), "{:?}", began.elapsed());
+        assert_eq!(said, "the build took longer than 3 seconds and was ended");
         let child: libc::pid_t = std::fs::read_to_string(bench.root.join("marks/child"))
             .expect("the child")
             .trim()
@@ -974,6 +1008,7 @@ chmod +x target/release/codefusion-runner"#;
             from: "0.1.0+aaaaaaaaaaaa".into(),
             to: "0.1.0+bbbbbbbbbbbb".into(),
             starts: 0,
+            failed: None,
         };
         let file = UpdateFile::in_state(state);
         assert_eq!(guard(state, &installed, &pending.to), Ok(Started::Nothing));
@@ -1006,7 +1041,7 @@ chmod +x target/release/codefusion-runner"#;
     }
 
     #[test]
-    fn a_new_program_with_nothing_to_go_back_to_stops_counting() {
+    fn a_new_program_with_nothing_to_go_back_to_stops_counting_and_says_so() {
         let folder = tempfile::tempdir().expect("folder");
         let installed = folder.path().join("bin/codefusion-runner");
         let file = UpdateFile::in_state(folder.path());
@@ -1015,10 +1050,23 @@ chmod +x target/release/codefusion-runner"#;
             from: "0.1.0+aaaaaaaaaaaa".into(),
             to: "0.1.0+bbbbbbbbbbbb".into(),
             starts: cf_daemon::update::MAX_STARTS,
+            failed: None,
         })
         .expect("written");
         let said = guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb").expect_err("no way back");
-        assert!(said.contains("no ") && said.contains("to go back to"), "{said}");
+        assert!(
+            said.starts_with("0.1.0+bbbbbbbbbbbb did not stay up, and there is no ")
+                && said.ends_with(" to go back to"),
+            "{said}"
+        );
+        // The program is started as it is, says so once, and counts no more.
+        assert_eq!(
+            guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb"),
+            Ok(Started::Failed {
+                id: "cmd-1".into(),
+                message: said
+            })
+        );
         assert_eq!(file.read(), Ok(None));
         assert_eq!(
             guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb"),
@@ -1027,7 +1075,7 @@ chmod +x target/release/codefusion-runner"#;
     }
 
     #[test]
-    fn a_program_before_that_cannot_be_put_back_ends_the_update_and_is_not_tried_at_every_start() {
+    fn a_program_before_that_cannot_be_put_back_ends_the_update_says_so_and_is_not_tried_at_every_start() {
         let folder = tempfile::tempdir().expect("folder");
         let installed = folder.path().join("bin/codefusion-runner");
         std::fs::create_dir_all(&installed).expect("a folder where the program would be");
@@ -1039,11 +1087,23 @@ chmod +x target/release/codefusion-runner"#;
             from: "0.1.0+aaaaaaaaaaaa".into(),
             to: "0.1.0+bbbbbbbbbbbb".into(),
             starts: cf_daemon::update::MAX_STARTS,
+            failed: None,
         })
         .expect("written");
         let said = guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb").expect_err("no way back");
+        assert!(
+            said.starts_with("0.1.0+bbbbbbbbbbbb did not stay up, and "),
+            "{said}"
+        );
         assert!(said.contains("could not be put back"), "{said}");
-        assert_eq!(file.read(), Ok(None), "the update ends");
+        assert_eq!(
+            guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb"),
+            Ok(Started::Failed {
+                id: "cmd-1".into(),
+                message: said
+            }),
+            "the update ends, and the console hears why"
+        );
         assert_eq!(
             guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb"),
             Ok(Started::Nothing)
@@ -1060,6 +1120,7 @@ chmod +x target/release/codefusion-runner"#;
             from: "0.1.0+aaaaaaaaaaaa".into(),
             to: "0.1.0+bbbbbbbbbbbb".into(),
             starts: 2,
+            failed: None,
         };
         let file = UpdateFile::in_state(state);
         assert_eq!(ended_in_order(state, &pending.to), Ok(()), "no update under way");

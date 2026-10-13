@@ -1300,9 +1300,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         inner.jobs.len() + inner.intents.len()
     }
 
-    /// How many slots were promised to GitHub, or granted, with no machine yet: a job may still come for each, and
-    /// its machine stand, although no new slot is granted.
-    pub fn promised(&self) -> usize {
+    /// How many jobs may still get a machine although no new slot is granted: one for each slot promised to GitHub,
+    /// or granted, with no machine yet. A registration under way still holds its slot, so it counts here and in
+    /// [`Machines::unsettled`] for those few seconds. A job that waits in line gets no machine while no slot is
+    /// granted: if the Runner ends, GitHub takes it back and hands it out again, as it would anyway.
+    pub fn coming(&self) -> usize {
         let inner = self.lock();
         let held: BTreeSet<SlotId> = inner.jobs.values().filter_map(|job| job.slot).collect();
         inner.grants.keys().filter(|slot| !held.contains(slot)).count()

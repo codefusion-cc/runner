@@ -1331,25 +1331,28 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         tracing::info!(from = %running, to = %built, "an update is built; no new job until the machines that stand are gone");
         shared.machines.hold_for_update(true);
         loop {
-            // A slot promised before the hold may still get its job: it is waited for as a machine that stands.
-            let standing = shared.machines.unsettled() + shared.machines.promised();
-            if standing == 0 {
+            // A job promised a slot before the hold may still get a machine: it is waited for too, until it comes
+            // or the promise runs out.
+            let (standing, coming) = (shared.machines.unsettled(), shared.machines.coming());
+            if standing + coming == 0 {
                 break;
             }
-            let (machines, stand) = if standing == 1 {
-                ("machine", "stands")
-            } else {
-                ("machines", "stand")
+            let plural = |n: usize, one: &str, more: &str| format!("{n} {}", if n == 1 { one } else { more });
+            let machines = plural(standing, "machine to end", "machines to end");
+            let jobs = plural(coming, "job that may still come", "jobs that may still come");
+            let waits_for = match (standing, coming) {
+                (_, 0) => machines,
+                (0, _) => jobs,
+                _ => format!("{machines} and {jobs}"),
             };
             if began.elapsed() >= shared.config.update_limit {
                 return Err(format!(
-                    "{built} was not installed: {standing} {machines} still {stand} after {}",
+                    "{built} was not installed: still waiting for {waits_for} after {}",
                     crate::update::spoken(shared.config.update_limit),
                 ));
             }
-            shared.update.lock().expect("update").doing = Some(format!(
-                "updating to {built}: waiting for {standing} {machines} to end"
-            ));
+            shared.update.lock().expect("update").doing =
+                Some(format!("updating to {built}: waiting for {waits_for}"));
             tokio::time::sleep(shared.config.tick_every).await;
         }
         shared.update.lock().expect("update").doing = Some(format!("updating to {built}: installing"));
@@ -1358,6 +1361,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             from: running,
             to: built,
             starts: 0,
+            failed: None,
         };
         tokio::task::spawn_blocking(move || updates.install(&pending))
             .await

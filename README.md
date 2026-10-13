@@ -142,9 +142,10 @@ own. The config's `build_folder` names that checkout, an absolute path not on an
 have been built there. The checkout stays at a commit (`git checkout --detach`), not on a branch, and has no changes of
 its own. Otherwise `update` touches nothing and says why: a person's checkout is never fetched into or moved. The
 update fetches `main`, checks it out at its commit and builds it while jobs run. It takes no new job until no machine
-stands and no slot promised to GitHub is left, then installs and starts again. A new program that does not stay up for a minute three times
-is replaced by the one before, and the console hears why. `restart` ends the Runner at once and launchd starts it
-again; machines that run go on and are adopted.
+stands and no slot promised to GitHub is left, then installs and starts again. A new program that does not stay up for
+a minute three times is replaced by the one before, and the console hears why; a start that ends as asked (a signal,
+`restart`) does not count. `restart` ends the Runner at once and launchd starts it again; machines that run go on and
+are adopted.
 
 `uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
 could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.

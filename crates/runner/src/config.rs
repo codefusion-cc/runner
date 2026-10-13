@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn the_state_folder_is_absolute_and_on_no_external_volume() {
         assert!(with(|v| v["state_dir"] = "state".into()).is_err());
-        let error = with(|v| v["state_dir"] = "/Volumes/Dev/runner".into()).expect_err("refused");
+        let error = with(|v| v["state_dir"] = "/Volumes/External/runner".into()).expect_err("refused");
         assert!(error.contains("external volume"), "{error}");
         assert!(with(|v| v["app_dir"] = "~/.config/x".into()).is_err());
     }
@@ -315,7 +315,7 @@ mod tests {
             error.starts_with("build_folder:") && error.contains("absolute"),
             "{error}"
         );
-        let error = with(|v| v["build_folder"] = "/Volumes/Dev/runner".into()).expect_err("refused");
+        let error = with(|v| v["build_folder"] = "/Volumes/External/runner".into()).expect_err("refused");
         assert!(
             error.starts_with("build_folder:") && error.contains("external volume"),
             "{error}"
