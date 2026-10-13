@@ -164,6 +164,8 @@ impl Rig {
 
     /// Starts again as [`Rig::restart`] does, once `edit` changed what the dead Runner left on disk.
     async fn restart_after(&mut self, edit: impl FnOnce(&Rig)) {
+        // From this moment nothing the dying Runner asks reaches GitHub: an answer it got is the last it gets.
+        self.github.set_down(true);
         self.stop_pump().await;
         self.service.kill();
         if self.store.crashed() {
@@ -232,6 +234,16 @@ impl Rig {
     }
 
     /// The Actions runners whose machine stands.
+    /// The Actions runners whose machine stands and has not said it is up.
+    fn booting(&self) -> Vec<String> {
+        self.parts
+            .vms
+            .booting()
+            .into_iter()
+            .map(|job| format!("{MACHINE}-{job}"))
+            .collect()
+    }
+
     fn standing(&self) -> Vec<String> {
         self.parts
             .vms
@@ -1607,6 +1619,11 @@ enum Happens {
     /// GitHub fails every removal of an Actions runner, and keeps the registration, from now on while jobs come and
     /// go; or it removes them again.
     RemovalsFail(bool),
+    /// Machines that start from now on boot until [`Happens::Up`] says they are up, or boot at once again: a job
+    /// can start, and end, on an Actions runner whose machine the Runner has not seen up yet.
+    SlowBoot(bool),
+    /// One machine that boots says it is up.
+    Up(u8),
     /// The Runner is uninstalled, whatever it is in the middle of. The last step.
     Uninstall,
     /// Tens of milliseconds pass.
@@ -1640,6 +1657,8 @@ fn happens() -> impl Strategy<Value = Happens> {
         2 => any::<u8>().prop_map(Happens::RestFails),
         3 => any::<u8>().prop_map(Happens::Minutes),
         3 => any::<bool>().prop_map(Happens::RemovalsFail),
+        2 => any::<bool>().prop_map(Happens::SlowBoot),
+        3 => any::<u8>().prop_map(Happens::Up),
         1 => Just(Happens::Uninstall),
         3 => (1u8..30).prop_map(Happens::Wait),
     ]
@@ -1663,6 +1682,8 @@ fn happens_around_removals() -> impl Strategy<Value = Happens> {
         1 => any::<bool>().prop_map(Happens::RestStale),
         1 => any::<u8>().prop_map(Happens::RestFails),
         1 => (any::<u8>(), any::<bool>()).prop_map(|(at, kept)| Happens::Crash(at, kept)),
+        1 => any::<bool>().prop_map(Happens::SlowBoot),
+        2 => any::<u8>().prop_map(Happens::Up),
         2 => (1u8..30).prop_map(Happens::Wait),
     ]
 }
@@ -1689,30 +1710,44 @@ fn pick<T: Clone>(items: &[T], n: u8) -> Option<T> {
     (!items.is_empty()).then(|| items[usize::from(n) % items.len()].clone())
 }
 
-/// The Runner died, or dies: it starts again, and opens every scale set's session anew.
-async fn start_again(rig: &mut Rig, sets: &[i64], causes: &mut [usize]) {
-    rig.restart().await;
+/// The Runner died, or dies: it starts again, and opens every scale set's session anew. Says which registrations
+/// GitHub removed at the dead Runner's request without that Runner having written the answer down: it died between
+/// GitHub's 204 and its write.
+async fn start_again(rig: &mut Rig, sets: &[i64], causes: &mut [usize]) -> Vec<String> {
+    let mut lost = Vec::new();
+    rig.restart_after(|rig| {
+        let kept: BTreeSet<String> = rig
+            .parts
+            .store
+            .load()
+            .into_iter()
+            .filter(|record| !record.unregistered)
+            .map(|record| record.runner)
+            .collect();
+        lost = rig
+            .github
+            .removed_at_request()
+            .into_iter()
+            .filter(|runner| kept.contains(runner))
+            .collect();
+    })
+    .await;
     for (at, set) in sets.iter().enumerate() {
         rig.github.lose_session(*set);
         causes[at] += 1;
     }
     rig.service.discover().await;
+    lost
 }
 
-/// What is stored of a machine never disagrees with itself, whenever the Runner dies: a record that says GitHub's
-/// job started on it does not say its machine still waits for one.
+/// What is stored of a machine never disagrees with itself, at any write in any phase, whenever the Runner dies:
+/// what GitHub said of the job and the lifecycle agree ([`cf_daemon::Record::agrees`]).
 fn stored_facts_agree(rig: &Rig) -> Result<(), TestCaseError> {
-    for record in rig.parts.store.load() {
-        let waits = record
-            .slot
-            .as_ref()
-            .is_some_and(|s| s.saved().phase == cf_lifecycle::Phase::Idle);
-        prop_assert!(
-            !(record.github.is_some() && record.ended.is_none() && waits),
-            "{} is stored with GitHub's job and a machine that waits for one",
-            record.runner
-        );
-    }
+    let disagreements = rig.store.disagreements();
+    prop_assert!(
+        disagreements.is_empty(),
+        "written with facts that disagree: {disagreements:?}"
+    );
     Ok(())
 }
 
@@ -1737,12 +1772,15 @@ fn no_running_job_stopped(rig: &Rig, jobs: &[i64]) -> Result<(), TestCaseError> 
     Ok(())
 }
 
-/// Machines started may never outnumber the jobs GitHub handed to this Mac, each hand-out counted.
+/// Machines started may never outnumber the jobs GitHub handed to this Mac, each hand-out counted, and the machines
+/// that never came up, each of which leaves its job to one that replaces it.
 fn one_machine_per_assignment(rig: &Rig) -> Result<(), TestCaseError> {
     let (started, assigned) = (rig.parts.vms.started().len(), rig.github.assignments());
+    // A machine that never came up leaves its job to a machine that replaces it.
+    let failed = rig.parts.vms.died_booting();
     prop_assert!(
-        started <= assigned,
-        "{started} machines for {assigned} jobs handed to this Mac"
+        started <= assigned + failed,
+        "{started} machines for {assigned} jobs handed to this Mac, {failed} of them never up"
     );
     Ok(())
 }
@@ -1765,12 +1803,11 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     // The Actions runners that ran a job, and for each scale set what may open its session again.
     let mut ran = BTreeSet::new();
     let mut causes = vec![1usize; sets.len()];
-    // Whether the Runner died losing its last write, and whether the crash armed now would.
-    let (mut lost_write, mut crash_loses) = (false, false);
+    // Registrations GitHub removed at the Runner's request whose answer died with a Runner.
+    let mut lost = BTreeSet::new();
     for step in script {
         if rig.store.crashed() {
-            lost_write |= crash_loses;
-            start_again(&mut rig, &sets, &mut causes).await;
+            lost.extend(start_again(&mut rig, &sets, &mut causes).await);
         }
         let running = |jobs: &[i64]| -> Vec<String> {
             rig.standing()
@@ -1810,8 +1847,13 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             Happens::Completed(n, github_first) => {
                 if let Some(runner) = pick(&running(&jobs), n) {
                     if github_first {
+                        // GitHub's word may come before the Runner saw a machine that boots slowly up.
                         rig.github.complete_job(&runner, "succeeded");
                         tokio::time::sleep(Duration::from_millis(30)).await;
+                        if rig.booting().contains(&runner) {
+                            rig.parts.vms.ready(job_name(&runner));
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
                         rig.parts.vms.end(job_name(&runner), End::Ok);
                     } else {
                         rig.parts.vms.end(job_name(&runner), End::Ok);
@@ -1881,10 +1923,13 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                     causes[at] += 1;
                 }
             }
-            Happens::Restart => start_again(&mut rig, &sets, &mut causes).await,
-            Happens::Crash(at, kept) => {
-                crash_loses = !kept;
-                rig.crash_at(1 + usize::from(at % 8), kept);
+            Happens::Restart => lost.extend(start_again(&mut rig, &sets, &mut causes).await),
+            Happens::Crash(at, kept) => rig.crash_at(1 + usize::from(at % 8), kept),
+            Happens::SlowBoot(slow) => rig.parts.vms.slow_boot(slow),
+            Happens::Up(n) => {
+                if let Some(runner) = pick(&rig.booting(), n) {
+                    rig.parts.vms.ready(job_name(&runner));
+                }
             }
             Happens::RestStale(stale) => rig.github.set_rest_stale(stale),
             Happens::RestFails(times) => {
@@ -1925,8 +1970,7 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         }
     }
     if rig.store.crashed() {
-        lost_write |= crash_loses;
-        start_again(&mut rig, &sets, &mut causes).await;
+        lost.extend(start_again(&mut rig, &sets, &mut causes).await);
     }
     // GitHub removes Actions runners again, and a crash that has not come does not come now.
     rig.github.recover(REMOVAL);
@@ -1957,7 +2001,7 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             "records left: {:?}",
             rig.parts.store.load()
         );
-        all_heard(&rig, &ran, lost_write).await?;
+        all_heard(&rig, &ran, &lost).await?;
         rig.stop_pump().await;
         rig.service.kill();
         return Ok(());
@@ -1966,6 +2010,14 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     // Room for every machine: what waits at GitHub moves at each of GitHub's looks, until the slots are full.
     rig.machines
         .with_host(|host| host.set(|reading| reading.available_bytes = roomy));
+    // Machines boot again, and the start breaker that machines which never came up opened lets the next try out.
+    rig.parts.vms.slow_boot(false);
+    if rig.parts.vms.died_booting() > 0 {
+        let time = Duration::from_secs(16 * 60);
+        rig.github.pass(time);
+        rig.later(time);
+        pass(&rig.machines, time.as_secs());
+    }
     let slots = usize::try_from(slots).unwrap_or(usize::MAX);
     let waiting = |rig: &Rig| {
         jobs.iter()
@@ -1997,14 +2049,14 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         rig.github.complete_job(&runner, "succeeded");
         rig.parts.vms.end(job_name(&runner), End::Ok);
     }
-    all_heard(&rig, &ran, lost_write).await?;
+    all_heard(&rig, &ran, &lost).await?;
     rig.stop_pump().await;
     rig.service.kill();
     Ok(())
 }
 
 /// Every job that ran here reaches the console, its start and its end, each once.
-async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost_write: bool) -> Result<(), TestCaseError> {
+async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -> Result<(), TestCaseError> {
     let heard_from = std::time::Instant::now();
     loop {
         let unheard: Vec<&String> = ran
@@ -2045,10 +2097,9 @@ async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost_write: bool) -> Resul
     // Accepted, and only this: GitHub removed a registration at the Runner's request and the Runner died before it
     // wrote that answer down. The next Runner finds it gone with no word that no job ran there and reports a job
     // (`docs/job-state.md`): one too many, never one lost.
-    let removed = rig.github.removed_at_request();
     for runner in &started {
         prop_assert!(
-            ran.contains(*runner) || (lost_write && removed.iter().any(|r| r == runner)),
+            ran.contains(*runner) || lost.contains(*runner),
             "{} never ran a job, yet the console heard of one",
             runner
         );
@@ -2762,6 +2813,7 @@ async fn a_stop_for_no_job_left_by_a_runner_before_is_asked_of_github_first() {
                 *slot = saved.into();
             }
             record.unregistered = false;
+            record.rules = 0;
             rig.parts.store.save(&record);
         }
     })
@@ -2772,10 +2824,17 @@ async fn a_stop_for_no_job_left_by_a_runner_before_is_asked_of_github_first() {
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        !rig.parts.vms.stopped().iter().any(|(job, ..)| *job == job_name(&runner)),
+        !rig.parts
+            .vms
+            .stopped()
+            .iter()
+            .any(|(job, ..)| *job == job_name(&runner)),
         "stops: {:?}",
         rig.parts.vms.stopped()
     );
-    assert_eq!(rig.standing(), vec![runner.clone()], "the machine of a running job stands");
+    assert_eq!(
+        rig.standing(),
+        vec![runner.clone()],
+        "the machine of a running job stands"
+    );
 }
-

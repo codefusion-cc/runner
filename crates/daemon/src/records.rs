@@ -98,9 +98,31 @@ pub struct Record {
     /// The machine is gone and GitHub never said its Actions runner took a job: whether a job ran is GitHub's to say,
     /// by whether the registration is still there (a one-job Actions runner removes its own once its job is over).
     /// Asked once the wait for GitHub's word is over, and then by the removal itself: answered, no job ran; gone
-    /// already or refused for a job, one did. Records written before it existed ask nothing.
+    /// already or refused for a job, one did.
     #[serde(default)]
     pub ask_github: bool,
+    /// The rules the record was written under: [`RULES`]. A record of an older Runner (0, by the field's absence)
+    /// is read once, by [`Record::upgrade`], and written under these rules from then on.
+    #[serde(default)]
+    pub rules: u32,
+}
+
+/// The rules every record is written under now. 1: only a 204 to the Runner's own removal says no job ran, so
+/// `unregistered` with no word of a job is that answer, an end without a job is never decided before it, and what
+/// GitHub said of the job and the lifecycle agree at every write ([`Record::agrees`]).
+pub const RULES: u32 = 1;
+
+/// What restore makes of a record ([`Record::upgrade`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upgrade {
+    /// Written under these rules, and its facts agree: it goes on as it is.
+    Current,
+    /// Written by an older Runner and consistent under these rules once GitHub's word is applied: it goes on.
+    Consistent,
+    /// Written by an older Runner on a belief these rules do not allow: whether a job ran is GitHub's to say. A
+    /// machine that stands asks for its registration's removal and is not stopped before the answer; one that is
+    /// gone is asked about as one that ended unheard.
+    AskGithub,
 }
 
 impl Record {
@@ -112,6 +134,109 @@ impl Record {
     /// Whether nothing is left to do for this Actions runner.
     pub fn finished(&self) -> bool {
         self.unregistered && self.end_reported && (self.ended.is_some() || self.slot.is_none())
+    }
+
+    /// Whether what GitHub said of the job and what the lifecycle wrote agree, in whatever phase: a job GitHub
+    /// named ran, no slot waits for a job (to boot, to retry, idle) beside one, none runs one GitHub said is over,
+    /// and no end without a job was decided beside a job or before GitHub answered the removal.
+    pub fn agrees(&self) -> bool {
+        let Some(slot) = self.slot else {
+            // Only a registration: no machine, so no job.
+            return self.github.is_none() && self.ended.is_none();
+        };
+        let saved = slot.saved();
+        let no_job_decided =
+            saved.end == Some(End::NoJob) && matches!(saved.phase, Phase::Stopping | Phase::Killing);
+        let Some(github) = &self.github else {
+            return !no_job_decided || self.unregistered;
+        };
+        let over = github.result.is_some();
+        saved.ran_job
+            && !no_job_decided
+            && !matches!(saved.phase, Phase::Starting | Phase::Retrying | Phase::Idle)
+            && !(over && saved.phase == Phase::Running)
+    }
+
+    /// Reads a record as these rules ([`RULES`]) would have written it; restore's one place for what an older
+    /// Runner left (`docs/job-state.md`). What it believed and these rules do not allow is never acted on:
+    ///
+    /// - GitHub's word of a job is a fact whoever wrote it down. A lifecycle that lags behind it (written apart
+    ///   from it, or not taken in the phase it met) is brought to it.
+    /// - Without that word, an older Runner's `unregistered` may stand for a 404 (a job ran), its settled end for
+    ///   a job it never asked about, and its stop of a machine for its belief that no job came (the idle limit, a
+    ///   surplus removal). None of them is evidence here, so GitHub is asked: by the sweep's look at a machine
+    ///   that is gone, or by the removal of the registration of one that stands, which is not stopped before the
+    ///   answer.
+    ///
+    /// Fields an older Runner wrote that no longer exist (`removing`) are not read: under these rules nothing it
+    /// meant to do is evidence.
+    pub fn upgrade(mut self) -> (Record, Upgrade) {
+        if self.rules >= RULES && self.agrees() {
+            return (self, Upgrade::Current);
+        }
+        self.rules = RULES;
+        let Some(slot) = self.slot else {
+            // A registration with no machine took no job: removing it is all that is left.
+            return (self, Upgrade::Consistent);
+        };
+        let mut saved = slot.saved();
+        if self.ended.is_some() {
+            // The machine is gone, so the slot is over, whatever phase was written.
+            saved.phase = Phase::Released;
+        }
+        if let Some(github) = &self.github {
+            let over = github.result.is_some();
+            let finished = if saved.oom { End::Oom } else { End::Ok };
+            saved.ran_job = true;
+            match saved.phase {
+                Phase::Reserved | Phase::Starting | Phase::Retrying | Phase::Idle | Phase::Running
+                    if over =>
+                {
+                    saved.phase = Phase::Finishing;
+                    saved.end = Some(finished);
+                }
+                Phase::Reserved | Phase::Starting | Phase::Retrying | Phase::Idle => {
+                    saved.phase = Phase::Running;
+                    saved.end = None;
+                }
+                Phase::Stopping | Phase::Killing if saved.end == Some(End::NoJob) => {
+                    saved.end = Some(End::Stopped);
+                }
+                Phase::Running | Phase::Finishing | Phase::Stopping | Phase::Killing | Phase::Released => {}
+            }
+            self.slot = Some(saved.into());
+            return (self, Upgrade::Consistent);
+        }
+        if let Some(ending) = &mut self.ended {
+            self.slot = Some(saved.into());
+            self.unregistered = false;
+            self.end_reported = false;
+            self.ask_github = true;
+            // Stopped by the Runner, on a belief this record no longer holds.
+            if ending.kind == crate::EndKind::NoJob.name() {
+                ending.kind = crate::EndKind::Stopped.name().to_string();
+            }
+            return (self, Upgrade::AskGithub);
+        }
+        let stopped_for_no_job = matches!(saved.phase, Phase::Stopping | Phase::Killing)
+            && matches!(saved.end, Some(End::NoJob | End::Stopped));
+        if self.unregistered || stopped_for_no_job || saved.end == Some(End::NoJob) {
+            self.unregistered = false;
+            // One that waited or was being stopped asks now; one that runs or finishes a job the guest saw keeps
+            // it, and is asked about once it is gone.
+            if matches!(
+                saved.phase,
+                Phase::Starting | Phase::Idle | Phase::Stopping | Phase::Killing
+            ) {
+                saved.phase = Phase::Idle;
+                saved.end = Some(End::NoJob);
+            } else if saved.end == Some(End::NoJob) {
+                saved.end = None;
+            }
+            self.slot = Some(saved.into());
+            return (self, Upgrade::AskGithub);
+        }
+        (self, Upgrade::Consistent)
     }
 }
 

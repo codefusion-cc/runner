@@ -231,7 +231,7 @@ fn a_process_that_survives_sigkill_is_killed_again_and_its_memory_kept() {
     assert_eq!(slot.on(Millis(121_999), Event::Tick), []);
     assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
     assert_eq!(
-        slot.on(s(122), Event::Stop),
+        slot.on(s(122), Event::Unregistered),
         [Effect::StopVm { grace: Millis::ZERO }]
     );
     assert_eq!(
@@ -275,12 +275,24 @@ fn an_idle_runner_past_its_limit_is_unregistered_and_its_vm_stops_only_when_told
         );
     }
     assert_eq!(
-        slot.on(s(130), Event::Stop),
+        slot.on(s(130), Event::Unregistered),
         [Effect::StopVm { grace: Millis::ZERO }]
     );
     assert_eq!(
         slot.on(s(131), Event::VmExited),
         [Effect::Unregister, Effect::Release, ended(End::NoJob, false)]
+    );
+    // Stopped from the console before GitHub answered: no answer said there was no job.
+    let mut slot = idle();
+    slot.on(s(100), Event::Heartbeat);
+    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
+    assert_eq!(
+        slot.on(s(123), Event::Stop),
+        [Effect::StopVm { grace: Millis::ZERO }]
+    );
+    assert_eq!(
+        slot.on(s(124), Event::VmExited),
+        [Effect::Unregister, Effect::Release, ended(End::Stopped, false)]
     );
 }
 
@@ -574,7 +586,7 @@ fn messages_that_come_twice_late_or_not_at_all() {
         slot.on(s(4), Event::VmExited),
         [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
     );
-    // After the end nothing does anything.
+    // After the end nothing does anything; a word of a job that comes late is kept as the fact that one ran.
     let (mut slot, _) = after(&[Event::Assigned, Event::VmExited, Event::VmExited]);
     let all = [
         Event::Assigned,
@@ -589,14 +601,18 @@ fn messages_that_come_twice_late_or_not_at_all() {
         MEMORY,
         DISK,
         Event::Stop,
+        Event::Unregistered,
         Event::Slept(s(1000)),
         Event::Tick,
     ];
-    let over = slot.clone();
+    let mut over = slot.saved();
+    assert!(!over.ran_job);
     for event in all {
         assert_eq!(slot.on(s(1_000_000), event), [], "{event:?}");
-        assert_eq!(slot, over);
+        over.ran_job |= matches!(event, Event::JobStarted | Event::JobCompleted);
+        assert_eq!(slot.saved(), over, "{event:?}");
     }
+    assert!(slot.saved().ran_job, "the job heard after the end is kept");
 }
 
 #[test]
@@ -793,4 +809,72 @@ fn a_restored_slot_never_starts_a_second_vm() {
             ended(End::StartFailed, false)
         ]
     );
+}
+
+/// Sol 4: GitHub's word of a job meets the slot in every phase. It moves the slot where it can and is kept until
+/// the slot gets there where it cannot yet; in no phase is it dropped, and no phase is left idle beside it.
+#[test]
+fn a_word_of_a_job_is_kept_whatever_phase_it_meets() {
+    // Before the VM's `ready`: the completion means the VM was up and the job is over.
+    let (mut slot, _) = after(&[Event::Assigned]);
+    assert_eq!(slot.on(s(1), Event::JobCompleted), [Effect::StartSucceeded]);
+    assert_eq!(
+        (slot.phase(), slot.saved().ran_job, slot.saved().end),
+        (Phase::Finishing, true, Some(End::Ok))
+    );
+    assert_eq!(slot.on(s(2), Event::VmReady), []);
+    assert_eq!(slot.phase(), Phase::Finishing, "a late ready changes nothing");
+    // With no VM yet, the word waits for one that is up.
+    for (word, phase) in [
+        (Event::JobStarted, Phase::Running),
+        (Event::JobCompleted, Phase::Finishing),
+    ] {
+        let mut slot = Slot::reserved(Limits::default());
+        assert_eq!(slot.on(s(0), word), []);
+        assert!(slot.saved().ran_job);
+        assert_eq!(slot.on(s(1), Event::Assigned), [Effect::StartVm]);
+        assert_eq!(slot.on(s(2), Event::VmReady), [Effect::StartSucceeded]);
+        assert_eq!(slot.phase(), phase, "{word:?}");
+    }
+    // The first VM, killed for not saying `ready`, took the job: its registration is spent, no second VM starts.
+    let (mut slot, _) = after(&[Event::Assigned]);
+    slot.on(s(21), Event::Tick);
+    assert_eq!(slot.phase(), Phase::Retrying);
+    assert_eq!(slot.on(s(22), Event::JobStarted), []);
+    assert_eq!(
+        slot.on(s(23), Event::VmExited),
+        [Effect::Unregister, Effect::Release, ended(End::GuestLost, true)]
+    );
+    // While the VM is stopped: a job ran, so the end is not one without a job.
+    let mut slot = idle();
+    slot.on(s(100), Event::Heartbeat);
+    slot.on(s(122), Event::Tick);
+    slot.on(s(123), Event::Stop);
+    assert_eq!(slot.on(s(124), Event::JobStarted), []);
+    assert_eq!(
+        slot.on(s(125), Event::VmExited),
+        [Effect::Unregister, Effect::Release, ended(End::Stopped, true)]
+    );
+}
+
+/// A slot restored while it waited for GitHub's answer to its removal asks again at once, and waits for no idle
+/// limit: the answer may have gone with the daemon. A slot whose VM went meanwhile ends as lost, not as one that
+/// GitHub said had no job.
+#[test]
+fn a_slot_restored_while_asking_asks_again() {
+    let asking = Saved {
+        phase: Phase::Idle,
+        starts: 1,
+        end: Some(End::NoJob),
+        oom: false,
+        ran_job: false,
+    };
+    let (mut slot, effects) = Slot::restore(Limits::default(), s(0), asking, true);
+    assert_eq!((effects, slot.phase()), (vec![Effect::Unregister], Phase::Idle));
+    slot.on(s(50), Event::Heartbeat);
+    assert_eq!(slot.on(s(100), Event::Tick), [], "no second ask, no stop");
+    assert_eq!(slot.on(s(101), Event::JobStarted), []);
+    assert_eq!(slot.phase(), Phase::Running);
+    let (_, effects) = Slot::restore(Limits::default(), s(0), asking, false);
+    assert_eq!(effects, [Effect::Unregister, ended(End::GuestLost, false)]);
 }

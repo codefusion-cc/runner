@@ -32,7 +32,7 @@ pub use machines::{
     JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT, Registration,
     Reports, Snapshot, Verdict,
 };
-pub use records::{DiskStore, Ending, GithubJob, MemoryStore, Record, SavedSlot, Store};
+pub use records::{DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade};
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};
 pub use service::{

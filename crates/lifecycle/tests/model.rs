@@ -169,7 +169,14 @@ impl World {
     fn send(&mut self, event: Event) -> Result<(), String> {
         let before = self.slot.clone();
         let effects = self.slot.on(self.now, event);
-        if before.phase() == Phase::Released && (!effects.is_empty() || self.slot != before) {
+        // A released slot does nothing more; it only keeps a word of a job that came late.
+        let learned = |saved: Saved| Saved {
+            ran_job: saved.ran_job || matches!(event, Event::JobStarted | Event::JobCompleted),
+            ..saved
+        };
+        if before.phase() == Phase::Released
+            && (!effects.is_empty() || self.slot.saved() != learned(before.saved()))
+        {
             return Err(format!("{event:?} did something to a released slot"));
         }
         let had_unregister = effects.contains(&Effect::Unregister);
@@ -283,6 +290,7 @@ fn actions() -> Vec<Action> {
         Event::Evict(EvictionCause::Memory),
         Event::Evict(EvictionCause::Disk),
         Event::Stop,
+        Event::Unregistered,
         Event::Slept(Millis::mins(6)),
         Event::Tick,
     ];

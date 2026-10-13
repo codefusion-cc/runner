@@ -21,7 +21,7 @@ use cf_vmhost::{JobRequest, JobState, OutOfMemory};
 
 use crate::ends::{EndKind, machine_end};
 use crate::names::job_name;
-use crate::records::{Ending, GithubJob, Record, Store};
+use crate::records::{Ending, GithubJob, RULES, Record, Store, Upgrade};
 use crate::roster::{JobInfo, Roster, Runner};
 use crate::secs;
 use crate::traits::{
@@ -417,6 +417,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             }
         }
         for record in records {
+            let (record, upgrade) = record.upgrade();
+            if upgrade != Upgrade::Current {
+                tracing::info!(runner = %record.runner, ?upgrade, "a record of an older Runner was read under these rules");
+                self.store.save(&record);
+            }
             let Some(saved) = record.slot else {
                 if record.unregistered {
                     self.store.remove(&record.job);
@@ -473,18 +478,19 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 _ => None,
             };
             let (life, effects) = Slot::restore(self.config.limits, now.elapsed, saved, alive);
+            // The end an idle slot expects was never GitHub's answer.
+            let decided = saved.end.filter(|_| saved.phase != Phase::Idle);
             let restored_end = (!alive).then(|| match state.as_ref().and_then(|s| s.end.as_ref()) {
-                Some(ended) => machine_end(saved.end.unwrap_or(End::Ok), Some(ended.end), false),
+                Some(ended) => machine_end(decided.unwrap_or(End::Ok), Some(ended.end), false),
                 None if !same_boot => EndKind::HostShutdown,
                 None if matches!(saved.phase, Phase::Reserved | Phase::Starting | Phase::Retrying) => {
                     EndKind::DaemonRestart
                 }
                 None => EndKind::GuestLost,
             });
-            // Derived from the one fact each depends on, never from a second field that could disagree with it: a
-            // registration that is gone leaves its machine nothing to wait for, and a job GitHub said started runs.
+            // Derived from the one fact it depends on: a registration that is gone leaves its machine nothing to wait
+            // for. What GitHub said of the job agrees with the lifecycle already ([`Record::upgrade`]).
             let done = alive && record.unregistered;
-            let heard = alive && record.github.is_some() && saved.phase == Phase::Idle;
             if alive {
                 tracing::info!(runner = %record.runner, job = %name, "a machine of the Runner before was adopted");
                 self.roster.adopt(Runner {
@@ -527,11 +533,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 },
             );
             self.apply(&mut inner, &name, now, effects);
-            if heard {
-                self.step(&mut inner, &name, now, Event::JobStarted);
-            }
             if done {
-                self.step(&mut inner, &name, now, Event::Stop);
+                self.step(&mut inner, &name, now, Event::Unregistered);
             }
         }
     }
@@ -949,16 +952,14 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             wall_ms: summary.map(|s| s.wall_ms),
             message: vm_end.and_then(|e| e.message.clone()),
         });
-        // Only a guest that came up can have run an Actions runner: one that booted now, or one written down as up
-        // before this Runner started.
-        let came_up = ran_job
-            || job.record.ended.as_ref().is_some_and(|e| e.boot_ms.is_some())
-            || job.record.slot.is_some_and(|slot| {
-                matches!(
-                    slot.saved().phase,
-                    Phase::Idle | Phase::Running | Phase::Finishing
-                )
-            });
+        // Only a guest that came up can have run an Actions runner. One whose slot was last written booting, or
+        // that ended as one that never got ready, did not; any other may have, whatever stopped it.
+        let never_up = job.record.slot.is_some_and(|slot| {
+            let saved = slot.saved();
+            matches!(saved.phase, Phase::Reserved | Phase::Starting | Phase::Retrying)
+                || matches!(saved.end, Some(End::StartFailed | End::Lost))
+        });
+        let came_up = ran_job || job.record.ended.as_ref().is_some_and(|e| e.boot_ms.is_some()) || !never_up;
         job.record.slot = Some(job.life.saved().into());
         job.ended_at = Some(now.elapsed);
         job.unregister = true;
@@ -1158,7 +1159,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 let (repo, set) = (job.record.repo.clone(), job.record.scale_set_id);
                 self.roster.mark_done(&repo, set, runner, self.clock.now());
             }
-            if !(stands && self.feed(&mut inner, &name, now, Event::Stop))
+            if !(stands && self.feed(&mut inner, &name, now, Event::Unregistered))
                 && let Some(job) = inner.jobs.get(&name)
             {
                 self.store.save(&job.record);
@@ -1433,6 +1434,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: true,
             oom: false,
             ask_github: false,
+            rules: RULES,
         };
         self.store.save(&record);
         self.lock().intents.insert(name.to_string(), (record, false));
@@ -1546,6 +1548,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: false,
             oom: false,
             ask_github: false,
+            rules: RULES,
         };
         // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
         self.store.save(&record);

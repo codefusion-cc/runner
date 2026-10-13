@@ -33,6 +33,8 @@ struct VmState {
     stopped: Vec<(String, StopReason, Duration)>,
     killed: Vec<String>,
     cleaned: Vec<String>,
+    /// Machines that went before they said they were up.
+    died_booting: usize,
     fail_start: usize,
     slow_boot: bool,
     late_state: bool,
@@ -168,7 +170,12 @@ impl FakeVms {
 
     /// The vm-host is killed from outside: its state stays as it was, without an end.
     pub fn die(&self, job: &str) {
-        self.with(job, |vm| vm.alive = false);
+        let mut state = self.lock();
+        if let Some(vm) = state.vms.get_mut(job) {
+            let booting = vm.alive && vm.state.stage == Stage::Booting;
+            vm.alive = false;
+            state.died_booting += usize::from(booting);
+        }
     }
 
     /// Nothing of the job is there, as when the daemon died before its vm-host existed.
@@ -194,6 +201,21 @@ impl FakeVms {
             .filter(|(_, vm)| vm.alive)
             .map(|(job, _)| job.clone())
             .collect()
+    }
+
+    /// The machines that stand and have not said they are up.
+    pub fn booting(&self) -> Vec<String> {
+        self.lock()
+            .vms
+            .iter()
+            .filter(|(_, vm)| vm.alive && vm.state.stage != Stage::Running)
+            .map(|(job, _)| job.clone())
+            .collect()
+    }
+
+    /// How many machines went without ever saying they were up: killed or dead while they booted.
+    pub fn died_booting(&self) -> usize {
+        self.lock().died_booting
     }
 
     /// The memory of the machines that stand.
@@ -333,7 +355,9 @@ impl Vms for FakeVms {
         if let Some(vm) = state.vms.get_mut(job)
             && !vm.unkillable
         {
+            let booting = vm.alive && vm.state.stage == Stage::Booting;
             vm.alive = false;
+            state.died_booting += usize::from(booting);
         }
     }
 
@@ -451,6 +475,8 @@ pub fn pass(machines: &TestMachines, seconds: u64) {
 pub struct CrashingStore {
     records: MemoryStore,
     crash: Mutex<Crash>,
+    /// Every write of a record whose facts disagree ([`Record::agrees`]), as it was written.
+    disagreements: Mutex<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -479,6 +505,12 @@ impl CrashingStore {
     /// Whether the daemon died at a write.
     pub fn crashed(&self) -> bool {
         self.crash.lock().expect("crash").dead
+    }
+
+    /// The writes of a record whose facts disagreed, at the moment of each: what a daemon that died right after it
+    /// would have found.
+    pub fn disagreements(&self) -> Vec<String> {
+        self.disagreements.lock().expect("disagreements").clone()
     }
 
     /// No crash any more: the daemon that starts next writes again, and one that was set and did not come is off.
@@ -513,6 +545,13 @@ impl CrashingStore {
 
 impl Store for CrashingStore {
     fn save(&self, record: &Record) {
+        if !record.agrees() {
+            let slot = record.slot.map(|slot| slot.saved());
+            self.disagreements.lock().expect("disagreements").push(format!(
+                "{}: {slot:?} beside {:?}, unregistered: {}",
+                record.runner, record.github, record.unregistered
+            ));
+        }
         self.write(|| self.records.save(record));
     }
 

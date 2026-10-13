@@ -1430,7 +1430,10 @@ fn disagreement(w: &World, runner: &str) -> Option<String> {
     let record = w.parts.store.load().into_iter().find(|r| r.runner == runner)?;
     let saved = record.slot?.saved();
     let github = record.github.as_ref()?;
-    let waits = matches!(saved.phase, cf_lifecycle::Phase::Starting | cf_lifecycle::Phase::Idle);
+    let waits = matches!(
+        saved.phase,
+        cf_lifecycle::Phase::Starting | cf_lifecycle::Phase::Idle
+    );
     let running_done = saved.phase == cf_lifecycle::Phase::Running && github.result.is_some();
     (waits || running_done || !saved.ran_job).then(|| format!("{saved:?} beside {github:?}"))
 }
@@ -1444,17 +1447,21 @@ async fn a_start_written_while_booting_by_a_runner_before_is_a_running_job_once_
     let runner = w.start().await;
     pass(&w.m, 1);
     let mut record = w.parts.store.load().pop().expect("a record");
-    assert_eq!(record.slot.expect("a slot").saved().phase, cf_lifecycle::Phase::Starting);
+    assert_eq!(
+        record.slot.expect("a slot").saved().phase,
+        cf_lifecycle::Phase::Starting
+    );
     record.github = Some(cf_daemon::GithubJob {
         repo: REPO.into(),
         job: "build".into(),
         ..cf_daemon::GithubJob::default()
     });
     record.start_reported = true;
+    record.rules = 0;
     cf_daemon::Store::save(w.parts.store.as_ref(), &record);
     w.restart();
     pass(&w.m, 1);
-    w.parts.vms.ready(&job_name(&runner));
+    w.parts.vms.ready(job_name(&runner));
     pass(&w.m, 2);
     assert_eq!(disagreement(&w, &runner), None);
 }
@@ -1469,7 +1476,7 @@ async fn a_completion_heard_while_booting_is_kept_until_the_machine_is_up() {
     pass(&w.m, 1);
     w.github(EventKind::Completed, &runner, "succeeded");
     assert_eq!(disagreement(&w, &runner), None, "at the completion");
-    w.parts.vms.ready(&job_name(&runner));
+    w.parts.vms.ready(job_name(&runner));
     pass(&w.m, 2);
     assert_eq!(disagreement(&w, &runner), None, "once up");
 }
@@ -1491,6 +1498,7 @@ async fn a_machine_a_runner_before_wrote_as_not_to_ask_about_is_asked_about() {
         for mut record in w.parts.store.load() {
             record.ask_github = false;
             record.end_reported = settled;
+            record.rules = 0;
             cf_daemon::Store::save(w.parts.store.as_ref(), &record);
         }
         w.restart();
