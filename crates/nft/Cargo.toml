@@ -1,0 +1,16 @@
+[package]
+name = "cf-nft"
+description = "Firewall rules for the kernel's nf_tables: the rules, what they do with a packet, and their netlink form."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

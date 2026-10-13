@@ -614,6 +614,31 @@ async fn a_machine_stopped_after_it_came_up_and_gone_without_a_trace_is_asked_ab
     );
 }
 
+/// The Runner never saw the guest up, and its job's messages went with a session. While no Runner runs, the job ends
+/// and the vm-host writes that its workload ran to its end, so the machine was up: the Runner that starts next asks
+/// GitHub, and the job its Actions runner ran is heard.
+#[tokio::test]
+async fn a_machine_whose_workload_ran_to_its_end_while_no_runner_was_there_was_up_and_is_asked_about() {
+    for end in [End::Ok, End::Failed, End::Oom] {
+        let mut w = World::new(1);
+        w.parts.vms.slow_boot(true);
+        let runner = w.start().await;
+        pass(&w.m, 2);
+        w.parts.vms.end(job_name(&runner), end);
+        w.restart();
+        // Its Actions runner removed its own registration when the job was over.
+        w.registered.remove(&runner);
+        pass(&w.m, RESULT_WAIT.as_secs() + 2);
+        w.sweep();
+        assert_eq!(
+            ids(&w.reports()),
+            [format!("{runner}/started"), format!("{runner}/completed")],
+            "{end:?}"
+        );
+        w.assert_nothing_left();
+    }
+}
+
 // --- slots -------------------------------------------------------------------------------------------------------
 
 #[tokio::test]

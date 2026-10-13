@@ -524,7 +524,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 _ => None,
             };
             // The vm-host saw the guest up although the Runner before did not hear it.
-            saved.up |= state.as_ref().is_some_and(|s| s.boot_ms.is_some());
+            saved.up |= state.as_ref().is_some_and(came_up);
             let (life, effects) = Slot::restore(self.config.limits, now.elapsed, saved, alive);
             let restored_end = (!alive).then(|| match state.as_ref().and_then(|s| s.end.as_ref()) {
                 Some(ended) => machine_end(saved.end.unwrap_or(End::Ok), Some(ended.end), false),
@@ -903,18 +903,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 }
             }
             Seen::Gone(state) => {
-                if let Some(ended) = &state.end {
-                    use cf_vmhost::End as VmEnd;
-                    let ran = matches!(ended.end, VmEnd::Ok | VmEnd::Oom | VmEnd::Failed);
+                if state.end.is_some() {
                     // The vm-host saw the guest up, though the Runner had not yet.
-                    if (ran || state.boot_ms.is_some()) && phase == Phase::Starting {
+                    if came_up(state) && phase == Phase::Starting {
                         events.push(Event::VmReady);
                     }
                     if state.oom.is_some() && !had_oom {
                         events.push(Event::OutOfMemory);
                     }
                     // The workload ran to its end, so the job is over whether GitHub's word of it came or not.
-                    if ran {
+                    if workload_ran(state) {
                         events.push(Event::JobCompleted);
                     }
                 }
@@ -1346,6 +1344,21 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     pub fn vms(&self) -> &V {
         &self.vms
     }
+}
+
+/// Whether the vm-host says the workload ran to its end: then the guest was up, whatever else it wrote.
+fn workload_ran(state: &JobState) -> bool {
+    use cf_vmhost::End as VmEnd;
+    state
+        .end
+        .as_ref()
+        .is_some_and(|ended| matches!(ended.end, VmEnd::Ok | VmEnd::Oom | VmEnd::Failed))
+}
+
+/// Whether the vm-host saw the guest up: it timed the boot, or the workload ran to its end. A look and the Runner
+/// that starts again read it the same way.
+fn came_up(state: &JobState) -> bool {
+    state.boot_ms.is_some() || workload_ran(state)
 }
 
 fn facts(record: &Record) -> MachineFacts {

@@ -1,9 +1,10 @@
 //! The supervisor's decisions against what they must do and the inputs that break them.
 
 use cf_guest_proto::{Limits, OomEvent, Process as Used, StopReason};
+use cf_nft::{IPV4, IPV6, Packet, Verdict, decide};
 use cf_supervisor::dhcp::{self, Lease, Reply};
 use cf_supervisor::environment::{find_user, workload_environment};
-use cf_supervisor::firewall::{self, BLOCKED, Packet, Verdict, decide, own_network, policy};
+use cf_supervisor::firewall::{self, BLOCKED, own_network, policy};
 use cf_supervisor::oom::{Count, Kill, Log, kills_in_events, message_of};
 use cf_supervisor::processes::{Process, Table, parse_stat};
 use cf_supervisor::tell::{JobFacts, out_of_memory_line, out_of_memory_summary, size, started, stopped};
@@ -13,7 +14,8 @@ const GATEWAY: [u8; 4] = [192, 168, 64, 1];
 
 fn out(dest: [u8; 4], protocol: u8, dest_port: u16) -> Verdict {
     let packet = Packet {
-        ipv6: false,
+        ether_type: IPV4,
+        in_interface: None,
         loopback: false,
         dest,
         protocol,
@@ -102,7 +104,8 @@ fn a_job_reaches_no_private_network() {
 fn ipv6_leaves_only_through_loopback() {
     let rules = policy(&[GATEWAY], &[]);
     let mut packet = Packet {
-        ipv6: true,
+        ether_type: IPV6,
+        in_interface: None,
         loopback: false,
         dest: [0; 4],
         protocol: 6,
@@ -117,7 +120,8 @@ fn ipv6_leaves_only_through_loopback() {
 #[test]
 fn loopback_carries_everything_even_to_the_guests_own_private_address() {
     let packet = Packet {
-        ipv6: false,
+        ether_type: IPV4,
+        in_interface: None,
         loopback: true,
         dest: [192, 168, 64, 7],
         protocol: 6,
@@ -133,7 +137,8 @@ fn loopback_carries_everything_even_to_the_guests_own_private_address() {
 fn nothing_new_comes_in_and_answers_do() {
     let rules = policy(&[GATEWAY], &[]);
     let mut packet = Packet {
-        ipv6: false,
+        ether_type: IPV4,
+        in_interface: None,
         loopback: false,
         dest: [192, 168, 64, 7],
         protocol: 6,
@@ -141,7 +146,7 @@ fn nothing_new_comes_in_and_answers_do() {
         established: false,
     };
     assert_eq!(decide(&rules.input, Verdict::Drop, &packet), Verdict::Drop);
-    packet.ipv6 = true;
+    packet.ether_type = IPV6;
     assert_eq!(decide(&rules.input, Verdict::Drop, &packet), Verdict::Drop);
     packet.established = true;
     assert_eq!(decide(&rules.input, Verdict::Drop, &packet), Verdict::Accept);
@@ -151,7 +156,8 @@ fn nothing_new_comes_in_and_answers_do() {
 fn without_a_name_server_no_private_address_is_reachable_at_all() {
     let rules = policy(&[], &[]);
     let packet = Packet {
-        ipv6: false,
+        ether_type: IPV4,
+        in_interface: None,
         loopback: false,
         dest: GATEWAY,
         protocol: 17,
@@ -171,7 +177,7 @@ proptest! {
         let (network, prefix) = BLOCKED[range];
         let host_bits = if prefix == 32 { 0 } else { host >> prefix };
         let dest = (u32::from_be_bytes(network) | host_bits).to_be_bytes();
-        let packet = Packet { ipv6: false, loopback: false, dest, protocol, dest_port: port, established: false };
+        let packet = Packet { ether_type: IPV4, in_interface: None, loopback: false, dest, protocol, dest_port: port, established: false };
         let verdict = decide(&policy(&servers, &[]).output, Verdict::Accept, &packet);
         let dns = servers.contains(&dest) && port == 53 && (protocol == 6 || protocol == 17);
         prop_assert_eq!(verdict, if dns { Verdict::Accept } else { Verdict::Drop });
@@ -202,7 +208,7 @@ fn attributes(mut bytes: &[u8], depth: usize, names: &mut Vec<String>) {
 #[test]
 fn the_netlink_form_is_one_well_formed_transaction_with_every_rule() {
     let rules = policy(&[GATEWAY], &[]);
-    let batch = firewall::netlink(&rules);
+    let batch = firewall::netlink(&rules).unwrap();
     let mut bytes = batch.bytes.as_slice();
     let (mut kinds, mut sequences, mut expression_names) = (Vec::new(), Vec::new(), Vec::new());
     while !bytes.is_empty() {
@@ -243,6 +249,26 @@ fn the_netlink_form_is_one_well_formed_transaction_with_every_rule() {
         ["ct", "bitwise", "cmp", "immediate"]
     );
     assert_eq!(rule_names[0].as_slice(), ["meta", "cmp", "immediate"]);
+}
+
+/// The guest's firewall is the same bytes it was before its encoding moved to cf-nft: `guest-firewall.hex` is
+/// what the supervisor's own encoder wrote for this policy. Netlink headers are in the host's byte order, so the
+/// file holds for little-endian hosts (the guest's and every host the tests run on).
+#[test]
+#[cfg(target_endian = "little")]
+fn the_guests_firewall_is_the_bytes_it_always_was() {
+    use cf_supervisor::firewall::beside;
+    let own = beside(
+        [192, 168, 64, 9],
+        [255, 255, 255, 0],
+        Some(GATEWAY),
+        &[([145, 97, 20, 0], 22), ([25, 3, 2, 1], 32)],
+    );
+    let batch = firewall::netlink(&policy(&[GATEWAY, [1, 1, 1, 1]], &own)).unwrap();
+    let hex: String = batch.bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let recorded: String = include_str!("guest-firewall.hex").split_whitespace().collect();
+    assert_eq!(hex, recorded);
+    assert_eq!(batch.acknowledged, 25);
 }
 
 const MAC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
@@ -942,7 +968,8 @@ fn a_job_does_not_reach_its_own_network_wherever_the_mac_put_it() {
     let rules = policy(&[gateway], &own).output;
     let to = |dest: [u8; 4], protocol: u8, dest_port: u16| {
         let packet = Packet {
-            ipv6: false,
+            ether_type: IPV4,
+            in_interface: None,
             loopback: false,
             dest,
             protocol,
@@ -970,7 +997,8 @@ fn a_job_does_not_reach_its_own_network_wherever_the_mac_put_it() {
     )
     .output;
     let packet = |dest| Packet {
-        ipv6: false,
+        ether_type: IPV4,
+        in_interface: None,
         loopback: false,
         dest,
         protocol: 6,
@@ -987,8 +1015,8 @@ fn a_job_does_not_reach_its_own_network_wherever_the_mac_put_it() {
     );
 
     // The kernel is given the same rules.
-    let with = firewall::netlink(&policy(&[gateway], &own));
-    let without = firewall::netlink(&policy(&[gateway], &[]));
+    let with = firewall::netlink(&policy(&[gateway], &own)).unwrap();
+    let without = firewall::netlink(&policy(&[gateway], &[])).unwrap();
     assert_eq!(with.acknowledged, without.acknowledged + 2);
 }
 
@@ -1011,7 +1039,8 @@ fn a_job_does_not_reach_the_networks_its_mac_is_in_whatever_their_range() {
     let rules = policy(&[gateway], &own).output;
     let to = |dest: [u8; 4], protocol: u8, dest_port: u16| {
         let packet = Packet {
-            ipv6: false,
+            ether_type: IPV4,
+            in_interface: None,
             loopback: false,
             dest,
             protocol,
@@ -1051,7 +1080,8 @@ fn a_job_does_not_reach_the_ranges_set_aside_for_inside_a_machine_or_site() {
     let rules = policy(&[], &[]).output;
     let to = |dest: [u8; 4]| {
         let packet = Packet {
-            ipv6: false,
+            ether_type: IPV4,
+            in_interface: None,
             loopback: false,
             dest,
             protocol: 6,
@@ -1099,7 +1129,8 @@ fn the_network_of_a_lease_is_its_address_under_its_mask() {
     }
     let rules = policy(&[], &[own_network([10, 1, 2, 3], [0, 0, 0, 0])]).output;
     let packet = Packet {
-        ipv6: false,
+        ether_type: IPV4,
+        in_interface: None,
         loopback: false,
         dest: [140, 82, 121, 4],
         protocol: 6,
