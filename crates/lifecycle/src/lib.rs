@@ -5,13 +5,12 @@
 //!
 //! ```text
 //! Reserved ──Assigned──▶ Starting ──VmReady──▶ Idle ──JobStarted──▶ Running ──JobCompleted──▶ Finishing
-//!    │                    │   ▲                 │                     │                          │
-//!    │ Lost, Expired      │   └── Retrying ◀────┘ 20 s without ready  │ evicted, 6 h, stop       │ 2 min
-//!    ▼                    ▼        (once)       ▼ 2 min without a job ▼                          ▼
-//! Released ◀──VmExited── Killing ◀── 10 s ── Stopping ◀───────────────┴──────────────────────────┘
-//!                                               ▲                    ▲
-//!                         Idle ──2 min, Retire──▶ Asking ──Unregistered (GitHub's 204), 6 h──┘
-//!                                                  └──JobStarted, JobCompleted──▶ Running, Finishing
+//!    │                    │   ▲                 │                     ▲  │                       │
+//!    │ Lost, Expired      │   └── Retrying      │ idle limit, Retire  │  │ evicted, 6 h, stop    │ 2 min
+//!    │                    │   20 s without      ▼                     │  │                       │
+//!    │                    │   ready (once)    Asking ──JobStarted─────┘  │                       │
+//!    ▼                    ▼                     │ GitHub's 204, 6 h      ▼                       ▼
+//! Released ◀──VmExited── Killing ◀── 10 s ── Stopping ◀─────────────────┴───────────────────────┘
 //! ```
 //!
 //! # What holds, on every path

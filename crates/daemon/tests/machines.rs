@@ -486,6 +486,43 @@ async fn an_idle_machine_that_is_retired_reports_no_job() {
     w.assert_nothing_left();
 }
 
+/// The scaler finds the same surplus at every pass until GitHub answers: the machines already asking count toward
+/// it, so one machine too many asks once, not once a pass, and only idle machines of that scale set ask.
+#[tokio::test]
+async fn a_surplus_is_retired_once_while_its_removal_waits_for_an_answer() {
+    let mut w = World::new(4);
+    let (a, b, c) = (w.start().await, w.start().await, w.start().await);
+    w.github(EventKind::Started, &c, "");
+    pass(&w.m, 2);
+    let asking = |w: &World| {
+        let mut names: Vec<String> =
+            w.m.registrations_to_remove()
+                .into_iter()
+                .map(|r| r.runner)
+                .collect();
+        names.sort();
+        names
+    };
+    let all = [a.clone(), b.clone(), c.clone()];
+    for _ in 0..3 {
+        w.m.retire(REPO, SET, 1, &all);
+    }
+    assert_eq!(
+        asking(&w),
+        std::slice::from_ref(&a),
+        "one surplus, one machine asking"
+    );
+    w.m.retire(REPO, SET + 1, 2, &all);
+    w.m.retire("org/other", SET, 2, &all);
+    assert_eq!(
+        asking(&w),
+        std::slice::from_ref(&a),
+        "another scale set's surplus is not this one's"
+    );
+    w.m.retire(REPO, SET, 3, &all);
+    assert_eq!(asking(&w), [a, b], "the running machine is never retired");
+}
+
 /// A machine retired as surplus whose registration is gone when the sweep removes it: its Actions runner took a job
 /// the Runner never heard of and removed its own registration once the job was over. The job is reported as one that
 /// finished by itself, not as one the Runner stopped.

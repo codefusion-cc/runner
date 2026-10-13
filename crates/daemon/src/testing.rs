@@ -39,6 +39,8 @@ struct VmState {
     slow_boot: bool,
     late_state: bool,
     ignore_stops: bool,
+    /// The daemon that drives them died: nothing it asks of them is done.
+    frozen: bool,
     next_pid: u32,
     held: Option<Arc<HeldLooks>>,
 }
@@ -117,6 +119,12 @@ impl FakeVms {
     /// Machines take a stop and go on.
     pub fn ignore_stops(&self, ignore: bool) {
         self.lock().ignore_stops = ignore;
+    }
+
+    /// The daemon died, and its hands with it: a start, stop, kill or cleanup it still asks for does nothing, until
+    /// the daemon that starts next thaws them.
+    pub fn freeze(&self, frozen: bool) {
+        self.lock().frozen = frozen;
     }
 
     /// Every look at a vm-host waits from now on, until the test lets them go.
@@ -284,6 +292,9 @@ fn finish(vm: &mut FakeVm, end: End) {
 impl Vms for FakeVms {
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let mut state = self.lock();
+        if state.frozen {
+            return Err(VmError("the daemon that asked is dead".into()));
+        }
         if state.fail_start > 0 {
             state.fail_start -= 1;
             return Err(VmError("the vm-host did not start".into()));
@@ -336,6 +347,9 @@ impl Vms for FakeVms {
 
     fn stop(&self, job: &str, reason: StopReason, grace: Duration) -> bool {
         let mut state = self.lock();
+        if state.frozen {
+            return false;
+        }
         state.stopped.push((job.to_string(), reason, grace));
         let ignore = state.ignore_stops;
         match state.vms.get_mut(job) {
@@ -351,6 +365,9 @@ impl Vms for FakeVms {
 
     fn kill(&self, job: &str) {
         let mut state = self.lock();
+        if state.frozen {
+            return;
+        }
         state.killed.push(job.to_string());
         if let Some(vm) = state.vms.get_mut(job)
             && !vm.unkillable
@@ -372,6 +389,9 @@ impl Vms for FakeVms {
 
     fn clean(&self, job: &str) {
         let mut state = self.lock();
+        if state.frozen {
+            return;
+        }
         state.cleaned.push(job.to_string());
         let gone = match state.vms.get_mut(job) {
             Some(vm) => {
@@ -511,6 +531,11 @@ impl CrashingStore {
     /// would have found.
     pub fn disagreements(&self) -> Vec<String> {
         self.disagreements.lock().expect("disagreements").clone()
+    }
+
+    /// Writes a record as another Runner left it: an older one's write is not this one's, and is not checked.
+    pub fn plant(&self, record: &Record) {
+        self.records.save(record);
     }
 
     /// No crash any more: the daemon that starts next writes again, and one that was set and did not come is off.

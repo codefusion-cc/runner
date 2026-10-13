@@ -9,7 +9,7 @@ use cf_budget::Size;
 use cf_daemon::testing::{FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
     Answer, Claim, EndKind, EventKind, Events, HostError, Hosts, JobEvent, JobReport, MemoryStore,
-    RESULT_WAIT, Roster, RunnerSpec, Slots, Ticket,
+    RESULT_WAIT, Roster, RunnerSpec, Slots, Store, Ticket,
 };
 use cf_fake_github::harness::TestClock;
 use cf_secret::Secret;
@@ -36,9 +36,14 @@ impl World {
 
     /// A Mac with these numbers.
     pub fn on(settings: cf_budget::Settings) -> World {
+        World::keeping(settings, Arc::new(MemoryStore::default()))
+    }
+
+    /// A Mac with these numbers whose records are kept there.
+    pub fn keeping(settings: cf_budget::Settings, store: Arc<dyn Store>) -> World {
         let parts = TestParts {
             vms: FakeVms::default(),
-            store: Arc::new(MemoryStore::default()),
+            store,
             roster: Arc::new(Roster::new()),
             clock: Arc::new(TestClock::default()),
             reports: Arc::new(ReportLog::default()),
