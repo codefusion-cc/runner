@@ -499,6 +499,28 @@ fn place_of(bytes: &[u8], pattern: &[u8]) -> usize {
 
 #[test]
 fn what_the_crate_does_not_write_is_not_read_as_its_own() {
+    // Tables `batch` would refuse to write are refused when read: a chain twice, and a rule moved to a hook where it
+    // could not do what it says (an output chain's loopback rule, its chain now on the input hook).
+    let looped = table(
+        Family::Inet,
+        Hook::Output,
+        vec![rule(&[Match::OutLoopback], Verdict::Accept)],
+    );
+    let once = batch(std::slice::from_ref(&looped), Load::Add).unwrap().bytes;
+    assert_eq!(read(&once).unwrap(), [looped]);
+    assert!(matches!(
+        read(&[once.clone(), once.clone()].concat()),
+        Err(Error::Unreadable(_))
+    ));
+    // NFTA_HOOK_HOOKNUM, 3: the output hook.
+    let output_hook = [&8u16.to_ne_bytes()[..], &1u16.to_ne_bytes(), &3u32.to_be_bytes()].concat();
+    let mut moved = once;
+    let at = moved
+        .windows(output_hook.len())
+        .position(|window| window == output_hook)
+        .unwrap();
+    moved[at + 7] = 1;
+    assert!(matches!(read(&moved), Err(Error::Unreadable(_))));
     // A dormant table holds rules its chains never run: not the firewall it looks like.
     let table_with_flags = |flags: u32| {
         let mut body = vec![1, 0, 0, 0];
