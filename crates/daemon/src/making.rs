@@ -46,13 +46,21 @@ pub struct Making {
     resting: Option<Millis>,
     /// Since when each size's polls have found no room.
     starved: [Option<Millis>; 4],
-    /// Whether each size's polls were last offered a place in line, so that the log says it once.
-    placed: [bool; 4],
+}
+
+/// What a poll of one size offers GitHub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offered {
+    /// This many machines of the size fit now.
+    Free(u32),
+    /// None fits now, but a job of the size gets a place in line ([`Making::place`]).
+    Place,
+    /// Nothing.
+    Nothing,
 }
 
 impl Making {
-    /// The size room is made for.
-    pub fn size(&self) -> Option<Size> {
+    fn size(&self) -> Option<Size> {
         self.room.map(|room| room.size)
     }
 
@@ -61,7 +69,6 @@ impl Making {
     /// back and did not hand here again, or on an empty Mac that has no room for the size anyway; and tells the
     /// budget what room is made for.
     pub fn check(&mut self, budget: &mut Budget, now: Now) {
-        budget.make_room(self.size());
         let rests = self.rests(now);
         match &mut self.room {
             Some(room) => {
@@ -84,7 +91,9 @@ impl Making {
                 let past = |since: Option<Millis>, wait: Millis| {
                     since.is_some_and(|at| now.elapsed.since(at) >= wait)
                 };
-                let end = if past(Some(room.since), MAKE_ROOM_LIMIT) {
+                let end = if budget.settings().can_run(size).is_err() {
+                    Some((false, "the settings no longer run this size"))
+                } else if now.elapsed.since(room.since) >= MAKE_ROOM_LIMIT {
                     Some((true, "room was made for half an hour and is still not there"))
                 } else if past(room.empty, NO_ROOM_WAIT) {
                     Some((
@@ -108,11 +117,18 @@ impl Making {
                     }
                 }
             }
-            None if budget.waiting() > 0 && !rests => {
+            // Room is made only beside machines of the Mac's own ([`worth`]).
+            None if budget.waiting() > 0 && budget.slots() > 0 && !rests => {
                 let status = budget.status(now);
-                let first = status.waiting.iter().find(|waiter| {
-                    !waiter.never && held_back(waiter.why) && worth(budget.settings(), &status, waiter.size)
-                });
+                // The first in line waits for what keeps it out; those behind it, for it. Only room it waits for
+                // is room to make: not a hold, a trouble or a Mac that calms down.
+                let mut line = status.waiting.iter().filter(|waiter| !waiter.never).peekable();
+                let first = match line.peek() {
+                    Some(first) if held_back(first.why) => {
+                        line.find(|waiter| worth(budget.settings(), &status, waiter.size))
+                    }
+                    _ => None,
+                };
                 if let Some(waiter) = first {
                     tracing::info!(
                         size = waiter.size.label(),
@@ -132,48 +148,43 @@ impl Making {
         budget.make_room(self.size());
     }
 
-    /// A machine of `size` got its slot: the room is made.
-    pub fn started(&mut self, size: Size) {
+    /// A machine of `size` got its slot: the room is made, and the budget lets the other sizes start again.
+    pub fn started(&mut self, budget: &mut Budget, size: Size) {
         if self.size() == Some(size) {
             tracing::info!(
                 size = size.label(),
                 "the room is made: a machine of this size starts, and the others may again"
             );
             self.room = None;
+            budget.make_room(None);
         }
     }
 
-    /// How many machines of `size` a poll offers GitHub: as many as fit, or a place in line.
-    pub fn offer(&mut self, budget: &Budget, now: Now, size: Size) -> u32 {
+    /// What a poll of `size` offers GitHub: as many machines as fit, or a place in line.
+    pub fn offer(&mut self, budget: &Budget, now: Now, size: Size) -> Offered {
         let at = size.index();
         let free = budget.free(now).of(size);
         if free > 0 {
             self.starved[at] = None;
-            self.placed[at] = false;
-            return free;
+            return Offered::Free(free);
         }
         self.starved[at].get_or_insert(now.elapsed);
-        let place = self.place(budget, now, size);
-        if place && !self.placed[at] {
-            tracing::info!(
-                size = size.label(),
-                "no machine of this size fits now, but a job of it gets a place in line: the smaller ones wait for it"
-            );
+        match budget.fits(now, size) {
+            Err(why) if self.place(budget, now, size, why) => Offered::Place,
+            _ => Offered::Nothing,
         }
-        self.placed[at] = place;
-        u32::from(place)
     }
 
-    /// Whether a poll of `size` offers a place in line although no machine of it fits now: the size room is made
-    /// for, while GitHub has taken its job back; or a size whose polls have found no room for
-    /// [`STARVED_AFTER`], for which room would be made ([`Making::check`]) once a job of it waits.
-    pub fn place(&self, budget: &Budget, now: Now, size: Size) -> bool {
+    /// Whether a poll of `size`, of which no machine fits for `why`, offers a place in line: the size room is made
+    /// for, while GitHub has taken its job back; or a size whose polls have found no room for [`STARVED_AFTER`],
+    /// for which room would be made ([`Making::check`]) once a job of it waits.
+    pub fn place(&self, budget: &Budget, now: Now, size: Size, why: Refusal) -> bool {
         if let Some(room) = self.room {
             return room.size == size && room.alone.is_some();
         }
         let starved =
             self.starved[size.index()].is_some_and(|since| now.elapsed.since(since) >= STARVED_AFTER);
-        if !starved || self.rests(now) || !held_back(budget.fits(now, size).err()) {
+        if !starved || self.rests(now) || !held_back(Some(why)) || budget.slots() == 0 {
             return false;
         }
         // A job of the size that waits has room made for it already ([`Making::check`]), unless it is one to make

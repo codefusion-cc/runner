@@ -3,22 +3,8 @@
 
 mod common;
 
-use cf_budget::{Assigned, Budget, GIB, Grant, Refusal, Size, SlotId};
+use cf_budget::{Budget, GIB, Grant, Refusal, Size};
 use common::*;
-
-fn waits(assigned: Assigned) -> (SlotId, Refusal) {
-    match assigned {
-        Assigned::Waits { slot, why } => (slot, why),
-        other => panic!("expected a job that waits, got {other:?}"),
-    }
-}
-
-fn starts(assigned: Assigned) -> Grant {
-    match assigned {
-        Assigned::Start(grant) => grant,
-        other => panic!("expected a job that starts, got {other:?}"),
-    }
-}
 
 /// The sizes of the jobs that start at `second`, with `available` bytes on the Mac. Readings come once a second from
 /// second 60 on: a gap would make the budget calm down first.
@@ -100,4 +86,24 @@ fn a_smaller_job_that_would_fit_is_held_back_until_the_larger_one_fits() {
     let (mut budget, first) = two_running_then_a_small_and_a_large_job_wait(false);
     budget.release(first.slot).expect("released");
     assert_eq!(started_with(&mut budget, 64, 10 * GIB), [Size::G2]);
+}
+
+#[test]
+fn a_slot_of_the_size_room_is_made_for_waits_only_for_the_jobs_of_its_size() {
+    let mut budget = open(dedicated());
+    budget.make_room(Some(Size::G6));
+    let (_, why) = waits(budget.assign(secs(61), Size::G2));
+    assert_eq!(why, Refusal::MakingRoom { size: Size::G6 });
+    // The cf-2g job waits for the cf-6g size: it goes before nothing of that size.
+    assert_eq!(budget.fits(secs(61), Size::G6), Ok(()));
+    assert_eq!(
+        budget.free(secs(61)).of(Size::G6),
+        open(dedicated()).free(secs(61)).of(Size::G6)
+    );
+    assert_eq!(
+        budget.fits(secs(61), Size::G4),
+        Err(Refusal::MakingRoom { size: Size::G6 })
+    );
+    assert_eq!(starts(budget.assign(secs(61), Size::G6)).size, Size::G6);
+    assert_eq!(budget.waiting(), 1);
 }

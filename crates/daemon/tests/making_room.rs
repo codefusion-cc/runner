@@ -6,25 +6,22 @@
 
 mod support;
 
-use cf_budget::{GIB, MIB, Size};
+use cf_budget::{GIB, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
 use cf_daemon::{Claim, EventKind, Slots, Ticket};
 use cf_vmhost::End;
 use support::Log;
-use support::world::{World, mini};
+use support::world::{MINI_HELD, MINI_PEAK, World, mini, mini_with_one};
 
-const HELD: u64 = 4109 * MIB;
+const HELD: u64 = MINI_HELD;
 const AVAILABLE: u64 = 5 * GIB;
 
 /// The mini with a cf-4g machine running.
 async fn mini_with_a_cf4g() -> (World, String) {
-    let mut w = World::on(mini());
-    let runner = w.running_sized(Size::G4).await;
-    w.parts.vms.usage(job_name(&runner), 1577 * MIB, 0);
-    w.parts.vms.resident(job_name(&runner), Some(HELD));
+    let (w, runner) = mini_with_one(MINI_PEAK, Some(HELD)).await;
     w.m.with_host(|host| host.set(|r| r.available_bytes = AVAILABLE));
-    pass(&w.m, 2);
+    pass(&w.m, 1);
     (w, runner)
 }
 
@@ -41,10 +38,6 @@ fn waits(claim: Claim) -> (Ticket, String) {
         Claim::Waits { ticket, why } => (ticket, why),
         other => panic!("expected a job that waits, got {other:?}"),
     }
-}
-
-fn nudges(w: &World) -> usize {
-    w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A scale set of this size polls once a second for this many seconds: what it offered GitHub at each.
@@ -140,12 +133,12 @@ async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_
 async fn a_place_in_line_rings_the_bells_once_and_not_at_every_look() {
     let (w, _) = mini_with_a_cf4g().await;
     polls(&w, Size::G6, 599);
-    let before = nudges(&w);
+    let before = w.nudges();
     pass(&w.m, 10);
-    assert_eq!(nudges(&w), before + 1, "the polls that offer none are told once");
+    assert_eq!(w.nudges(), before + 1, "the polls that offer none are told once");
     assert_eq!(w.m.open_slots(Size::G6), 1);
     polls(&w, Size::G6, 120);
-    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(w.nudges(), before + 1);
 }
 
 #[tokio::test]
@@ -199,9 +192,16 @@ async fn room_is_made_for_half_an_hour_at_most_and_then_for_none_for_as_long() {
         w.m.withdraw(cf6g);
         pass(&w.m, 1);
         assert_eq!(w.m.open_slots(Size::G6), 1);
+        let rung = w.nudges();
         cf6g = waits(w.m.claim(Size::G6, None)).0;
+        pass(&w.m, 1);
+        assert_eq!(
+            w.nudges(),
+            rung + 1,
+            "the polls that offer its place hear that it is taken"
+        );
     }
-    pass(&w.m, 30 * 60 - 5 * 301 - 1);
+    pass(&w.m, 30 * 60 - 5 * 302 - 1);
     assert_eq!(w.m.snapshot().room(Size::G2).why, Some("making-room"));
     pass(&w.m, 1);
     assert_eq!(
@@ -287,4 +287,61 @@ async fn a_job_handed_here_again_once_the_room_is_there_ends_the_making_at_once(
             "promised: {promised}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_job_behind_one_a_hold_keeps_out_has_no_room_made_for_it() {
+    let log = Log::start();
+    let (w, _) = mini_with_a_cf4g().await;
+    w.m.pause(true);
+    let (_, why) = waits(w.m.claim(Size::G2, None));
+    assert_eq!(why, "paused");
+    // The cf-6g job waits behind the cf-2g one, which waits for the pause, not for room.
+    let (_, why) = waits(w.m.claim(Size::G6, None));
+    assert_eq!(why, "assigned-first");
+    pass(&w.m, 2);
+    assert_eq!(log.lines("smaller ones keep taking"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn room_made_for_a_size_the_settings_then_rule_out_is_given_up_at_once() {
+    let log = Log::start();
+    let (w, _) = mini_with_a_cf4g().await;
+    let _ = waits(w.m.claim(Size::G6, None));
+    pass(&w.m, 1);
+    assert_eq!(w.m.snapshot().room(Size::G2).why, Some("making-room"));
+    let mut settings = mini();
+    settings.away.cap_bytes = 5 * GIB;
+    settings.in_use.cap_bytes = settings.in_use.cap_bytes.min(5 * GIB);
+    w.m.set_settings(settings).expect("settings");
+    pass(&w.m, 1);
+    assert_ne!(w.m.snapshot().room(Size::G2).why, Some("making-room"));
+    assert_eq!(
+        w.m.open_slots(Size::G6),
+        0,
+        "no place for a size the Mac never runs"
+    );
+    assert_eq!(
+        log.lines("no more room is made"),
+        [
+            "no more room is made for this size: the others start again size=\"cf-6g\" why=\"the settings no longer run this size\""
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_size_room_is_made_for_is_promised_the_room_before_the_jobs_held_back_for_it() {
+    let (w, cf4g) = mini_with_a_cf4g().await;
+    let (cf6g, _) = waits(w.m.claim(Size::G6, None));
+    pass(&w.m, 1);
+    let (cf2g, why) = waits(w.m.claim(Size::G2, None));
+    assert_eq!(why, "making-room");
+    pass(&w.m, 60);
+    w.m.withdraw(cf6g);
+    ends(&w, &cf4g);
+    // GitHub offers the cf-6g job again: its scale set takes it, ahead of the cf-2g job that waits for it.
+    assert_eq!(w.m.open_slots(Size::G6), 1);
+    assert!(w.m.reserve(Size::G6).is_ok());
+    assert!(!w.m.ready(cf2g));
+    assert_ne!(w.m.snapshot().room(Size::G2).why, Some("making-room"));
 }

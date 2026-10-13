@@ -441,8 +441,9 @@ impl Budget {
     }
 
     /// Makes room for one machine of `size`, or stops making it with `None`: no slot of another size is granted,
-    /// an assigned job of another size waits, and the jobs of `size` that wait go first in line. A Mac that keeps
-    /// running jobs of smaller sizes would otherwise never have the room a larger one needs.
+    /// an assigned job of another size waits, and the jobs of `size` that wait go first in line: a slot of `size`
+    /// waits only for them. A Mac that keeps running jobs of smaller sizes would otherwise never have the room a
+    /// larger one needs.
     pub fn make_room(&mut self, size: Option<Size>) {
         self.making_room = size;
     }
@@ -529,7 +530,8 @@ impl Budget {
     /// calm time, heat, battery, disk, a missing reading, and every hold. Those it waits for.
     ///
     /// Jobs that wait start in the order of [`Budget::line`], and while one waits no other slot is granted
-    /// ([`Refusal::AssignedFirst`], and [`Budget::free`] is zero, so the Runner offers GitHub nothing).
+    /// ([`Refusal::AssignedFirst`], and [`Budget::free`] is zero, so the Runner offers GitHub nothing), but one of
+    /// the size room is made for ([`Budget::make_room`]), which goes before the jobs of other sizes.
     pub fn assign(&mut self, now: Now, size: Size) -> Assigned {
         self.assign_in_turn(now, size, Turn::default())
     }
@@ -540,10 +542,7 @@ impl Budget {
             return Assigned::Never(never);
         }
         let slot = self.next_id();
-        let fits = self.made_for(size).and_then(|()| match self.assigned_first() {
-            Some(first) => Err(first),
-            None => self.assigned_fits(now, size),
-        });
+        let fits = self.in_turn(size).and_then(|()| self.assigned_fits(now, size));
         match fits {
             Ok(()) => {
                 self.started(&turn);
@@ -633,11 +632,7 @@ impl Budget {
     /// time it is read: only [`Budget::claim`] decides.
     pub fn fits(&self, now: Now, size: Size) -> Result<(), Refusal> {
         let reading = self.takes_jobs(now)?;
-        // Room made for another size is why, more than the jobs in line: none of them gets it either.
-        self.made_for(size)?;
-        if let Some(first) = self.assigned_first() {
-            return Err(first);
-        }
+        self.in_turn(size)?;
         self.admits(reading, profile_for(&self.settings, Some(reading)), size)
     }
 
@@ -720,20 +715,19 @@ impl Budget {
         if self.emergency(now).is_some() {
             return Level::Evict;
         }
-        self.gate(now)
-            .map_or_else(|refusal| refusal.level(), |_| Level::Open)
+        self.closed_by(now).map_or(Level::Open, |refusal| refusal.level())
     }
 
     /// How many more slots of each size would fit now, each size counted alone. This is what the Runner tells
     /// GitHub it has; a slot still needs [`Budget::claim`].
     pub fn free(&self, now: Now) -> Free {
-        let Ok(reading) = self.gate(now) else {
+        let Ok(reading) = self.takes_jobs(now) else {
             return Free::default();
         };
         let limits = profile_for(&self.settings, Some(reading));
         let held = self.charges();
         Free(Size::ALL.map(|size| {
-            if self.made_for(size).is_err() {
+            if self.in_turn(size).is_err() {
                 return 0;
             }
             let mut charges = held.clone();
@@ -760,7 +754,7 @@ impl Budget {
         let reading = self.watch.fresh(&self.settings, now).copied();
         Status {
             level: self.level(now),
-            closed_by: self.gate(now).err(),
+            closed_by: self.closed_by(now),
             limits: *profile_for(&self.settings, reading.as_ref()),
             committed_bytes: self.committed_bytes(),
             resident_bytes: self.slots.values().fold(0, |sum, slot| {
@@ -783,13 +777,9 @@ impl Budget {
         }
     }
 
-    /// Everything that must hold before the arithmetic is even tried. `Ok` carries the reading to decide with.
-    fn gate(&self, now: Now) -> Result<&HostReading, Refusal> {
-        let reading = self.takes_jobs(now)?;
-        match self.assigned_first() {
-            Some(first) => Err(first),
-            None => Ok(reading),
-        }
+    /// Why the Mac takes no job of any size now: it does not take jobs, or jobs in line go first.
+    fn closed_by(&self, now: Now) -> Option<Refusal> {
+        self.takes_jobs(now).err().or_else(|| self.assigned_first(None))
     }
 
     /// [`Budget::health`], and a person at a Mac that takes no new job while they are.
@@ -843,6 +833,13 @@ impl Budget {
         )
     }
 
+    /// Whether a slot of `size` may go before what waits: room made for another size is why it may not, more than
+    /// the jobs in line, since none of them gets a slot either.
+    fn in_turn(&self, size: Size) -> Result<(), Refusal> {
+        self.made_for(size)?;
+        self.assigned_first(Some(size)).map_or(Ok(()), Err)
+    }
+
     /// Whether a slot of `size` may be granted while room is made ([`Budget::make_room`]).
     fn made_for(&self, size: Size) -> Result<(), Refusal> {
         match self.making_room {
@@ -851,12 +848,15 @@ impl Budget {
         }
     }
 
-    /// What whoever comes after the waiting jobs is told: how many of them go first. A job the settings have
-    /// since made impossible goes before nobody, so it does not count.
-    fn assigned_first(&self) -> Option<Refusal> {
+    /// What whoever comes after the waiting jobs is told: how many of them go first, before a slot of `size`, or
+    /// of any size. A job the settings have since made impossible goes before nobody, so it does not count; nor
+    /// does one of another size when room is made for `size` ([`Budget::make_room`]): that size is first in line.
+    fn assigned_first(&self, size: Option<Size>) -> Option<Refusal> {
+        let made = size.filter(|&size| self.making_room == Some(size));
         let waiting = self
             .waiting
             .iter()
+            .filter(|waiter| made.is_none_or(|made| waiter.size == made))
             .filter(|waiter| self.settings.can_run(waiter.size).is_ok())
             .count();
         (waiting > 0).then_some(Refusal::AssignedFirst { waiting })
