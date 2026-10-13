@@ -1,0 +1,14 @@
+# The rules nft 1.0.6 sent as netdev.hex. See tests/nft.rs for how it was recorded.
+flush ruleset
+table netdev codefusion {
+  chain ingress {
+    type filter hook ingress device "lo" priority 0; policy drop;
+    meta protocol arp accept
+    meta protocol ip6 drop
+    ip daddr 172.16.0.0/12 drop
+    ip daddr 192.0.2.1 udp dport 53 accept
+    meta l4proto udp udp dport 67 accept
+    iifname "lo" meta l4proto tcp tcp dport 443 accept
+    meta protocol ip accept
+  }
+}

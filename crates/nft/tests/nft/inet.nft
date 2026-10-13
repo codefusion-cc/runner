@@ -1,0 +1,21 @@
+# The rules nft 1.0.6 sent as inet.hex. See tests/nft.rs for how it was recorded.
+flush ruleset
+table inet codefusion {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta oif lo accept
+    meta nfproto ipv6 drop
+    ip daddr 192.168.64.1 meta l4proto udp udp dport 53 accept
+    ip daddr 192.168.64.1 meta l4proto tcp tcp dport 53 accept
+    ip daddr 172.16.0.0/12 drop
+    ip daddr 100.64.0.0/10 drop
+    ip daddr 192.168.64.1 drop
+    meta protocol arp drop
+  }
+  chain input {
+    type filter hook input priority 0; policy drop;
+    meta iif lo accept
+    ct state established,related accept
+    iifname "eth0" accept
+  }
+}
