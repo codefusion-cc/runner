@@ -236,6 +236,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-host-linux"
+version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "libc",
+ "proptest",
+ "tempfile",
+]
+
+[[package]]
 name = "cf-host-macos"
 version = "0.1.0"
 dependencies = [

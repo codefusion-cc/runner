@@ -1,0 +1,18 @@
+[package]
+name = "cf-host-linux"
+description = "What the Runner reads from Linux: memory, swap, pressure, heat, power, free disk, the fast cores, and what the console's page shows. Behind the budget's Host trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cf-budget = { path = "../budget" }
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
