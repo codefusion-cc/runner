@@ -113,6 +113,16 @@ impl Layout {
         self.0.join("logs")
     }
 
+    /// `machines/`: on Linux, the monitor's own folder of each running machine (its vsock socket, its events).
+    pub fn machines(&self) -> PathBuf {
+        self.0.join("machines")
+    }
+
+    /// `programs/`: on Linux, cloud-hypervisor and pasta as the Runner carries them, unpacked.
+    pub fn programs(&self) -> PathBuf {
+        self.0.join("programs")
+    }
+
     /// `scratch/`: one formatted, empty disk an image and size, which every job's disk is a copy of.
     pub fn scratch_templates(&self) -> PathBuf {
         self.0.join("scratch")

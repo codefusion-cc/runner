@@ -14,6 +14,9 @@
 //!   a machine that writes more is stopped. It is made new for each job, so a job of a name used before starts
 //!   with an empty log.
 //!
+//! - On Linux, `machines/` holds the monitor's own folder of each running machine, and `programs/` the monitor and
+//!   pasta the Runner carries, unpacked by `cf-vmm-ch`.
+//!
 //! Each of these files and the socket is this user's alone (0600), whatever the mask of the process is.
 //!
 //! The state folder, `images/` and each image in it must be this user's and writable by nobody else, or no job

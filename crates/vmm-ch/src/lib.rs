@@ -22,6 +22,9 @@ pub mod ending;
 pub mod events;
 pub mod firewall;
 pub mod link;
+/// The pinned versions of the programs a machine runs.
+pub mod pins;
+pub mod programs;
 pub mod sandbox;
 pub mod vsock;
 

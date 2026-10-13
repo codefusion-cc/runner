@@ -364,6 +364,8 @@ dependencies = [
  "libc",
  "proptest",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -412,6 +414,7 @@ dependencies = [
  "cf-secret",
  "cf-vmhost",
  "cf-vmm",
+ "cf-vmm-ch",
  "cf-vmm-vz",
  "ed25519-dalek",
  "libc",
