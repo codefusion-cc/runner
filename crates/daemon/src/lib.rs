@@ -13,6 +13,7 @@ mod log;
 #[cfg(target_os = "macos")]
 mod mac;
 mod machines;
+mod making;
 pub mod names;
 mod records;
 mod roster;
@@ -31,7 +32,7 @@ pub use log::{Lines, ROLL_AT};
 pub use mac::{MacMachines, MacService, MacSetup, mac_service, records_dir};
 pub use machines::{
     Answer, JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT,
-    Registration, Reports, Snapshot,
+    Registration, Reports, SizeRoom, Snapshot,
 };
 pub use records::{
     Disagrees, DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade,

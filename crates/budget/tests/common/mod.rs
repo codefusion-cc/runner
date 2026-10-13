@@ -1,7 +1,10 @@
 //! Two Macs to test with, and readings of a Mac where nothing is wrong.
 #![allow(dead_code)]
 
-use cf_budget::{Budget, GIB, Grant, HostFacts, HostReading, Millis, Mode, Now, Pressure, Settings, Thermal};
+use cf_budget::{
+    Assigned, Budget, GIB, Grant, HostFacts, HostReading, Millis, Mode, Now, Pressure, Refusal, Settings,
+    SlotId, Thermal,
+};
 
 /// A 16 GB Mac with 10 cores that nobody works on.
 pub const DEDICATED: HostFacts = HostFacts {
@@ -77,4 +80,20 @@ pub fn open(settings: Settings) -> Budget {
     let mut budget = Budget::new(settings).unwrap();
     watch(&mut budget, 0, 60, |_| {});
     budget
+}
+
+/// The slot of an assigned job that waits, and why.
+pub fn waits(assigned: Assigned) -> (SlotId, Refusal) {
+    match assigned {
+        Assigned::Waits { slot, why } => (slot, why),
+        other => panic!("expected a job that waits, got {other:?}"),
+    }
+}
+
+/// The grant of an assigned job that starts.
+pub fn starts(assigned: Assigned) -> Grant {
+    match assigned {
+        Assigned::Start(grant) => grant,
+        other => panic!("expected a job that starts, got {other:?}"),
+    }
 }

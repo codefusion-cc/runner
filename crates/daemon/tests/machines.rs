@@ -10,7 +10,9 @@ use std::time::Duration;
 use cf_budget::{GIB, MIB, Millis, Pressure, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{Answer, Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, Slots, Ticket};
+use cf_daemon::{
+    Answer, Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, SizeRoom, Slots, Ticket,
+};
 use cf_guest_proto::StopReason;
 use cf_vmhost::{End, OutOfMemory};
 use support::Log;
@@ -688,15 +690,12 @@ async fn two_jobs_that_want_the_last_slot_get_it_one_after_the_other_in_the_orde
         // A machine may not be started on a place in line whose turn has not come.
         let early = w.start_on(waits[turn]).await;
         assert!(early.is_err(), "started without a grant");
-        let nudges = w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed);
+        let nudges = w.nudges();
         w.parts.vms.end(job_name(&runner), End::Ok);
         pass(&w.m, 3);
         let ready: Vec<Ticket> = waits.iter().copied().filter(|t| w.m.ready(*t)).collect();
         assert_eq!(ready, [waits[turn]], "the one that waited longest, and only it");
-        assert!(
-            w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed) > nudges,
-            "the scalers are told"
-        );
+        assert!(w.nudges() > nudges, "the scalers are told");
         runner = w.start_on(waits[turn]).await.expect("its turn");
         assert_eq!(w.parts.vms.standing(), [job_name(&runner).to_string()]);
     }
@@ -1079,24 +1078,15 @@ async fn a_stop_in_the_moment_the_mac_wakes_is_not_put_off_by_the_time_it_slept(
 #[test]
 fn a_pause_and_a_drain_tell_the_polls_in_flight_once() {
     let w = World::new(2);
-    let before = w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed);
+    let before = w.nudges();
     w.m.pause(true);
     w.m.pause(true);
-    assert_eq!(
-        w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
-        before + 1
-    );
+    assert_eq!(w.nudges(), before + 1);
     w.m.pause(false);
-    assert_eq!(
-        w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
-        before + 2
-    );
+    assert_eq!(w.nudges(), before + 2);
     w.m.drain();
     w.m.drain();
-    assert_eq!(
-        w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed),
-        before + 3
-    );
+    assert_eq!(w.nudges(), before + 3);
 }
 
 #[tokio::test]
@@ -1270,10 +1260,6 @@ async fn a_vm_host_that_hangs_before_it_wrote_anything_is_ended_by_the_runner_th
 
 // --- the room the polls in flight offer ----------------------------------------------------------------------------
 
-fn nudges(w: &World) -> usize {
-    w.parts.nudges.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The memory the Mac's other programs leave: enough to stay open, too little for one machine of the test's size.
 fn memory_for_no_machine(w: &World) -> u64 {
     w.parts.settings.away.floor_bytes + GIB
@@ -1285,40 +1271,40 @@ fn the_last_slot_one_scale_set_takes_ends_the_polls_that_still_offer_it() {
     // to several, and all but one waited in line for memory while the other Mac had room.
     let w = World::new(2);
     assert_eq!(w.m.open_slots(SIZE), 2, "a listener begins its poll with room");
-    let before = nudges(&w);
+    let before = w.nudges();
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before,
         "a slot is left: every poll's offer still holds"
     );
     assert_eq!(w.m.open_slots(SIZE), 1);
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
-    assert_eq!(nudges(&w), before + 1, "the last slot went: the polls are told");
+    assert_eq!(w.nudges(), before + 1, "the last slot went: the polls are told");
     assert_eq!(w.m.open_slots(SIZE), 0);
     // A job GitHub assigned all the same waits in line, and nobody is told twice of room that was gone already.
     assert!(matches!(w.m.claim(SIZE, None), Claim::Waits { .. }));
-    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(w.nudges(), before + 1);
 }
 
 #[test]
 fn a_promise_for_the_last_slot_ends_the_polls_that_still_offer_it() {
     let w = World::new(1);
     assert_eq!(w.m.open_slots(SIZE), 1);
-    let before = nudges(&w);
+    let before = w.nudges();
     let ticket = w.m.reserve(SIZE).expect("a slot");
-    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(w.nudges(), before + 1);
     // The promise is made a machine's: nothing more went.
     assert!(matches!(w.m.claim(SIZE, Some(ticket)), Claim::Start(_)));
-    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(w.nudges(), before + 1);
 }
 
 #[test]
 fn a_slot_no_poll_was_told_of_ends_no_poll() {
     let w = World::new(1);
-    let before = nudges(&w);
+    let before = w.nudges();
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
-    assert_eq!(nudges(&w), before);
+    assert_eq!(w.nudges(), before);
 }
 
 #[test]
@@ -1328,32 +1314,32 @@ fn room_that_went_or_came_back_with_the_macs_memory_is_told_at_the_next_look_and
     let short = memory_for_no_machine(&w);
     let set = |bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
     assert_eq!(w.m.open_slots(SIZE), 2);
-    let before = nudges(&w);
+    let before = w.nudges();
     pass(&w.m, 3);
-    assert_eq!(nudges(&w), before, "nothing changed: no poll is ended");
+    assert_eq!(w.nudges(), before, "nothing changed: no poll is ended");
 
     set(short);
     pass(&w.m, 1);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 1,
         "room went: told at the first look that sees it"
     );
     assert_eq!(w.m.open_slots(SIZE), 0);
     pass(&w.m, 10);
-    assert_eq!(nudges(&w), before + 1, "and once");
+    assert_eq!(w.nudges(), before + 1, "and once");
 
     // The polls now offer nothing: room that comes back must end them too, or the Mac idles for the rest of a poll.
     set(64 * GIB);
     pass(&w.m, 1);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 2,
         "room came back: told at the first look that sees it"
     );
     pass(&w.m, 10);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 2,
         "and once, also while no listener has asked again"
     );
@@ -1366,17 +1352,17 @@ fn room_that_went_or_came_back_with_the_macs_memory_is_told_at_the_next_look_and
     );
     set(short);
     pass(&w.m, 1);
-    assert_eq!(nudges(&w), before + 3);
+    assert_eq!(w.nudges(), before + 3);
     assert_eq!(w.m.open_slots(SIZE), 0);
     set(64 * GIB);
     pass(&w.m, 4);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 3,
         "within five seconds of the last time: not yet"
     );
     pass(&w.m, 1);
-    assert_eq!(nudges(&w), before + 4, "and then");
+    assert_eq!(w.nudges(), before + 4, "and then");
 
     // Room that went and came back within the wait is what the listeners heard: nothing is owed for it.
     assert_eq!(w.m.open_slots(SIZE), 2);
@@ -1384,27 +1370,27 @@ fn room_that_went_or_came_back_with_the_macs_memory_is_told_at_the_next_look_and
     pass(&w.m, 2);
     set(64 * GIB);
     pass(&w.m, 10);
-    assert_eq!(nudges(&w), before + 4);
+    assert_eq!(w.nudges(), before + 4);
 }
 
 #[test]
 fn a_size_no_listener_asked_about_and_a_pause_the_listeners_heard_of_ring_no_bell_at_a_look() {
     let w = World::new(2);
-    let before = nudges(&w);
+    let before = w.nudges();
     w.m.with_host(|host| host.set(|r| r.available_bytes = w.parts.settings.away.floor_bytes + GIB));
     pass(&w.m, 10);
-    assert_eq!(nudges(&w), before, "no poll offers anything");
+    assert_eq!(w.nudges(), before, "no poll offers anything");
 
     let w = World::new(2);
     assert_eq!(w.m.open_slots(SIZE), 2);
-    let before = nudges(&w);
+    let before = w.nudges();
     w.m.pause(true);
-    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(w.nudges(), before + 1);
     // The listeners ask again at once and hear that nothing fits.
     assert_eq!(w.m.open_slots(SIZE), 0);
     pass(&w.m, 10);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 1,
         "the pause told them: a look does not tell them again"
     );
@@ -1419,7 +1405,7 @@ fn an_open_mac_with_no_room_for_a_size_says_so_once_and_when_one_fits_again() {
     let set = |bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
     set(memory_for_no_machine(&w));
     pass(&w.m, 1);
-    assert_eq!(w.m.short_of(SIZE), Some("memory"));
+    assert_eq!(w.m.snapshot().short_of(SIZE), Some("memory"));
     for _ in 0..3 {
         assert_eq!(w.m.open_slots(SIZE), 0);
         pass(&w.m, 30);
@@ -1430,7 +1416,7 @@ fn an_open_mac_with_no_room_for_a_size_says_so_once_and_when_one_fits_again() {
 
     set(64 * GIB);
     pass(&w.m, 1);
-    assert_eq!(w.m.short_of(SIZE), None);
+    assert_eq!(w.m.snapshot().short_of(SIZE), None);
     assert_eq!(w.m.open_slots(SIZE), 2);
     assert_eq!(w.m.open_slots(SIZE), 2);
     assert_eq!(
@@ -1445,12 +1431,16 @@ fn a_mac_its_own_machines_fill_and_a_closed_mac_are_not_said_to_be_short_of_memo
     let log = Log::start();
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.short_of(SIZE), None, "full of its own machines");
+    assert_eq!(w.m.snapshot().short_of(SIZE), None, "full of its own machines");
     w.m.pause(true);
     w.m.with_host(|host| host.set(|r| r.available_bytes = w.parts.settings.away.floor_bytes + GIB));
     pass(&w.m, 1);
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.short_of(SIZE), None, "closed: the Mac says why itself");
+    assert_eq!(
+        w.m.snapshot().short_of(SIZE),
+        None,
+        "closed: the Mac says why itself"
+    );
     assert_eq!(log.lines("of this size"), Vec::<String>::new());
 }
 
@@ -1462,10 +1452,10 @@ fn room_one_listener_heard_is_gone_is_still_told_to_those_whose_polls_offer_it()
     let short = memory_for_no_machine(&w);
     let set = |bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
     assert_eq!(w.m.open_slots(SIZE), 2);
-    let before = nudges(&w);
+    let before = w.nudges();
     set(short);
     pass(&w.m, 1);
-    assert_eq!(nudges(&w), before + 1);
+    assert_eq!(w.nudges(), before + 1);
     assert_eq!(
         w.m.open_slots(SIZE),
         0,
@@ -1476,14 +1466,14 @@ fn room_one_listener_heard_is_gone_is_still_told_to_those_whose_polls_offer_it()
     set(64 * GIB);
     pass(&w.m, 1);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 1,
         "within five seconds of the last time: not yet"
     );
     assert_eq!(w.m.open_slots(SIZE), 2);
     pass(&w.m, 4);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 2,
         "the others still offer nothing while there is room: they are told"
     );
@@ -1498,7 +1488,7 @@ fn room_one_listener_heard_is_gone_is_still_told_to_those_whose_polls_offer_it()
     set(short);
     pass(&w.m, 1);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 2,
         "within five seconds of the last time: not yet"
     );
@@ -1509,13 +1499,13 @@ fn room_one_listener_heard_is_gone_is_still_told_to_those_whose_polls_offer_it()
     );
     pass(&w.m, 4);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 3,
         "the others still offer the slot: they are told"
     );
     assert_eq!(w.m.open_slots(SIZE), 0);
     pass(&w.m, 10);
-    assert_eq!(nudges(&w), before + 3, "and once");
+    assert_eq!(w.nudges(), before + 3, "and once");
 }
 
 #[test]
@@ -1526,13 +1516,13 @@ fn a_bell_rung_for_another_reason_leaves_nothing_owed_to_the_listeners() {
     assert_eq!(w.m.open_slots(SIZE), 1);
     let ticket = w.m.reserve(SIZE).expect("a slot");
     assert_eq!(w.m.open_slots(SIZE), 0);
-    let before = nudges(&w);
+    let before = w.nudges();
     w.m.release(ticket);
-    assert_eq!(nudges(&w), before + 1, "the slot is back: the listeners are told");
+    assert_eq!(w.nudges(), before + 1, "the slot is back: the listeners are told");
     assert_eq!(w.m.open_slots(SIZE), 1);
     pass(&w.m, 10);
     assert_eq!(
-        nudges(&w),
+        w.nudges(),
         before + 1,
         "they heard of it: no look tells them again"
     );
@@ -1552,9 +1542,9 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     set(&w, floor + machine + GIB);
     pass(&w.m, 1);
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.room(SIZE), 0);
+    assert_eq!(room_of(&w, SIZE).free, Some(0));
     assert_eq!(
-        w.m.short_of(SIZE),
+        w.m.snapshot().short_of(SIZE),
         None,
         "without its own machine a second would fit"
     );
@@ -1565,7 +1555,7 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     pass(&w.m, 2);
     assert_eq!(w.m.open_slots(SIZE), 0);
     assert_eq!(
-        w.m.short_of(SIZE),
+        w.m.snapshot().short_of(SIZE),
         None,
         "what its own machine holds is not what else runs on the Mac"
     );
@@ -1575,8 +1565,115 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     set(&w, floor + 256 * MIB);
     pass(&w.m, 1);
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.short_of(SIZE), Some("memory"));
+    assert_eq!(w.m.snapshot().short_of(SIZE), Some("memory"));
     assert_eq!(log.lines("of this size").len(), 1);
+}
+
+// --- what each size meets, for the console ----------------------------------------------------------------------------
+
+/// What a size meets without memory figures: how many fit, `None` for never, and why.
+fn said(size: Size, free: Option<u32>, why: Option<&'static str>) -> SizeRoom {
+    SizeRoom {
+        size,
+        free,
+        why,
+        need_bytes: None,
+        short_bytes: None,
+    }
+}
+
+fn room_of(w: &World, size: Size) -> SizeRoom {
+    *w.m.snapshot().room(size)
+}
+
+#[test]
+fn every_size_is_said_once_with_how_many_fit_and_sizes_over_the_cap_are_never_run() {
+    // An 8 GiB Mac given to CI: a cap of 5 GiB, so never a cf-6g or cf-8g machine, whatever it has available.
+    let w = World::on(cf_budget::Settings::for_host(
+        cf_budget::HostFacts {
+            total_bytes: 8 * GIB,
+            cores: 8,
+        },
+        cf_budget::Mode::Dedicated,
+    ));
+    w.m.with_host(|host| host.set(|r| r.available_bytes = 8 * GIB));
+    pass(&w.m, 2);
+    let never = |size| said(size, None, Some("never"));
+    assert_eq!(
+        w.m.snapshot().rooms,
+        [
+            said(Size::G2, Some(2), None),
+            said(Size::G4, Some(1), None),
+            never(Size::G6),
+            never(Size::G8)
+        ]
+    );
+    // A pause closes the sizes it runs, and a size it never runs stays never.
+    w.m.pause(true);
+    assert_eq!(
+        w.m.snapshot().rooms,
+        [
+            said(Size::G2, Some(0), Some("paused")),
+            said(Size::G4, Some(0), Some("paused")),
+            never(Size::G6),
+            never(Size::G8)
+        ]
+    );
+}
+
+#[test]
+fn a_size_its_other_programs_leave_no_memory_for_says_how_much_it_needs_and_lacks() {
+    let w = World::new(2);
+    let settings = &w.parts.settings;
+    let available = memory_for_no_machine(&w);
+    w.m.with_host(|host| host.set(|r| r.available_bytes = available));
+    pass(&w.m, 1);
+    let room = room_of(&w, SIZE);
+    // One machine of its size and the floor, where it has the floor and a gigabyte.
+    let need = settings.host_bytes(SIZE) + settings.away.floor_bytes;
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (Some(0), Some("memory"), Some(need), Some(need - available))
+    );
+}
+
+#[test]
+fn a_mac_its_own_machines_fill_says_full_for_the_size() {
+    let w = World::new(1);
+    assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
+    let room = room_of(&w, SIZE);
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (Some(0), Some("full"), None, None)
+    );
+}
+
+#[tokio::test]
+async fn the_minis_second_machine_its_first_keeps_out_is_full_with_what_it_needs() {
+    // The mini of 2026-10-13 with its first cf-4g machine: a second one needs 6515 MiB available. Short of that
+    // because of the first, the Mac is full, not short of memory, and the console hears both numbers.
+    let (w, _) = mini::with_one(mini::PEAK, Some(mini::HELD)).await;
+    let available = mini::needed(mini::HELD) - GIB;
+    assert!(!mini::second_fits(&w, available));
+    let room = room_of(&w, Size::G4);
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (Some(0), Some("full"), Some(6515 * MIB), Some(GIB))
+    );
+    // Its other programs take all but 100 MiB over the floor: with what the first holds given back, a second still
+    // would not fit.
+    let available = mini::settings().away.floor_bytes + 100 * MIB;
+    assert!(!mini::second_fits(&w, available));
+    let room = room_of(&w, Size::G4);
+    assert_eq!(
+        (room.free, room.why, room.need_bytes, room.short_bytes),
+        (
+            Some(0),
+            Some("memory"),
+            Some(6515 * MIB),
+            Some(6515 * MIB - available)
+        )
+    );
 }
 
 // --- what the Mac holds for a machine --------------------------------------------------------------------------------
@@ -1588,30 +1685,9 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
 /// that the Mac had already given, and refused a second machine whenever 6.4 to 8.8 GiB were available.
 mod mini {
     use super::*;
-    use cf_budget::{HostFacts, Mode, Settings};
-
-    pub const PEAK: u64 = 1577 * MIB;
-    pub const HELD: u64 = 4109 * MIB;
-
-    pub fn settings() -> Settings {
-        Settings::for_host(
-            HostFacts {
-                total_bytes: 16 * GIB,
-                cores: 8,
-            },
-            Mode::Dedicated,
-        )
-    }
-
-    /// The mini with its first machine running, its job's peak and the vm-host's reading of the Mac as given.
-    pub async fn with_one(peak: u64, held: Option<u64>) -> (World, String) {
-        let mut w = World::on(settings());
-        let runner = w.running_sized(Size::G4).await;
-        w.parts.vms.usage(job_name(&runner), peak, 0);
-        w.parts.vms.resident(job_name(&runner), held);
-        pass(&w.m, 1);
-        (w, runner)
-    }
+    pub use support::world::{
+        MINI_HELD as HELD, MINI_PEAK as PEAK, mini as settings, mini_with_one as with_one,
+    };
 
     /// Whether a second cf-4g machine gets a slot with this much memory available.
     pub fn second_fits(w: &World, available: u64) -> bool {
@@ -1650,7 +1726,7 @@ async fn the_minis_own_reading_carries_no_second_machine() {
     let (w, _) = mini::with_one(mini::PEAK, Some(4136 * MIB)).await;
     assert!(!mini::second_fits(&w, 3676 * MIB));
     assert_eq!(
-        w.m.short_of(Size::G4),
+        w.m.snapshot().short_of(Size::G4),
         None,
         "the Mac's own machine is what is in the way"
     );

@@ -4,8 +4,6 @@
 
 mod support;
 
-use std::sync::atomic::Ordering;
-
 use cf_budget::GIB;
 use cf_daemon::testing::pass;
 use cf_daemon::{Claim, Slots, Ticket};
@@ -56,13 +54,13 @@ impl Listeners {
     fn new(w: &World) -> Listeners {
         Listeners {
             offers: [w.m.open_slots(SIZE) > 0; 4],
-            rung: w.parts.nudges.load(Ordering::Relaxed),
+            rung: w.nudges(),
         }
     }
 
     /// A bell that rang ends every poll: each listener asks again.
     fn hear(&mut self, w: &World) {
-        let rung = w.parts.nudges.load(Ordering::Relaxed);
+        let rung = w.nudges();
         if rung != self.rung {
             self.rung = rung;
             self.offers = [w.m.open_slots(SIZE) > 0; 4];
@@ -123,7 +121,7 @@ proptest! {
             pass(&w.m, 1);
             listeners.hear(&w);
         }
-        let room = w.m.room(SIZE) > 0;
+        let room = w.m.snapshot().room(SIZE).free.is_some_and(|free| free > 0);
         prop_assert_eq!(listeners.offers, [room; 4]);
     }
 }

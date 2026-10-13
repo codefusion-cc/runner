@@ -13,8 +13,8 @@ use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enrol
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{CrashingStore, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
-    Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
-    ServiceConfig, ServiceParts,
+    Claim, Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
+    ServiceConfig, ServiceParts, Slots,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
@@ -61,6 +61,24 @@ fn http() -> Http {
 }
 
 impl Rig {
+    /// A rig whose scale set has its session, with the pump stopped: the tests pass the time.
+    async fn with_session() -> Rig {
+        let mut rig = Rig::new(2).await;
+        rig.service.discover().await;
+        until("the scale set's session", || {
+            rig.github.scale_sets().iter().any(|s| s.has_session)
+        })
+        .await;
+        rig.stop_pump().await;
+        rig
+    }
+
+    /// The report to the console a second on.
+    fn report(&self) -> Value {
+        pass(&self.machines, 1);
+        serde_json::to_value(self.service.status()).expect("a report")
+    }
+
     /// A Mac with room for `machines` machines, enrolled at the console, serving [`REPO`] with one workflow.
     async fn new(machines: u32) -> Rig {
         let github = FakeGithub::start(Options {
@@ -404,6 +422,16 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
         json!("2026-09-21T14:13:20Z")
     );
     assert_eq!(report["activity"]["cpuPercent"], json!(12.0));
+    // Beside the machine that runs, its 4 GB of machines take one more cf-2g and no cf-4g; larger sizes, never.
+    assert_eq!(
+        report["status"]["sizes"],
+        json!([
+            {"size": "cf-2g", "free": 1},
+            {"size": "cf-4g", "free": 0, "why": "full"},
+            {"size": "cf-6g", "free": -1, "why": "never"},
+            {"size": "cf-8g", "free": -1, "why": "never"},
+        ])
+    );
 
     rig.finish(&runner, "succeeded");
     until("the end at the console", || rig.events().len() == 2).await;
@@ -1386,10 +1414,7 @@ async fn a_report_says_the_memory_that_is_available_what_the_runner_keeps_free_a
  {
     let mut rig = Rig::new(2).await;
     rig.stop_pump().await;
-    let report = |rig: &Rig| {
-        pass(&rig.machines, 1);
-        serde_json::to_value(rig.service.status()).expect("a report")
-    };
+    let report = Rig::report;
     // 64 GB installed, of which a quarter and a byte are available: three quarters are in use.
     rig.machines
         .with_host(|host| host.set(|reading| reading.available_bytes = (16 << 30) + 1));
@@ -1543,17 +1568,8 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
 #[tokio::test]
 async fn a_mac_whose_other_programs_leave_no_memory_for_what_it_serves_tells_the_console_it_is_closed_for_memory()
  {
-    let mut rig = Rig::new(2).await;
-    rig.service.discover().await;
-    until("the scale set's session", || {
-        rig.github.scale_sets().iter().any(|s| s.has_session)
-    })
-    .await;
-    rig.stop_pump().await;
-    let status = |rig: &Rig| {
-        pass(&rig.machines, 1);
-        serde_json::to_value(rig.service.status()).expect("a report")["status"].clone()
-    };
+    let rig = Rig::with_session().await;
+    let status = |rig: &Rig| rig.report()["status"].clone();
     let said = status(&rig);
     assert_eq!((&said["open"], &said["reason"]), (&json!(true), &Value::Null));
 
@@ -1577,6 +1593,33 @@ async fn a_mac_whose_other_programs_leave_no_memory_for_what_it_serves_tells_the
         .with_host(|host| host.set(|reading| reading.available_bytes = 64 << 30));
     let said = status(&rig);
     assert_eq!((&said["open"], &said["reason"]), (&json!(true), &Value::Null));
+}
+
+#[tokio::test]
+async fn jobs_that_wait_while_nothing_runs_tell_the_console_what_keeps_the_first_of_them() {
+    let rig = Rig::with_session().await;
+    let idle = |rig: &Rig| {
+        let said = rig.report()["status"].clone();
+        (
+            said["idleWithJobsWaitingSeconds"].clone(),
+            said["idleWithJobsWaitingReason"].clone(),
+        )
+    };
+    assert_eq!(
+        idle(&rig),
+        (Value::Null, Value::Null),
+        "left out while nothing waits"
+    );
+    // GitHub assigned a job just before what else runs on the Mac took the memory: it waits, and nothing runs.
+    let short = rig.parts.settings.away.floor_bytes + (1 << 30);
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = short));
+    pass(&rig.machines, 1);
+    let Claim::Waits { why, .. } = rig.machines.claim(cf_budget::Size::G2, None) else {
+        panic!("the job got a machine");
+    };
+    assert_eq!(why, "memory");
+    assert_eq!(idle(&rig).1, json!("nothing runs and no job starts: memory"));
 }
 
 /// One thing that happens to a Mac serving two repositories whose jobs take the same size. A number picks among
