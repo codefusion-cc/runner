@@ -4,6 +4,11 @@
 
 pub mod world;
 
+/// The `i`th of these, round and round: how a generated number picks among what is there; `None` when nothing is.
+pub fn pick<T: Clone>(from: &[T], i: u8) -> Option<T> {
+    (!from.is_empty()).then(|| from[usize::from(i) % from.len()].clone())
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -113,8 +118,7 @@ struct Seen {
     withdrawn: Vec<Ticket>,
     claimed: usize,
     started: Vec<(String, i64, Ticket)>,
-    stopped: Vec<String>,
-    fail_stop: usize,
+    retired: Vec<String>,
     unanswered: bool,
 }
 
@@ -178,17 +182,13 @@ impl Spy {
         self.seen().started.clone()
     }
 
-    /// The Actions runners whose machine was asked to stop.
-    pub fn stopped(&self) -> Vec<String> {
-        self.seen().stopped.clone()
+    /// The Actions runners the scaler retired as surplus.
+    pub fn retired(&self) -> Vec<String> {
+        self.seen().retired.clone()
     }
 
     pub fn fail_start(&self, n: usize) {
         self.machines.vms().fail_start(n);
-    }
-
-    pub fn fail_stop(&self, n: usize) {
-        self.seen().fail_stop = n;
     }
 
     pub fn mark_out_of_memory(&self, runner: &str) {
@@ -197,6 +197,14 @@ impl Spy {
 
     pub fn leave_out_of_memory_unanswered(&self) {
         self.seen().unanswered = true;
+    }
+
+    /// Every machine started so far comes up: its Actions runner waits for a job.
+    pub fn boot_all(&self) {
+        for (runner, ..) in self.started() {
+            self.machines.vms().ready(job_name(&runner));
+        }
+        pass(&self.machines, 1);
     }
 
     /// The Actions runner's machine ends by itself and the machines' side sees it go.
@@ -260,29 +268,23 @@ impl Hosts for Spy {
         self.machines.registration_unsure(name);
     }
 
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]) {
+        // A machine that asks for its removal names its registration to the sweep.
+        let asking = || -> Vec<String> {
+            let names = self.machines.registrations_to_remove().into_iter();
+            names.map(|registration| registration.runner).collect()
+        };
+        let before = asking();
+        self.machines.retire(repo, scale_set_id, n, idle);
+        let asked = asking().into_iter().filter(|runner| !before.contains(runner));
+        self.seen().retired.extend(asked);
+    }
+
     async fn start(&self, spec: RunnerSpec) -> Result<String, HostError> {
         let seen = (spec.name.clone(), spec.runner_id, spec.ticket);
         let handle = self.machines.start(spec).await?;
         self.seen().started.push(seen);
         Ok(handle)
-    }
-
-    async fn stop(&self, handle: &str) -> Result<(), HostError> {
-        let name = self
-            .seen()
-            .started
-            .iter()
-            .find(|(name, _, _)| job_name(name) == handle)
-            .map_or(handle.to_string(), |(name, _, _)| name.clone());
-        {
-            let mut seen = self.seen();
-            if seen.fail_stop > 0 {
-                seen.fail_stop -= 1;
-                return Err(HostError("the machine did not stop".into()));
-            }
-            seen.stopped.push(name);
-        }
-        self.machines.stop(handle).await
     }
 
     async fn out_of_memory(&self, handle: &str) -> OutOfMemory {

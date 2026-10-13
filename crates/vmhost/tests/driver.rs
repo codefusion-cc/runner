@@ -383,6 +383,26 @@ fn a_machine_that_dies_mid_job_or_talks_nonsense_is_a_lost_guest() {
     assert_eq!(ended.end, End::GuestLost);
     assert!(ended.message.unwrap().contains("the hypervisor's process died"));
 
+    // The channel closes a moment before the machine is gone, as it may when the hypervisor dies: the end still
+    // carries the machine's reason, not the closed channel's.
+    let vmm = FakeVmm::new([job(|mut stream, power, _| {
+        say(&mut stream, GuestMessage::Heartbeat(usage()));
+        std::thread::sleep(Duration::from_millis(150));
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(50));
+        power.crash("the hypervisor's process died")
+    })]);
+    let ended = go(&vmm, &layout, request("c"), quick()).unwrap().end.unwrap();
+    assert_eq!(ended.end, End::GuestLost);
+    assert!(
+        ended
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("the hypervisor's process died")),
+        "{:?}",
+        ended.message
+    );
+
     let vmm = FakeVmm::new([job(|mut stream, power, _| {
         use std::io::Write;
         // A frame that claims a gigabyte.

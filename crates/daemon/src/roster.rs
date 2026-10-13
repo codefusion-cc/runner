@@ -19,6 +19,19 @@ pub struct JobInfo {
     pub started: SystemTime,
 }
 
+impl From<&crate::records::GithubJob> for JobInfo {
+    /// The job as GitHub named it; one only GitHub's answers implied has no name.
+    fn from(github: &crate::records::GithubJob) -> JobInfo {
+        JobInfo {
+            repo: github.repo.clone(),
+            name: github.job.clone(),
+            workflow: github.workflow.clone(),
+            run_id: github.run_id,
+            started: crate::time_of(github.started_at.unwrap_or(0)),
+        }
+    }
+}
+
 /// One Actions runner of this machine: a registered Actions runner and the machine it runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Runner {
@@ -41,7 +54,7 @@ pub struct Runner {
     pub busy: bool,
     /// Already running when the Runner started, so whether it has a job is unknown: never scaled down.
     pub adopted: bool,
-    /// When its job completed; its machine goes away on its own shortly after.
+    /// When its job completed, or its registration was removed: its machine goes away shortly after.
     pub done: Option<SystemTime>,
     /// The job it took.
     pub job: Option<JobInfo>,

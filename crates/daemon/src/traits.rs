@@ -104,14 +104,15 @@ pub trait Hosts: Send + Sync {
     /// Whoever removes left-over registrations looks for it by name.
     fn registration_unsure(&self, name: &str);
 
+    /// The scale set has `n` Actions runners more than GitHub's jobs need: up to `n` of these idle ones, less those
+    /// of the scale set already asking for their removal, ask for theirs. GitHub's answer decides whether the machine
+    /// stops (`docs/job-state.md`).
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]);
+
     /// Starts a machine for the Actions runner and returns its handle. After an error no machine stands and the
     /// slot is still the caller's: the host removed what it had begun before it answers. After a success the slot
     /// is the machine's, and goes back when the machine is gone.
     fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send;
-
-    /// Asks a machine to stop; one that is gone already is stopped. The machine goes away, and its slot with it,
-    /// in its own time. After an error the machine stands as before.
-    fn stop(&self, handle: &str) -> impl Future<Output = Result<(), HostError>> + Send;
 
     /// Whether the machine lost a process because it had used up its memory. `Unknown` when nobody can say (the
     /// vm-host does not answer, the machine's state is gone), never `No`: the scaler then asks whoever watched the
@@ -120,8 +121,9 @@ pub trait Hosts: Send + Sync {
 
     /// How many jobs GitHub still counts as assigned to Actions runners of this repository's scale set whose
     /// machines are gone: a job was started on each, GitHub has not said how it ended, and the registration still
-    /// stands (GitHub keeps it while it counts the job). The scaler starts no machine in their place: there is no
-    /// job to take.
+    /// stands (GitHub keeps it while it counts the job), or a guest came up and went with no word from GitHub, which
+    /// may count a job of it until the sweep asked. The scaler starts no machine in their place: there is no job to
+    /// take.
     fn lost_with_job(&self, _repo: &str, _scale_set_id: i64) -> usize {
         0
     }
@@ -140,16 +142,16 @@ impl<T: Hosts> Hosts for std::sync::Arc<T> {
         (**self).registration_unsure(name);
     }
 
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]) {
+        (**self).retire(repo, scale_set_id, n, idle);
+    }
+
     fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {
         (**self).lost_with_job(repo, scale_set_id)
     }
 
     fn start(&self, spec: RunnerSpec) -> impl Future<Output = Result<String, HostError>> + Send {
         (**self).start(spec)
-    }
-
-    fn stop(&self, handle: &str) -> impl Future<Output = Result<(), HostError>> + Send {
-        (**self).stop(handle)
     }
 
     fn out_of_memory(&self, handle: &str) -> impl Future<Output = OutOfMemory> + Send {
@@ -170,6 +172,9 @@ pub trait Registry: Send + Sync {
 
     /// Removes a registered Actions runner; one with a job refuses.
     fn remove_runner(&self, runner_id: i64) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Whether a registered Actions runner has a job, by GitHub's own record; `None` when GitHub no longer has it.
+    fn runner_busy(&self, runner_id: i64) -> impl Future<Output = Result<Option<bool>, Error>> + Send;
 }
 
 /// Which kind of job event.

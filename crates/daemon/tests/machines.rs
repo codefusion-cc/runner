@@ -10,7 +10,7 @@ use std::time::Duration;
 use cf_budget::{GIB, MIB, Millis, Pressure, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, Slots, Ticket};
+use cf_daemon::{Answer, Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, Slots, Ticket};
 use cf_guest_proto::StopReason;
 use cf_vmhost::{End, OutOfMemory};
 use support::Log;
@@ -480,10 +480,136 @@ async fn an_idle_machine_that_is_retired_reports_no_job() {
     let mut w = World::new(1);
     let runner = w.start().await;
     pass(&w.m, 3);
-    w.m.stop(job_name(&runner)).await.expect("stop");
+    w.m.stop(job_name(&runner));
     pass(&w.m, 2);
     assert_eq!(w.reports(), []);
     w.assert_nothing_left();
+}
+
+/// GitHub's word of a job that only its REST view had implied names the job, though the lifecycle does not move: the
+/// name is written all the same, so a Runner that starts next reports the job's end under its name.
+#[tokio::test]
+async fn a_word_that_names_an_implied_job_is_written_though_the_machine_does_not_move() {
+    let mut w = World::new(2);
+    let runner = w.start().await;
+    pass(&w.m, 2);
+    w.m.answered(&runner, Answer::Busy);
+    w.github(EventKind::Started, &runner, "");
+    w.restart();
+    w.registered.remove(&runner);
+    w.parts.vms.end(job_name(&runner), cf_vmhost::End::Ok);
+    pass(&w.m, RESULT_WAIT.as_secs() + 2);
+    let completed: Vec<String> = w
+        .reports()
+        .into_iter()
+        .filter(|r| r.kind == EventKind::Completed)
+        .map(|r| r.github.job)
+        .collect();
+    assert_eq!(completed, ["build"]);
+}
+
+/// The scaler finds the same surplus at every pass until GitHub answers: the machines already asking count toward
+/// it, so one machine too many asks once, not once a pass, and only idle machines of that scale set ask.
+#[tokio::test]
+async fn a_surplus_is_retired_once_while_its_removal_waits_for_an_answer() {
+    let mut w = World::new(4);
+    let (a, b, c) = (w.start().await, w.start().await, w.start().await);
+    w.github(EventKind::Started, &c, "");
+    pass(&w.m, 2);
+    let asking = |w: &World| {
+        let mut names: Vec<String> =
+            w.m.registrations_to_remove()
+                .into_iter()
+                .map(|r| r.runner)
+                .collect();
+        names.sort();
+        names
+    };
+    let all = [a.clone(), b.clone(), c.clone()];
+    for _ in 0..3 {
+        w.m.retire(REPO, SET, 1, &all);
+    }
+    assert_eq!(
+        asking(&w),
+        std::slice::from_ref(&a),
+        "one surplus, one machine asking"
+    );
+    w.m.retire(REPO, SET + 1, 2, &all);
+    w.m.retire("org/other", SET, 2, &all);
+    assert_eq!(
+        asking(&w),
+        std::slice::from_ref(&a),
+        "another scale set's surplus is not this one's"
+    );
+    w.m.retire(REPO, SET, 3, &all);
+    assert_eq!(asking(&w), [a, b], "the running machine is never retired");
+}
+
+/// A machine retired as surplus whose registration is gone when the sweep removes it: its Actions runner took a job
+/// the Runner never heard of and removed its own registration once the job was over. The job is reported as one that
+/// finished by itself, not as one the Runner stopped.
+#[tokio::test]
+async fn a_job_over_before_its_machine_was_retired_is_reported_as_finished() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    w.retire(&runner);
+    w.registered.remove(&runner);
+    w.sweep();
+    // The guest finishes (two minutes at most), and the wait for GitHub's word of the job is over.
+    pass(&w.m, 120 + RESULT_WAIT.as_secs() + 60);
+    w.assert_nothing_left();
+    assert_eq!(w.ends(), [(runner, EndKind::Finished)]);
+}
+
+/// A machine retired as surplus is stopped from the console before the sweep asked for the removal. Its Actions
+/// runner had taken a job nobody heard of and removed its own registration once the job was over. The stop ends the
+/// ask: nothing is removed while the machine is being stopped, and the 404 the sweep meets once it is gone and the
+/// wait for GitHub's word is over is that job's. The console hears its start and end.
+#[tokio::test]
+async fn a_registration_found_gone_while_its_machine_is_being_stopped_is_a_job() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    w.retire(&runner);
+    w.parts.vms.ignore_stops(true);
+    w.m.stop(job_name(&runner));
+    pass(&w.m, 1);
+    assert_eq!(w.parts.vms.standing(), [job_name(&runner)], "still being stopped");
+    w.registered.remove(&runner);
+    assert!(w.m.registrations_to_remove().is_empty(), "a stop ends the ask");
+    w.parts.vms.ignore_stops(false);
+    pass(&w.m, 120 + RESULT_WAIT.as_secs() + 60);
+    w.sweep();
+    assert_eq!(
+        ids(&w.reports()),
+        [format!("{runner}/started"), format!("{runner}/completed")]
+    );
+    w.assert_nothing_left();
+}
+
+/// An idle machine is stopped from the console and the Runner dies; when it starts again nothing of the machine is
+/// left, not even how long it took to boot. It was up, so its start may have gone unheard: GitHub is asked, and the
+/// job its Actions runner ran is heard.
+#[tokio::test]
+async fn a_machine_stopped_after_it_came_up_and_gone_without_a_trace_is_asked_about() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    w.m.stop(job_name(&runner));
+    w.parts.vms.forget(job_name(&runner));
+    w.restart();
+    // The job ran, its messages went with a session, and its Actions runner removed its own registration.
+    w.registered.remove(&runner);
+    pass(&w.m, RESULT_WAIT.as_secs() + 2);
+    w.sweep();
+    assert_eq!(
+        ids(&w.reports()),
+        [format!("{runner}/started"), format!("{runner}/completed")]
+    );
 }
 
 // --- slots -------------------------------------------------------------------------------------------------------
@@ -918,7 +1044,7 @@ async fn a_stop_in_the_moment_the_mac_wakes_is_not_put_off_by_the_time_it_slept(
     // The Mac sleeps for a few minutes and wakes; before the daemon's next look at it, the scaler retires the
     // machine. The time to its forced end runs from now, not from now plus the sleep.
     w.m.with_host(|host| host.sleep(Millis::mins(4)));
-    w.m.stop(&job).await.expect("stop");
+    w.m.stop(&job);
     pass(&w.m, 40);
     assert_eq!(w.parts.vms.killed(), [job.as_str()]);
     assert_eq!(w.slots(), 0);
@@ -950,9 +1076,14 @@ fn a_pause_and_a_drain_tell_the_polls_in_flight_once() {
 
 #[tokio::test]
 async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() {
-    let mut w = World::new(3);
-    // One dies before any job came to it: GitHub counts nothing for it.
+    let mut w = World::new(4);
+    // One whose guest never came up dies: it took no job.
+    let never_up = w.start().await;
+    w.parts.vms.die(job_name(&never_up));
+    // One came up and dies before any word of a job came for it.
     let idle = w.start().await;
+    w.parts.vms.ready(job_name(&idle));
+    pass(&w.m, 1);
     w.parts.vms.die(job_name(&idle));
     // Two die under their jobs.
     let (first, second) = (w.start().await, w.start().await);
@@ -962,6 +1093,11 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     w.parts.vms.die(job_name(&second));
     pass(&w.m, 2);
     assert_eq!(w.parts.vms.standing(), Vec::<String>::new());
+    // A start can go with a session of GitHub's: the one that died idle counts until GitHub was asked about it, the
+    // one that never came up does not.
+    assert_eq!(w.m.lost_with_job(REPO, SET), 3);
+    w.registered.remove(&idle);
+    w.m.answered(&idle, cf_daemon::Answer::Removed);
     assert_eq!(w.m.lost_with_job(REPO, SET), 2, "GitHub still counts both jobs");
     assert_eq!(w.m.lost_with_job(REPO, SET + 1), 0, "and for this scale set only");
     assert_eq!(
@@ -973,7 +1109,7 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     w.github(EventKind::Completed, &first, "failed");
     assert_eq!(w.m.lost_with_job(REPO, SET), 1);
     w.registered.remove(&second);
-    w.m.unregistered(&second);
+    w.m.answered(&second, cf_daemon::Answer::Gone);
     assert_eq!(w.m.lost_with_job(REPO, SET), 0);
     w.assert_nothing_left();
 }
@@ -1416,4 +1552,111 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     assert_eq!(w.m.open_slots(SIZE), 0);
     assert_eq!(w.m.short_of(SIZE), Some("memory"));
     assert_eq!(log.lines("of this size").len(), 1);
+}
+
+// --- what GitHub said agrees with the lifecycle at every write ------------------------------------------------------
+
+/// The facts a record holds disagree ([`cf_daemon::Record::agrees`]): for one, a job GitHub said started or
+/// completed beside a lifecycle that still waits for one, or one that does not know a job ran.
+fn disagreement(w: &World, runner: &str) -> Option<String> {
+    let record = w.parts.store.load().into_iter().find(|r| r.runner == runner)?;
+    (!record.agrees()).then(|| format!("{:?} beside {:?}", record.slot.map(|s| s.saved()), record.github))
+}
+
+/// Sol 3: a Runner from before wrote GitHub's word that the job started while the machine was still booting, and
+/// died before the lifecycle took it. The Runner that starts next sees the machine come up: the job runs there.
+#[tokio::test]
+async fn a_start_written_while_booting_by_a_runner_before_is_a_running_job_once_it_is_up() {
+    let mut w = World::new(2);
+    w.parts.vms.slow_boot(true);
+    let runner = w.start().await;
+    pass(&w.m, 1);
+    let mut record = w.parts.store.load().pop().expect("a record");
+    assert_eq!(
+        record.slot.expect("a slot").saved().phase,
+        cf_lifecycle::Phase::Starting
+    );
+    record.github = Some(cf_daemon::GithubJob {
+        repo: REPO.into(),
+        job: "build".into(),
+        ..cf_daemon::GithubJob::default()
+    });
+    record.start_reported = true;
+    record.rules = 0;
+    cf_daemon::Store::save(w.parts.store.as_ref(), &record);
+    w.restart();
+    pass(&w.m, 1);
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    assert_eq!(disagreement(&w, &runner), None);
+}
+
+/// Sol 4: a job's start went with a session, and its completion arrives while the machine is still booting (its
+/// `ready` not yet seen). The completion is kept: once the machine is up, it is a machine whose job is over.
+#[tokio::test]
+async fn a_completion_heard_while_booting_is_kept_until_the_machine_is_up() {
+    let mut w = World::new(2);
+    w.parts.vms.slow_boot(true);
+    let runner = w.start().await;
+    pass(&w.m, 1);
+    w.github(EventKind::Completed, &runner, "succeeded");
+    assert_eq!(disagreement(&w, &runner), None, "at the completion");
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    assert_eq!(disagreement(&w, &runner), None, "once up");
+}
+
+/// Sol 2: a machine whose job's start and end went with a session ended under a Runner before, which wrote it as
+/// one GitHub need not be asked about (the Runner of main had no such field; a build of this branch wrote it so for
+/// a surplus it was removing) and may have settled it. The registration is gone, removed by its own Actions runner
+/// once the job was over: after the upgrade the removal meets 404, and the job is heard, never forgotten.
+#[tokio::test]
+async fn a_machine_a_runner_before_wrote_as_not_to_ask_about_is_asked_about() {
+    for settled in [false, true] {
+        let mut w = World::new(1);
+        let runner = w.start().await;
+        w.parts.vms.ready(job_name(&runner));
+        pass(&w.m, 2);
+        w.registered.remove(&runner);
+        w.parts.vms.end(job_name(&runner), End::Ok);
+        pass(&w.m, 2);
+        for mut record in w.parts.store.load() {
+            record.end_reported = settled;
+            record.rules = 0;
+            cf_daemon::Store::save(w.parts.store.as_ref(), &record);
+        }
+        w.restart();
+        for _ in 0..3 {
+            pass(&w.m, RESULT_WAIT.as_secs() + 2);
+            w.sweep();
+        }
+        let ids = ids(&w.reports());
+        assert!(
+            ids.contains(&format!("{runner}/started")) && ids.contains(&format!("{runner}/completed")),
+            "settled before: {settled}; reports: {ids:?}; records: {:?}",
+            w.parts.store.load()
+        );
+    }
+}
+
+/// GitHub removed an idle machine's registration at the Runner's asking, and the machine is gone; a word of a job
+/// for it then still comes, within the wait for one. The job ran: its end is not reported as one without a job.
+#[tokio::test]
+async fn a_word_of_a_job_after_its_machine_ended_without_one_is_not_reported_as_no_job() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    w.retire(&runner);
+    w.sweep();
+    pass(&w.m, 30);
+    assert_eq!(w.parts.vms.standing(), Vec::<String>::new());
+    w.github(EventKind::Started, &runner, "");
+    pass(&w.m, RESULT_WAIT.as_secs() + 2);
+    assert_eq!(
+        ids(&w.reports()),
+        [format!("{runner}/started"), format!("{runner}/completed")]
+    );
+    assert_eq!(w.ends(), [(runner, EndKind::Stopped)]);
+    w.assert_nothing_left();
 }

@@ -27,4 +27,8 @@ impl Registry for SetRegistry {
     async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {
         self.client.remove_runner(runner_id).await
     }
+
+    async fn runner_busy(&self, runner_id: i64) -> Result<Option<bool>, Error> {
+        self.client.runner_busy(runner_id).await
+    }
 }

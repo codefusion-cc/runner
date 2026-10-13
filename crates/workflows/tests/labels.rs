@@ -588,3 +588,35 @@ fn boolean_and_null_literals_are_allowed_in_a_variable_expression() {
     assert!(served("vars.CI_RUNNER || maybe").is_empty());
     assert!(served("vars.CI_RUNNER || env.X").is_empty());
 }
+
+#[test]
+fn nesting_deep_enough_to_exhaust_a_stack_is_skipped_and_the_others_still_count() {
+    let deep = format!(
+        "jobs:\n  a:\n    runs-on: {}{}\n",
+        "[".repeat(100_000),
+        "]".repeat(100_000)
+    );
+    let got = self_hosted(&files(&[
+        ("deep.yml", deep.as_str()),
+        ("ok.yml", "jobs:\n  a:\n    runs-on: [self-hosted, cf-8g]\n"),
+    ]));
+    assert_eq!(keys(&got), vec!["cf-8g,self-hosted"]);
+}
+
+#[test]
+fn an_anchor_and_its_alias_name_the_same_labels() {
+    let got = self_hosted(&files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: &mac [self-hosted, cf-4g]\n  b:\n    runs-on: *mac\n    needs: a\n",
+    )]));
+    assert_eq!(keys(&got), vec!["cf-4g,self-hosted"]);
+}
+
+#[test]
+fn keys_that_are_numbers_or_booleans_leave_the_rest_of_the_file_readable() {
+    let got = self_hosted(&files(&[(
+        "ci.yml",
+        "on:\n  push:\n    branches: [main]\nenv:\n  1: one\n  true: yes\n  ? [a, b]\n  : complex\njobs:\n  7:\n    runs-on: [self-hosted, 16]\n",
+    )]));
+    assert_eq!(keys(&got), vec!["16,self-hosted"]);
+}

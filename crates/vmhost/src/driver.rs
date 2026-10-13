@@ -63,6 +63,9 @@ const SOCKET_PATH_MAX: usize = 103;
 /// How many messages wait for the job's loop. A guest that talks faster than the loop takes waits in its write.
 const QUEUE: usize = 256;
 
+/// How long a closed channel waits for its machine's own end: one that died exits within it.
+const EXIT_AFTER_CLOSE: Duration = Duration::from_millis(300);
+
 /// Replaces a file whole: a reader sees the old state or the new one, never half of one.
 fn replace(path: &Path, text: &str) {
     let partial = path.with_extension("json.new");
@@ -412,6 +415,14 @@ fn run_in(
             // What a machine that was let go of still says: nothing to the job, and no reason to miss a wait.
             Ok(Message::Machine(..) | Message::Channel(..)) => Event::Tick,
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Event::Tick,
+        };
+        // A machine that dies closes its guest's channel too, and which of the two threads says so first is the
+        // scheduler's choice: the machine's own word of why is worth a moment.
+        let event = match (event, &vm) {
+            (Event::ChannelClosed, Some(vm)) => vm
+                .wait(EXIT_AFTER_CLOSE)
+                .map_or(Event::ChannelClosed, |exit| Event::VmExited(describe(&exit))),
+            (event, _) => event,
         };
         actions.extend(machine.handle(event, started.elapsed()));
     }
