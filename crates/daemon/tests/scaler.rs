@@ -1036,3 +1036,384 @@ async fn another_repositorys_idle_runner_under_the_same_number_is_not_retired_as
     // Nor does a word about a runner of that name in this repository touch it.
     assert!(!h.roster.mark_done(REPO, h.set.id, "mac-b-theirs", h.clock_now()));
 }
+
+// --- who goes first: the main branch and deploys, repositories in turn, nobody for ever -----------------------------
+
+const OTHER: &str = "org/other";
+
+/// A job as GitHub assigns it: no request ID, no times (`the_real_services_assigned_job_has_no_request_id_and_no_times`).
+fn job_at(repo: &str, run: i64, git_ref: &str, event: &str) -> JobBase {
+    let (owner, name) = repo.split_once('/').expect("owner/name");
+    JobBase {
+        owner_name: owner.into(),
+        repository_name: name.into(),
+        job_display_name: "check".into(),
+        job_workflow_ref: format!("{repo}/.github/workflows/ci.yml@{git_ref}"),
+        workflow_run_id: run,
+        event_name: event.into(),
+        request_labels: vec!["self-hosted".into(), "cf-2g".into()],
+        ..JobBase::default()
+    }
+}
+
+fn pull_job(repo: &str, run: i64) -> JobBase {
+    job_at(repo, run, &format!("refs/pull/{run}/merge"), "pull_request")
+}
+
+fn main_job(repo: &str, run: i64) -> JobBase {
+    job_at(repo, run, "refs/heads/main", "push")
+}
+
+fn counts(assigned: i64) -> Option<Statistics> {
+    Some(Statistics {
+        total_assigned_jobs: assigned,
+        ..Statistics::default()
+    })
+}
+
+/// GitHub assigns these jobs to the scale set, which has `assigned` jobs with them.
+fn assigned(jobs: Vec<JobBase>, assigned: i64) -> Message {
+    Message {
+        assigned: jobs,
+        statistics: counts(assigned),
+        ..Message::default()
+    }
+}
+
+fn started_repos(h: &Harness) -> Vec<String> {
+    h.hosts.started_repos()
+}
+
+/// The newest Actions runner started.
+fn newest(h: &Harness) -> String {
+    names(h).last().expect("a runner").clone()
+}
+
+/// The Actions runner's job is done, `left` jobs stay assigned to its scale set, and its machine goes: the room it
+/// held goes to the first in line.
+async fn finish(hosts: &Spy, scaler: &mut TestScaler, runner: &str, job: JobBase, left: i64) {
+    let done = Message {
+        completed: vec![completed(runner, "succeeded", job)],
+        statistics: counts(left),
+        ..Message::default()
+    };
+    scaler.scale(Some(&done)).await.unwrap();
+    hosts.gone(runner);
+}
+
+/// A Mac of one machine, running a pull request job of [`REPO`]: its Actions runner.
+async fn busy_mac() -> (Harness, String) {
+    let mut h = harness(1).await;
+    let first = pull_job(REPO, 1);
+    h.scaler
+        .scale(Some(&assigned(vec![first.clone()], 1)))
+        .await
+        .unwrap();
+    let runner = newest(&h);
+    h.hosts.boot_all();
+    h.scaler.scale(Some(&started(&runner, first))).await.unwrap();
+    (h, runner)
+}
+
+#[tokio::test]
+async fn a_main_job_behind_five_pull_request_jobs_starts_first() {
+    let (mut h, running) = busy_mac().await;
+    let mut other = h.another_repository(OTHER).await;
+    let pulls: Vec<JobBase> = (10..15).map(|run| pull_job(OTHER, run)).collect();
+    other.scale(Some(&assigned(pulls, 5))).await.unwrap();
+    h.scaler
+        .scale(Some(&assigned(vec![main_job(REPO, 2)], 2)))
+        .await
+        .unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 6);
+
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), 1).await;
+    other.scale(None).await.unwrap();
+    h.scaler.scale(None).await.unwrap();
+    assert_eq!(
+        started_repos(&h),
+        [REPO, REPO],
+        "the main job came last and went first"
+    );
+    assert_eq!(h.machines.snapshot().waiting, 5);
+}
+
+#[tokio::test]
+async fn within_one_scale_set_the_place_of_the_main_job_goes_first() {
+    // GitHub hands a scale set's jobs to its Actions runners itself; the place that stands for the main job is the
+    // one that starts first.
+    let (mut h, running) = busy_mac().await;
+    let mut jobs: Vec<JobBase> = (10..15).map(|run| pull_job(REPO, run)).collect();
+    jobs.push(main_job(REPO, 2));
+    h.scaler.scale(Some(&assigned(jobs, 7))).await.unwrap();
+    let line = h.machines.snapshot().budget.waiting;
+    assert_eq!(line.len(), 6);
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), 6).await;
+    h.scaler.scale(None).await.unwrap();
+    let (_, _, ticket) = *h.hosts.started().last().expect("a runner");
+    assert_eq!(ticket, line[0].slot, "the line named it first");
+    assert_eq!(
+        h.slots.held().last(),
+        Some(&ticket),
+        "and it is the sixth place taken"
+    );
+}
+
+#[tokio::test]
+async fn a_pull_request_job_passed_over_for_the_defer_limit_beats_a_fresh_main_job() {
+    let (mut h, running) = busy_mac().await;
+    let mut other = h.another_repository(OTHER).await;
+    other
+        .scale(Some(&assigned(vec![pull_job(OTHER, 10)], 1)))
+        .await
+        .unwrap();
+    pass(&h.machines, cf_budget::DEFER_LIMIT.0 / 1000);
+    h.scaler
+        .scale(Some(&assigned(vec![main_job(REPO, 2)], 2)))
+        .await
+        .unwrap();
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), 1).await;
+    h.scaler.scale(None).await.unwrap();
+    other.scale(None).await.unwrap();
+    assert_eq!(started_repos(&h), [REPO, OTHER]);
+}
+
+#[tokio::test]
+async fn two_repositories_take_turns() {
+    let (mut h, running) = busy_mac().await;
+    let mut other = h.another_repository(OTHER).await;
+    let ours: Vec<JobBase> = (20..23).map(|run| pull_job(REPO, run)).collect();
+    let theirs: Vec<JobBase> = (30..33).map(|run| pull_job(OTHER, run)).collect();
+    h.scaler.scale(Some(&assigned(ours.clone(), 4))).await.unwrap();
+    other.scale(Some(&assigned(theirs.clone(), 3))).await.unwrap();
+    // The busy repository's job ran last, so the other goes first; then each in turn.
+    let (mut ours, mut theirs) = (ours.into_iter(), theirs.into_iter());
+    let (mut left_ours, mut left_theirs) = (3, 3);
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), left_ours).await;
+    for _ in 0..6 {
+        h.scaler.scale(None).await.unwrap();
+        other.scale(None).await.unwrap();
+        let runner = newest(&h);
+        if started_repos(&h).last().map(String::as_str) == Some(REPO) {
+            left_ours -= 1;
+            finish(&h.hosts, &mut h.scaler, &runner, ours.next().unwrap(), left_ours).await;
+        } else {
+            left_theirs -= 1;
+            finish(&h.hosts, &mut other, &runner, theirs.next().unwrap(), left_theirs).await;
+        }
+    }
+    assert_eq!(started_repos(&h), [REPO, OTHER, REPO, OTHER, REPO, OTHER, REPO]);
+}
+
+#[tokio::test]
+async fn an_empty_line_waits_for_nothing() {
+    let mut h = harness(1).await;
+    let capacity = h.scaler.scale(Some(&assigned(vec![], 0))).await.unwrap();
+    assert_eq!(capacity, 1, "the free machine is offered");
+    assert!(h.hosts.started().is_empty());
+    assert_eq!(h.machines.snapshot().waiting, 0);
+    // The first job assigned starts at once.
+    h.scaler
+        .scale(Some(&assigned(vec![pull_job(REPO, 1)], 1)))
+        .await
+        .unwrap();
+    assert_eq!(h.hosts.started().len(), 1);
+}
+
+#[tokio::test]
+async fn a_main_job_cancelled_while_it_waits_gives_its_place_back_and_the_next_goes() {
+    let (mut h, running) = busy_mac().await;
+    let mut other = h.another_repository(OTHER).await;
+    other
+        .scale(Some(&assigned(vec![pull_job(OTHER, 10)], 1)))
+        .await
+        .unwrap();
+    h.scaler
+        .scale(Some(&assigned(vec![main_job(REPO, 2)], 2)))
+        .await
+        .unwrap();
+    // Cancelled before any Actions runner had it: it completes without one.
+    let cancelled = Message {
+        completed: vec![completed("", "canceled", main_job(REPO, 2))],
+        statistics: counts(1),
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&cancelled)).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 1);
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), 0).await;
+    h.scaler.scale(None).await.unwrap();
+    other.scale(None).await.unwrap();
+    assert_eq!(started_repos(&h), [REPO, OTHER]);
+}
+
+#[tokio::test]
+async fn an_assignment_heard_twice_is_one_job() {
+    let (mut h, running) = busy_mac().await;
+    let mut other = h.another_repository(OTHER).await;
+    other
+        .scale(Some(&assigned(vec![pull_job(OTHER, 10)], 1)))
+        .await
+        .unwrap();
+    let main = assigned(vec![main_job(REPO, 2)], 2);
+    h.scaler.scale(Some(&main)).await.unwrap();
+    h.scaler.scale(Some(&main)).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 2, "one place for the main job");
+    // A pull request job comes after it. Had the main job been counted twice, its place would be the main job's.
+    h.scaler
+        .scale(Some(&assigned(vec![pull_job(REPO, 3)], 3)))
+        .await
+        .unwrap();
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), 2).await;
+    h.scaler.scale(None).await.unwrap();
+    let main_runner = newest(&h);
+    finish(&h.hosts, &mut h.scaler, &main_runner, main_job(REPO, 2), 1).await;
+    h.scaler.scale(None).await.unwrap();
+    other.scale(None).await.unwrap();
+    assert_eq!(
+        started_repos(&h),
+        [REPO, REPO, OTHER],
+        "the other repository's pull request job goes before ours: ours started last"
+    );
+}
+
+#[tokio::test]
+async fn offered_jobs_that_do_not_all_fit_are_taken_main_first() {
+    let mut h = harness(1).await;
+    let labels = ["self-hosted", "cf-2g"];
+    let pulls: Vec<i64> = (1..=5)
+        .map(|n| {
+            h.fake.queue_job_at(
+                REPO,
+                &labels,
+                &format!("check {n}"),
+                &format!("refs/pull/{n}/merge"),
+            )
+        })
+        .collect();
+    let main = h.fake.queue_job(REPO, &labels, "check");
+    let message = next_messages(&h, 6, 1).await;
+    h.scaler.scale(Some(&message)).await.unwrap();
+    assert_eq!(h.fake.job_state(main), Some(JobState::Acquired(h.set.id)));
+    for id in pulls {
+        assert_eq!(
+            h.fake.job_state(id),
+            Some(JobState::Available),
+            "it waits at GitHub"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_offered_job_passed_over_for_the_defer_limit_is_taken_before_a_main_job() {
+    let mut h = harness(1).await;
+    let labels = ["self-hosted", "cf-2g"];
+    h.slots.set_open(false);
+    let old = h.fake.queue_job_at(REPO, &labels, "check", "refs/pull/1/merge");
+    let first = next_message(&h, 1).await;
+    h.scaler.scale(Some(&first)).await.unwrap();
+    h.clock.advance(Duration::from_millis(cf_budget::DEFER_LIMIT.0));
+    h.slots.set_open(true);
+    pass(&h.machines, 1);
+    let main = h.fake.queue_job(REPO, &labels, "check");
+    // The old job's offer was not taken, so it comes again, with the new one's.
+    let again = next_messages(&h, 2, 1).await;
+    assert_eq!(again.available.len(), 2);
+    h.scaler.scale(Some(&again)).await.unwrap();
+    assert_eq!(h.fake.job_state(old), Some(JobState::Acquired(h.set.id)));
+    assert_eq!(h.fake.job_state(main), Some(JobState::Available));
+}
+
+#[tokio::test]
+async fn a_main_job_that_went_elsewhere_between_offer_and_acquire_gives_its_slot_back() {
+    let mut h = harness(1).await;
+    let labels = ["self-hosted", "cf-2g"];
+    let pull = h.fake.queue_job_at(REPO, &labels, "check", "refs/pull/1/merge");
+    let main = h.fake.queue_job(REPO, &labels, "check");
+    let message = next_messages(&h, 2, 1).await;
+    h.fake.take_job(main);
+    h.scaler.scale(Some(&message)).await.unwrap();
+    assert_eq!(h.fake.job_state(main), Some(JobState::TakenElsewhere));
+    assert_eq!(
+        h.fake.job_state(pull),
+        Some(JobState::Available),
+        "the job passed over is still offered, not lost"
+    );
+    assert_eq!((h.slots.used(), h.slots.released().len()), (0, 1));
+    // Offered again, it is taken.
+    let mut again = message;
+    again.available.retain(|offer| offer.runner_request_id == pull);
+    h.scaler.scale(Some(&again)).await.unwrap();
+    assert_eq!(h.fake.job_state(pull), Some(JobState::Acquired(h.set.id)));
+}
+
+#[tokio::test]
+async fn a_main_job_offered_twice_is_acquired_once_and_the_next_slot_goes_to_the_next_job() {
+    let mut h = harness(2).await;
+    let labels = ["self-hosted", "cf-2g"];
+    let pull = h.fake.queue_job_at(REPO, &labels, "check", "refs/pull/1/merge");
+    let main = h.fake.queue_job(REPO, &labels, "check");
+    let mut message = next_messages(&h, 2, 2).await;
+    let offered_again = message.available[1].clone();
+    message.available.insert(0, offered_again);
+    h.scaler.scale(Some(&message)).await.unwrap();
+    assert_eq!(h.fake.job_state(main), Some(JobState::Acquired(h.set.id)));
+    assert_eq!(h.fake.job_state(pull), Some(JobState::Acquired(h.set.id)));
+    assert_eq!((h.slots.used(), h.fake.count("acquirejobs")), (2, 1));
+    assert!(h.slots.released().is_empty(), "no slot was promised to the copy");
+}
+
+#[tokio::test]
+async fn a_place_in_line_takes_the_turn_of_the_job_it_stands_for_when_another_goes() {
+    let (mut h, running) = busy_mac().await;
+    let mut other = h.another_repository(OTHER).await;
+    other
+        .scale(Some(&assigned(vec![pull_job(OTHER, 10)], 1)))
+        .await
+        .unwrap();
+    // A pull request job and then a main job wait; the pull request job is cancelled. The newest place goes, so the
+    // one left now stands for the main job.
+    h.scaler
+        .scale(Some(&assigned(vec![pull_job(REPO, 2), main_job(REPO, 3)], 3)))
+        .await
+        .unwrap();
+    let cancelled = Message {
+        completed: vec![completed("", "canceled", pull_job(REPO, 2))],
+        statistics: counts(2),
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&cancelled)).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 2);
+    finish(&h.hosts, &mut h.scaler, &running, pull_job(REPO, 1), 1).await;
+    h.scaler.scale(None).await.unwrap();
+    other.scale(None).await.unwrap();
+    assert_eq!(started_repos(&h), [REPO, REPO]);
+}
+
+#[tokio::test]
+async fn an_offered_job_passed_over_keeps_its_age_however_many_other_offers_come_and_go() {
+    let mut h = harness(1).await;
+    let labels = ["self-hosted", "cf-2g"];
+    h.slots.set_open(false);
+    let old = h.fake.queue_job_at(REPO, &labels, "check", "refs/pull/1/merge");
+    let first = next_message(&h, 1).await;
+    h.scaler.scale(Some(&first)).await.unwrap();
+    // A thousand jobs are offered once each, and taken elsewhere, while the old one waits.
+    for n in 0..1000 {
+        let gone = Message {
+            available: vec![JobBase {
+                runner_request_id: 100_000 + n,
+                ..pull_job(REPO, 100_000 + n)
+            }],
+            ..first.clone()
+        };
+        h.scaler.scale(Some(&gone)).await.unwrap();
+    }
+    h.clock.advance(Duration::from_millis(cf_budget::DEFER_LIMIT.0));
+    h.slots.set_open(true);
+    pass(&h.machines, 1);
+    let main = h.fake.queue_job(REPO, &labels, "check");
+    let again = next_messages(&h, 2, 1).await;
+    h.scaler.scale(Some(&again)).await.unwrap();
+    assert_eq!(h.fake.job_state(old), Some(JobState::Acquired(h.set.id)));
+    assert_eq!(h.fake.job_state(main), Some(JobState::Available));
+}

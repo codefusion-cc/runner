@@ -1,4 +1,4 @@
-use cf_budget::{Size, SlotId};
+use cf_budget::{Size, SlotId, Turn};
 use cf_scaleset::{Error, JitConfig};
 use cf_secret::Secret;
 use cf_vmhost::OutOfMemory;
@@ -50,7 +50,17 @@ pub trait Slots: Send + Sync {
     /// A slot for the Actions runner of a job already assigned: the promised one, or, when the promise ran out or
     /// there was none, what the budget gives a job that is already this machine's. Such a job is never turned
     /// away for who is at the Mac: it starts, or it waits in line. The promise is used up either way.
-    fn claim(&self, size: Size, promised: Option<Ticket>) -> Claim;
+    fn claim(&self, size: Size, promised: Option<Ticket>) -> Claim {
+        self.claim_in_turn(size, promised, Turn::default())
+    }
+
+    /// [`Slots::claim`] for a job whose kind and repository are known: a job that waits takes its place in line by
+    /// them ([`cf_budget::Budget::line`]).
+    fn claim_in_turn(&self, size: Size, promised: Option<Ticket>, turn: Turn) -> Claim;
+
+    /// What the job that waits with this ticket stands for changed: it takes its place in line by `turn` from now on.
+    /// A ticket that no longer waits is not an error.
+    fn set_turn(&self, ticket: Ticket, turn: Turn);
 
     /// Whether the job that waits with this ticket may start now. From then on the ticket is a slot like any other.
     fn ready(&self, ticket: Ticket) -> bool;

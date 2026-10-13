@@ -9,7 +9,8 @@ use crate::machines::Answer;
 use crate::names::runner_name;
 use crate::roster::{JobInfo, Roster, Runner};
 use crate::traits::{Claim, EventKind, Events, Hosts, JobEvent, Jobs, Registry, RunnerSpec, Slots, Ticket};
-use cf_budget::Size;
+use crate::turns::turn_of;
+use cf_budget::{DEFER_LIMIT, Size, Turn};
 use cf_vmhost::OutOfMemory;
 
 /// How long a new Actions runner may wait for its job before it counts as surplus.
@@ -21,6 +22,9 @@ pub const PROMISE_TTL: Duration = Duration::from_secs(2 * 60);
 
 /// How often an Actions runner whose name is taken is registered again under another.
 const NAME_TRIES: usize = 3;
+
+/// How many offered jobs the scaler remembers first seeing, for [`DEFER_LIMIT`].
+const OFFERS_KEPT: usize = 512;
 
 /// What one scale set's scaler needs to know about itself.
 #[derive(Debug, Clone)]
@@ -68,6 +72,13 @@ pub struct Scaler<J, R, H> {
     promised: Vec<Promise>,
     /// Places in line of assigned jobs the machine has no room for yet, oldest first.
     waiting: Vec<Ticket>,
+    /// Jobs GitHub assigned to the scale set that no Actions runner here has started, oldest first: what a new place
+    /// in line stands for. GitHub hands a scale set's jobs to its Actions runners itself, so this is the scaler's
+    /// best guess of which job a machine started next will run, assuming the order they were assigned in.
+    pending: Vec<JobBase>,
+    /// Offered jobs by request ID, with when they were first offered: one passed over goes first after
+    /// [`DEFER_LIMIT`].
+    offered: Vec<(i64, SystemTime)>,
     /// Why the scale set's jobs can never run on this machine, when its settings rule the size out.
     never: Arc<Mutex<Option<String>>>,
     /// The counts as the service last reported them.
@@ -100,6 +111,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             was_out_of_memory: None,
             promised: vec![],
             waiting: vec![],
+            pending: vec![],
+            offered: vec![],
             never: Arc::new(Mutex::new(None)),
             last: Arc::new(Mutex::new(None)),
             wanted: None,
@@ -179,6 +192,18 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
 
     async fn handle(&mut self, message: &Message) -> Result<(), Error> {
         self.acquire(message).await?;
+        for job in &message.assigned {
+            // A message that comes again after a failure names the same jobs again.
+            if !self.pending.iter().any(|p| same_job(p, job)) {
+                self.pending.push(job.clone());
+            }
+        }
+        let ended = message.started.iter().map(|s| &s.job);
+        for job in ended.chain(message.completed.iter().map(|c| &c.job)) {
+            if let Some(at) = self.pending.iter().position(|p| same_job(p, job)) {
+                self.pending.remove(at);
+            }
+        }
         for started in &message.started {
             let event = self.event(EventKind::Started, &started.runner_name, &started.job, "");
             self.roster.mark_busy(
@@ -234,6 +259,11 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         }
         match message.statistics {
             Some(stats) => {
+                // A start or an end GitHub's word did not tie to its assignment leaves no job behind for long.
+                let running = usize::try_from(stats.total_running_jobs).unwrap_or(0);
+                let unstarted = stats.assigned().saturating_sub(running);
+                let gone = self.pending.len().saturating_sub(unstarted);
+                self.pending.drain(..gone);
                 self.wanted = Some(stats.assigned());
                 *self.last.lock().expect("statistics") = Some(stats);
             }
@@ -247,16 +277,50 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
 
     /// Takes the offered jobs that fit. A slot is promised to each before it is acquired, so no more is acquired
     /// than the machine can run; jobs another machine took first give their slots back.
+    ///
+    /// When not all fit, the jobs offered for longer than [`DEFER_LIMIT`] go first, then those of the main branch and
+    /// deploys ([`turn_of`]), then the rest; the others stay offered at GitHub.
     async fn acquire(&mut self, message: &Message) -> Result<(), Error> {
-        let mut ids: Vec<i64> = vec![];
+        let now = self.clock.now();
+        let mut offers: Vec<(u8, SystemTime, i64)> = vec![];
         for offer in &message.available {
-            if !ids.contains(&offer.runner_request_id) {
-                ids.push(offer.runner_request_id);
+            let id = offer.runner_request_id;
+            if offers.iter().any(|&(_, _, seen)| seen == id) {
+                continue;
+            }
+            let since = match self.offered.iter().find(|(seen, _)| *seen == id) {
+                Some(&(_, since)) => since,
+                None => {
+                    self.offered.push((id, now));
+                    now
+                }
+            };
+            let waited = now.duration_since(since).unwrap_or(Duration::ZERO);
+            let kind = if waited >= Duration::from_millis(DEFER_LIMIT.0) {
+                0
+            } else if turn_of(offer).urgent {
+                1
+            } else {
+                2
+            };
+            offers.push((kind, since, id));
+        }
+        // Past the bound, those not offered now are forgotten, the newest of them first: they lose the least age.
+        let mut excess = self.offered.len().saturating_sub(OFFERS_KEPT);
+        let mut at = self.offered.len();
+        while excess > 0 && at > 0 {
+            at -= 1;
+            let id = self.offered[at].0;
+            if !offers.iter().any(|&(_, _, offered)| offered == id) {
+                self.offered.remove(at);
+                excess -= 1;
             }
         }
-        if ids.is_empty() {
+        if offers.is_empty() {
             return Ok(());
         }
+        offers.sort_by_key(|&(kind, since, _)| (kind, since));
+        let mut ids: Vec<i64> = offers.into_iter().map(|(_, _, id)| id).collect();
         // The promises are the scaler's as soon as they are made: were this call dropped while it waits for the
         // service, they would still run out or go back with the scaler.
         let first = self.promised.len();
@@ -287,6 +351,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 return Err(e);
             }
         };
+        // A job acquired, or gone to another machine, is offered no more.
+        self.offered.retain(|(id, _)| !ids.contains(id));
         // Jobs another machine took first give their slots back (the oldest of these promises, as the Go manager
         // did).
         let lost = reserved.saturating_sub(got.len());
@@ -344,9 +410,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             }
         }
         let active = self.active();
-        for _ in active + self.waiting.len()..assigned {
+        // The jobs the Actions runners that wait for one take first, then those the places in line stand for.
+        let taken = self.idle() + self.waiting.len();
+        for n in 0..assigned.saturating_sub(active + self.waiting.len()) {
             let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
-            match self.slots.claim(self.config.size, promised) {
+            let turn = self.turn_for(taken + n);
+            match self.slots.claim_in_turn(self.config.size, promised, turn) {
                 Claim::Start(ticket) => {
                     if let Err(e) = self.start(ticket).await {
                         self.slots.release(ticket);
@@ -371,6 +440,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             }
         }
         *self.never.lock().expect("never") = None;
+        self.retune();
         if active > assigned {
             self.retire_surplus(active - assigned);
         }
@@ -478,6 +548,33 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         self.hosts.retire(&repo, set, n, &idle);
     }
 
+    /// The turn of the `at`th job GitHub assigned that no Actions runner here started.
+    fn turn_for(&self, at: usize) -> Turn {
+        Turn {
+            repo: self.config.repo.clone(),
+            ..self.pending.get(at).map(turn_of).unwrap_or_default()
+        }
+    }
+
+    /// Gives each place in line the turn of the job it stands for now: jobs started, ended or went away since it was
+    /// taken, and the places that went were the newest, whatever job went.
+    fn retune(&self) {
+        let idle = self.idle();
+        for (k, &ticket) in self.waiting.iter().enumerate() {
+            self.slots.set_turn(ticket, self.turn_for(idle + k));
+        }
+    }
+
+    /// The Actions runners of this scale set that wait for a job here.
+    fn idle(&self) -> usize {
+        let (repo, id) = (self.config.repo.as_str(), self.config.scale_set_id);
+        self.roster
+            .runners(repo, id)
+            .iter()
+            .filter(|runner| !runner.busy && runner.done.is_none())
+            .count()
+    }
+
     /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone
     /// under a job GitHub has not let go of.
     fn active(&self) -> usize {
@@ -508,6 +605,18 @@ impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
         self.expire_promises();
         Ok(self.capacity())
     }
+}
+
+/// Whether two messages speak of the same job: by its request ID when both carry one, else by its run and name. The
+/// real service sends an assigned job with no request ID; two jobs of one run that name nothing may be two.
+fn same_job(a: &JobBase, b: &JobBase) -> bool {
+    if a.runner_request_id > 0 && b.runner_request_id > 0 {
+        return a.runner_request_id == b.runner_request_id;
+    }
+    a.workflow_run_id > 0
+        && !a.job_display_name.is_empty()
+        && a.workflow_run_id == b.workflow_run_id
+        && a.job_display_name == b.job_display_name
 }
 
 /// When GitHub says a job started, as a text, and how many seconds later its word came. A start GitHub names no
@@ -567,5 +676,32 @@ impl<J, R, H> Drop for Scaler<J, R, H> {
         for ticket in self.waiting.drain(..) {
             self.slots.withdraw(ticket);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: i64, run: i64, name: &str) -> JobBase {
+        JobBase {
+            runner_request_id: id,
+            workflow_run_id: run,
+            job_display_name: name.into(),
+            ..JobBase::default()
+        }
+    }
+
+    #[test]
+    fn a_job_is_known_by_its_request_id_else_by_its_run_and_name() {
+        assert!(same_job(&job(5, 1, "a"), &job(5, 2, "b")));
+        assert!(!same_job(&job(5, 1, "a"), &job(6, 1, "a")));
+        // An assignment names no request ID; its start does.
+        assert!(same_job(&job(0, 1, "check"), &job(5, 1, "check")));
+        assert!(!same_job(&job(0, 1, "check"), &job(5, 1, "deploy")));
+        assert!(!same_job(&job(0, 1, "check"), &job(0, 2, "check")));
+        // Jobs that name neither run nor name may be any jobs.
+        assert!(!same_job(&job(0, 0, "check"), &job(0, 0, "check")));
+        assert!(!same_job(&job(0, 1, ""), &job(0, 1, "")));
     }
 }

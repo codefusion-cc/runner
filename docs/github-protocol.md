@@ -58,3 +58,9 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
   no job, 422 under a job, 404 once a one-job Actions runner removed its own. What each answer proves, and what is
   written before what is done, is `docs/job-state.md`. The result of a job whose `JobCompleted` was lost cannot be read
   without the App permission `actions: read`.
+- Which job goes first is the Runner's to choose only among the jobs it holds: those that wait for room on the Mac,
+  across its scale sets, and the offers of one message. Within one scale set, GitHub chooses which assigned job each
+  Actions runner gets. A job message names its repository, its name, its run, the run's event and its workflow file at
+  a ref (`jobWorkflowRef`, `owner/repo/.github/workflows/ci.yml@refs/heads/main`); it names no head branch and no run
+  attempt. The one `JobAssigned` kept from the probes (`cf-scaleset`'s `types.rs`) shows none of them, perhaps only
+  because it was cut short; a job whose message names none of them waits as a pull request's would (`turns.rs`). A job that should never wait behind pull requests runs on labels of its own.

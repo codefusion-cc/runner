@@ -3,7 +3,30 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
 use crate::level::{Watch, person_there, profile_for};
-use crate::{Hold, HostReading, Level, Millis, Now, Profile, Settings, SettingsError, Size, Trouble};
+use crate::{
+    DEFER_LIMIT, Hold, HostReading, Level, Millis, Now, Profile, Settings, SettingsError, Size, Trouble,
+};
+
+/// What decides an assigned job's place in line besides when it came ([`Budget::assign_in_turn`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Turn {
+    /// A job of the main branch or a deploy: it goes before the other jobs that wait, as long as none of those has
+    /// waited [`DEFER_LIMIT`].
+    pub urgent: bool,
+    /// The repository, `owner/name`. Of the jobs of one kind, those of the repository that started a job least
+    /// recently go first, so one busy repository does not keep another waiting.
+    pub repo: String,
+}
+
+/// One assigned job that waits for room.
+#[derive(Clone, Debug)]
+struct Waiter {
+    slot: SlotId,
+    size: Size,
+    turn: Turn,
+    /// When it began to wait.
+    since: Millis,
+}
 
 /// One slot of the budget: the memory and CPUs of one VM, from its reservation to its release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -358,8 +381,12 @@ pub struct Budget {
     settings: Settings,
     watch: Watch,
     slots: BTreeMap<SlotId, Slot>,
-    /// Assigned jobs that have no room yet, oldest first. They hold nothing.
-    waiting: VecDeque<(SlotId, Size)>,
+    /// Assigned jobs that have no room yet, in the order they came. They hold nothing; [`Budget::line`] says
+    /// which goes first.
+    waiting: VecDeque<Waiter>,
+    /// For each repository, when it last started an assigned job, as a count of such starts.
+    started_last: BTreeMap<String, u64>,
+    starts: u64,
     next_slot: u64,
     /// How many slots ever held memory here.
     inserted: u64,
@@ -376,6 +403,8 @@ impl Budget {
             watch: Watch::default(),
             slots: BTreeMap::new(),
             waiting: VecDeque::new(),
+            started_last: BTreeMap::new(),
+            starts: 0,
             next_slot: 0,
             inserted: 0,
             holds: BTreeSet::new(),
@@ -423,6 +452,9 @@ impl Budget {
                 slot.usage = slot.usage.map(|(_, usage)| (now.elapsed, usage));
             }
             self.last_eviction = self.last_eviction.map(|_| now.elapsed);
+            for waiter in &mut self.waiting {
+                waiter.since = waiter.since.min(now.elapsed);
+            }
         }
         if let Some(reading) = self.watch.fresh(&self.settings, now) {
             for slot in self.slots.values_mut() {
@@ -440,11 +472,18 @@ impl Budget {
         }
         let evict = self.pick_eviction(now);
         let mut started = Vec::new();
-        while let Some((index, slot, size)) = self.next_waiting() {
+        for slot in self.line(now) {
+            let Some(index) = self.waiting.iter().position(|waiter| waiter.slot == slot) else {
+                continue;
+            };
+            let size = self.waiting[index].size;
             if self.assigned_fits(now, size).is_err() {
                 break;
             }
-            self.waiting.remove(index);
+            let Some(waiter) = self.waiting.remove(index) else {
+                break;
+            };
+            self.started(&waiter.turn);
             started.push(self.insert(slot, size, None, self.assigned_origin(now)));
         }
         Observed {
@@ -476,9 +515,14 @@ impl Budget {
     /// still holds for it: the floor in force (the higher one while the person is there), pressure, swapping, the
     /// calm time, heat, battery, disk, a missing reading, and every hold. Those it waits for.
     ///
-    /// Jobs that wait start in the order they came, and while one waits no other slot is granted
+    /// Jobs that wait start in the order of [`Budget::line`], and while one waits no other slot is granted
     /// ([`Refusal::AssignedFirst`], and [`Budget::free`] is zero, so the Runner offers GitHub nothing).
     pub fn assign(&mut self, now: Now, size: Size) -> Assigned {
+        self.assign_in_turn(now, size, Turn::default())
+    }
+
+    /// [`Budget::assign`] for a job whose kind and repository are known: they decide its place in line.
+    pub fn assign_in_turn(&mut self, now: Now, size: Size, turn: Turn) -> Assigned {
         if let Err(never) = self.settings.can_run(size) {
             return Assigned::Never(never);
         }
@@ -488,22 +532,79 @@ impl Budget {
             None => self.assigned_fits(now, size),
         };
         match fits {
-            Ok(()) => Assigned::Start(self.insert(slot, size, None, self.assigned_origin(now))),
+            Ok(()) => {
+                self.started(&turn);
+                Assigned::Start(self.insert(slot, size, None, self.assigned_origin(now)))
+            }
             Err(why) => {
-                self.waiting.push_back((slot, size));
+                self.waiting.push_back(Waiter {
+                    slot,
+                    size,
+                    turn,
+                    since: now.elapsed,
+                });
                 Assigned::Waits { slot, why }
             }
         }
     }
 
+    /// The jobs that wait, in the order they start: first those that waited [`DEFER_LIMIT`] or longer,
+    /// oldest first; then the urgent ones ([`Turn::urgent`]); then the rest. Within the urgent ones and within the
+    /// rest, the repository that started a job least recently goes first, then the job that came first. A job the
+    /// settings have since ruled out is not in it: it holds nobody up.
+    ///
+    /// No job waits for ever: each one that waits reaches the first group after [`DEFER_LIMIT`], and
+    /// nothing that comes later goes before it then.
+    pub fn line(&self, now: Now) -> Vec<SlotId> {
+        let mut last = self.started_last.clone();
+        let mut starts = self.starts;
+        let mut left: Vec<usize> = (0..self.waiting.len())
+            .filter(|&index| self.settings.can_run(self.waiting[index].size).is_ok())
+            .collect();
+        let mut order = Vec::with_capacity(left.len());
+        while let Some(pick) = left
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &index)| {
+                let waiter = &self.waiting[index];
+                let overdue = now.elapsed.since(waiter.since) >= DEFER_LIMIT;
+                let (kind, repo) = match (overdue, waiter.turn.urgent) {
+                    (true, _) => (0, None),
+                    (false, true) => (1, Some(last.get(&waiter.turn.repo).copied())),
+                    (false, false) => (2, Some(last.get(&waiter.turn.repo).copied())),
+                };
+                (kind, repo, index)
+            })
+            .map(|(at, _)| at)
+        {
+            let waiter = &self.waiting[left.remove(pick)];
+            starts += 1;
+            last.insert(waiter.turn.repo.clone(), starts);
+            order.push(waiter.slot);
+        }
+        order
+    }
+
+    /// Gives a job that waits another turn: what it stands for changed while it waited. It keeps the time it began
+    /// to wait. An error means it does not wait.
+    pub fn set_turn(&mut self, slot: SlotId, turn: Turn) -> Result<(), UnknownSlot> {
+        let waiter = self
+            .waiting
+            .iter_mut()
+            .find(|waiter| waiter.slot == slot)
+            .ok_or(UnknownSlot(slot))?;
+        waiter.turn = turn;
+        Ok(())
+    }
+
     /// Forgets an assigned job that still waits: GitHub took it back or it was cancelled. It held nothing. An
     /// error means it does not wait: it started (then [`Budget::release`] is the call), or it was never there.
     pub fn withdraw(&mut self, slot: SlotId) -> Result<Size, UnknownSlot> {
-        let index = self.waiting.iter().position(|(id, _)| *id == slot);
-        let (_, size) = index
+        let index = self.waiting.iter().position(|waiter| waiter.slot == slot);
+        let waiter = index
             .and_then(|index| self.waiting.remove(index))
             .ok_or(UnknownSlot(slot))?;
-        Ok(size)
+        Ok(waiter.size)
     }
 
     /// How many assigned jobs wait for room.
@@ -524,6 +625,14 @@ impl Budget {
     pub fn confirm(&mut self, slot: SlotId) -> Result<(), UnknownSlot> {
         let held = self.slots.get_mut(&slot).ok_or(UnknownSlot(slot))?;
         held.expires = None;
+        Ok(())
+    }
+
+    /// [`Budget::confirm`] for a job whose repository is known: its start counts for the repository's turn
+    /// ([`Budget::line`]) as one through [`Budget::assign_in_turn`] does.
+    pub fn confirm_in_turn(&mut self, slot: SlotId, turn: &Turn) -> Result<(), UnknownSlot> {
+        self.confirm(slot)?;
+        self.started(turn);
         Ok(())
     }
 
@@ -708,19 +817,15 @@ impl Budget {
         let waiting = self
             .waiting
             .iter()
-            .filter(|(_, size)| self.settings.can_run(*size).is_ok())
+            .filter(|waiter| self.settings.can_run(waiter.size).is_ok())
             .count();
         (waiting > 0).then_some(Refusal::AssignedFirst { waiting })
     }
 
-    /// The oldest waiting job this Mac can run at all, with its place in the line. A job that the settings have
-    /// since made impossible keeps its place and holds nobody up.
-    fn next_waiting(&self) -> Option<(usize, SlotId, Size)> {
-        self.waiting
-            .iter()
-            .enumerate()
-            .find(|(_, (_, size))| self.settings.can_run(*size).is_ok())
-            .map(|(index, (slot, size))| (index, *slot, *size))
+    /// A repository started an assigned job: its other jobs go after those of repositories that did not since.
+    fn started(&mut self, turn: &Turn) {
+        self.starts += 1;
+        self.started_last.insert(turn.repo.clone(), self.starts);
     }
 
     /// Every slot as admission counts it.
@@ -731,9 +836,18 @@ impl Budget {
     /// Every waiting job with what keeps it waiting at `now`.
     fn waiting_now(&self, now: Now) -> Vec<Waiting> {
         let mut ahead = 0;
+        // A job the settings ruled out keeps its place; the others take theirs in the order they start.
+        let mut line = self.line(now).into_iter();
         self.waiting
             .iter()
-            .map(|&(slot, size)| {
+            .map(|waiter| match self.settings.can_run(waiter.size) {
+                Ok(()) => line
+                    .next()
+                    .and_then(|slot| self.waiting.iter().find(|w| w.slot == slot))
+                    .unwrap_or(waiter),
+                Err(_) => waiter,
+            })
+            .map(|&Waiter { slot, size, .. }| {
                 let ruled_out = self.settings.can_run(size).err();
                 let why = match ruled_out {
                     Some(limit) => Some(limit),

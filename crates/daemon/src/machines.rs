@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use cf_budget::{
     Assigned, Budget, Grant, Hold, Host, HostReading, Level, Millis, Now, Settings, Size, SlotId, Status,
-    Usage,
+    Turn, Usage,
 };
 use cf_ghapp::Clock;
 use cf_guest_proto::{StopReason, Workload};
@@ -1356,17 +1356,17 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         }
     }
 
-    fn claim(&self, size: Size, promised: Option<Ticket>) -> Claim {
+    fn claim_in_turn(&self, size: Size, promised: Option<Ticket>, turn: Turn) -> Claim {
         let mut inner = self.lock();
         let now = inner.host.now();
         self.holds(&mut inner, now);
         if let Some(ticket) = promised {
-            if inner.budget.confirm(ticket).is_ok() {
+            if inner.budget.confirm_in_turn(ticket, &turn).is_ok() {
                 return Claim::Start(ticket);
             }
             inner.grants.remove(&ticket);
         }
-        let claim = match inner.budget.assign(now, size) {
+        let claim = match inner.budget.assign_in_turn(now, size, turn) {
             Assigned::Start(grant) => {
                 inner.breaker.admit(now.elapsed);
                 inner.grants.insert(grant.slot, grant);
@@ -1389,6 +1389,10 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             self.ring();
         }
         claim
+    }
+
+    fn set_turn(&self, ticket: Ticket, turn: Turn) {
+        let _ = self.lock().budget.set_turn(ticket, turn);
     }
 
     fn ready(&self, ticket: Ticket) -> bool {

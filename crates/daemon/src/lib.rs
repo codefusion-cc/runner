@@ -21,6 +21,7 @@ mod service;
 #[doc(hidden)]
 pub mod testing;
 mod traits;
+mod turns;
 mod vms;
 
 pub use adapters::SetRegistry;
@@ -44,6 +45,7 @@ pub use service::{
 pub use traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
 };
+pub use turns::turn_of;
 pub use vms::{Seen, VmError, VmHosts, Vms};
 
 /// A moment in seconds since 1970; 0 for one before that.
