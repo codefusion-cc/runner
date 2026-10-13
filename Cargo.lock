@@ -368,6 +368,7 @@ dependencies = [
 name = "cf-vmm-ch"
 version = "0.1.0"
 dependencies = [
+ "cf-host-linux",
  "cf-netlink",
  "cf-nft",
  "cf-vmhost",

@@ -22,7 +22,7 @@ extern "C" fn cancel(_signal: libc::c_int) {
 pub struct Host {
     /// The host CPUs the machines run on; by default the fastest this process may use.
     #[cfg(target_os = "linux")]
-    pub cpus: Option<Vec<usize>>,
+    pub cpus: Option<Vec<u32>>,
 }
 
 impl Host {

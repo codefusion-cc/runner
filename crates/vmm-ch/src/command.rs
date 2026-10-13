@@ -56,7 +56,7 @@ pub fn monitor(
     program: &Path,
     spec: &VmSpec,
     files: Files<'_>,
-    cores: &[usize],
+    cores: &[u32],
 ) -> Result<Vec<OsString>, String> {
     if cores.is_empty() {
         return Err("no host CPU for the machine".into());

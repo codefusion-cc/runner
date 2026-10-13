@@ -2,50 +2,24 @@
 //!
 //! On a board with big and little cores (an RK3588 has four Cortex-A76 and four Cortex-A55), a vCPU that the host
 //! moves from one kind of core to the other can make `KVM_RUN` fail: KVM refuses to run a vCPU on a CPU its PMU does
-//! not cover. So every machine is held to one kind of core, the fastest the Runner may use, and every job gets the
-//! same, fast cores. The kernel says how fast each core is in `cpu_capacity` (1024 for the fastest); a host whose
-//! cores are all alike says nothing there, or the same for each, and every core it allows is taken.
+//! not cover. So every machine is held to one kind of core: the host's fast cores as `cf_host_linux::fast_cpus`
+//! names them, those of them this process may use, or the cores `--host-cpus` names.
 
 use std::fmt;
 
-/// The highest CPU number a list may name: far above any host, low enough that a hostile list costs nothing.
-pub const MAX_CPU: usize = 4095;
-
-/// A kernel CPU list (`0-3,6,8-9`, as `cpuset.cpus` and `/sys/devices/system/cpu/online` write them) as sorted,
-/// distinct CPU numbers. An empty text is an empty list.
-pub fn parse_list(text: &str) -> Result<Vec<usize>, String> {
-    let text = text.trim();
-    let mut cpus = Vec::new();
-    if text.is_empty() {
-        return Ok(cpus);
-    }
-    let number = |part: &str| -> Result<usize, String> {
-        let valid = !part.is_empty() && part.len() <= 4 && part.bytes().all(|byte| byte.is_ascii_digit());
-        match part.parse::<usize>() {
-            Ok(cpu) if valid && cpu <= MAX_CPU => Ok(cpu),
-            _ => Err(format!("{part:?} is not a CPU number from 0 to {MAX_CPU}")),
-        }
-    };
-    for part in text.split(',') {
-        let (first, last) = match part.split_once('-') {
-            Some((first, last)) => (number(first)?, number(last)?),
-            None => {
-                let cpu = number(part)?;
-                (cpu, cpu)
-            }
-        };
-        if first > last {
-            return Err(format!("the range {part:?} runs backwards"));
-        }
-        cpus.extend(first..=last);
-    }
-    cpus.sort_unstable();
-    cpus.dedup();
-    Ok(cpus)
+/// A kernel CPU list (`0-3,6,8-9`, as `cpuset.cpus` and `/sys/devices/system/cpu/online` write them) as the CPU
+/// numbers in order. An empty text is an empty list.
+pub fn parse_list(text: &str) -> Result<Vec<u32>, String> {
+    cf_host_linux::parse::cpu_list(text).ok_or_else(|| {
+        format!(
+            "{:?} is not a CPU list as the kernel writes one, such as 4-7 or 0,2-3",
+            text.trim()
+        )
+    })
 }
 
 /// A list of CPU numbers as the kernel writes one: ranges where they run on.
-pub struct List<'a>(pub &'a [usize]);
+pub struct List<'a>(pub &'a [u32]);
 
 impl fmt::Display for List<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,38 +48,11 @@ impl fmt::Display for List<'_> {
     }
 }
 
-/// The cores a machine runs on: of the CPUs this process may use (`allowed`), those of the highest capacity among
-/// them. `capacity` gives a CPU's `cpu_capacity`, `None` where the kernel says nothing. When no allowed CPU has a
-/// capacity, every allowed CPU is taken: the host's cores are all alike.
-pub fn fastest(allowed: &[usize], capacity: impl Fn(usize) -> Option<u32>) -> Vec<usize> {
-    let known: Vec<(usize, u32)> = allowed
-        .iter()
-        .filter_map(|&cpu| capacity(cpu).map(|value| (cpu, value)))
-        .collect();
-    let Some(top) = known.iter().map(|&(_, value)| value).max() else {
-        let mut all = allowed.to_vec();
-        all.sort_unstable();
-        all.dedup();
-        return all;
-    };
-    let mut cores: Vec<usize> = known
-        .into_iter()
-        .filter(|&(_, value)| value == top)
-        .map(|(cpu, _)| cpu)
-        .collect();
-    cores.sort_unstable();
-    cores.dedup();
-    cores
-}
-
 /// The cores machines run on: `chosen` (from the configuration) when given, which must be CPUs this process may
-/// use, else [`fastest`]. Never empty.
-pub fn host_cores(
-    chosen: Option<&[usize]>,
-    allowed: &[usize],
-    capacity: impl Fn(usize) -> Option<u32>,
-) -> Result<Vec<usize>, String> {
-    let cores = match chosen {
+/// use (`allowed`), else the host's `fast` cores that it may use. `fast` is `None` when the host's CPUs could not be
+/// read. Never empty.
+pub fn host_cores(chosen: Option<&[u32]>, allowed: &[u32], fast: Option<&[u32]>) -> Result<Vec<u32>, String> {
+    let mut cores = match chosen {
         Some(chosen) => {
             if let Some(cpu) = chosen.iter().find(|cpu| !allowed.contains(cpu)) {
                 return Err(format!(
@@ -113,13 +60,24 @@ pub fn host_cores(
                     List(allowed)
                 ));
             }
-            let mut chosen = chosen.to_vec();
-            chosen.sort_unstable();
-            chosen.dedup();
-            chosen
+            chosen.to_vec()
         }
-        None => fastest(allowed, capacity),
+        None => {
+            let fast = fast.ok_or("the host's CPUs could not be read from /sys/devices/system/cpu")?;
+            let usable: Vec<u32> = fast.iter().copied().filter(|cpu| allowed.contains(cpu)).collect();
+            if usable.is_empty() && !fast.is_empty() {
+                return Err(format!(
+                    "this process may use CPUs {}, none of the host's fast cores {}: name the machines' cores with \
+                     --host-cpus",
+                    List(allowed),
+                    List(fast)
+                ));
+            }
+            usable
+        }
     };
+    cores.sort_unstable();
+    cores.dedup();
     if cores.is_empty() {
         return Err("no CPU is left for the machines".into());
     }
@@ -128,32 +86,23 @@ pub fn host_cores(
 
 #[cfg(target_os = "linux")]
 pub(crate) mod host {
-    //! What the kernel says about this host's CPUs.
+    //! What the kernel says about the CPUs this process may use.
 
     use super::parse_list;
     use std::path::Path;
 
-    /// A CPU's `cpu_capacity`, `None` where the kernel has none.
-    pub fn capacity(cpu: usize) -> Option<u32> {
-        std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-    }
-
     /// The CPUs this process may run on: its affinity, within what `cpuset.cpus.effective` of `cgroup` allows when
     /// that file is there.
-    pub fn allowed(cgroup: &Path) -> Result<Vec<usize>, String> {
+    pub fn allowed(cgroup: &Path) -> Result<Vec<u32>, String> {
         // SAFETY: `set` is a plain bit set that sched_getaffinity fills; the size passed is its own.
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         // SAFETY: as above; pid 0 is this thread.
         if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
             return Err(format!("sched_getaffinity: {}", std::io::Error::last_os_error()));
         }
-        let mut cpus: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+        let mut cpus: Vec<u32> = (0..libc::CPU_SETSIZE as u32)
             // SAFETY: CPU_ISSET reads one bit of the set, below its size.
-            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu as usize, &set) })
             .collect();
         if let Ok(text) = std::fs::read_to_string(cgroup.join("cpuset.cpus.effective")) {
             let effective = parse_list(&text)?;
@@ -168,66 +117,59 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    #[test]
-    fn a_list_is_read_as_the_kernel_writes_it() {
-        assert_eq!(parse_list("0-3,6,8-9\n"), Ok(vec![0, 1, 2, 3, 6, 8, 9]));
-        assert_eq!(parse_list("7"), Ok(vec![7]));
-        assert_eq!(parse_list(""), Ok(vec![]));
-        assert_eq!(parse_list("4-7,5"), Ok(vec![4, 5, 6, 7]));
-    }
+    const RK3588_FAST: &[u32] = &[4, 5, 6, 7];
 
     #[test]
-    fn a_list_that_is_not_one_is_refused() {
+    fn a_list_is_read_as_the_kernel_writes_it_and_nothing_else() {
+        assert_eq!(parse_list("0-3,6,8-9\n"), Ok(vec![0, 1, 2, 3, 6, 8, 9]));
+        assert_eq!(parse_list(""), Ok(vec![]));
         for text in [
-            "3-1",
-            "a",
-            "1,,2",
-            "-1",
-            "1-",
-            "4096",
-            "99999999999999999999",
-            "1 2",
-            "0x3",
-            "+1",
-            ",",
+            "3-1", "a", "1,,2", "-1", "1-", "1 2", "0x3", "+1", ",", "6,4", "4-7,5",
         ] {
-            assert!(parse_list(text).is_err(), "{text:?} was taken");
+            let error = parse_list(text).unwrap_err();
+            assert!(error.contains("such as 4-7"), "{text:?}: {error}");
         }
     }
 
     #[test]
-    fn the_big_cores_of_a_big_little_board_are_taken() {
-        let rk3588 = |cpu: usize| Some(if cpu < 4 { 405 } else { 1024 });
-        assert_eq!(fastest(&[0, 1, 2, 3, 4, 5, 6, 7], rk3588), vec![4, 5, 6, 7]);
+    fn the_fast_cores_this_process_may_use_are_taken() {
+        let all: Vec<u32> = (0..8).collect();
+        assert_eq!(host_cores(None, &all, Some(RK3588_FAST)), Ok(vec![4, 5, 6, 7]));
+        assert_eq!(host_cores(None, &[0, 1, 5, 7], Some(RK3588_FAST)), Ok(vec![5, 7]));
+        // A host whose cores are alike has them all fast.
+        assert_eq!(host_cores(None, &[0, 1], Some(&[0, 1, 2, 3])), Ok(vec![0, 1]));
     }
 
     #[test]
-    fn only_allowed_cores_are_taken_and_the_fastest_of_those() {
-        let rk3588 = |cpu: usize| Some(if cpu < 4 { 405 } else { 1024 });
-        assert_eq!(fastest(&[0, 1, 5], rk3588), vec![5]);
-        // Little cores alone are all alike: a machine on them never changes kind.
-        assert_eq!(fastest(&[0, 1, 2], rk3588), vec![0, 1, 2]);
+    fn little_cores_alone_are_never_taken_in_place_of_the_fast_ones() {
+        let error = host_cores(None, &[0, 1, 2], Some(RK3588_FAST)).unwrap_err();
+        assert!(
+            error.contains("0-2") && error.contains("4-7") && error.contains("--host-cpus"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn a_host_that_says_nothing_of_capacity_gives_every_allowed_core() {
-        assert_eq!(fastest(&[3, 1, 2], |_| None), vec![1, 2, 3]);
-        assert_eq!(fastest(&[0, 1], |_| Some(1024)), vec![0, 1]);
+    fn a_host_whose_cpus_cannot_be_read_takes_none_unless_they_are_chosen() {
+        assert!(host_cores(None, &[0, 1], None).is_err());
+        assert_eq!(host_cores(Some(&[1]), &[0, 1], None), Ok(vec![1]));
     }
 
     #[test]
     fn a_choice_must_be_allowed_and_never_empty() {
-        let none = |_| None;
-        assert_eq!(host_cores(Some(&[6, 4]), &[0, 4, 6], none), Ok(vec![4, 6]));
-        let refused = host_cores(Some(&[4, 9]), &[0, 4], none).unwrap_err();
+        assert_eq!(
+            host_cores(Some(&[6, 4]), &[0, 4, 6], Some(RK3588_FAST)),
+            Ok(vec![4, 6])
+        );
+        let refused = host_cores(Some(&[4, 9]), &[0, 4], Some(RK3588_FAST)).unwrap_err();
         assert!(refused.contains("CPU 9"), "{refused}");
-        assert!(host_cores(Some(&[]), &[0], none).is_err());
-        assert!(host_cores(None, &[], none).is_err());
+        assert!(host_cores(Some(&[]), &[0], Some(RK3588_FAST)).is_err());
+        assert!(host_cores(None, &[], Some(&[])).is_err());
     }
 
     proptest! {
         #[test]
-        fn a_written_list_reads_back_the_same(cpus in proptest::collection::vec(0usize..=MAX_CPU, 0..40)) {
+        fn a_written_list_reads_back_the_same(cpus in proptest::collection::vec(0u32..4096, 0..40)) {
             let mut expected = cpus.clone();
             expected.sort_unstable();
             expected.dedup();
@@ -235,19 +177,17 @@ mod tests {
         }
 
         #[test]
-        fn the_fastest_are_allowed_alike_and_none_allowed_is_faster(
-            capacities in proptest::collection::vec(proptest::option::of(1u32..2048), 1..16),
-            allowed in proptest::collection::btree_set(0usize..16, 1..16),
+        fn the_cores_taken_are_fast_and_allowed_and_every_such_core_is_taken(
+            fast in proptest::collection::btree_set(0u32..16, 0..16),
+            allowed in proptest::collection::btree_set(0u32..16, 0..16),
         ) {
-            let allowed: Vec<usize> = allowed.into_iter().collect();
-            let capacity = |cpu: usize| capacities.get(cpu).copied().flatten();
-            let cores = fastest(&allowed, capacity);
-            prop_assert!(!cores.is_empty());
-            prop_assert!(cores.iter().all(|cpu| allowed.contains(cpu)));
-            let speeds: std::collections::BTreeSet<Option<u32>> = cores.iter().map(|&cpu| capacity(cpu)).collect();
-            prop_assert_eq!(speeds.len(), 1, "one kind of core");
-            let top = allowed.iter().filter_map(|&cpu| capacity(cpu)).max();
-            prop_assert_eq!(speeds.into_iter().next().unwrap(), top);
+            let fast: Vec<u32> = fast.into_iter().collect();
+            let allowed: Vec<u32> = allowed.into_iter().collect();
+            let both: Vec<u32> = fast.iter().copied().filter(|cpu| allowed.contains(cpu)).collect();
+            match host_cores(None, &allowed, Some(&fast)) {
+                Ok(cores) => prop_assert_eq!(cores, both),
+                Err(_) => prop_assert!(both.is_empty()),
+            }
         }
     }
 }

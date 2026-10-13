@@ -42,7 +42,7 @@ pub struct Config {
     /// The program whose `vm-sandbox` subcommand is [`crate::sandbox`]: the one that hosts this crate.
     pub sandbox: PathBuf,
     /// The host CPUs machines run on; `None` for the fastest this process may use.
-    pub host_cpus: Option<Vec<usize>>,
+    pub host_cpus: Option<Vec<u32>>,
     /// The networks of the host's interfaces, which no guest reaches.
     pub host_networks: Vec<(Ip, u8)>,
 }
@@ -51,7 +51,7 @@ pub struct Config {
 pub struct ChVmm {
     config: Config,
     delegation: Delegation,
-    cores: Vec<usize>,
+    cores: Vec<u32>,
     next: AtomicU64,
 }
 
@@ -66,8 +66,12 @@ impl ChVmm {
             .map_err(|e| VmmError::Unsupported(format!("/dev/kvm: {e}")))?;
         let delegation = Delegation::claim().map_err(VmmError::Unsupported)?;
         let allowed = cpus::host::allowed(delegation.machines()).map_err(VmmError::Unsupported)?;
-        let cores = cpus::host_cores(config.host_cpus.as_deref(), &allowed, cpus::host::capacity)
-            .map_err(VmmError::Unsupported)?;
+        let cores = cpus::host_cores(
+            config.host_cpus.as_deref(),
+            &allowed,
+            cf_host_linux::fast_cpus(Path::new("/")).as_deref(),
+        )
+        .map_err(VmmError::Unsupported)?;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -95,7 +99,7 @@ impl ChVmm {
     }
 
     /// The host CPUs machines run on.
-    pub fn cores(&self) -> &[usize] {
+    pub fn cores(&self) -> &[u32] {
         &self.cores
     }
 
