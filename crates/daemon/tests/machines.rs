@@ -486,6 +486,46 @@ async fn an_idle_machine_that_is_retired_reports_no_job() {
     w.assert_nothing_left();
 }
 
+/// A machine retired as surplus whose registration is gone when the sweep removes it: its Actions runner took a job
+/// the Runner never heard of and removed its own registration once the job was over. The job is reported as one that
+/// finished by itself, not as one the Runner stopped.
+#[tokio::test]
+async fn a_job_over_before_its_machine_was_retired_is_reported_as_finished() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    Hosts::retire(w.m.as_ref(), &runner);
+    w.registered.remove(&runner);
+    w.sweep();
+    // The guest finishes (two minutes at most), and the wait for GitHub's word of the job is over.
+    pass(&w.m, 120 + RESULT_WAIT.as_secs() + 60);
+    w.assert_nothing_left();
+    assert_eq!(w.ends(), [(runner, EndKind::Finished)]);
+}
+
+/// An idle machine is stopped from the console and the Runner dies; when it starts again nothing of the machine is
+/// left, not even how long it took to boot. It was up, so its start may have gone unheard: GitHub is asked, and the
+/// job its Actions runner ran is heard.
+#[tokio::test]
+async fn a_machine_stopped_after_it_came_up_and_gone_without_a_trace_is_asked_about() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    w.m.stop(job_name(&runner));
+    w.parts.vms.forget(job_name(&runner));
+    w.restart();
+    // The job ran, its messages went with a session, and its Actions runner removed its own registration.
+    w.registered.remove(&runner);
+    pass(&w.m, RESULT_WAIT.as_secs() + 2);
+    w.sweep();
+    assert_eq!(
+        ids(&w.reports()),
+        [format!("{runner}/started"), format!("{runner}/completed")]
+    );
+}
+
 // --- slots -------------------------------------------------------------------------------------------------------
 
 #[tokio::test]

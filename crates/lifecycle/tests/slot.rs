@@ -855,6 +855,20 @@ fn a_word_of_a_job_is_kept_whatever_phase_it_meets() {
         slot.on(s(125), Event::VmExited),
         [Effect::Unregister, Effect::Release, ended(End::Stopped, true)]
     );
+    // Stopped as one without a job, and then a word of one: the job's word wins over the end that assumed none.
+    for word in [Event::JobStarted, Event::JobCompleted] {
+        let mut slot = idle();
+        slot.on(s(100), Event::Heartbeat);
+        slot.on(s(122), Event::Tick);
+        slot.on(s(123), Event::Unregistered);
+        assert_eq!(slot.saved().end, Some(End::NoJob));
+        assert_eq!(slot.on(s(124), word), []);
+        assert_eq!(
+            slot.on(s(125), Event::VmExited),
+            [Effect::Unregister, Effect::Release, ended(End::Stopped, true)],
+            "{word:?}"
+        );
+    }
 }
 
 /// A slot restored while it waited for GitHub's answer to its removal asks again at once, and waits for no idle
