@@ -1852,13 +1852,9 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             Happens::Completed(n, github_first) => {
                 if let Some(runner) = pick(&running(&jobs), n) {
                     if github_first {
-                        // GitHub's word may come before the Runner saw a machine that boots slowly up.
+                        // GitHub's word may come before the Runner saw the machine up.
                         rig.github.complete_job(&runner, "succeeded");
                         tokio::time::sleep(Duration::from_millis(30)).await;
-                        if rig.booting().contains(&runner) {
-                            rig.parts.vms.ready(job_name(&runner));
-                            tokio::time::sleep(Duration::from_millis(30)).await;
-                        }
                         rig.parts.vms.end(job_name(&runner), End::Ok);
                     } else {
                         rig.parts.vms.end(job_name(&runner), End::Ok);
