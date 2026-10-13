@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use cf_budget::{Host, HostError, HostFacts, HostReading, Millis, Now};
+use cf_budget::{Host, HostError, HostFacts, HostReading, Now};
 
 use crate::{Battery, Raw, reading};
 
@@ -91,18 +91,6 @@ fn sysctl<T: Plain>(name: &'static CStr) -> Result<T, HostError> {
     }
     // SAFETY: every byte was written (zeroed, then filled by the kernel) and `T: Plain` takes any bytes.
     Ok(unsafe { value.assume_init() })
-}
-
-fn clock(id: libc::clockid_t) -> Option<Millis> {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `time` is a timespec this call may write.
-    let status = unsafe { libc::clock_gettime(id, &mut time) };
-    let secs = u64::try_from(time.tv_sec).ok()?;
-    let nanos = u64::try_from(time.tv_nsec).ok()?;
-    (status == 0).then(|| Millis(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000)))
 }
 
 /// The HID system's idle time in nanoseconds; `None` when macOS has no HID system (no window server yet) or it
@@ -457,13 +445,9 @@ impl Host for MacHost {
         }
     }
 
-    /// Both clocks: `CLOCK_UPTIME_RAW` stands still while the Mac sleeps, `CLOCK_MONOTONIC_RAW` does not. A clock
-    /// that cannot be read answers zero, which the budget takes as time gone backwards and closes the Mac.
+    /// `CLOCK_UPTIME_RAW` stands still while the Mac sleeps, `CLOCK_MONOTONIC_RAW` does not ([`cf_clock::now`]).
     fn now(&self) -> Now {
-        match (clock(libc::CLOCK_UPTIME_RAW), clock(libc::CLOCK_MONOTONIC_RAW)) {
-            (Some(awake), Some(elapsed)) => Now { awake, elapsed },
-            _ => Now::default(),
-        }
+        cf_clock::now()
     }
 
     fn read(&mut self) -> Result<HostReading, HostError> {

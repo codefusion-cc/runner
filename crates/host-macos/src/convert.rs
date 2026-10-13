@@ -1,4 +1,4 @@
-use cf_budget::{HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
+use cf_budget::{Battery, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 
 /// What macOS answered, before anything is made of it. Page counts are in pages of [`Raw::page_bytes`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,17 +106,6 @@ pub fn reading(facts: HostFacts, at: Now, raw: &Raw) -> Result<HostReading, Host
         on_battery: raw.power_remaining_secs != POWER_UNLIMITED,
         disk_free_bytes: raw.disk_free_bytes,
     })
-}
-
-/// A Mac's battery, as `pmset -g batt` says it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Battery {
-    /// Whether the Mac draws from its battery and not from a charger.
-    pub on_battery: bool,
-    /// The charge, 0 to 100.
-    pub percent: u32,
-    /// Whether it is charging.
-    pub charging: bool,
 }
 
 /// The battery in what `pmset -g batt` printed; `None` for a Mac without one, and for a text that is not what

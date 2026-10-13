@@ -69,7 +69,7 @@ jobs:
     timeout-minutes: 30
     env:
       # The crates that build and pass on Linux. Add a crate here once it does.
-      LINUX_CRATES: -p cf-budget -p cf-guest-proto -p cf-image -p cf-lifecycle -p cf-nft -p cf-secret -p cf-supervisor -p cf-vmm -p cf-workflows
+      LINUX_CRATES: -p cf-budget -p cf-clock -p cf-guest-proto -p cf-host-linux -p cf-image -p cf-lifecycle -p cf-nft -p cf-secret -p cf-supervisor -p cf-vmm -p cf-workflows
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -93,6 +93,8 @@ jobs:
         env:
           # A kernel test that cannot make its namespace fails here instead of passing as skipped.
           CF_REQUIRE_NAMESPACES: '1'
+      - name: The probe reads this host
+        run: cargo run --locked -p cf-host-linux --example linux-probe
 
   deny:
     name: Dependencies (cargo deny)
