@@ -136,10 +136,15 @@ Mac that cannot set the mark logs a line and goes on. A cache folder the Runner 
 
 One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 
-To update, build the new version and run its `install` again. It refuses while a machine stands, so a job is never
-cut off by an update. `uninstall` stops the agent and every machine, removes every scale set and registration at
-GitHub and says what it could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the
-state folder with its images.
+To update by hand, build the new version and run its `install` again. It refuses while a machine stands, so a job is
+never cut off by an update. A Runner installed so updates itself when the console asks (`update`): from the checkout it
+was built from, which must have no changes of its own, it fetches `main`, builds it while jobs run, takes no new job
+until no machine stands, then installs and starts again. A new program that does not stay up for a minute three times
+is replaced by the one before, and the console hears why. `restart` ends the Runner at once and launchd starts it
+again; machines that run go on and are adopted.
+
+`uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
+could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
 
 Beside the cf-runners manager of `codefusion-cc/codefusion` the Runner touches nothing of it: another launchd label,
 another folder, another name at GitHub (it refuses to run under the manager's own). Both serve a `runs-on` that includes
