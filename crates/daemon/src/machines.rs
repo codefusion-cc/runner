@@ -146,8 +146,8 @@ pub enum Verdict {
     Ran,
     /// Idle, once: GitHub is asked again at a later sweep, and the registration stays until then.
     AskAgain,
-    /// No job ran, and that is written down: the registration may go.
-    NoJob,
+    /// Idle twice: the registration is removed, and GitHub's answer to that decides whether a job ran.
+    Idle,
 }
 
 /// A registration at GitHub that has to go.
@@ -250,7 +250,7 @@ struct Job {
     /// The end a restored slot is reported with, when its machine was not there any more.
     restored_end: Option<EndKind>,
     /// GitHub's REST view said the Actions runner of this machine, gone with no word of a job, was idle: once more at a
-    /// later sweep, and it ran none ([`Machines::asked`]).
+    /// later sweep, and its registration is removed ([`Machines::asked`]).
     idle_seen: bool,
 }
 
@@ -1059,11 +1059,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// What GitHub's REST view said of the Actions runner of a machine that is gone with no word of a job
     /// ([`Registration::ask_github`]): busy, idle, or `None` for gone. Says what follows (`docs/job-state.md`).
     ///
-    /// Busy means a job started. Gone means the same: the Runner never set out to remove this registration (it would
-    /// not be asked about otherwise), and a one-job Actions runner removes its own once its job is over. Idle is
-    /// evidence only for its moment, which may lie before the machine went: the job is reported as none only when
-    /// a second read, at a later sweep, says idle again, and that verdict is written down before the registration is
-    /// removed.
+    /// Busy means a job started. Gone means the same: a one-job Actions runner removes its own registration once its
+    /// job is over, and a removal of the Runner's own that GitHub answered is written in the step that heard it, so
+    /// this one is not asked about. Idle is evidence only for its moment, which may lie before the machine went: only
+    /// when a second read, at a later sweep, says idle again is the registration removed, and GitHub's answer to that
+    /// removal decides ([`Machines::unregistered`]).
     pub fn asked(&self, runner: &str, busy: Option<bool>) -> Verdict {
         if busy != Some(false) {
             self.ran_unheard(runner);
@@ -1075,13 +1075,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             .get_mut(job_name(runner))
             .filter(|job| job.record.runner == runner && job.record.ask_github)
         else {
-            return Verdict::NoJob;
+            return Verdict::Idle;
         };
         if !std::mem::replace(&mut job.idle_seen, true) {
             return Verdict::AskAgain;
         }
         tracing::info!(%runner, "GitHub says twice that the Actions runner of a gone machine is idle; its removal decides");
-        Verdict::NoJob
+        Verdict::Idle
     }
 
     /// GitHub says an Actions runner of a machine whose start nobody heard took a job: busy, gone by itself, or a
@@ -1133,14 +1133,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             inner
                 .jobs
                 .get(job_name(runner))
-                .filter(|job| {
-                    let record = &job.record;
-                    record.runner == runner
-                        && record.github.is_none()
-                        && !removed_idle
-                        && !record.removed_idle
-                        && !record.unregistered
-                })
+                .filter(|job| job.record.runner == runner && job.record.github.is_none() && !removed_idle)
                 .is_some_and(|job| {
                     job.record.ask_github || (job.record.ended.is_none() && job.life.phase() == Phase::Idle)
                 })
@@ -1158,10 +1151,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             && job.record.runner == runner
         {
             job.record.unregistered = true;
-            if removed_idle {
-                job.record.removed_idle = true;
-                job.record.ask_github = false;
-            }
             // An Actions runner whose registration is gone takes no job and no longer counts: its machine has nothing
             // left to wait for. The stop and the fact it follows from are one write.
             let stands = job.record.ended.is_none();
@@ -1444,7 +1433,6 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: true,
             oom: false,
             ask_github: false,
-            removed_idle: false,
         };
         self.store.save(&record);
         self.lock().intents.insert(name.to_string(), (record, false));
@@ -1558,7 +1546,6 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: false,
             oom: false,
             ask_github: false,
-            removed_idle: false,
         };
         // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
         self.store.save(&record);

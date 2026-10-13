@@ -761,7 +761,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             {
                 match client.runner_busy(id).await {
                     Ok(busy) => match shared.machines.asked(&registration.runner, busy) {
-                        Verdict::Ran | Verdict::NoJob => {}
+                        Verdict::Ran | Verdict::Idle => {}
                         Verdict::AskAgain => {
                             shared
                                 .refused

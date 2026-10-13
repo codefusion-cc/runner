@@ -2627,6 +2627,13 @@ async fn a_machine_past_its_idle_limit_whose_start_was_lost_keeps_its_job() {
         "stops: {:?}",
         rig.parts.vms.stopped()
     );
+    let removals = rig.github.count(REMOVAL);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        rig.github.count(REMOVAL),
+        removals,
+        "a job runs there: its removal is not asked for again"
+    );
     rig.github.complete_job(&runner, "succeeded");
     rig.parts.vms.end(job_name(&runner), End::Ok);
     until("the job's end at the console", || {
@@ -2679,7 +2686,10 @@ async fn a_surplus_found_gone_while_its_machine_stands_ran_a_job() {
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
     until("no record", || rig.parts.store.load().is_empty()).await;
-    assert_eq!(heard(&rig, &runner), (true, true), "{:?}", rig.events());
+    until("the start and the end at the console", || {
+        heard(&rig, &runner) == (true, true)
+    })
+    .await;
 }
 
 /// Sol, machines.rs:960: the removal of a surplus Actions runner fails at GitHub, which keeps the registration. A
@@ -2723,5 +2733,8 @@ async fn a_surplus_whose_removal_failed_and_that_then_ran_a_job_is_heard() {
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
     until("no record", || rig.parts.store.load().is_empty()).await;
-    assert_eq!(heard(&rig, &runner), (true, true), "{:?}", rig.events());
+    until("the start and the end at the console", || {
+        heard(&rig, &runner) == (true, true)
+    })
+    .await;
 }

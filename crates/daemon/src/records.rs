@@ -95,17 +95,12 @@ pub struct Record {
     pub end_reported: bool,
     /// Whether a process of the job was stopped for memory.
     pub oom: bool,
-    /// The machine is gone and GitHub never said its Actions runner took a job, nor did the Runner retire it: whether
-    /// a job ran is GitHub's to say, by whether the registration is still there (a one-job Actions runner removes
-    /// its own once its job is over). Asked once the wait for GitHub's word is over, before the registration is
-    /// removed, by this Runner or the one that starts after it. Records written before it existed ask nothing.
+    /// The machine is gone and GitHub never said its Actions runner took a job: whether a job ran is GitHub's to say,
+    /// by whether the registration is still there (a one-job Actions runner removes its own once its job is over).
+    /// Asked once the wait for GitHub's word is over, and then by the removal itself: answered, no job ran; gone
+    /// already or refused for a job, one did. Records written before it existed ask nothing.
     #[serde(default)]
     pub ask_github: bool,
-    /// GitHub answered the Runner's own removal of the registration, which it refuses for an Actions runner that holds
-    /// a job: the registration was there and no job ran on it. The one word that settles a machine without a job;
-    /// written in the same write as `unregistered`.
-    #[serde(default)]
-    pub removed_idle: bool,
 }
 
 impl Record {
