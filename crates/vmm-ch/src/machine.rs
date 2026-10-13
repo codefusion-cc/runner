@@ -6,7 +6,7 @@ use crate::cpus::{self, List};
 use crate::ending::{self, Ending, Recent, Status};
 use crate::events::{Event, Events};
 use crate::sandbox::{self, Access, Sandbox};
-use crate::vsock;
+use crate::{programs, vsock};
 use cf_nft::Ip;
 use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
 use std::ffi::OsString;
@@ -16,11 +16,11 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 /// How long a machine may take from its start to running.
@@ -37,8 +37,9 @@ pub struct Config {
     pub dir: PathBuf,
     /// The cloud-hypervisor program.
     pub cloud_hypervisor: PathBuf,
-    /// The pasta program.
-    pub pasta: PathBuf,
+    /// The pasta program; `None` for the system's ([`crate::programs::pasta`]), found and tried when the first
+    /// machine with a network starts.
+    pub pasta: Option<PathBuf>,
     /// The program whose `vm-sandbox` subcommand is [`crate::sandbox`]: the one that hosts this crate.
     pub sandbox: PathBuf,
     /// The host CPUs machines run on; `None` for the fastest this process may use.
@@ -50,6 +51,7 @@ pub struct Config {
 /// The monitor: cloud-hypervisor under KVM.
 pub struct ChVmm {
     config: Config,
+    pasta: OnceLock<Result<PathBuf, String>>,
     delegation: Delegation,
     cores: Vec<u32>,
     next: AtomicU64,
@@ -66,12 +68,12 @@ impl ChVmm {
             .map_err(|e| VmmError::Unsupported(format!("/dev/kvm: {e}")))?;
         let delegation = Delegation::claim().map_err(VmmError::Unsupported)?;
         let allowed = cpus::host::allowed(delegation.machines()).map_err(VmmError::Unsupported)?;
-        let cores = cpus::host_cores(
-            config.host_cpus.as_deref(),
-            &allowed,
-            cf_host_linux::fast_cpus(Path::new("/")).as_deref(),
-        )
-        .map_err(VmmError::Unsupported)?;
+        let fast = match config.host_cpus {
+            Some(_) => None,
+            None => cf_host_linux::fast_cpus(Path::new("/")),
+        };
+        let cores = cpus::host_cores(config.host_cpus.as_deref(), &allowed, fast.as_deref())
+            .map_err(VmmError::Unsupported)?;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -95,22 +97,17 @@ impl ChVmm {
                 }
             }
         }
+        let pasta = OnceLock::new();
+        if let Some(path) = config.pasta.take() {
+            let _ = pasta.set(Ok(path));
+        }
         Ok(ChVmm {
             config,
+            pasta,
             delegation,
             cores,
             next: AtomicU64::new(0),
         })
-    }
-
-    /// The host CPUs machines run on.
-    pub fn cores(&self) -> &[u32] {
-        &self.cores
-    }
-
-    /// Whether machines are held to their cores by their cgroup as well as by their vCPUs' affinity.
-    pub fn has_cpuset(&self) -> bool {
-        self.delegation.has_cpuset()
     }
 }
 
@@ -183,7 +180,14 @@ impl Vmm for ChVmm {
         }
         let sandbox = sandbox.command(&self.config.sandbox, monitor);
         let command = match spec.network {
-            Network::Nat => command::pasta(&self.config.pasta, sandbox),
+            Network::Nat => {
+                let pasta = self
+                    .pasta
+                    .get_or_init(programs::pasta)
+                    .as_ref()
+                    .map_err(|why| VmmError::Start(why.clone()))?;
+                command::pasta(pasta, sandbox)
+            }
             Network::None => sandbox,
         };
         let cpuset = self
@@ -350,6 +354,12 @@ impl Shared {
         self.group.kill();
     }
 
+    /// Ends the machine as the host asked: whatever it did meanwhile, it ends as stopped.
+    fn stop(&self) {
+        self.stop_asked.store(true, Ordering::SeqCst);
+        self.plug();
+    }
+
     /// Starts the machine's first process, waits for it, says how the machine ended, and removes what it left.
     fn run(self: Arc<Self>, command: Vec<OsString>, pipes: Pipes) {
         let Pipes {
@@ -374,10 +384,7 @@ impl Shared {
             let _ = closed.send(());
         });
         let status = match child.wait() {
-            Ok(status) => match status.code() {
-                Some(code) => Status::Code(code),
-                None => Status::Signal(status.signal().unwrap_or(0)),
-            },
+            Ok(status) => Status::from(status),
             Err(error) => {
                 self.exit
                     .end(VmExit::Error(format!("waiting for the monitor: {error}")));
@@ -386,10 +393,7 @@ impl Shared {
         };
         // What the first process leaves behind ends with it, and only then do the streams end.
         self.plug();
-        let began = Instant::now();
-        while self.group.populated() && began.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        self.group.wait_empty(Duration::from_secs(2));
         drop(events_held);
         if output_thread.is_ok() {
             let _ = output_done.recv_timeout(Duration::from_secs(2));
@@ -538,14 +542,12 @@ impl Vm for ChVm {
         if let Some(exit) = self.shared.exit.wait(Duration::ZERO) {
             return Err(VmmError::Stop(format!("the machine has ended: {exit:?}")));
         }
-        self.shared.stop_asked.store(true, Ordering::SeqCst);
-        self.shared.plug();
+        self.shared.stop();
         Ok(())
     }
 
     fn kill(&self) {
-        self.shared.stop_asked.store(true, Ordering::SeqCst);
-        self.shared.plug();
+        self.shared.stop();
         self.shared.exit.end(VmExit::Stopped);
     }
 
@@ -559,8 +561,7 @@ impl Vm for ChVm {
 
 impl Drop for ChVm {
     fn drop(&mut self) {
-        self.shared.stop_asked.store(true, Ordering::SeqCst);
-        self.shared.plug();
+        self.shared.stop();
         let deadline = Instant::now() + CLEANUP_WAIT;
         let mut state = self.shared.state();
         while !state.finished {

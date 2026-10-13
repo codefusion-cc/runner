@@ -189,8 +189,8 @@ pub fn sparse_copy(from: &fs::File, out: &fs::File) -> std::io::Result<()> {
         copy_range(from, out, data, hole)?;
         at = hole;
     }
-    out.set_len(length)?;
-    out.sync_all()
+    // No sync: the copy is one job's disk, and a host that goes down mid-job ends the job anyway.
+    out.set_len(length)
 }
 
 /// Where `lseek` with `whence` goes from `offset`, or `None` when no data follows (`ENXIO`). A file system that does

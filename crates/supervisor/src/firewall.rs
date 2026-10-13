@@ -48,10 +48,7 @@ pub fn beside(address: Ip, netmask: Ip, gateway: Option<Ip>, told: &[(Ip, u8)]) 
 /// says is next to it, the network it is in and its gateway: the Mac and the other jobs' machines, whatever range
 /// the Mac was set up to give them.
 pub fn policy(name_servers: &[Ip], own: &[(Ip, u8)]) -> Policy {
-    let rule = |when: &[Match], then| Rule {
-        when: when.to_vec(),
-        then,
-    };
+    let rule = Rule::new;
     let mut output = vec![
         rule(&[Match::OutLoopback], Verdict::Accept),
         rule(&[Match::Ipv6], Verdict::Drop),

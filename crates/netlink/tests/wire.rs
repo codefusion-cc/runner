@@ -1,7 +1,9 @@
 //! Netlink's wire form, from its spec: a message is a 16-byte header and a body, an attribute a 4-byte header and a
 //! payload, each padded to 4 bytes, and every length counts its own header but not the padding.
 
-use cf_netlink::{LONGEST_PAYLOAD, Message, NLA_F_NESTED, attribute, attributes, message, messages, nested};
+use cf_netlink::{
+    LONGEST_PAYLOAD, Message, NLA_F_NESTED, attribute, attribute_str, attributes, message, messages, nested,
+};
 use proptest::prelude::*;
 
 #[test]
@@ -16,6 +18,32 @@ fn an_attribute_is_its_length_kind_payload_and_padding() {
     let mut empty = Vec::new();
     attribute(&mut empty, 1, b"");
     assert_eq!(empty, [4u16.to_ne_bytes(), 1u16.to_ne_bytes()].concat());
+}
+
+#[test]
+fn a_text_attribute_ends_in_a_nul_inside_its_length() {
+    let mut bytes = Vec::new();
+    attribute_str(&mut bytes, 3, "br0");
+    assert_eq!(
+        bytes,
+        [8u16.to_ne_bytes(), 3u16.to_ne_bytes()]
+            .concat()
+            .into_iter()
+            .chain(*b"br0\0")
+            .collect::<Vec<_>>()
+    );
+    let mut empty = Vec::new();
+    attribute_str(&mut empty, 1, "");
+    assert_eq!(
+        empty,
+        [5u16.to_ne_bytes(), 1u16.to_ne_bytes(), [0, 0], [0, 0]].concat()
+    );
+    // Ten bytes of UTF-8 and the NUL: the length counts 15, the padding makes 16.
+    let mut unicode = Vec::new();
+    attribute_str(&mut unicode, 1, "zażółć");
+    assert_eq!(u16::from_ne_bytes([unicode[0], unicode[1]]), 15);
+    assert_eq!(&unicode[4..15], "zażółć\0".as_bytes());
+    assert_eq!(unicode.len(), 16);
 }
 
 #[test]

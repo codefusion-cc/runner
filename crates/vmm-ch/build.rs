@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 include!("src/pins.rs");
 
-const NONE: &str = "const EMBEDDED: Option<Embedded> = None;\n";
+const NONE: &str = "const EMBEDDED: Option<&[u8]> = None;\n";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -41,8 +41,7 @@ fn main() {
             ch.display()
         );
         format!(
-            "const EMBEDDED: Option<Embedded> = Some(Embedded {{ cloud_hypervisor: include_bytes!({:?}), \
-             cloud_hypervisor_sha256: {CLOUD_HYPERVISOR_SHA256:?} }});\n",
+            "const EMBEDDED: Option<&[u8]> = Some(include_bytes!({:?}));\n",
             ch.display().to_string()
         )
     };

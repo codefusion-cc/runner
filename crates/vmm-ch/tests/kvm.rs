@@ -70,7 +70,7 @@ mod linux {
         let vmm = match ChVmm::new(Config {
             dir: base.path().join("machines"),
             cloud_hypervisor: monitor,
-            pasta: "pasta".into(),
+            pasta: None,
             sandbox: std::env::current_exe().unwrap(),
             host_cpus: None,
             host_networks: Vec::new(),
@@ -208,15 +208,10 @@ mod linux {
 
     /// The one machine's cgroup there is now.
     fn machine_group() -> Result<PathBuf, String> {
-        let machines = Delegation::claim()?.machines().to_path_buf();
-        fs::read_dir(&machines)
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with("vm-"))
-            })
+        Delegation::claim()?
+            .machines_of(std::process::id())
+            .first()
+            .map(|group| group.path().to_path_buf())
             .ok_or_else(|| "no machine cgroup".to_string())
     }
 }

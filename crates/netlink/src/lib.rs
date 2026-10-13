@@ -75,6 +75,14 @@ pub fn attribute(to: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     to.resize(to.len().next_multiple_of(4), 0);
 }
 
+/// Appends an attribute that holds `text` as C writes it, ended by a NUL.
+pub fn attribute_str(to: &mut Vec<u8>, kind: u16, text: &str) {
+    let mut payload = Vec::with_capacity(text.len() + 1);
+    payload.extend_from_slice(text.as_bytes());
+    payload.push(0);
+    attribute(to, kind, &payload);
+}
+
 /// Appends an attribute that holds the attributes `fill` writes.
 pub fn nested(to: &mut Vec<u8>, kind: u16, fill: impl FnOnce(&mut Vec<u8>)) {
     let mut inner = Vec::new();

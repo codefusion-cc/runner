@@ -1,7 +1,7 @@
 //! The network devices of a machine's namespace, through rtnetlink: a bridge that joins pasta's tap and the
 //! guest's, both up. The kernel takes these messages from the namespace's root (the sandbox) and from nobody else.
 
-use cf_netlink::{NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, attribute, message, nested};
+use cf_netlink::{NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, attribute, attribute_str, message, nested};
 
 /// The bridge in the namespace.
 pub const BRIDGE: &str = "br0";
@@ -26,19 +26,13 @@ fn ifinfomsg(index: u32, flags: u32, change: u32) -> Vec<u8> {
     body
 }
 
-fn name(text: &str) -> Vec<u8> {
-    let mut bytes = text.as_bytes().to_vec();
-    bytes.push(0);
-    bytes
-}
-
 /// Makes a bridge of this name and MTU, down; one of the name that is there already is an error.
 pub fn new_bridge(bridge: &str, mtu: u16, sequence: u32) -> Vec<u8> {
     let mut body = ifinfomsg(0, 0, 0);
-    attribute(&mut body, IFLA_IFNAME, &name(bridge));
+    attribute_str(&mut body, IFLA_IFNAME, bridge);
     attribute(&mut body, IFLA_MTU, &u32::from(mtu).to_ne_bytes());
     nested(&mut body, IFLA_LINKINFO, |info| {
-        attribute(info, IFLA_INFO_KIND, &name("bridge"))
+        attribute_str(info, IFLA_INFO_KIND, "bridge")
     });
     let mut bytes = Vec::new();
     message(

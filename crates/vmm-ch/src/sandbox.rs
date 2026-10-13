@@ -308,7 +308,7 @@ mod linux {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use std::os::unix::process::CommandExt as _;
     use std::path::Path;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -406,16 +406,11 @@ mod linux {
         let status = child
             .wait()
             .map_err(|e| format!("waiting for the monitor: {e}"))?;
-        let ended = match status.code() {
-            Some(code) => Status::Code(code),
-            None => Status::Signal(status.signal().unwrap_or(0)),
-        };
+        let ended = Status::from(status);
         // The monitor was the first process of its PID namespace: all of it is gone, and this line comes last, on a
         // line of its own even when the monitor's last ended without a newline.
         eprintln!("\n{}", report(ended));
-        Ok(status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
+        Ok(ended.exit_code())
     }
 
     fn unshare(flags: libc::c_int) -> Result<(), String> {

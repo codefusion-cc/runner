@@ -102,7 +102,10 @@ fn service(_command: &str, _config: &str, _options: &[&str]) -> Result<(), Strin
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn vm_host(state: &str, cpus: Option<&str>) -> Result<(), String> {
-    crate::vm::host(state, &crate::vm::Host::with_cpus(cpus)?)
+    let host = crate::vm::Host {
+        cpus: cpus.map(String::from),
+    };
+    crate::vm::host(state, &host)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -136,7 +139,9 @@ fn boot_proof(options: &[&str]) -> Result<(), String> {
     crate::vm::boot_proof(
         memory_bytes,
         std::time::Duration::from_secs(timeout),
-        &crate::vm::Host::with_cpus(cpus)?,
+        &crate::vm::Host {
+            cpus: cpus.map(String::from),
+        },
     )
 }
 

@@ -3,28 +3,18 @@
 //! is what was built in. pasta comes with the system (`apt install passt`): it is found on `PATH`, refused when
 //! another user could change it, and tried once with the options a machine runs it with.
 
-use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{ErrorKind, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+use std::io::{ErrorKind, Read as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// cloud-hypervisor as a build carries it.
-#[derive(Clone, Copy)]
-pub struct Embedded {
-    /// cloud-hypervisor's static aarch64 build.
-    pub cloud_hypervisor: &'static [u8],
-    /// Its SHA-256, the pin.
-    pub cloud_hypervisor_sha256: &'static str,
-}
-
 include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 
-/// cloud-hypervisor as this build carries it, if it carries it.
-pub fn embedded() -> Option<Embedded> {
+/// cloud-hypervisor's static aarch64 build as this build carries it, if it carries it.
+pub fn embedded() -> Option<&'static [u8]> {
     EMBEDDED
 }
 
@@ -35,53 +25,57 @@ pub const PASTA_TRIAL: Duration = Duration::from_secs(10);
 /// Where pasta is looked for when there is no `PATH`.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
-/// Unpacks the embedded cloud-hypervisor into `dir` (made private when it is not there), checked against its
-/// SHA-256, and says where it is; a file that is there and right stays. A folder or file another user could change
-/// is refused.
+/// Unpacks the embedded cloud-hypervisor into `dir` (made private when it is not there), checked byte for byte,
+/// and says where it is; a file that is there and right stays. A folder or file another user could change is
+/// refused.
 pub fn unpack(dir: &Path) -> Result<PathBuf, String> {
     let embedded = embedded().ok_or(
         "this build carries no cloud-hypervisor: build it after `cargo xtask cloud-hypervisor` on Linux for arm64, \
          the one architecture it is pinned for",
     )?;
-    unpack_these(dir, &embedded)
+    unpack_these(dir, embedded)
 }
 
-fn unpack_these(dir: &Path, embedded: &Embedded) -> Result<PathBuf, String> {
+fn unpack_these(dir: &Path, program: &[u8]) -> Result<PathBuf, String> {
     let say = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| say(dir, e))?;
+    cf_secret::private_dir(dir).map_err(|e| say(dir, e))?;
     owned_by(dir, false)?;
     let path = dir.join("cloud-hypervisor");
-    if check(&path, embedded.cloud_hypervisor_sha256).is_ok() {
+    if check(&path, program).is_ok() {
         return Ok(path);
     }
-    let partial = path.with_extension("partial");
-    let _ = fs::remove_file(&partial);
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o500)
-        .open(&partial)
-        .and_then(|mut file| {
-            file.write_all(embedded.cloud_hypervisor)
-                .and_then(|()| file.sync_all())
-        })
-        .map_err(|e| say(&partial, e))?;
-    fs::rename(&partial, &path).map_err(|e| say(&path, e))?;
-    check(&path, embedded.cloud_hypervisor_sha256)?;
+    // A link in its place is replaced by the rename, not followed.
+    cf_secret::replace_private_as(&path, program, 0o500).map_err(|e| say(&path, e))?;
     Ok(path)
 }
 
-/// Whether the file at `path` is this user's, writable by nobody else, and has the SHA-256 `sha256`.
-pub fn check(path: &Path, sha256: &str) -> Result<(), String> {
+/// Whether the file at `path` (not what a link there leads to) is this user's, writable by nobody else, and holds
+/// `wanted`, byte for byte.
+fn check(path: &Path, wanted: &[u8]) -> Result<(), String> {
     owned_by(path, false)?;
-    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let found = format!("{:x}", Sha256::digest(&bytes));
-    if found != sha256 {
-        return Err(format!("{} has SHA-256 {found}, not {sha256}", path.display()));
+    let say = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(say)?;
+    let differs = || {
+        Err(format!(
+            "{} is not the program this build carries",
+            path.display()
+        ))
+    };
+    if file.metadata().map_err(say)?.len() != wanted.len() as u64 {
+        return differs();
+    }
+    let mut chunk = vec![0u8; 64 << 10];
+    let mut at = 0;
+    while at < wanted.len() {
+        let read = file.read(&mut chunk).map_err(say)?;
+        if read == 0 || chunk[..read] != wanted[at..(at + read).min(wanted.len())] {
+            return differs();
+        }
+        at += read;
     }
     Ok(())
 }
@@ -150,7 +144,7 @@ fn try_pasta(path: &Path, within: Duration) -> Result<(), String> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if began.elapsed() < within => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if began.elapsed() < within => std::thread::sleep(Duration::from_millis(2)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -214,16 +208,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn sha(bytes: &[u8]) -> &'static str {
-        Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str())
-    }
-
-    fn fake() -> Embedded {
-        Embedded {
-            cloud_hypervisor: b"a monitor",
-            cloud_hypervisor_sha256: sha(b"a monitor"),
-        }
-    }
+    const FAKE: &[u8] = b"a monitor";
 
     /// A temporary folder, by the path without links that pasta's check walks up; checks stop above it.
     struct Private {
@@ -263,7 +248,7 @@ mod tests {
     fn cloud_hypervisor_is_unpacked_private_and_runnable() {
         let folder = tempfile::tempdir().unwrap();
         let dir = folder.path().join("bin");
-        let path = unpack_these(&dir, &fake()).unwrap();
+        let path = unpack_these(&dir, FAKE).unwrap();
         assert_eq!(path, dir.join("cloud-hypervisor"));
         assert_eq!(fs::read(&path).unwrap(), b"a monitor");
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
@@ -274,14 +259,14 @@ mod tests {
     #[test]
     fn a_changed_program_is_put_back_and_a_right_one_stays() {
         let folder = tempfile::tempdir().unwrap();
-        let path = unpack_these(folder.path(), &fake()).unwrap();
+        let path = unpack_these(folder.path(), FAKE).unwrap();
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        unpack_these(folder.path(), &fake()).unwrap();
+        unpack_these(folder.path(), FAKE).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
         mode(&path, 0o700);
         fs::write(&path, b"something else").unwrap();
-        unpack_these(folder.path(), &fake()).unwrap();
+        unpack_these(folder.path(), FAKE).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"a monitor");
     }
 
@@ -294,7 +279,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         mode(&dir, 0o700);
         std::os::unix::fs::symlink(&elsewhere, dir.join("cloud-hypervisor")).unwrap();
-        let path = unpack_these(&dir, &fake()).unwrap();
+        let path = unpack_these(&dir, FAKE).unwrap();
         assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
         assert_eq!(fs::read(&elsewhere).unwrap(), b"a monitor");
     }
@@ -305,21 +290,29 @@ mod tests {
         let dir = folder.path().join("bin");
         fs::create_dir(&dir).unwrap();
         mode(&dir, 0o777);
-        let refused = unpack_these(&dir, &fake()).unwrap_err();
+        let refused = unpack_these(&dir, FAKE).unwrap_err();
         assert!(refused.contains("cannot be trusted"), "{refused}");
     }
 
     #[test]
-    fn a_check_says_what_differs() {
+    fn a_check_takes_the_same_bytes_only() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("p");
-        fs::write(&path, b"x").unwrap();
+        let program: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &program).unwrap();
         mode(&path, 0o500);
-        assert!(check(&path, sha(b"x")).is_ok());
-        let refused = check(&path, sha(b"y")).unwrap_err();
-        assert!(refused.contains("SHA-256"), "{refused}");
+        assert!(check(&path, &program).is_ok());
+        let mut changed = program.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        let refused = check(&path, &changed).unwrap_err();
         assert!(
-            check(&folder.path().join("missing"), sha(b"x"))
+            refused.ends_with("is not the program this build carries"),
+            "{refused}"
+        );
+        assert!(check(&path, &program[..program.len() - 1]).is_err());
+        assert!(check(&path, b"").is_err());
+        assert!(
+            check(&folder.path().join("missing"), b"x")
                 .unwrap_err()
                 .contains("not there")
         );

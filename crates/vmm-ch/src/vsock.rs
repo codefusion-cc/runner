@@ -10,11 +10,10 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use cf_vmm::SEND_TIMEOUT;
+
 /// How long the whole handshake may take.
 pub const HANDSHAKE: Duration = Duration::from_secs(5);
-
-/// How long a write to the guest may wait for the guest to read, as under Virtualization.framework.
-pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest answer read: `OK ` and a port number with room to spare.
 const MAX_ANSWER: usize = 32;
@@ -24,9 +23,8 @@ pub fn is_yes(line: &[u8]) -> bool {
     let Some(port) = line.strip_prefix(b"OK ") else {
         return false;
     };
-    !port.is_empty()
-        && port.len() <= 10
-        && port.iter().all(u8::is_ascii_digit)
+    // `parse` alone would take a leading `+`.
+    port.iter().all(u8::is_ascii_digit)
         && std::str::from_utf8(port).is_ok_and(|port| port.parse::<u32>().is_ok())
 }
 
@@ -200,6 +198,9 @@ mod tests {
         assert!(!is_yes(b"OK 4294967296"));
         assert!(!is_yes(b"OK -1"));
         assert!(!is_yes(b"OK 1 "));
+        assert!(!is_yes(b"OK +1"));
+        assert!(!is_yes(b"OK "));
+        assert!(!is_yes(b"ok 1"));
         assert!(!is_yes(b""));
     }
 
@@ -211,7 +212,7 @@ mod tests {
             let reads_as_yes = std::str::from_utf8(&noise)
                 .ok()
                 .and_then(|text| text.strip_prefix("OK "))
-                .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()) && digits.len() <= 10 && digits.parse::<u32>().is_ok());
+                .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()) && digits.parse::<u32>().is_ok());
             prop_assert_eq!(is_yes(&noise), reads_as_yes);
         }
     }

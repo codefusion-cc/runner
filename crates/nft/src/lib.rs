@@ -158,6 +158,16 @@ pub struct Rule {
     pub then: Verdict,
 }
 
+impl Rule {
+    /// A rule of these conditions and this verdict.
+    pub fn new(when: &[Match], then: Verdict) -> Self {
+        Rule {
+            when: when.to_vec(),
+            then,
+        }
+    }
+}
+
 /// A packet, as far as the rules look at it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Packet {

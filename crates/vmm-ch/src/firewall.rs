@@ -21,13 +21,6 @@ const LOOPBACK: (Ip, u8) = ([127, 0, 0, 0], 8);
 /// DHCP's server port.
 const DHCP: u16 = 67;
 
-fn rule(when: &[Match], then: Verdict) -> Rule {
-    Rule {
-        when: when.to_vec(),
-        then,
-    }
-}
-
 fn to(address: Ip) -> Match {
     Match::DestIn {
         network: address,
@@ -39,28 +32,28 @@ fn to(address: Ip) -> Match {
 pub fn rules(host: &[(Ip, u8)]) -> Vec<Rule> {
     let ipv4 = Match::EtherType(IPV4);
     let mut rules = vec![
-        rule(&[Match::EtherType(ARP)], Verdict::Accept),
-        rule(
+        Rule::new(&[Match::EtherType(ARP)], Verdict::Accept),
+        Rule::new(
             &[ipv4, to([255; 4]), Match::Protocol(UDP), Match::DestPort(DHCP)],
             Verdict::Accept,
         ),
-        rule(
+        Rule::new(
             &[ipv4, to(GATEWAY), Match::Protocol(UDP), Match::DestPort(DHCP)],
             Verdict::Accept,
         ),
-        rule(
+        Rule::new(
             &[ipv4, to(GATEWAY), Match::Protocol(UDP), Match::DestPort(53)],
             Verdict::Accept,
         ),
-        rule(
+        Rule::new(
             &[ipv4, to(GATEWAY), Match::Protocol(TCP), Match::DestPort(53)],
             Verdict::Accept,
         ),
     ];
     for &(network, prefix) in BLOCKED.iter().chain([&LOOPBACK]).chain(host) {
-        rules.push(rule(&[Match::DestIn { network, prefix }], Verdict::Drop));
+        rules.push(Rule::new(&[Match::DestIn { network, prefix }], Verdict::Drop));
     }
-    rules.push(rule(&[ipv4], Verdict::Accept));
+    rules.push(Rule::new(&[ipv4], Verdict::Accept));
     rules
 }
 

@@ -18,6 +18,12 @@ pub fn private_dir(path: &Path) -> std::io::Result<()> {
 /// The bytes go to `<path with extension partial>` (mode 0600, synced) and that file is renamed over `path`. A crash
 /// leaves the old file whole, or the new one, and at worst a `.partial` file beside it. The folder must exist.
 pub fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace_private_as(path, bytes, 0o600)
+}
+
+/// [`replace_private`] with the file's mode `mode`, of which only the user's own bits are kept: `0o500` for a
+/// program only this user may run.
+pub fn replace_private_as(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let partial = path.with_extension("partial");
     // A file a crash left here keeps its permissions when opened again, so it goes first.
     match std::fs::remove_file(&partial) {
@@ -28,7 +34,7 @@ pub fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode & 0o700)
         .open(&partial)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -54,6 +60,19 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("state.json")]);
+    }
+
+    #[test]
+    fn a_mode_keeps_only_the_users_own_bits() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mode_of = |name: &str, mode: u32| {
+            let path = dir.path().join(name);
+            replace_private_as(&path, b"x", mode).expect("write");
+            std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777
+        };
+        assert_eq!(mode_of("program", 0o500), 0o500);
+        assert_eq!(mode_of("shared", 0o755), 0o700);
+        assert_eq!(mode_of("everyone", 0o777), 0o700);
     }
 
     #[test]

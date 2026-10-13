@@ -49,7 +49,7 @@ pub(crate) fn meminfo(root: &Path) -> Result<Meminfo, HostError> {
 }
 
 pub(crate) fn swapouts(root: &Path) -> Result<u64, HostError> {
-    parse::vmstat(&needed(root, "/proc/vmstat")?, "pswpout")
+    parse::counter(&needed(root, "/proc/vmstat")?, "pswpout")
         .ok_or_else(|| parse::implausible("pswpout of /proc/vmstat", "missing"))
 }
 

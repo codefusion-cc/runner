@@ -20,36 +20,17 @@ extern "C" fn cancel(_signal: libc::c_int) {
 /// What the host chooses for its machines.
 #[derive(Debug, Default)]
 pub struct Host {
-    /// The host CPUs the machines run on; by default the fastest this process may use.
-    #[cfg(target_os = "linux")]
-    pub cpus: Option<Vec<u32>>,
-}
-
-impl Host {
-    /// The host's choice with the CPUs `--host-cpus` names, a kernel CPU list such as `4-7`.
-    pub fn with_cpus(cpus: Option<&str>) -> Result<Self, String> {
-        let Some(cpus) = cpus else {
-            return Ok(Self::default());
-        };
-        #[cfg(target_os = "linux")]
-        {
-            let cpus = cf_vmm_ch::cpus::parse_list(cpus).map_err(|error| format!("--host-cpus: {error}"))?;
-            if cpus.is_empty() {
-                return Err("--host-cpus names no CPU".into());
-            }
-            Ok(Self { cpus: Some(cpus) })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = cpus;
-            Err("--host-cpus is for Linux".into())
-        }
-    }
+    /// `--host-cpus`: the host CPUs the machines run on, a kernel CPU list such as `4-7`; by default the fastest
+    /// this process may use. Linux only.
+    pub cpus: Option<String>,
 }
 
 /// The monitor of this host's machines: Virtualization.framework.
 #[cfg(target_os = "macos")]
-fn monitor(_machines: &Path, _programs: &Path, _host: &Host) -> Result<cf_vmm_vz::VzVmm, String> {
+fn monitor(_machines: &Path, _programs: &Path, host: &Host) -> Result<cf_vmm_vz::VzVmm, String> {
+    if host.cpus.is_some() {
+        return Err("--host-cpus is for Linux".into());
+    }
     cf_vmm_vz::VzVmm::new().map_err(|error| error.to_string())
 }
 
@@ -57,15 +38,24 @@ fn monitor(_machines: &Path, _programs: &Path, _host: &Host) -> Result<cf_vmm_vz
 /// with the system's pasta, each machine with a folder of its own in `machines`, its sandbox this same binary.
 #[cfg(target_os = "linux")]
 fn monitor(machines: &Path, programs: &Path, host: &Host) -> Result<cf_vmm_ch::ChVmm, String> {
+    let host_cpus = match host.cpus.as_deref() {
+        Some(text) => {
+            let cpus = cf_vmm_ch::cpus::parse_list(text).map_err(|error| format!("--host-cpus: {error}"))?;
+            if cpus.is_empty() {
+                return Err("--host-cpus names no CPU".into());
+            }
+            Some(cpus)
+        }
+        None => None,
+    };
     let cloud_hypervisor = cf_vmm_ch::programs::unpack(programs)?;
-    let pasta = cf_vmm_ch::programs::pasta()?;
     let sandbox = std::env::current_exe().map_err(|error| format!("this program's path: {error}"))?;
     cf_vmm_ch::ChVmm::new(cf_vmm_ch::Config {
         dir: machines.to_path_buf(),
         cloud_hypervisor,
-        pasta,
+        pasta: None,
         sandbox,
-        host_cpus: host.cpus.clone(),
+        host_cpus,
         host_networks: cf_vmhost::host_networks(),
     })
     .map_err(|error| error.to_string())

@@ -5,10 +5,7 @@
 use cf_nft::{Interface, Match, Rule, Verdict};
 
 pub fn rule(when: &[Match], then: Verdict) -> Rule {
-    Rule {
-        when: when.to_vec(),
-        then,
-    }
+    Rule::new(when, then)
 }
 
 pub fn device(name: &str) -> Interface {

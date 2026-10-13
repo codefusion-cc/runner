@@ -75,7 +75,7 @@ try 10.1.2.3 80 private-again; try $gw 22 gateway-again"#;
 
 /// What a job's root tries against its own machine from inside the container: the pipe its end is reported on
 /// and the process that holds it, the kernel's settings and what is mounted read-only over them, a lower score
-/// for the kernel's choice under memory pressure, swap, and the socket the supervisor talks to the Mac on.
+/// for the kernel's choice under memory pressure, swap, and the socket the supervisor talks to the host on.
 /// `control` is the same kind of try on something a job may do, so a refusal is not just a `sudo` that is missing.
 const INSIDE_PROBES: &str = r#"
 sudo -n sh -c 'echo x > /tmp/control' 2>/dev/null; echo control=$?
@@ -130,15 +130,13 @@ struct Finished {
     machines: BTreeSet<u32>,
     machine_peak: u64,
     host_peak: u64,
-    /// The most the vm-host said its machine held of the Mac's memory (`resident_bytes` in its state).
+    /// The most the vm-host said its machine held of the host's memory (`resident_bytes` in its state).
     resident_peak: u64,
     available_before: u64,
     available_least: u64,
     /// The limit of the machine's cgroup and the most it held, page cache in it.
     #[cfg(target_os = "linux")]
-    group_max: u64,
-    #[cfg(target_os = "linux")]
-    group_peak: u64,
+    group: Group,
 }
 
 /// Runs the scenarios named after `--only` (all of them otherwise) and fails when one did.
@@ -439,7 +437,7 @@ fn finish(
     let (mut machine_peak, mut host_peak, mut available_least) = (0, 0, running.available_before);
     let mut resident_peak = 0;
     #[cfg(target_os = "linux")]
-    let (mut group_max, mut group_peak) = (0, 0);
+    let mut group = Group::default();
     let exited = loop {
         if running.child.try_wait()?.is_some() {
             break true;
@@ -454,9 +452,9 @@ fn finish(
         resident_peak = resident_peak.max(said.unwrap_or(0));
         available_least = available_least.min(available());
         #[cfg(target_os = "linux")]
-        for group in groups_of(running.child.id()) {
-            group_max = group_max.max(group.max);
-            group_peak = group_peak.max(group.peak);
+        for one in groups_of(running.child.id()) {
+            group.max = group.max.max(one.max);
+            group.peak = group.peak.max(one.peak);
         }
         seen.extend(now.iter().copied());
         if let Err(error) = during(&console_of(bench, &running.job), &now) {
@@ -497,9 +495,7 @@ fn finish(
         available_before: running.available_before,
         available_least,
         #[cfg(target_os = "linux")]
-        group_max,
-        #[cfg(target_os = "linux")]
-        group_peak,
+        group,
     })
 }
 
@@ -571,7 +567,7 @@ fn ms_after(text: &str, before: &str) -> Option<f64> {
 }
 
 #[cfg(target_os = "macos")]
-/// The Mac's load average over the last minute, and how many CPUs it has.
+/// The host's load average over the last minute, and how many CPUs it has.
 fn load() -> (f64, usize) {
     let printed = Command::new("sysctl")
         .args(["-n", "vm.loadavg"])
@@ -771,7 +767,7 @@ echo step=$?"#;
             mb(finished.host_peak)
         ),
         format!(
-            "the Mac's available memory: {} before, {} at its least, {} after",
+            "the host's available memory: {} before, {} at its least, {} after",
             mb(finished.available_before),
             mb(finished.available_least),
             mb(available())
@@ -780,7 +776,7 @@ echo step=$?"#;
     ])
 }
 
-/// A machine whose job took all it got, as the Mac and the guest counted it.
+/// A machine whose job took all it got, as the host and the guest counted it.
 struct Filled {
     size: u64,
     limit: u64,
@@ -793,9 +789,7 @@ struct Filled {
     resident_peak: u64,
     /// The limit of the machine's cgroup, and the most it held, page cache in it.
     #[cfg(target_os = "linux")]
-    group_max: u64,
-    #[cfg(target_os = "linux")]
-    group_peak: u64,
+    group: Group,
 }
 
 impl Filled {
@@ -836,11 +830,11 @@ impl Filled {
             mb(self.touched),
             mb(self.total),
             mb(self.resident_peak),
-            mb(self.group_peak),
+            mb(self.group.peak),
             mb(self.host_peak),
             mb(self.group_at_most()),
-            mb(self.group_max),
-            mb(self.group_max.saturating_sub(self.size))
+            mb(self.group.max),
+            mb(self.group.max.saturating_sub(self.size))
         )
     }
 
@@ -875,9 +869,7 @@ fn filled(bench: &Bench, job_name: &str, size_mb: u64) -> Fallible<Filled> {
         host_peak: finished.host_peak,
         resident_peak: finished.resident_peak,
         #[cfg(target_os = "linux")]
-        group_max: finished.group_max,
-        #[cfg(target_os = "linux")]
-        group_peak: finished.group_peak,
+        group: finished.group,
     };
     let least = filled.limit.saturating_sub(300 * MB);
     expect(
@@ -898,7 +890,7 @@ fn filled(bench: &Bench, job_name: &str, size_mb: u64) -> Fallible<Filled> {
     Ok(filled)
 }
 
-/// What a machine costs the Mac beyond its size when its job takes all the memory it gets: the number the budget
+/// What a machine costs the host beyond its size when its job takes all the memory it gets: the number the budget
 /// counts every machine with (`vm_host_overhead_bytes`). A `cf-4g`, the size most jobs run in, and a machine of
 /// 1024 MB, which bounds the cost from above most closely.
 #[cfg(target_os = "macos")]
@@ -907,7 +899,7 @@ fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
     let needed = (SIZE_MB + 2048) * MB;
     if available() < needed {
         return Ok(vec![format!(
-            "SKIPPED: {} of memory are available on this Mac and a cf-4g machine that fills up needs {} with the Mac's floor",
+            "SKIPPED: {} of memory are available on this host and a cf-4g machine that fills up needs {} with the floor it keeps",
             mb(available()),
             mb(needed)
         )]);
@@ -922,7 +914,7 @@ fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
         large.line(),
         small.line(),
         format!(
-            "the budget counts {} for a machine beyond its size; the Mac's available memory was {} before",
+            "the budget counts {} for a machine beyond its size; the host's available memory was {} before",
             mb(counted),
             mb(available_before)
         ),
@@ -930,7 +922,7 @@ fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
     expect(
         large.at_least() <= counted && small.at_least() <= counted && small.at_most() <= counted,
         format!(
-            "a machine costs the Mac more beyond its size than the budget counts:\n{}",
+            "a machine costs the host more beyond its size than the budget counts:\n{}",
             indent(&lines)
         ),
     )?;
@@ -956,10 +948,10 @@ fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
     for size in SIZES_MB {
         let filled = filled(bench, &format!("it-full-{size}"), size)?;
         expect(
-            filled.group_max > filled.size,
+            filled.group.max > filled.size,
             format!("no cgroup of the machine was read: {}", filled.line()),
         )?;
-        if filled.group_at_most() > filled.group_max - filled.size {
+        if filled.group_at_most() > filled.group.max - filled.size {
             short.push(mb(filled.size));
         }
         lines.push(filled.line());
@@ -981,7 +973,7 @@ fn timeout(bench: &Bench) -> Fallible<Vec<String>> {
     expect(!finished.console.contains("woke"), "the job went on")?;
     // The deadline (5 s) and its grace (20 s) count from the workload's start. The guest then ends the job
     // itself and says so; only a guest that does not is stopped by the host, 10 s later (`Limits::longest_run`).
-    // The job's time is the guest's own count: the vm-host's also holds what the Mac took to start the machine,
+    // The job's time is the guest's own count: the vm-host's also holds what the host took to start the machine,
     // which is seconds when the scenario before left it short of memory.
     let ran = finished.state["end"]["summary"]["wall_ms"]
         .as_f64()

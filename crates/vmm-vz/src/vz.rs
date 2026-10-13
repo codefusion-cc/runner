@@ -29,8 +29,6 @@ use objc2_virtualization::{
 /// How long the framework gets to answer a start or a connect before the call gives up.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// The longest a write to the guest waits for the guest to read.
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The monitor on Virtualization.framework.
 #[derive(Debug, Clone, Copy)]
@@ -170,7 +168,7 @@ impl Vm for VzVm {
         });
         match result.recv_timeout(CONNECT_TIMEOUT) {
             Ok(Ok(fd)) => {
-                patient_for(&fd, SEND_TIMEOUT);
+                patient_for(&fd, cf_vmm::SEND_TIMEOUT);
                 Ok(Box::new(Stream(File::from(fd))))
             }
             Ok(Err(reason)) => Err(refuse(reason)),

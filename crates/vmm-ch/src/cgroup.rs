@@ -7,6 +7,8 @@
 //! processes is bounded, its CPUs are the chosen cores, and `cgroup.kill` is the plug. `memory.current` is what the
 //! machine holds of the host's memory.
 
+use cf_host_linux::parse::counter;
+
 /// The most processes and threads a machine's cgroup may hold: cloud-hypervisor's vCPU, device and I/O threads,
 /// pasta and the namespace's helper, with room to spare.
 pub const PIDS_MAX: u32 = 256;
@@ -19,8 +21,6 @@ pub const SWAP_MAX: &str = "memory.swap.max";
 pub struct Limits {
     /// `memory.max`: the machine's memory and the overhead of its monitor and network.
     pub memory_max: u64,
-    /// `pids.max`.
-    pub pids_max: u32,
     /// `cpuset.cpus`, when the delegation has the cpuset controller.
     pub cpus: Option<String>,
 }
@@ -31,11 +31,7 @@ impl Limits {
         let memory_max = memory_bytes
             .checked_add(overhead)
             .ok_or_else(|| format!("a machine of {memory_bytes} bytes and {overhead} more is no size"))?;
-        Ok(Limits {
-            memory_max,
-            pids_max: PIDS_MAX,
-            cpus,
-        })
+        Ok(Limits { memory_max, cpus })
     }
 
     /// The files written and what goes into each, in the order they are written. Swap is off, and when the cap is
@@ -45,7 +41,7 @@ impl Limits {
             ("memory.max", self.memory_max.to_string()),
             (SWAP_MAX, "0".to_string()),
             ("memory.oom.group", "1".to_string()),
-            ("pids.max", self.pids_max.to_string()),
+            ("pids.max", PIDS_MAX.to_string()),
         ];
         if let Some(cpus) = &self.cpus {
             files.push(("cpuset.cpus", cpus.clone()));
@@ -66,20 +62,12 @@ pub fn own_path(proc_self_cgroup: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
-/// The value of `key` in a file of `key value` lines (`memory.events`, `memory.stat`, `cgroup.events`).
-pub fn value(text: &str, key: &str) -> Option<u64> {
-    text.lines().find_map(|line| {
-        let (name, value) = line.split_once(' ')?;
-        (name == key).then(|| value.trim().parse().ok()).flatten()
-    })
-}
-
 /// What a machine holds of the host's memory: its cgroup's `memory.current` less the page cache of the files it
 /// read and wrote (the disk images, the kernel), which the host takes back whenever it needs to. The guest's memory
 /// is anonymous memory of the monitor, or shared memory where it is a shared mapping, and stays in.
 pub fn resident(current: u64, stat: &str) -> u64 {
-    let file = value(stat, "file").unwrap_or(0);
-    let shared = value(stat, "shmem").unwrap_or(0);
+    let file = counter(stat, "file").unwrap_or(0);
+    let shared = counter(stat, "shmem").unwrap_or(0);
     current.saturating_sub(file.saturating_sub(shared))
 }
 
@@ -125,14 +113,33 @@ pub fn owner(name: &str) -> Option<u32> {
     host.parse().ok()
 }
 
+/// Whether a machine may run where its cgroup has no [`SWAP_MAX`]: only when the host swaps to nothing, as
+/// `/proc/swaps` (a line of headings, then one line per device) says. Otherwise the refusal says what to do.
+pub fn without_swap_account(proc_swaps: &str) -> Result<(), String> {
+    let devices: Vec<&str> = proc_swaps
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    if devices.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "this kernel keeps no account of swap per cgroup (a machine's cgroup has no {SWAP_MAX}) and the host swaps \
+         to {}, where a machine's memory could go: turn swap off, or boot the kernel with swapaccount=1",
+        devices.join(" and ")
+    ))
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::{Delegation, MachineGroup, enter_host, own};
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Limits, own_path, plain_name, value, wanted};
+    use super::{Limits, counter, own_path, plain_name, wanted};
     use std::fs;
-    use std::io::ErrorKind;
+    use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -155,7 +162,6 @@ mod linux {
     /// The part of the cgroup tree this process may make machines in.
     #[derive(Debug, Clone)]
     pub struct Delegation {
-        root: PathBuf,
         machines: PathBuf,
         cpuset: bool,
     }
@@ -223,15 +229,9 @@ mod linux {
             make(&machines)?;
             enable_in(&machines, enable.trim())?;
             Ok(Delegation {
-                root,
                 machines,
                 cpuset: wanted.contains(&"cpuset"),
             })
-        }
-
-        /// The delegated cgroup.
-        pub fn root(&self) -> &Path {
-            &self.root
         }
 
         /// The parent of the machines' cgroups.
@@ -247,18 +247,32 @@ mod linux {
         /// Removes what machines of hosts that are gone left: the cgroup of a machine is named after the process
         /// that started it ([`super::owner`]), and one whose process is not `alive` is killed and removed.
         pub fn sweep(&self, alive: impl Fn(u32) -> bool) {
-            let Ok(entries) = fs::read_dir(&self.machines) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(owner) = name.to_str().and_then(super::owner) else {
-                    continue;
-                };
-                if !alive(owner) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    MachineGroup { path: entry.path() }.remove(Duration::from_secs(1));
+            for (owner, group) in self.groups() {
+                if !alive(owner) {
+                    group.remove(Duration::from_secs(1));
                 }
             }
+        }
+
+        /// The cgroups of the machines the process `host` started.
+        pub fn machines_of(&self, host: u32) -> Vec<MachineGroup> {
+            self.groups()
+                .filter(|(owner, _)| *owner == host)
+                .map(|(_, group)| group)
+                .collect()
+        }
+
+        /// Every machine's cgroup with the process that started it.
+        fn groups(&self) -> impl Iterator<Item = (u32, MachineGroup)> {
+            fs::read_dir(&self.machines)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .filter_map(|entry| {
+                    let owner = entry.file_name().to_str().and_then(super::owner)?;
+                    Some((owner, MachineGroup { path: entry.path() }))
+                })
         }
 
         /// Makes the cgroup of a machine, empty, with its limits. A cgroup of the name that a vm-host before this
@@ -350,7 +364,7 @@ mod linux {
     }
 
     impl MachineGroup {
-        /// Its folder.
+        /// Its folder, for what a test changes or reads by hand.
         pub fn path(&self) -> &Path {
             &self.path
         }
@@ -392,8 +406,39 @@ mod linux {
         pub fn populated(&self) -> bool {
             fs::read_to_string(self.path.join("cgroup.events"))
                 .ok()
-                .and_then(|text| value(&text, "populated"))
+                .and_then(|text| counter(&text, "populated"))
                 .is_none_or(|populated| populated != 0)
+        }
+
+        /// Waits at most `within` for the last process in it to end, woken by the kernel when `cgroup.events`
+        /// changes. `false` when one is still there.
+        pub fn wait_empty(&self, within: Duration) -> bool {
+            let Ok(mut events) = fs::File::open(self.path.join("cgroup.events")) else {
+                return !self.path.exists();
+            };
+            let began = Instant::now();
+            loop {
+                // Reading it again is what makes the next change wake the poll.
+                let mut text = String::new();
+                if events.seek(SeekFrom::Start(0)).is_err() || events.read_to_string(&mut text).is_err() {
+                    return false;
+                }
+                if counter(&text, "populated") == Some(0) {
+                    return true;
+                }
+                let left = within.saturating_sub(began.elapsed());
+                if left.is_zero() {
+                    return false;
+                }
+                let mut wake = libc::pollfd {
+                    fd: events.as_raw_fd(),
+                    events: libc::POLLPRI,
+                    revents: 0,
+                };
+                let millis = i32::try_from(left.as_millis() + 1).unwrap_or(i32::MAX);
+                // SAFETY: one pollfd that lives through the call, for a file that stays open.
+                unsafe { libc::poll(&mut wake, 1, millis) };
+            }
         }
 
         /// What its machine holds of the host's memory ([`super::resident`]).
@@ -420,7 +465,7 @@ mod linux {
         pub fn oom_kills(&self) -> u64 {
             fs::read_to_string(self.path.join("memory.events"))
                 .ok()
-                .and_then(|text| value(&text, "oom_kill"))
+                .and_then(|text| counter(&text, "oom_kill"))
                 .unwrap_or(0)
         }
 
@@ -432,34 +477,23 @@ mod linux {
                 match fs::remove_dir(&self.path) {
                     Ok(()) => return true,
                     Err(error) if error.kind() == ErrorKind::NotFound => return true,
-                    Err(_) if began.elapsed() < within => {
-                        self.kill();
-                        std::thread::sleep(Duration::from_millis(20));
+                    Err(_) => {
+                        let left = within.saturating_sub(began.elapsed());
+                        if left.is_zero() {
+                            return false;
+                        }
+                        if self.populated() {
+                            self.kill();
+                            self.wait_empty(left);
+                        } else {
+                            std::thread::sleep(Duration::from_millis(20).min(left));
+                        }
                     }
-                    Err(_) => return false,
                 }
             }
         }
     }
 }
-/// Whether a machine may run where its cgroup has no [`SWAP_MAX`]: only when the host swaps to nothing, as
-/// `/proc/swaps` (a line of headings, then one line per device) says. Otherwise the refusal says what to do.
-pub fn without_swap_account(proc_swaps: &str) -> Result<(), String> {
-    let devices: Vec<&str> = proc_swaps
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_whitespace().next())
-        .collect();
-    if devices.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "this kernel keeps no account of swap per cgroup (a machine's cgroup has no {SWAP_MAX}) and the host swaps \
-         to {}, where a machine's memory could go: turn swap off, or boot the kernel with swapaccount=1",
-        devices.join(" and ")
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,17 +550,6 @@ mod tests {
         assert!(own_path("").is_err());
         assert!(own_path("0::/a/../../etc").is_err());
         assert!(own_path("0::relative").is_err());
-    }
-
-    #[test]
-    fn values_are_read_by_their_whole_key() {
-        let events = "low 0\nhigh 0\nmax 12\noom 1\noom_kill 1\noom_group_kill 1\n";
-        assert_eq!(value(events, "oom_kill"), Some(1));
-        assert_eq!(value(events, "oom"), Some(1));
-        assert_eq!(value(events, "max"), Some(12));
-        assert_eq!(value(events, "kill"), None);
-        assert_eq!(value("populated x\n", "populated"), None);
-        assert_eq!(value("", "populated"), None);
     }
 
     #[test]

@@ -73,6 +73,9 @@ mod mac {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
+    use std::sync::OnceLock;
+
+    use cf_vmm_ch::cgroup::Delegation;
 
     use super::super::Fallible;
 
@@ -88,15 +91,8 @@ mod linux {
     pub fn available() -> u64 {
         fs::read_to_string("/proc/meminfo")
             .ok()
-            .and_then(|text| meminfo(&text, "MemAvailable:"))
-            .unwrap_or(0)
-    }
-
-    /// A field of `/proc/meminfo`, in bytes.
-    pub fn meminfo(text: &str, field: &str) -> Option<u64> {
-        let line = text.lines().find(|line| line.starts_with(field))?;
-        let kb: u64 = line[field.len()..].split_whitespace().next()?.parse().ok()?;
-        Some(kb << 10)
+            .and_then(|text| cf_host_linux::parse::meminfo(&text).ok())
+            .map_or(0, |memory| memory.available_bytes)
     }
 
     /// Moves every process of this one's cgroup, `cargo` with it, into its `host` leaf, as the Runner does when it
@@ -119,29 +115,18 @@ mod linux {
         pub peak: u64,
     }
 
-    /// The cgroups of the machines the vm-host `host` started (`vm-<host>-<n>`, beside the suite's `host` leaf).
+    /// The cgroups of the machines the vm-host `host` started, beside the suite's `host` leaf.
     pub fn groups_of(host: u32) -> Vec<Group> {
-        let Some(machines) = cf_vmm_ch::cgroup::own()
-            .ok()
-            .and_then(|own| Some(own.parent()?.join("machines")))
-        else {
+        static DELEGATION: OnceLock<Option<Delegation>> = OnceLock::new();
+        let Some(delegation) = DELEGATION.get_or_init(|| Delegation::claim().ok()) else {
             return Vec::new();
         };
-        let prefix = format!("vm-{host}-");
-        let Ok(entries) = fs::read_dir(machines) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix))
-            })
-            .filter_map(|entry| {
+        delegation
+            .machines_of(host)
+            .iter()
+            .filter_map(|group| {
                 let read = |file: &str| {
-                    fs::read_to_string(entry.path().join(file))
+                    fs::read_to_string(group.path().join(file))
                         .ok()?
                         .trim()
                         .parse()
@@ -149,7 +134,7 @@ mod linux {
                 };
                 Some(Group {
                     max: read("memory.max")?,
-                    peak: read("memory.peak").or_else(|| read("memory.current"))?,
+                    peak: group.peak().or_else(|| read("memory.current"))?,
                 })
             })
             .collect()
@@ -227,15 +212,6 @@ default dev wg0 scope link
             assert_eq!(routers_in(listing), ["10.20.30.1", "172.20.0.1"]);
             assert!(routers_in("").is_empty());
             assert!(routers_in("default via\ndefault via fe80::1 dev eth0\n").is_empty());
-        }
-
-        #[test]
-        fn meminfo_is_read_in_bytes() {
-            let text = "MemTotal:        8000000 kB\nMemFree:          100 kB\nMemAvailable:    2048 kB\n";
-            assert_eq!(meminfo(text, "MemAvailable:"), Some(2048 << 10));
-            assert_eq!(meminfo(text, "MemTotal:"), Some(8_000_000 << 10));
-            assert_eq!(meminfo(text, "SwapTotal:"), None);
-            assert_eq!(meminfo("MemAvailable: lots kB\n", "MemAvailable:"), None);
         }
     }
 }

@@ -17,6 +17,26 @@ pub enum Status {
     Signal(i32),
 }
 
+impl From<std::process::ExitStatus> for Status {
+    fn from(status: std::process::ExitStatus) -> Self {
+        use std::os::unix::process::ExitStatusExt as _;
+        match status.code() {
+            Some(code) => Status::Code(code),
+            None => Status::Signal(status.signal().unwrap_or(0)),
+        }
+    }
+}
+
+impl Status {
+    /// The exit code a shell gives a process that ended so: its own, or 128 and the signal.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Status::Code(code) => code,
+            Status::Signal(signal) => 128 + signal,
+        }
+    }
+}
+
 /// What the sandbox writes last, once the monitor has ended, to say how it did. The exit status of the machine's
 /// first process does not say it on its own: pasta of before 2024 exits 0 when the program it runs dies of a signal.
 const REPORT: &str = "vm-sandbox: the monitor ended with ";
@@ -158,6 +178,18 @@ impl Recent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exit_status_is_told_as_a_shell_tells_it() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let exited = std::process::ExitStatus::from_raw(7 << 8);
+        let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        assert_eq!(Status::from(exited), Status::Code(7));
+        assert_eq!(Status::from(killed), Status::Signal(9));
+        assert_eq!(Status::Code(7).exit_code(), 7);
+        assert_eq!(Status::Signal(9).exit_code(), 137);
+        assert_eq!(Status::Code(0).exit_code(), 0);
+    }
     use proptest::prelude::*;
 
     const POWERED_OFF: &str = "vm-sandbox: the monitor ended with code 0\n";

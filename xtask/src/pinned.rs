@@ -261,6 +261,20 @@ pub fn check_sources(curl: &Curl, sources: &[Source], pin: Pin<'_>, dir: &Path, 
     Checked { copy, notices }
 }
 
+/// The newest version a listing (a release, an index) names, as `read` finds it in the listing's bytes.
+pub fn newest(
+    curl: &Curl,
+    listing: &Source,
+    dir: &Path,
+    read: impl FnOnce(&[u8]) -> std::result::Result<String, String>,
+) -> std::result::Result<String, String> {
+    let file = dir.join("listing");
+    get(curl, listing, MAX_LISTING_BYTES, curl.listing, &file)
+        .map_err(|e| e.to_string())
+        .and_then(|()| fs::read(&file).map_err(|e| e.to_string()))
+        .and_then(|bytes| read(&bytes))
+}
+
 /// Ends a check: prints its notices, and fails when our copy did not give the pin. `fix` says where to act.
 pub fn conclude(checked: Checked, what: &str, fix: &str) -> Result<()> {
     for text in &checked.notices {

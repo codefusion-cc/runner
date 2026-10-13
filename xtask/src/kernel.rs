@@ -25,14 +25,13 @@
 //! Our copy: `gh release create kernel-linux-virt-<version> <the checked .apk> --prerelease --latest=false`, by
 //! the owner. The tag does not start with `image-`, so nothing takes it for a guest image.
 
-use std::fs;
 use std::io::Read;
 use std::path::Path;
 
 use flate2::read::GzDecoder;
 
 use crate::Result;
-use crate::pinned::{self, Checked, Curl, GITHUB_RELEASE_HOSTS, MAX_LISTING_BYTES, Pin, Scratch, Source};
+use crate::pinned::{self, Checked, Curl, GITHUB_RELEASE_HOSTS, Pin, Scratch, Source};
 
 /// The package's version, part of the bundle's version.
 pub const APK_VERSION: &str = "6.18.56-r0";
@@ -93,12 +92,7 @@ pub fn check(root: &Path, args: &[String]) -> Result<()> {
 
 fn check_sources(curl: &Curl, sources: &[Source], pin: Pin<'_>, index: &Source, dir: &Path) -> Checked {
     let mut checked = pinned::check_sources(curl, sources, pin, dir, WHAT);
-    let file = dir.join("APKINDEX.tar.gz");
-    let newest = pinned::get(curl, index, MAX_LISTING_BYTES, curl.listing, &file)
-        .map_err(|e| e.to_string())
-        .and_then(|()| fs::read(&file).map_err(|e| e.to_string()))
-        .and_then(|bytes| newest_in_index(&bytes).map_err(|e| e.to_string()));
-    match newest {
+    match pinned::newest(curl, index, dir, |bytes| newest_in_index(bytes).map_err(|e| e.to_string())) {
         Ok(newest) if newest == APK_VERSION => println!("Alpine {ALPINE_BRANCH} has no newer linux-virt"),
         Ok(newest) => checked.notices.push(format!(
             "Alpine {ALPINE_BRANCH} has linux-virt {newest}, the pin is {APK_VERSION}: move the pin (xtask/src/kernel.rs)"
@@ -345,9 +339,9 @@ mod tests {
         /// An index as Alpine signs it: a gzip stream with the signature, then one with the index, from real tar.
         fn index_archive(records: &str) -> Vec<u8> {
             let dir = tempfile::tempdir().unwrap();
-            fs::write(dir.path().join(".SIGN.RSA.key.pub"), b"signature").unwrap();
-            fs::write(dir.path().join("DESCRIPTION"), b"v3.24").unwrap();
-            fs::write(dir.path().join("APKINDEX"), records).unwrap();
+            std::fs::write(dir.path().join(".SIGN.RSA.key.pub"), b"signature").unwrap();
+            std::fs::write(dir.path().join("DESCRIPTION"), b"v3.24").unwrap();
+            std::fs::write(dir.path().join("APKINDEX"), records).unwrap();
             let tar = |names: &[&str]| {
                 let out = std::process::Command::new("tar")
                     .arg("-cf")

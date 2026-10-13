@@ -26,6 +26,9 @@ pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 /// Playwright's Chromium crashed its video capture). The guest reports no SVE, so `arm64.nosve` is not needed.
 pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 arm64.nosme";
 
+/// The longest a write to the guest's connection waits for the guest to read, under either monitor.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Why the monitor could not do what was asked.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VmmError {

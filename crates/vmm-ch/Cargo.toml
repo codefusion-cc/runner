@@ -10,10 +10,10 @@ publish.workspace = true
 cf-host-linux = { path = "../host-linux" }
 cf-netlink = { path = "../netlink" }
 cf-nft = { path = "../nft" }
+cf-secret = { path = "../secret" }
 cf-vmm = { path = "../vmm" }
 libc.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 
 [build-dependencies]
 sha2.workspace = true

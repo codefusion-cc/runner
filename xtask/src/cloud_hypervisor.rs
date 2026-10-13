@@ -13,11 +13,10 @@
 //! publish our copy (`gh release create cloud-hypervisor-<version> cloud-hypervisor-static-aarch64 --prerelease
 //! --latest=false`, by the owner), then change the three numbers in `pins.rs`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
-use crate::pinned::{self, Checked, Curl, GITHUB_RELEASE_HOSTS, MAX_LISTING_BYTES, Pin, Scratch, Source};
+use crate::pinned::{self, Checked, Curl, GITHUB_RELEASE_HOSTS, Pin, Scratch, Source};
 
 mod pins {
     include!("../../crates/vmm-ch/src/pins.rs");
@@ -87,18 +86,13 @@ pub fn fetch(root: &Path) -> Result<PathBuf> {
 fn check(root: &Path, args: &[String]) -> Result<()> {
     crate::no_options(args)?;
     let dir = Scratch::new(root.join("target/cloud-hypervisor-check"))?;
-    let checked = check_sources(&Curl::https(), &sources(), &latest_release(), dir.path());
+    let checked = check_sources(&Curl::https(), &sources(), PIN, &latest_release(), dir.path());
     pinned::conclude(checked, WHAT, "xtask/src/cloud_hypervisor.rs")
 }
 
-fn check_sources(curl: &Curl, sources: &[Source], latest: &Source, dir: &Path) -> Checked {
-    let mut checked = pinned::check_sources(curl, sources, PIN, dir, WHAT);
-    let file = dir.join("latest.json");
-    let newest = pinned::get(curl, latest, MAX_LISTING_BYTES, curl.listing, &file)
-        .map_err(|e| e.to_string())
-        .and_then(|()| fs::read(&file).map_err(|e| e.to_string()))
-        .and_then(|bytes| tag_of(&bytes));
-    match newest {
+fn check_sources(curl: &Curl, sources: &[Source], pin: Pin<'_>, latest: &Source, dir: &Path) -> Checked {
+    let mut checked = pinned::check_sources(curl, sources, pin, dir, WHAT);
+    match pinned::newest(curl, latest, dir, tag_of) {
         Ok(newest) if newest == VERSION => println!("cloud-hypervisor has no release newer than {VERSION}"),
         Ok(newest) => checked.notices.push(format!(
             "cloud-hypervisor has {newest}, the pin is {VERSION}: move the pin (xtask/src/cloud_hypervisor.rs)"
@@ -143,10 +137,7 @@ mod tests {
     fn checked(curl: &Curl, sources: &[Source], latest: &Source) -> Checked {
         let dir = tempfile::tempdir().unwrap();
         let hash = sha(BODY);
-        let mut checked = pinned::check_sources(curl, sources, pin(&hash), dir.path(), WHAT);
-        let newest = check_sources(curl, &[], latest, dir.path());
-        checked.notices.extend(newest.notices);
-        checked
+        check_sources(curl, sources, pin(&hash), latest, dir.path())
     }
 
     #[test]
