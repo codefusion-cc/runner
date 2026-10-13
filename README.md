@@ -28,6 +28,12 @@ ran, each in a machine that was gone when the job ended. What is there:
   while the person is away,
 - nothing stays behind: a Runner that starts finds the machines of the one before, goes on with those that run and
   removes what is left of the others, on the Mac and at GitHub,
+- never more machines than GitHub assigned jobs, and no machine stopped while its job runs. A machine idle for 10
+  minutes, or found surplus, asks GitHub to remove its registration, and only GitHub's answer stops it: a removal
+  means no job came, a refusal means one did, since a job's start can go missing with GitHub's messages. For the
+  same reason a machine that came up and ended with no word of a job still counts as one for about two and a half
+  minutes (the minute GitHub's word may come late, then the removal and its answer); in that time a newly queued
+  job may wait for a machine that would have fit (`docs/job-state.md`),
 - a job in its own virtual machine (`codefusion-runner vm`): one Linux machine per job with a fixed amount of memory
   and CPU, no swap and nothing that gives memory back while it runs. The job runs in a container in that machine as
   the image's user; its `sudo` makes it root of the container, not of the machine. When the job ends the machine and
@@ -43,7 +49,9 @@ ran, each in a machine that was gone when the job ended. What is there:
   GitHub's 2 GB asset limit. `image install` verifies a release in a folder of its own before a machine boots from
   it, and refuses one older than the newest it has accepted,
 - reports to the CodeFusion Console: the Mac's state every minute, and each job's start and end within a second
-  or two. While the console is away up to 500 job events wait in a file and arrive later, each once.
+  or two. While the console is away up to 500 job events wait in a file and arrive later, each once. Jobs that
+  wait while a machine of their size fits are in the report with how long and why, and warned of in the log after
+  a minute.
 
 `docs/MAP.md` says where things are and how a job's machine is put together.
 

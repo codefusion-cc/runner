@@ -11,7 +11,7 @@ use cf_host_macos::FakeHost;
 use cf_vmhost::{End, Ended, JobRequest, JobState, Stage};
 
 use crate::machines::{JobReport, MachineConfig, MachineParts, Machines, Reports};
-use crate::records::Store;
+use crate::records::{MemoryStore, Record, Store};
 use crate::roster::Roster;
 use crate::traits::{Events, JobEvent};
 use crate::vms::{Seen, VmError, Vms};
@@ -33,10 +33,14 @@ struct VmState {
     stopped: Vec<(String, StopReason, Duration)>,
     killed: Vec<String>,
     cleaned: Vec<String>,
+    /// Machines that went before they said they were up.
+    died_booting: usize,
     fail_start: usize,
     slow_boot: bool,
     late_state: bool,
     ignore_stops: bool,
+    /// The daemon that drives them died: nothing it asks of them is done.
+    frozen: bool,
     next_pid: u32,
     held: Option<Arc<HeldLooks>>,
 }
@@ -117,6 +121,12 @@ impl FakeVms {
         self.lock().ignore_stops = ignore;
     }
 
+    /// The daemon died, and its hands with it: a start, stop, kill or cleanup it still asks for does nothing, until
+    /// the daemon that starts next thaws them.
+    pub fn freeze(&self, frozen: bool) {
+        self.lock().frozen = frozen;
+    }
+
     /// Every look at a vm-host waits from now on, until the test lets them go.
     pub fn hold_looks(&self) -> Arc<HeldLooks> {
         let held = Arc::new(HeldLooks::default());
@@ -168,7 +178,12 @@ impl FakeVms {
 
     /// The vm-host is killed from outside: its state stays as it was, without an end.
     pub fn die(&self, job: &str) {
-        self.with(job, |vm| vm.alive = false);
+        let mut state = self.lock();
+        if let Some(vm) = state.vms.get_mut(job) {
+            let booting = vm.alive && vm.state.stage == Stage::Booting;
+            vm.alive = false;
+            state.died_booting += usize::from(booting);
+        }
     }
 
     /// Nothing of the job is there, as when the daemon died before its vm-host existed.
@@ -194,6 +209,21 @@ impl FakeVms {
             .filter(|(_, vm)| vm.alive)
             .map(|(job, _)| job.clone())
             .collect()
+    }
+
+    /// The machines that stand and have not said they are up.
+    pub fn booting(&self) -> Vec<String> {
+        self.lock()
+            .vms
+            .iter()
+            .filter(|(_, vm)| vm.alive && vm.state.stage != Stage::Running)
+            .map(|(job, _)| job.clone())
+            .collect()
+    }
+
+    /// How many machines went without ever saying they were up: killed or dead while they booted.
+    pub fn died_booting(&self) -> usize {
+        self.lock().died_booting
     }
 
     /// The memory of the machines that stand.
@@ -262,6 +292,9 @@ fn finish(vm: &mut FakeVm, end: End) {
 impl Vms for FakeVms {
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let mut state = self.lock();
+        if state.frozen {
+            return Err(VmError("the daemon that asked is dead".into()));
+        }
         if state.fail_start > 0 {
             state.fail_start -= 1;
             return Err(VmError("the vm-host did not start".into()));
@@ -314,6 +347,9 @@ impl Vms for FakeVms {
 
     fn stop(&self, job: &str, reason: StopReason, grace: Duration) -> bool {
         let mut state = self.lock();
+        if state.frozen {
+            return false;
+        }
         state.stopped.push((job.to_string(), reason, grace));
         let ignore = state.ignore_stops;
         match state.vms.get_mut(job) {
@@ -329,11 +365,16 @@ impl Vms for FakeVms {
 
     fn kill(&self, job: &str) {
         let mut state = self.lock();
+        if state.frozen {
+            return;
+        }
         state.killed.push(job.to_string());
         if let Some(vm) = state.vms.get_mut(job)
             && !vm.unkillable
         {
+            let booting = vm.alive && vm.state.stage == Stage::Booting;
             vm.alive = false;
+            state.died_booting += usize::from(booting);
         }
     }
 
@@ -348,6 +389,9 @@ impl Vms for FakeVms {
 
     fn clean(&self, job: &str) {
         let mut state = self.lock();
+        if state.frozen {
+            return;
+        }
         state.cleaned.push(job.to_string());
         let gone = match state.vms.get_mut(job) {
             Some(vm) => {
@@ -440,6 +484,108 @@ pub fn pass(machines: &TestMachines, seconds: u64) {
     for _ in 0..seconds {
         machines.with_host(|host| host.pass(Millis::secs(1)));
         machines.tick();
+    }
+}
+
+/// Records in memory at which a test can make the daemon die between any two writes: the `n`th write from
+/// [`CrashingStore::crash_at`] on is the daemon's last, kept or lost with it, and no write after it is kept until
+/// [`CrashingStore::revive`]. `on_crash` runs at that moment, while the writer waits: whatever else the dead daemon
+/// could still do (talk to GitHub, queue a report) is for the test to stop there.
+#[derive(Default)]
+pub struct CrashingStore {
+    records: MemoryStore,
+    crash: Mutex<Crash>,
+    /// Every write of a record whose facts disagree ([`Record::agrees`]), as it was written.
+    disagreements: Mutex<Vec<String>>,
+}
+
+#[derive(Default)]
+struct Crash {
+    /// Writes left before the crash, and whether the last one is kept.
+    armed: Option<(usize, bool)>,
+    dead: bool,
+    on_crash: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl CrashingStore {
+    /// The `writes`th write from now is the last; `kept`: whether it is written before the daemon dies.
+    pub fn crash_at(&self, writes: usize, kept: bool, on_crash: impl Fn() + Send + Sync + 'static) {
+        let mut crash = self.crash.lock().expect("crash");
+        if crash.armed.is_none() && !crash.dead {
+            crash.armed = Some((writes.max(1), kept));
+            crash.on_crash = Some(Box::new(on_crash));
+        }
+    }
+
+    /// Whether a crash is set and has not come yet.
+    pub fn armed(&self) -> bool {
+        self.crash.lock().expect("crash").armed.is_some()
+    }
+
+    /// Whether the daemon died at a write.
+    pub fn crashed(&self) -> bool {
+        self.crash.lock().expect("crash").dead
+    }
+
+    /// The writes of a record whose facts disagreed, at the moment of each: what a daemon that died right after it
+    /// would have found.
+    pub fn disagreements(&self) -> Vec<String> {
+        self.disagreements.lock().expect("disagreements").clone()
+    }
+
+    /// Writes a record as another Runner left it: an older one's write is not this one's, and is not checked.
+    pub fn plant(&self, record: &Record) {
+        self.records.save(record);
+    }
+
+    /// No crash any more: the daemon that starts next writes again, and one that was set and did not come is off.
+    pub fn revive(&self) {
+        *self.crash.lock().expect("crash") = Crash::default();
+    }
+
+    /// Writes with `apply` unless the daemon is dead, counting the write towards the crash. The crash holds the
+    /// lock until `on_crash` returned, so a write of another thread meanwhile finds the daemon dead.
+    fn write(&self, apply: impl FnOnce()) {
+        let mut crash = self.crash.lock().expect("crash");
+        match crash.armed {
+            _ if crash.dead => {}
+            None => apply(),
+            Some((left, kept)) if left > 1 => {
+                crash.armed = Some((left - 1, kept));
+                apply();
+            }
+            Some((_, kept)) => {
+                crash.armed = None;
+                crash.dead = true;
+                if kept {
+                    apply();
+                }
+                if let Some(on_crash) = &crash.on_crash {
+                    on_crash();
+                }
+            }
+        }
+    }
+}
+
+impl Store for CrashingStore {
+    fn save(&self, record: &Record) {
+        if !record.agrees() {
+            let slot = record.slot.map(|slot| slot.saved());
+            self.disagreements.lock().expect("disagreements").push(format!(
+                "{}: {slot:?} beside {:?}, unregistered: {}",
+                record.runner, record.github, record.unregistered
+            ));
+        }
+        self.write(|| self.records.save(record));
+    }
+
+    fn remove(&self, job: &str) {
+        self.write(|| self.records.remove(job));
+    }
+
+    fn load(&self) -> Vec<Record> {
+        self.records.load()
     }
 }
 

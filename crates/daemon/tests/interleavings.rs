@@ -8,9 +8,10 @@ use std::collections::BTreeSet;
 use cf_budget::{GIB, Pressure, Size};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{Claim, EventKind, Hosts, RESULT_WAIT, Seen, Slots, Ticket, Vms};
+use cf_daemon::{Claim, EventKind, RESULT_WAIT, Seen, Slots, Ticket, Vms};
 use cf_vmhost::End;
 use proptest::prelude::*;
+use support::pick;
 use support::world::World;
 
 /// One thing that happens. A number picks among what is there at that moment.
@@ -99,10 +100,6 @@ const ENDS: [End; 6] = [
 ];
 const RESULTS: [&str; 3] = ["succeeded", "failed", "canceled"];
 
-fn pick<T: Clone>(from: &[T], i: u8) -> Option<T> {
-    (!from.is_empty()).then(|| from[usize::from(i) % from.len()].clone())
-}
-
 /// What the test knows of the world beside the machines themselves.
 #[derive(Default)]
 struct Model {
@@ -115,10 +112,6 @@ struct Model {
     runners: Vec<String>,
     /// The slots of the machines this daemon started.
     held: Vec<(String, Ticket)>,
-}
-
-fn up(w: &World, runner: &str) -> bool {
-    matches!(w.parts.vms.look(job_name(runner)), Seen::Alive(state) if state.boot_ms.is_some())
 }
 
 fn standing(w: &World, model: &Model) -> Vec<String> {
@@ -212,7 +205,7 @@ async fn apply(w: &mut World, model: &mut Model, op: Op) {
         Op::JobStarts(i) => {
             let free: Vec<String> = standing(w, model)
                 .into_iter()
-                .filter(|r| !model.job_started.contains(r) && up(w, r))
+                .filter(|r| !model.job_started.contains(r) && w.up(r))
                 .collect();
             if let Some(runner) = pick(&free, i) {
                 w.github(EventKind::Started, &runner, "");
@@ -253,7 +246,7 @@ async fn apply(w: &mut World, model: &mut Model, op: Op) {
         }
         Op::Stop(i) => {
             if let Some(runner) = pick(&standing(w, model), i) {
-                let _ = w.m.stop(job_name(&runner)).await;
+                w.m.stop(job_name(&runner));
             }
         }
         Op::StopAll => w.m.stop_all(),

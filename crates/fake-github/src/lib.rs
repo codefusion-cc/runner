@@ -13,5 +13,5 @@ pub mod harness;
 pub mod httpd;
 mod keys;
 
-pub use github::{FakeGithub, JobState, Logged, Options, ScaleSetInfo};
+pub use github::{FakeGithub, JobState, Logged, Options, ScaleSetInfo, TAKE_BACK_AFTER};
 pub use keys::{TestKey, test_key};

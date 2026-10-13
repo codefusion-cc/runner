@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
@@ -23,12 +23,12 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::machines::{JobReport, Machines, Reports};
+use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
-use crate::scaler::{Scaler, ScalerConfig};
+use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
-use crate::traits::{EventKind, Hosts, Slots};
+use crate::traits::{EventKind, Slots};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -223,7 +223,21 @@ struct Shared<H, V> {
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
     told: Mutex<(u64, bool)>,
+    /// Jobs that wait while the Mac could run them, since the first look that saw them.
+    stall: Mutex<Option<Stall>>,
 }
+
+/// Jobs this Mac serves that wait while it could run them.
+#[derive(Debug)]
+struct Stall {
+    since: SystemTime,
+    /// Whether the log warned of them.
+    warned: bool,
+}
+
+/// How long jobs handed to this Mac may wait while nothing runs here before the log warns. A machine starts within
+/// seconds when one fits; a minute is far past that.
+pub const STALL_WARN_AFTER: Duration = Duration::from_secs(60);
 
 /// The Runner's service on one Mac.
 pub struct Service<H, V> {
@@ -342,6 +356,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 refused: Mutex::new(BTreeMap::new()),
                 console_paused: Mutex::new(false),
                 told: Mutex::new((0, false)),
+                stall: Mutex::new(None),
             }),
         }
     }
@@ -734,11 +749,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             let Some(client) = self.client_for(&registration.repo).await else {
                 // The App no longer reads its repository, or GitHub is away: asked again later.
                 tracing::debug!(runner = %registration.runner, repo = %registration.repo, "no client for a registration yet");
-                shared
-                    .refused
-                    .lock()
-                    .expect("refused")
-                    .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                self.sweep_later(registration.runner);
                 continue;
             };
             let id = match registration.runner_id {
@@ -749,33 +760,94 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .await
                     .map(|found| found.map(|runner| runner.id)),
             };
-            let removed = match id {
-                Ok(None) => Ok(()),
+            // GitHub's answer is what proves anything (`Machines::answered`); no answer (a 5xx, a timeout, a dropped
+            // connection) proves nothing, and the removal is sent again at a later sweep.
+            let answer = match id {
+                Ok(None) => Ok(machines::Answer::Gone),
                 Ok(Some(id)) => match client.remove_runner(id).await {
-                    Err(error) if !error.is_not_found() => Err(error),
-                    _ => Ok(()),
+                    Ok(()) => Ok(machines::Answer::Removed),
+                    Err(error) if error.is_not_found() => Ok(machines::Answer::Gone),
+                    Err(error) if error.status() == Some(422) => Ok(machines::Answer::Refused),
+                    Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
             };
-            match removed {
-                Ok(()) => {
-                    shared
-                        .refused
-                        .lock()
-                        .expect("refused")
-                        .remove(&registration.runner);
-                    shared.machines.unregistered(&registration.runner);
+            match answer {
+                Ok(answer) => {
+                    if answer == machines::Answer::Refused {
+                        // The job holds it until it is over: asked again later.
+                        self.sweep_later(registration.runner.clone());
+                    } else {
+                        shared
+                            .refused
+                            .lock()
+                            .expect("refused")
+                            .remove(&registration.runner);
+                    }
+                    shared.machines.answered(&registration.runner, answer);
                 }
                 Err(error) => {
                     tracing::warn!(runner = %registration.runner, %error, "a registration could not be removed; it is tried again");
-                    shared
-                        .refused
-                        .lock()
-                        .expect("refused")
-                        .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                    self.sweep_later(registration.runner);
                 }
             }
         }
+    }
+
+    /// Leaves a registration to a later sweep.
+    fn sweep_later(&self, runner: String) {
+        let again = Instant::now() + self.shared.config.sweep_again;
+        self.shared.refused.lock().expect("refused").insert(runner, again);
+    }
+
+    /// Why jobs GitHub handed to this Mac wait while nothing runs here, when they do. Jobs GitHub still holds are
+    /// not seen: its counts never name them (`totalAvailableJobs` is 0 in every count the probes of 2026-10-12 saw),
+    /// and only it decides when to hand them over (`docs/github-protocol.md`).
+    fn stall_reason(&self, sets: &[SetState], snapshot: &Snapshot) -> Option<String> {
+        let shared = &self.shared;
+        if *shared.console_paused.lock().expect("paused") {
+            return None;
+        }
+        if snapshot.waiting == 0 || !snapshot.machines.is_empty() {
+            return None;
+        }
+        let why = if snapshot.open {
+            sets.iter()
+                .find_map(|set| shared.machines.short_of(set.size))
+                .unwrap_or("no machine of their size fits")
+                .to_string()
+        } else {
+            snapshot.reason.clone()
+        };
+        Some(format!("nothing runs and no job starts: {why}"))
+    }
+
+    /// For how long jobs have waited while the Mac could run them, and why it believes they do: warns once when
+    /// that passes [`STALL_WARN_AFTER`], and says when it is over.
+    fn watch_stall(&self, sets: &[SetState], snapshot: &Snapshot) -> (u64, Option<String>) {
+        let now = self.shared.clock.now();
+        let reason = self.stall_reason(sets, snapshot);
+        let mut stall = self.shared.stall.lock().expect("stall");
+        let Some(reason) = reason else {
+            if let Some(over) = stall.take().filter(|over| over.warned) {
+                let seconds = now.duration_since(over.since).unwrap_or_default().as_secs();
+                tracing::info!(
+                    seconds,
+                    "the jobs that waited while the Mac was idle are under way or gone"
+                );
+            }
+            return (0, None);
+        };
+        let stall = stall.get_or_insert(Stall {
+            since: now,
+            warned: false,
+        });
+        let waited = now.duration_since(stall.since).unwrap_or_default();
+        if waited >= STALL_WARN_AFTER && !stall.warned {
+            stall.warned = true;
+            tracing::warn!(seconds = waited.as_secs(), %reason, "idle with jobs waiting");
+        }
+        (waited.as_secs(), Some(reason))
     }
 
     /// What the console is told now, without the job events.
@@ -813,6 +885,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             }
         });
         let paused = *shared.console_paused.lock().expect("paused");
+        let (idle_with_jobs_waiting_seconds, idle_with_jobs_waiting_reason) =
+            self.watch_stall(&sets, &snapshot);
         // A Mac the budget calls open takes no job while what runs on it leaves no memory for even the smallest
         // size it serves: the console hears that it is closed and what for, in the budget's word.
         let no_room = sets
@@ -846,6 +920,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 discovery_error: self.discovery_error().map(|error| cut(error, STATUS_TEXT_MAX)),
                 update: None,
                 not_serving: shared.not_serving.lock().expect("not serving").clone(),
+                idle_with_jobs_waiting_seconds,
+                idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
+                    .map(|reason| cut(reason, STATUS_TEXT_MAX)),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)
@@ -1019,10 +1096,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !stands {
                     return (false, format!("{name} is not on this Mac"));
                 }
-                match self.shared.machines.stop(crate::names::job_name(name)).await {
-                    Ok(()) => (true, format!("{name} is being stopped")),
-                    Err(error) => (false, error.to_string()),
-                }
+                self.shared.machines.stop(crate::names::job_name(name));
+                (true, format!("{name} is being stopped"))
             }
             kind => (false, format!("this Runner does not do `{kind}` yet")),
         }
@@ -1068,6 +1143,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // A job that was queued, started or ended is on the console's page within a moment, not with
                 // the next report in its turn.
                 _ = news.tick() => {
+                    self.watch_stall(&self.sets(), &self.shared.machines.snapshot());
                     if self.has_news() {
                         let next = self.report().await;
                         report.as_mut().reset(tokio::time::Instant::now() + next);
@@ -1140,9 +1216,17 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     set = %name, id = set.id, %repo, labels = %labels.join(","), size = size.label(),
                     "a scale set at GitHub"
                 );
+                let registry = SetRegistry {
+                    client: client.clone(),
+                    scale_set_id: set.id,
+                };
+                let machines = shared.machines.clone();
+                reconcile(&registry, &shared.roster, &repo, set.id, |runner, answer| {
+                    machines.answered(runner, answer);
+                })
+                .await;
                 let session = client.open_session(set.id, &shared.config.machine).await?;
                 tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
-                let machines = shared.machines.clone();
                 let slots: Arc<dyn Slots> = machines.clone();
                 let mut scaler = Scaler::new(
                     ScalerConfig {
@@ -1152,10 +1236,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         size,
                     },
                     session.clone(),
-                    SetRegistry {
-                        client: client.clone(),
-                        scale_set_id: set.id,
-                    },
+                    registry,
                     machines.clone(),
                     slots,
                     shared.roster.clone(),

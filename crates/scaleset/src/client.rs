@@ -470,6 +470,16 @@ impl ScaleSetClient {
             .find(|r| r.name == name))
     }
 
+    /// Whether a registered Actions runner of the repository has a job, by GitHub's own record; `None` when GitHub no
+    /// longer has it, as after a one-job Actions runner's job.
+    pub async fn runner_busy(&self, runner_id: i64) -> Result<Option<bool>, Error> {
+        Ok(self
+            .inner
+            .app
+            .runner_busy(self.inner.installation, &self.inner.repo, runner_id)
+            .await?)
+    }
+
     /// Removes a registered Actions runner. An Actions runner with a job refuses (the service answers 422); one that is
     /// gone is [`Error::is_not_found`].
     pub async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {

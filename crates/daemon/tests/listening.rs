@@ -44,12 +44,14 @@ async fn a_job_the_closed_machine_refused_waits_at_github_and_is_taken_once_the_
     assert_eq!(h.fake.count("acquirejobs"), 0);
 
     h.slots.set_open(true);
+    until("the machine to offer its free slot twice", || {
+        polls_with_room("1") >= 2
+    })
+    .await;
+    // GitHub hands the job over at its next look at the queue, which no poll brings about.
+    h.fake.github_looks();
     until("a runner for the job", || h.hosts.started().len() == 1).await;
     assert_eq!(h.fake.runners().len(), 1);
-    assert!(
-        polls_with_room("1") >= 1,
-        "the machine offers its free slot once it is open"
-    );
 
     trigger.trigger();
     task.await.unwrap().unwrap();

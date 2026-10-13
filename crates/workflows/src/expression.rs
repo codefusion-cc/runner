@@ -164,7 +164,7 @@ fn operand_value(operand: &str, vars: &BTreeMap<String, String>) -> Option<Strin
 }
 
 fn unquote_json(value: &str) -> String {
-    serde_yaml_ng::from_str::<String>(value)
+    serde_saphyr::from_str::<String>(value)
         .ok()
         .filter(|_| value.starts_with('"'))
         .unwrap_or_else(|| value.to_string())

@@ -9,7 +9,8 @@ pub enum Phase {
     Starting,
     /// The first VM did not get ready and was killed; the second starts once its process is gone.
     Retrying,
-    /// The Actions runner in the VM is up and waits for its job. Left after [`Limits::idle`] without one.
+    /// The Actions runner in the VM is up and waits for its job. After [`Limits::idle`] without one, or when it is
+    /// surplus ([`Event::Retire`]), it asks for its registration's removal.
     Idle,
     /// The job runs.
     Running,
@@ -21,6 +22,11 @@ pub enum Phase {
     Killing,
     /// Over: no VM, the memory given back.
     Released,
+    /// The Actions runner is up, no job was heard, and its registration's removal is asked for: GitHub's answer
+    /// decides. Removed ([`Event::Unregistered`]): the VM stops as one that had no job. Refused for a job, or gone
+    /// already: the job is heard ([`Event::JobStarted`], [`Event::JobCompleted`]). The VM is not stopped on the
+    /// belief that no job came; without an answer for [`Limits::job`], it is stopped as a job over its time.
+    Asking,
 }
 
 /// How a slot ended.
@@ -46,7 +52,8 @@ pub enum End {
     Lost,
     /// The VM did not get ready, twice.
     StartFailed,
-    /// The Actions runner was up and no job came.
+    /// GitHub removed the Actions runner's registration at the Runner's request, which it does only for one that
+    /// holds no job: no job came.
     NoJob,
 }
 
@@ -92,6 +99,11 @@ pub enum Event {
     VmExited,
     /// The budget says this job has to stop for the Mac's sake.
     Evict(EvictionCause),
+    /// GitHub removed the Actions runner's registration at the Runner's own request, which it does only for an
+    /// Actions runner without a job. It takes none any more.
+    Unregistered,
+    /// The Actions runner is not needed: its registration's removal is asked for, if it is up and waits for a job.
+    Retire,
     /// The console, the tray or a shutdown asks for this slot to stop.
     Stop,
     /// The Mac slept for this long.
@@ -122,8 +134,6 @@ pub enum Effect {
     StopVm { grace: Millis },
     /// Send the vm-host's process group SIGKILL.
     KillVm,
-    /// Remove the Actions runner's registration at GitHub if it is still there.
-    Unregister,
     /// Give the slot's memory back to the budget and delete its scratch disk. The VM's process is gone.
     Release,
     /// A VM did not reach `ready`: tell the [`crate::StartBreaker`].
@@ -211,6 +221,10 @@ pub struct Saved {
     pub oom: bool,
     /// Whether a job started in it.
     pub ran_job: bool,
+    /// Whether its VM came up: only one that did can have run an Actions runner.
+    pub up: bool,
+    /// Whether GitHub said the job is over before the VM was up to finish it.
+    pub completed: bool,
 }
 
 /// One slot's state machine. See the crate's page for the picture and for what holds on every path.
@@ -221,7 +235,12 @@ pub struct Slot {
     starts: u32,
     end: Option<End>,
     oom: bool,
+    /// Whether a job started: GitHub said so, or its end came.
     ran_job: bool,
+    /// Whether GitHub said the job is over before there was a VM to finish: applied once the VM is up.
+    completed: bool,
+    /// Whether the VM came up: it said `ready`, or a word of its job came.
+    up: bool,
     /// Whether the budget still counts this slot.
     memory: bool,
     /// Whether this slot came back from disk: what a second VM needs to register (the Actions runner's
@@ -243,6 +262,8 @@ impl Slot {
             end: None,
             oom: false,
             ran_job: false,
+            completed: false,
+            up: false,
             memory: true,
             restored: false,
             deadline: None,
@@ -258,16 +279,10 @@ impl Slot {
     /// A VM that was still booting goes on booting. One that was waiting to be started a second time is not
     /// started again: what the Actions runner needs to register was never on disk.
     pub fn restore(limits: Limits, now: Millis, saved: Saved, vm_alive: bool) -> (Slot, Vec<Effect>) {
-        let mut slot = Slot::reserved(limits);
-        slot.starts = saved.starts;
-        slot.end = saved.end;
-        slot.oom = saved.oom;
-        slot.ran_job = saved.ran_job;
+        let mut slot = Slot::from_saved(limits, saved);
         slot.memory = vm_alive && saved.phase != Phase::Released;
-        slot.restored = true;
         let mut effects = Vec::new();
         if saved.phase == Phase::Released {
-            slot.phase = Phase::Released;
             return (slot, effects);
         }
         // How a slot ends whose VM is not to go on, unless its phase says more.
@@ -281,6 +296,7 @@ impl Slot {
                     End::StartFailed
                 }
                 Phase::Retrying => End::StartFailed,
+                Phase::Idle | Phase::Asking => End::GuestLost,
                 _ => recorded,
             };
             slot.starts = slot.starts.max(u32::from(saved.phase != Phase::Reserved));
@@ -294,6 +310,11 @@ impl Slot {
                 slot.deadline = Some(now.plus(limits.start));
             }
             Phase::Idle => slot.idle(now),
+            // The answer may have gone with the daemon: the removal is asked again, as the phase says.
+            Phase::Asking => {
+                slot.idle(now);
+                slot.ask(now);
+            }
             Phase::Running => slot.run(now),
             Phase::Finishing => {
                 slot.phase = Phase::Finishing;
@@ -322,7 +343,33 @@ impl Slot {
             end: self.end,
             oom: self.oom,
             ran_job: self.ran_job,
+            up: self.up,
+            completed: self.completed,
         }
+    }
+
+    /// What a slot saved so becomes once it hears these words of its job from GitHub, as [`Slot::on`] takes them:
+    /// for a record whose lifecycle was written apart from GitHub's word.
+    pub fn hear(limits: Limits, saved: Saved, words: &[Event]) -> Saved {
+        let mut slot = Slot::from_saved(limits, saved);
+        for word in words {
+            slot.on(Millis::ZERO, *word);
+        }
+        slot.saved()
+    }
+
+    /// A slot that came back from disk as it was saved, with no timer running.
+    fn from_saved(limits: Limits, saved: Saved) -> Slot {
+        let mut slot = Slot::reserved(limits);
+        slot.phase = saved.phase;
+        slot.starts = saved.starts;
+        slot.end = saved.end;
+        slot.oom = saved.oom;
+        slot.ran_job = saved.ran_job;
+        slot.up = saved.up;
+        slot.completed = saved.completed;
+        slot.restored = true;
+        slot
     }
 
     /// Where the slot is.
@@ -339,7 +386,7 @@ impl Slot {
     pub fn timers(&self, now: Millis) -> Vec<(Timer, Millis)> {
         let phase_timer = match self.phase {
             Phase::Starting => Some(Timer::Start),
-            Phase::Idle => Some(Timer::Idle),
+            Phase::Idle | Phase::Asking => Some(Timer::Idle),
             Phase::Finishing => Some(Timer::Finish),
             Phase::Stopping => Some(Timer::Stop),
             Phase::Retrying | Phase::Killing => Some(Timer::Kill),
@@ -366,32 +413,58 @@ impl Slot {
             .min()
     }
 
-    /// Takes one event at `now` and returns what to do, in order. An event that means nothing where the slot is
-    /// (a message that came twice or late) does nothing.
+    /// Takes one event at `now` and returns what to do, in order. Every phase answers every event, with no arm
+    /// for the rest, so a new phase or event cannot go unanswered. A word of a job is never dropped for the phase
+    /// it meets: it moves the slot where it can, and is kept until the slot gets there where it cannot yet. An
+    /// event that means nothing where the slot is (a message that came twice or late) does nothing.
     pub fn on(&mut self, now: Millis, event: Event) -> Vec<Effect> {
+        use Event::{
+            Assigned, Evict, Expired, Heartbeat, JobCompleted, JobStarted, Lost, OutOfMemory, Retire, Slept,
+            Stop, Tick, Unregistered, VmExited, VmReady,
+        };
+        use Phase::{
+            Asking, Finishing, Idle, Killing, Released, Reserved, Retrying, Running, Starting, Stopping,
+        };
         let mut effects = Vec::new();
-        if self.phase == Phase::Released {
-            return effects;
-        }
         let out = &mut effects;
         let due = |at: Option<Millis>| at.is_some_and(|at| now >= at);
-        let long_sleep = matches!(event, Event::Slept(span) if span > self.limits.long_sleep);
+        let long_sleep = matches!(event, Slept(span) if span > self.limits.long_sleep);
         // A guest sleeps with its host, so no watchdog runs while the Mac sleeps: each is due that much later.
-        if let Event::Slept(span) = event {
+        if let Slept(span) = event {
             for timer in [&mut self.deadline, &mut self.heartbeat, &mut self.job] {
                 *timer = timer.map(|at| at.plus(span));
             }
         }
         match (self.phase, event) {
-            (Phase::Reserved, Event::Assigned) => self.start(now, out),
-            (Phase::Reserved, Event::Lost | Event::Stop | Event::Evict(_)) => self.release(End::Lost, out),
-            (Phase::Reserved, Event::Expired) => {
+            // --- memory reserved, no VM ---
+            (Reserved, Assigned) => self.start(now, out),
+            (Reserved, Lost | Stop | Evict(_) | Unregistered) => self.release(End::Lost, out),
+            (Reserved, Expired) => {
                 self.memory = false;
                 self.release(End::Lost, out);
             }
+            // No VM yet to run it: kept until there is one that is up.
+            (Reserved, JobStarted) => self.ran_job = true,
+            (Reserved, JobCompleted) => self.heard_end(),
+            (Reserved, VmReady | VmExited | Heartbeat | OutOfMemory | Retire | Slept(_) | Tick) => {}
 
-            // The VM's process is gone, wherever the slot was.
-            (Phase::Starting, Event::VmExited) => {
+            // --- the VM boots ---
+            (Starting, VmReady) => {
+                out.push(Effect::StartSucceeded);
+                self.up(now);
+            }
+            // A word of the job means the VM was up: its `ready` was lost on the way.
+            (Starting, JobStarted) => {
+                out.push(Effect::StartSucceeded);
+                self.ran_job = true;
+                self.up(now);
+            }
+            (Starting, JobCompleted) => {
+                out.push(Effect::StartSucceeded);
+                self.heard_end();
+                self.up(now);
+            }
+            (Starting, VmExited) => {
                 out.push(Effect::StartFailed);
                 if self.may_start_again() {
                     self.start(now, out);
@@ -399,94 +472,171 @@ impl Slot {
                     self.release(End::StartFailed, out);
                 }
             }
-            (Phase::Retrying, Event::VmExited) => self.start(now, out),
-            (Phase::Idle | Phase::Running, Event::VmExited) => self.release(End::GuestLost, out),
-            (Phase::Finishing | Phase::Stopping | Phase::Killing, Event::VmExited) => {
-                self.release(self.end.unwrap_or(End::GuestLost), out);
-            }
-
-            (Phase::Starting, Event::VmReady) => {
-                out.push(Effect::StartSucceeded);
-                self.idle(now);
-            }
-            // The job started, so the VM was ready: its `ready` was lost on the way.
-            (Phase::Starting, Event::JobStarted) => {
-                out.push(Effect::StartSucceeded);
-                self.run(now);
-            }
-            (Phase::Starting, Event::Tick) if due(self.deadline) => {
+            (Starting, Tick) if due(self.deadline) => {
                 out.push(Effect::StartFailed);
                 out.push(Effect::KillVm);
                 if self.may_start_again() {
-                    self.phase = Phase::Retrying;
+                    self.phase = Retrying;
                 } else {
-                    self.phase = Phase::Killing;
+                    self.phase = Killing;
                     self.end = Some(End::StartFailed);
                 }
                 self.deadline = Some(now.plus(self.limits.kill_again));
             }
-            (Phase::Starting, Event::Stop) => self.kill(now, End::Stopped, out),
-            (Phase::Starting, Event::Evict(cause)) => self.kill(now, evicted(cause), out),
-            (Phase::Starting, Event::Slept(_)) if long_sleep => self.kill(now, End::HostSlept, out),
+            (Starting, Stop) => self.kill(now, End::Stopped, out),
+            (Starting, Evict(cause)) => self.kill(now, evicted(cause), out),
+            (Starting, Unregistered) => self.kill(now, self.removed(), out),
+            (Starting, Slept(_)) if long_sleep => self.kill(now, End::HostSlept, out),
+            // A VM that is not up yet waits for no job: it is retired once it is.
+            (Starting, Assigned | Lost | Expired | Heartbeat | OutOfMemory | Retire | Slept(_) | Tick) => {}
 
+            // --- the first VM was killed; the second starts once it is gone ---
+            (Retrying, VmExited) => self.start(now, out),
             // The kill was sent already; only the reason for it changes.
-            (Phase::Retrying, Event::Stop) => self.give_up_retry(End::Stopped),
-            (Phase::Retrying, Event::Evict(cause)) => self.give_up_retry(evicted(cause)),
-            (Phase::Retrying, Event::Slept(_)) if long_sleep => self.give_up_retry(End::HostSlept),
-            (Phase::Retrying | Phase::Killing, Event::Tick) if due(self.deadline) => {
+            (Retrying, Stop) => self.give_up_retry(End::Stopped),
+            (Retrying, Evict(cause)) => self.give_up_retry(evicted(cause)),
+            (Retrying, Unregistered) => self.give_up_retry(End::StartFailed),
+            (Retrying, Slept(_)) if long_sleep => self.give_up_retry(End::HostSlept),
+            // The VM that was killed for not saying `ready` was up and took the job: the registration it used is
+            // spent, so no second VM is started for it.
+            (Retrying, JobStarted) => {
+                self.up = true;
+                self.ran_job = true;
+                self.give_up_retry(End::GuestLost);
+            }
+            (Retrying, JobCompleted) => {
+                self.up = true;
+                self.heard_end();
+                self.give_up_retry(End::GuestLost);
+            }
+            (Retrying | Killing, Tick) if due(self.deadline) => {
                 out.push(Effect::KillVm);
                 out.push(Effect::Stuck);
                 self.deadline = Some(now.plus(self.limits.kill_again));
             }
+            (
+                Retrying,
+                Assigned | Lost | Expired | VmReady | Heartbeat | OutOfMemory | Retire | Slept(_) | Tick,
+            ) => {}
 
-            (Phase::Idle, Event::JobStarted) => self.run(now),
+            // --- the Actions runner waits for its job, or for GitHub's answer to its removal ---
+            (Idle | Asking, JobStarted) => self.run(now),
             // The job is over, so it had started: its start was lost on the way.
-            (Phase::Idle, Event::JobCompleted) => {
+            (Idle | Asking, JobCompleted) => {
                 self.ran_job = true;
                 self.finish(now);
             }
-            (Phase::Idle | Phase::Running, Event::Heartbeat) => {
-                self.heartbeat = Some(now.plus(self.limits.heartbeat));
-            }
-            (Phase::Idle | Phase::Running, Event::Tick) if due(self.heartbeat) => {
-                self.kill(now, End::GuestLost, out)
-            }
-            (Phase::Idle, Event::Tick) if due(self.deadline) => self.stop(now, End::NoJob, Millis::ZERO, out),
-            (Phase::Idle, Event::Stop) => self.stop(now, End::Stopped, Millis::ZERO, out),
-            (Phase::Idle, Event::Evict(cause)) => self.stop(now, evicted(cause), Millis::ZERO, out),
-            (Phase::Idle | Phase::Running, Event::Slept(_)) if long_sleep => {
-                self.stop(now, End::HostSlept, Millis::ZERO, out);
-            }
-
-            (Phase::Idle | Phase::Running, Event::OutOfMemory) => self.oom = true,
-            (Phase::Running, Event::JobCompleted) => self.finish(now),
-            (Phase::Running, Event::Tick) if due(self.job) => {
+            (Idle | Asking | Running, Heartbeat) => self.heartbeat = Some(now.plus(self.limits.heartbeat)),
+            (Idle | Asking | Running, Tick) if due(self.heartbeat) => self.kill(now, End::GuestLost, out),
+            // No job came, as far as the Runner heard: its start may have gone unheard, so the VM is not stopped on
+            // that belief. Its registration's removal is asked for, and GitHub's answer decides.
+            (Idle, Tick) if due(self.deadline) => self.ask(now),
+            (Idle, Retire) => self.ask(now),
+            // An answer that never comes (GitHub away, no client for the repository) does not hold the VM for ever: a
+            // job whose start went unheard began before the ask, so it is over its time once a job's time has passed.
+            (Asking, Tick) if due(self.deadline) => {
                 out.push(Effect::Tell(Notice::TimedOut));
                 self.stop(now, End::Timeout, self.limits.grace, out);
             }
-            (Phase::Running, Event::Evict(cause)) => {
+            (Idle | Asking, Unregistered) => self.stop(now, self.removed(), Millis::ZERO, out),
+            (Idle | Asking, Stop) => self.stop(now, End::Stopped, Millis::ZERO, out),
+            (Idle | Asking, Evict(cause)) => self.stop(now, evicted(cause), Millis::ZERO, out),
+            (Idle | Asking | Running, Slept(_)) if long_sleep => {
+                self.stop(now, End::HostSlept, Millis::ZERO, out)
+            }
+            (Idle | Asking | Running, VmExited) => self.release(End::GuestLost, out),
+            (Idle | Asking | Running, OutOfMemory) => self.oom = true,
+            (Idle, Assigned | Lost | Expired | VmReady | Slept(_) | Tick) => {}
+            (Asking, Assigned | Lost | Expired | VmReady | Retire | Slept(_) | Tick) => {}
+
+            // --- the job runs ---
+            (Running, JobCompleted) => self.finish(now),
+            (Running, Tick) if due(self.job) => {
+                out.push(Effect::Tell(Notice::TimedOut));
+                self.stop(now, End::Timeout, self.limits.grace, out);
+            }
+            (Running, Evict(cause)) => {
                 out.push(Effect::Tell(Notice::Evicted(cause)));
                 self.stop(now, evicted(cause), self.limits.grace, out);
             }
-            (Phase::Running, Event::Stop) => {
+            (Running, Stop) => {
                 out.push(Effect::Tell(Notice::Stopped));
                 self.stop(now, End::Stopped, self.limits.grace, out);
             }
+            // GitHub removes no registration that holds a job: an answer that says so is from before the job, and the
+            // job goes on.
+            (
+                Running,
+                Assigned | Lost | Expired | VmReady | JobStarted | Unregistered | Retire | Slept(_) | Tick,
+            ) => {}
 
-            // The job is over and its end is decided; all that is left is to get the VM gone sooner.
-            (Phase::Finishing, Event::Tick) if due(self.deadline) => self.stop_finished(now, out),
-            (Phase::Finishing, Event::Stop | Event::Evict(_)) => self.stop_finished(now, out),
-            (Phase::Finishing, Event::Slept(_)) if long_sleep => self.stop_finished(now, out),
+            // --- the job is over and its end is decided; all that is left is to get the VM gone sooner ---
+            (Finishing, Tick) if due(self.deadline) => self.stop_finished(now, out),
+            (Finishing, Stop | Evict(_)) => self.stop_finished(now, out),
+            (Finishing, Slept(_)) if long_sleep => self.stop_finished(now, out),
 
-            (Phase::Stopping, Event::Tick) if due(self.deadline) => {
+            (Stopping, Tick) if due(self.deadline) => {
                 out.push(Effect::KillVm);
-                self.phase = Phase::Killing;
+                self.phase = Killing;
                 self.deadline = Some(now.plus(self.limits.kill_again));
             }
+            (Finishing | Stopping | Killing, VmExited) => {
+                self.release(self.end.unwrap_or(End::GuestLost), out)
+            }
+            // A word of a job that came while the VM was being stopped: a job ran, whatever stops it.
+            (Finishing | Stopping | Killing, JobStarted | JobCompleted) => self.heard_late(),
+            (Stopping | Killing, Stop | Evict(_)) => {}
+            (
+                Finishing | Stopping | Killing,
+                Assigned | Lost | Expired | VmReady | Heartbeat | OutOfMemory,
+            )
+            | (Finishing | Stopping | Killing, Unregistered | Retire | Slept(_) | Tick) => {}
 
-            _ => {}
+            // --- over: its end went out already, and only the fact that a job ran is kept ---
+            (Released, JobStarted | JobCompleted) => self.heard_late(),
+            (Released, Assigned | Lost | Expired | Stop | Evict(_) | Unregistered | VmReady | VmExited)
+            | (Released, Heartbeat | OutOfMemory | Retire | Slept(_) | Tick) => {}
         }
         effects
+    }
+
+    /// The VM is up: the Actions runner waits for its job, or runs or finishes the one already heard of.
+    fn up(&mut self, now: Millis) {
+        self.up = true;
+        if self.completed {
+            self.finish(now);
+        } else if self.ran_job {
+            self.run(now);
+        } else {
+            self.idle(now);
+        }
+    }
+
+    /// GitHub said the job is over: it ran.
+    fn heard_end(&mut self) {
+        self.ran_job = true;
+        self.completed = true;
+    }
+
+    /// A word of a job came after the slot's end was decided: it ran, on a VM that was up, so the end is not one
+    /// without a job.
+    fn heard_late(&mut self) {
+        self.ran_job = true;
+        self.up = true;
+        if self.end == Some(End::NoJob) {
+            self.end = Some(End::Stopped);
+        }
+    }
+
+    /// The end of a slot whose registration GitHub removed at the Runner's asking: no job, unless one was heard.
+    fn removed(&self) -> End {
+        if self.ran_job { End::Stopped } else { End::NoJob }
+    }
+
+    /// Asks for the registration's removal, and waits for GitHub's answer for a job's time at most.
+    fn ask(&mut self, now: Millis) {
+        self.phase = Phase::Asking;
+        self.deadline = Some(now.plus(self.limits.job));
     }
 
     fn may_start_again(&self) -> bool {
@@ -508,6 +658,7 @@ impl Slot {
 
     fn run(&mut self, now: Millis) {
         self.phase = Phase::Running;
+        self.end = None;
         self.ran_job = true;
         self.deadline = None;
         self.heartbeat = Some(now.plus(self.limits.heartbeat));
@@ -550,9 +701,6 @@ impl Slot {
     }
 
     fn release(&mut self, end: End, out: &mut Vec<Effect>) {
-        if self.starts > 0 {
-            out.push(Effect::Unregister);
-        }
         if self.memory {
             out.push(Effect::Release);
             self.memory = false;

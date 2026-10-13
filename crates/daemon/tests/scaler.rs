@@ -331,7 +331,7 @@ async fn a_completed_job_is_not_replaced_and_its_runner_is_left_to_exit() {
     h.scaler.scale(Some(&done)).await.unwrap();
     assert_eq!(h.hosts.started().len(), 1, "one job, one runner");
     assert!(
-        h.hosts.stopped().is_empty(),
+        h.hosts.retired().is_empty(),
         "a finishing runner is not removed as surplus"
     );
     assert_eq!(h.fake.runners(), vec![name]);
@@ -371,41 +371,40 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
     // The two idle jobs were cancelled: only the busy Actions runner's job is assigned.
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert!(
-        h.hosts.stopped().is_empty(),
+        h.hosts.retired().is_empty(),
         "retired runners still inside their grace period"
     );
 
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE);
-    let (stuck_name, _, stuck_id) = {
-        let (n, id, t) = all
-            .iter()
-            .skip(1)
-            .map(|(n, id, t)| (n.clone(), *id, *t))
-            .next()
-            .unwrap();
-        (n, t, id)
-    };
-    h.fake.fail(
-        &format!("DELETE /svc/_apis/distributedtask/pools/0/agents/{stuck_id}"),
-        Reply::text(400, "job still running"),
-        10,
-    );
     h.scaler.scale(None).await.unwrap();
-    let removed = h.hosts.stopped();
+    let mut idle: Vec<String> = all.iter().skip(1).map(|(n, ..)| n.clone()).collect();
+    idle.sort();
+    let retired = |h: &Harness| {
+        let mut retired = h.hosts.retired();
+        retired.sort();
+        retired
+    };
     assert_eq!(
-        removed.len(),
-        1,
-        "only the idle runner that could be unregistered goes: {removed:?}"
+        retired(&h),
+        idle,
+        "the idle runners retire, the busy and the adopted one stay"
     );
-    assert_ne!(removed[0], stuck_name);
-    assert_ne!(removed[0], busy);
-    for kept in [&busy, &"adopted".to_string(), &stuck_name] {
-        assert!(
-            h.roster.get(kept).is_some(),
-            "{kept}: busy, adopted and not-yet-removable runners must stay"
-        );
-    }
+    // Retiring is asking: nothing is stopped and nothing changes at GitHub until the sweep has GitHub's answer.
+    assert_eq!(h.fake.runners().len(), 3);
+    h.scaler.scale(None).await.unwrap();
+    assert_eq!(
+        retired(&h),
+        idle,
+        "a runner that retires is not retired again, and counts"
+    );
     assert_eq!(h.slots.used(), 3, "a slot went back before its machine was gone");
+    // GitHub removed one at the sweep's request; the other's removal GitHub has not answered.
+    h.machines.answered(&idle[0], cf_daemon::Answer::Removed);
+    for kept in [&busy, &"adopted".to_string(), &idle[1]] {
+        assert!(h.roster.get(kept).is_some(), "{kept} must stay");
+    }
     pass(&h.machines, 1);
     assert_eq!(
         h.slots.used(),
@@ -428,9 +427,12 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
         },
     )
     .await;
+    // GitHub hands a job out at its queue event, against room two polls showed it.
+    h.fake.set_poll_timeout(std::time::Duration::from_millis(100));
+    for _ in 0..2 {
+        assert_eq!(h.session.poll(0, 1).await.expect("poll"), None);
+    }
     let id = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "job");
-    let offered = next_message(&h, 1).await;
-    h.scaler.scale(Some(&offered)).await.unwrap();
     let assigned = next_message(&h, 1).await;
     assert_eq!(assigned.statistics.unwrap().assigned(), 1);
     h.scaler.scale(Some(&assigned)).await.unwrap();
@@ -440,13 +442,25 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
     let cancelled = next_message(&h, 1).await;
     h.scaler.scale(Some(&cancelled)).await.unwrap();
     assert!(
-        h.hosts.stopped().is_empty(),
+        h.hosts.retired().is_empty(),
         "inside the grace period the runner may still be wanted"
     );
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE);
     h.scaler.scale(None).await.unwrap();
-    assert_eq!(h.hosts.stopped().len(), 1);
-    assert!(h.fake.runners().is_empty());
+    let name = h.hosts.started()[0].0.clone();
+    assert_eq!(h.hosts.retired(), vec![name.clone()]);
+    assert_eq!(
+        h.machines
+            .registrations_to_remove()
+            .iter()
+            .map(|r| r.runner.clone())
+            .collect::<Vec<_>>(),
+        vec![name.clone()],
+        "the sweep removes its registration"
+    );
+    h.machines.answered(&name, cf_daemon::Answer::Removed);
     pass(&h.machines, 1);
     assert_eq!(h.slots.used(), 0);
 }
@@ -622,10 +636,12 @@ async fn a_runner_whose_job_is_done_is_never_retired_as_surplus() {
     };
     h.scaler.scale(Some(&done)).await.unwrap();
     // Both assigned jobs are gone from the counts, long past the grace period.
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE * 3);
     h.scaler.scale(Some(&stats(0))).await.unwrap();
     assert_eq!(
-        h.hosts.stopped(),
+        h.hosts.retired(),
         vec![idle],
         "only the idle runner goes; the finished one exits by itself"
     );
@@ -745,7 +761,7 @@ async fn a_completed_job_without_new_counts_gets_no_second_runner() {
     }
     assert_eq!(h.hosts.started().len(), 2);
     assert!(
-        h.hosts.stopped().is_empty(),
+        h.hosts.retired().is_empty(),
         "the runner of a job still assigned was retired"
     );
     assert_eq!(
@@ -756,7 +772,7 @@ async fn a_completed_job_without_new_counts_gets_no_second_runner() {
 
     h.scaler.scale(Some(&done(&second))).await.unwrap();
     assert_eq!(h.hosts.started().len(), 2);
-    assert!(h.hosts.stopped().is_empty());
+    assert!(h.hosts.retired().is_empty());
 
     // Only the service's own counts bring new Actions runners.
     h.scaler.scale(Some(&stats(1))).await.unwrap();
@@ -814,7 +830,7 @@ async fn a_message_that_names_a_runner_of_another_scale_set_leaves_that_runner_a
     assert!(!theirs.busy && theirs.job.is_none(), "marked busy: {theirs:?}");
     assert_eq!(theirs.done, None, "marked done");
     assert!(
-        h.hosts.stopped().is_empty(),
+        h.hosts.retired().is_empty(),
         "the completion counted against this scale set's own job"
     );
 }
@@ -851,10 +867,13 @@ async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
     let mut h = harness(2).await;
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     let (name, _, ticket) = h.hosts.started()[0].clone();
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE);
-    h.hosts.fail_stop(1);
     h.scaler.scale(Some(&stats(0))).await.unwrap();
-    assert_eq!(h.fake.runners(), Vec::<String>::new(), "its registration is gone");
+    assert_eq!(h.hosts.retired(), vec![name.clone()]);
+    // GitHub removed its registration at the sweep's request; the machine is told to stop and still stands.
+    h.machines.answered(&name, cf_daemon::Answer::Removed);
     assert_eq!(
         h.slots.held(),
         vec![ticket],
@@ -1012,7 +1031,7 @@ async fn another_repositorys_idle_runner_under_the_same_number_is_not_retired_as
         IDLE_GRACE + Duration::from_secs(1),
     ));
     h.scaler.scale(Some(&stats(0))).await.unwrap();
-    assert!(h.hosts.stopped().is_empty(), "{:?}", h.hosts.stopped());
+    assert!(h.hosts.retired().is_empty(), "{:?}", h.hosts.retired());
     assert_eq!(h.roster.active("org/other", h.set.id), 1);
     // Nor does a word about a runner of that name in this repository touch it.
     assert!(!h.roster.mark_done(REPO, h.set.id, "mac-b-theirs", h.clock_now()));
