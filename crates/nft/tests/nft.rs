@@ -72,8 +72,11 @@ fn rules(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Each chain's attributes that carry meaning, by kind, the hook's own attributes by kind.
-fn chains(bytes: &[u8]) -> Vec<(u8, BTreeMap<u16, Vec<u8>>, BTreeMap<u16, Vec<u8>>)> {
+/// Attributes by kind.
+type ByKind = BTreeMap<u16, Vec<u8>>;
+
+/// Each chain's attributes that carry meaning, and the hook's own attributes.
+fn chains(bytes: &[u8]) -> Vec<(u8, ByKind, ByKind)> {
     messages(bytes)
         .into_iter()
         .filter(|(kind, _, _)| *kind == 3)
