@@ -1421,3 +1421,88 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     assert_eq!(w.m.short_of(SIZE), Some("memory"));
     assert_eq!(log.lines("of this size").len(), 1);
 }
+
+// --- what GitHub said agrees with the lifecycle at every write ------------------------------------------------------
+
+/// The facts a record holds about a job and its lifecycle disagree: a job GitHub said started or completed on a
+/// lifecycle that still waits for one, or one that does not know a job ran.
+fn disagreement(w: &World, runner: &str) -> Option<String> {
+    let record = w.parts.store.load().into_iter().find(|r| r.runner == runner)?;
+    let saved = record.slot?.saved();
+    let github = record.github.as_ref()?;
+    let waits = matches!(saved.phase, cf_lifecycle::Phase::Starting | cf_lifecycle::Phase::Idle);
+    let running_done = saved.phase == cf_lifecycle::Phase::Running && github.result.is_some();
+    (waits || running_done || !saved.ran_job).then(|| format!("{saved:?} beside {github:?}"))
+}
+
+/// Sol 3: a Runner from before wrote GitHub's word that the job started while the machine was still booting, and
+/// died before the lifecycle took it. The Runner that starts next sees the machine come up: the job runs there.
+#[tokio::test]
+async fn a_start_written_while_booting_by_a_runner_before_is_a_running_job_once_it_is_up() {
+    let mut w = World::new(2);
+    w.parts.vms.slow_boot(true);
+    let runner = w.start().await;
+    pass(&w.m, 1);
+    let mut record = w.parts.store.load().pop().expect("a record");
+    assert_eq!(record.slot.expect("a slot").saved().phase, cf_lifecycle::Phase::Starting);
+    record.github = Some(cf_daemon::GithubJob {
+        repo: REPO.into(),
+        job: "build".into(),
+        ..cf_daemon::GithubJob::default()
+    });
+    record.start_reported = true;
+    cf_daemon::Store::save(w.parts.store.as_ref(), &record);
+    w.restart();
+    pass(&w.m, 1);
+    w.parts.vms.ready(&job_name(&runner));
+    pass(&w.m, 2);
+    assert_eq!(disagreement(&w, &runner), None);
+}
+
+/// Sol 4: a job's start went with a session, and its completion arrives while the machine is still booting (its
+/// `ready` not yet seen). The completion is kept: once the machine is up, it is a machine whose job is over.
+#[tokio::test]
+async fn a_completion_heard_while_booting_is_kept_until_the_machine_is_up() {
+    let mut w = World::new(2);
+    w.parts.vms.slow_boot(true);
+    let runner = w.start().await;
+    pass(&w.m, 1);
+    w.github(EventKind::Completed, &runner, "succeeded");
+    assert_eq!(disagreement(&w, &runner), None, "at the completion");
+    w.parts.vms.ready(&job_name(&runner));
+    pass(&w.m, 2);
+    assert_eq!(disagreement(&w, &runner), None, "once up");
+}
+
+/// Sol 2: a machine whose job's start and end went with a session ended under a Runner before, which wrote it as
+/// one GitHub need not be asked about (the Runner of main had no such field; a build of this branch wrote it so for
+/// a surplus it was removing) and may have settled it. The registration is gone, removed by its own Actions runner
+/// once the job was over: after the upgrade the removal meets 404, and the job is heard, never forgotten.
+#[tokio::test]
+async fn a_machine_a_runner_before_wrote_as_not_to_ask_about_is_asked_about() {
+    for settled in [false, true] {
+        let mut w = World::new(1);
+        let runner = w.start().await;
+        w.parts.vms.ready(job_name(&runner));
+        pass(&w.m, 2);
+        w.registered.remove(&runner);
+        w.parts.vms.end(job_name(&runner), End::Ok);
+        pass(&w.m, 2);
+        for mut record in w.parts.store.load() {
+            record.ask_github = false;
+            record.end_reported = settled;
+            cf_daemon::Store::save(w.parts.store.as_ref(), &record);
+        }
+        w.restart();
+        for _ in 0..3 {
+            pass(&w.m, RESULT_WAIT.as_secs() + 2);
+            w.sweep();
+        }
+        let ids = ids(&w.reports());
+        assert!(
+            ids.contains(&format!("{runner}/started")) && ids.contains(&format!("{runner}/completed")),
+            "settled before: {settled}; reports: {ids:?}; records: {:?}",
+            w.parts.store.load()
+        );
+    }
+}

@@ -2738,3 +2738,44 @@ async fn a_surplus_whose_removal_failed_and_that_then_ran_a_job_is_heard() {
     })
     .await;
 }
+
+/// Sol 1: a Runner from before lost a job's start, reached the idle limit, wrote the machine as stopping for no job
+/// with its registration still there, and died before the machine went. That stop was a belief, not GitHub's word:
+/// the Runner that starts next asks GitHub first, which refuses for the job that runs there, and the machine stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_for_no_job_left_by_a_runner_before_is_asked_of_github_first() {
+    let mut rig = Rig::new(1).await;
+    rig.service.discover().await;
+    rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    let set = rig.github.scale_sets()[0].id;
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    rig.restart_after(|rig| {
+        for mut record in rig.parts.store.load() {
+            if let Some(slot) = record.slot.as_mut() {
+                let mut saved = slot.saved();
+                saved.phase = cf_lifecycle::Phase::Stopping;
+                saved.end = Some(cf_lifecycle::End::NoJob);
+                *slot = saved.into();
+            }
+            record.unregistered = false;
+            rig.parts.store.save(&record);
+        }
+    })
+    .await;
+    until("GitHub's refusal heard as the job's start", || {
+        heard(&rig, &runner).0
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !rig.parts.vms.stopped().iter().any(|(job, ..)| *job == job_name(&runner)),
+        "stops: {:?}",
+        rig.parts.vms.stopped()
+    );
+    assert_eq!(rig.standing(), vec![runner.clone()], "the machine of a running job stands");
+}
+
