@@ -101,7 +101,7 @@ fn parse_network(text: &str) -> Result<(Ip, u8), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::main;
+pub use linux::{guard, main};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -206,6 +206,14 @@ mod linux {
 
     /// The guest's side of the namespace pasta made: its tap device behind the firewall, in a bridge with pasta's.
     fn network(host: &[(Ip, u8)]) -> Result<OwnedFd, String> {
+        guard(host, || tap(GUEST_DEVICE))
+    }
+
+    /// Sets up the guest's side of the namespace pasta made, run as root of it: waits for pasta's device, turns
+    /// IPv6 off, has `make` make the guest's device [`GUEST_DEVICE`] (a tap; a stand-in in tests), loads the guest's
+    /// firewall onto it and checks it reads back as written, and only then joins the two devices in a bridge and
+    /// sets them up. What `make` returns comes back.
+    pub fn guard<T>(host: &[(Ip, u8)], make: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let began = Instant::now();
         while crate::link::index(PASTA_DEVICE).is_err() {
             if began.elapsed() > DEVICE_WAIT {
@@ -222,7 +230,7 @@ mod linux {
                 _ => {}
             }
         }
-        let tap = tap(GUEST_DEVICE)?;
+        let device = make()?;
         let table = firewall::table(host).map_err(|e| e.to_string())?;
         let batch =
             cf_nft::batch(std::slice::from_ref(&table), cf_nft::Load::Replace).map_err(|e| e.to_string())?;
@@ -232,7 +240,7 @@ mod linux {
             return Err(format!("the guest's firewall reads back as {loaded:?}"));
         }
         crate::link::join(&[PASTA_DEVICE, GUEST_DEVICE], MTU)?;
-        Ok(tap)
+        Ok(device)
     }
 
     /// A tap device of this name, which lives as long as the descriptor: frames with a virtio-net header, no

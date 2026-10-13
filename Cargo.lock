@@ -360,6 +360,7 @@ name = "cf-vmm-ch"
 version = "0.1.0"
 dependencies = [
  "cf-nft",
+ "cf-vmhost",
  "cf-vmm",
  "libc",
  "proptest",

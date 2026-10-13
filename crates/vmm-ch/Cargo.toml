@@ -17,6 +17,7 @@ sha2.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+cf-vmhost = { path = "../vmhost" }
 proptest.workspace = true
 tempfile.workspace = true
 
