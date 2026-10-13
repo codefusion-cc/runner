@@ -156,6 +156,16 @@ impl FakeVms {
         });
     }
 
+    /// The job's machine holds this much of the Mac's memory now, as its vm-host read it (`None`: it could not).
+    pub fn resident(&self, job: &str, bytes: Option<u64>) {
+        self.with(job, |vm| vm.state.resident_bytes = bytes);
+    }
+
+    /// The job's vm-host is at this stage now.
+    pub fn stage(&self, job: &str, stage: Stage) {
+        self.with(job, |vm| vm.state.stage = stage);
+    }
+
     /// The kernel stops a process of the job for memory.
     pub fn out_of_memory(&self, job: &str) {
         self.with(job, |vm| {
@@ -316,6 +326,7 @@ impl Vms for FakeVms {
                 boots: 1,
                 boot_ms: ready.then_some(1200),
                 usage: None,
+                resident_bytes: None,
                 oom: None,
                 end: None,
             },

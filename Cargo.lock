@@ -331,12 +331,14 @@ name = "cf-vmm-vz"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "cf-host-macos",
  "cf-vmm",
  "dispatch2",
  "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
+ "tempfile",
 ]
 
 [[package]]
