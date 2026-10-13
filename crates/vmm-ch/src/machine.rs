@@ -186,9 +186,6 @@ impl Vmm for ChVmm {
             Network::Nat => command::pasta(&self.config.pasta, sandbox),
             Network::None => sandbox,
         };
-        let memory_max = spec
-            .memory_bytes
-            .saturating_add(crate::overhead(spec.memory_bytes));
         let cpuset = self
             .delegation
             .has_cpuset()
@@ -214,7 +211,7 @@ impl Vmm for ChVmm {
             group,
             dir,
             vsock,
-            memory_max,
+            memory_max: limits.memory_max,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
         });
@@ -528,7 +525,7 @@ impl Vm for ChVm {
         if self.shared.ended() {
             return Err(refuse("the machine has ended".into()));
         }
-        let stream = UnixStream::connect(&self.shared.vsock).map_err(|e| refuse(e.to_string()))?;
+        let stream = connect_socket(&self.shared.vsock).map_err(|e| refuse(e.to_string()))?;
         vsock::handshake(&stream, port, vsock::HANDSHAKE).map_err(refuse)?;
         Ok(Box::new(Stream(stream)))
     }
@@ -580,6 +577,24 @@ impl Drop for ChVm {
     }
 }
 
+/// Connects to the Unix socket at `path` itself, never to what a link there leads to: the machine's folder is the
+/// monitor's to write, and a link it put in place of its socket would send the host to another socket of this user
+/// (another machine's, or the vm-host's own).
+fn connect_socket(path: &Path) -> io::Result<UnixStream> {
+    use std::os::unix::fs::FileTypeExt as _;
+    let socket = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !socket.metadata()?.file_type().is_socket() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} is no socket", path.display()),
+        ));
+    }
+    UnixStream::connect(format!("/proc/self/fd/{}", socket.as_raw_fd()))
+}
+
 /// A connection to a guest's port.
 struct Stream(UnixStream);
 
@@ -606,5 +621,41 @@ impl Channel for Stream {
 
     fn shutdown(&self) {
         let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn the_host_connects_to_the_machines_socket_and_nowhere_a_link_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("another-machines-vsock");
+        let listener = UnixListener::bind(&other).unwrap();
+        let vsock = dir.path().join("vsock");
+
+        // A link the monitor put there is opened as the link, which is no socket.
+        std::os::unix::fs::symlink(&other, &vsock).unwrap();
+        let refused = connect_socket(&vsock).unwrap_err();
+        assert!(refused.to_string().ends_with("vsock is no socket"), "{refused}");
+
+        fs::remove_file(&vsock).unwrap();
+        fs::write(&vsock, "").unwrap();
+        let refused = connect_socket(&vsock).unwrap_err();
+        assert!(refused.to_string().ends_with("vsock is no socket"), "{refused}");
+
+        fs::remove_file(&vsock).unwrap();
+        assert_eq!(connect_socket(&vsock).unwrap_err().kind(), ErrorKind::NotFound);
+
+        // The socket itself, at the path, is taken.
+        let mine = UnixListener::bind(&vsock).unwrap();
+        connect_socket(&vsock).unwrap().write_all(b"x").unwrap();
+        let mut byte = [0u8; 1];
+        mine.accept().unwrap().0.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"x");
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "the other socket was reached");
     }
 }

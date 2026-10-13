@@ -73,7 +73,6 @@ mod mac {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
-    use std::path::{Path, PathBuf};
 
     use super::super::Fallible;
 
@@ -100,42 +99,17 @@ mod linux {
         Some(kb << 10)
     }
 
-    /// Where the unified hierarchy is mounted.
-    const MOUNT: &str = "/sys/fs/cgroup";
-
     /// Moves every process of this one's cgroup, `cargo` with it, into its `host` leaf, as the Runner does when it
     /// starts alone in a delegated cgroup: the vm-hosts the suite starts then find the delegation as their cgroup's
     /// parent, and machines can have cgroups beside them. A suite already in a `host` leaf stays.
     pub fn enter_host_cgroup() -> Fallible<()> {
-        let own = own_cgroup()?;
-        if own.file_name().is_some_and(|name| name == "host") {
-            return Ok(());
-        }
-        let host = own.join("host");
-        if let Err(error) = fs::create_dir(&host)
-            && error.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(format!(
-                "{}: {error}; run the suite in a cgroup delegated to this user, as `systemd-run --user --scope -p \
-                 Delegate=yes cargo xtask it` does",
-                host.display()
+        cf_vmm_ch::cgroup::enter_host().map_err(|why| {
+            format!(
+                "{why}; run the suite in a cgroup delegated to this user, as `systemd-run --user --scope -p \
+                 Delegate=yes cargo xtask it` does"
             )
-            .into());
-        }
-        for pid in fs::read_to_string(own.join("cgroup.procs"))?.lines() {
-            // A process that ended meanwhile is no matter.
-            let _ = fs::write(host.join("cgroup.procs"), pid);
-        }
-        Ok(())
-    }
-
-    fn own_cgroup() -> Fallible<PathBuf> {
-        let text = fs::read_to_string("/proc/self/cgroup")?;
-        let path = text
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .ok_or("no cgroup v2 in /proc/self/cgroup")?;
-        Ok(Path::new(MOUNT).join(path.trim().trim_start_matches('/')))
+            .into()
+        })
     }
 
     /// What the cgroup of a machine a vm-host started says now: its limit, and the most it has held.
@@ -147,7 +121,7 @@ mod linux {
 
     /// The cgroups of the machines the vm-host `host` started (`vm-<host>-<n>`, beside the suite's `host` leaf).
     pub fn groups_of(host: u32) -> Vec<Group> {
-        let Some(machines) = own_cgroup()
+        let Some(machines) = cf_vmm_ch::cgroup::own()
             .ok()
             .and_then(|own| Some(own.parent()?.join("machines")))
         else {

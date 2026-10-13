@@ -3,9 +3,10 @@
 //! With a network it runs under pasta, as root of pasta's user and network namespace. It makes the guest's tap
 //! device, loads the guest's firewall ([`crate::firewall`]) onto it, and joins it with pasta's device in a bridge.
 //! Without one it makes an empty user and network namespace of its own. Either way it then makes a cgroup, a PID
-//! and a mount namespace and starts cloud-hypervisor in them with no capability left. The monitor's root is a
-//! read-only tmpfs that holds the files and folders it is shown ([`Shown`]), each at its own path, and a `/proc` of
-//! its own: it sees no other file of the host or of the user it runs as, and no process but itself. It cannot
+//! and a mount namespace and starts cloud-hypervisor in them with no capability left, and no user namespace of its
+//! own to gain one in. The monitor's root is a read-only tmpfs that holds the files and folders it is shown
+//! ([`Shown`]), each at its own path, and a `/proc` of its own: it sees no other file of the host or of the user it
+//! runs as, and no process but itself. It cannot
 //! change the firewall or the devices, leave its cgroup, or see or signal any process outside its machine. The
 //! sandbox waits for it, writes how it ended ([`crate::ending::report`]) and exits as it did, or with
 //! [`crate::ending::SANDBOX_FAILED`] when it could not set up.
@@ -314,6 +315,8 @@ mod linux {
 
     /// How long pasta's device may take to show up in the namespace.
     const DEVICE_WAIT: Duration = Duration::from_secs(5);
+    /// How many user namespaces may be made below the user namespace of the process that reads or writes it.
+    const MAX_USER_NAMESPACES: &str = "/proc/sys/user/max_user_namespaces";
 
     /// Runs the subcommand with what follows its name and returns the exit code.
     pub fn main(args: &[OsString]) -> i32 {
@@ -330,11 +333,13 @@ mod linux {
         let (sandbox, mut monitor) = Sandbox::parse(args)?;
         // SAFETY: prctl, getppid and close_range take no pointers.
         unsafe {
+            let parent = libc::getppid();
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(format!("PR_SET_PDEATHSIG: {}", io::Error::last_os_error()));
             }
-            // The parent ended before the line above: nobody is left to end this machine.
-            if libc::getppid() == 1 {
+            // The parent ended before the line above, and this process went to init or to a subreaper (a user's
+            // systemd is one): nobody is left to end this machine.
+            if parent == 1 || libc::getppid() != parent {
                 return Err("the host is gone".into());
             }
             // No descriptor this process was handed reaches the monitor, which could reach the host's files through
@@ -367,6 +372,9 @@ mod linux {
                 None
             }
         };
+        // A process without capabilities may still make a user namespace below its own and hold every capability
+        // there: the monitor may make none.
+        fs::write(MAX_USER_NAMESPACES, "0").map_err(|e| format!("{MAX_USER_NAMESPACES}: {e}"))?;
         let root = build_root(&sandbox.root, &sandbox.shown)?;
         // The monitor's root becomes this process's too; nothing of the host's stays open here.
         std::env::set_current_dir("/").map_err(|e| format!("/: {e}"))?;
@@ -402,8 +410,9 @@ mod linux {
             Some(code) => Status::Code(code),
             None => Status::Signal(status.signal().unwrap_or(0)),
         };
-        // The monitor was the first process of its PID namespace: all of it is gone, and this line comes last.
-        eprintln!("{}", report(ended));
+        // The monitor was the first process of its PID namespace: all of it is gone, and this line comes last, on a
+        // line of its own even when the monitor's last ended without a newline.
+        eprintln!("\n{}", report(ended));
         Ok(status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))

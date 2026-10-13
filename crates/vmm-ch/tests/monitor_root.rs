@@ -14,6 +14,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use cf_vmm::Network;
+    use cf_vmm_ch::ending::{Status, reported};
     use cf_vmm_ch::sandbox::{Access, ROOT, SUBCOMMAND, Sandbox};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -142,6 +143,7 @@ mod linux {
             ("the_monitor_mounts_nothing", "mount", "1"),
             ("a_device_to_write_is_written", "dev-null", "ok"),
             ("a_device_to_read_is_read", "dev-urandom", "ok"),
+            ("the_monitor_makes_no_user_namespace", "userns", "28"),
             ("the_monitor_ends_as_it_exits", "end", "ok"),
         ];
         let mut failed = Vec::new();
@@ -179,7 +181,14 @@ mod linux {
         } else {
             println!("test the_monitors_socket_is_on_the_host ... ok");
         }
-        let checks = wanted.len() + 5;
+        // The monitor's last words end without a newline; the sandbox's report after them is still read.
+        if reported(&String::from_utf8_lossy(&done.stderr)) == Some(Status::Code(0)) {
+            println!("test the_sandbox_reports_on_a_line_of_its_own ... ok");
+        } else {
+            println!("test the_sandbox_reports_on_a_line_of_its_own ... FAILED");
+            failed.push("the_sandbox_reports_on_a_line_of_its_own");
+        }
+        let checks = wanted.len() + 6;
         if failed.is_empty() {
             println!("\ntest result: ok. {checks} passed");
         } else {
@@ -305,6 +314,17 @@ mod linux {
             "dev-urandom",
             code(fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random))),
         );
+        // Last: in a namespace of its own, the probes above would see something else. ENOSPC is the limit.
+        // SAFETY: unshare takes no pointers.
+        say(
+            "userns",
+            code(if unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }),
+        );
         say("end", "ok".into());
+        eprint!("the monitor's last words, without a newline");
     }
 }

@@ -10,6 +10,9 @@
 /// The most processes and threads a machine's cgroup may hold: cloud-hypervisor's vCPU, device and I/O threads,
 /// pasta and the namespace's helper, with room to spare.
 pub const PIDS_MAX: u32 = 256;
+/// The file that turns a machine's swap off. A kernel that keeps no account of swap per cgroup (booted with
+/// `swapaccount=0`, or built without swap) has none.
+pub const SWAP_MAX: &str = "memory.swap.max";
 
 /// What a machine's cgroup is set to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +43,7 @@ impl Limits {
     pub fn files(&self) -> Vec<(&'static str, String)> {
         let mut files = vec![
             ("memory.max", self.memory_max.to_string()),
-            ("memory.swap.max", "0".to_string()),
+            (SWAP_MAX, "0".to_string()),
             ("memory.oom.group", "1".to_string()),
             ("pids.max", self.pids_max.to_string()),
         ];
@@ -123,7 +126,7 @@ pub fn owner(name: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{Delegation, MachineGroup};
+pub use linux::{Delegation, MachineGroup, enter_host, own};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -142,6 +145,8 @@ mod linux {
     const HOST: &str = "host";
     /// The parent of the machines' cgroups.
     const MACHINES: &str = "machines";
+    /// The host's swap devices.
+    const SWAPS: &str = "/proc/swaps";
 
     fn say(path: &Path, error: impl std::fmt::Display) -> String {
         format!("{}: {error}", path.display())
@@ -178,9 +183,7 @@ mod linux {
                     mount.display()
                 ));
             }
-            let text =
-                fs::read_to_string("/proc/self/cgroup").map_err(|e| format!("/proc/self/cgroup: {e}"))?;
-            let own = mount.join(own_path(&text)?.trim_start_matches('/'));
+            let own = own_under(mount)?;
             let root = if own.file_name().is_some_and(|name| name == HOST) {
                 own.parent()
                     .ok_or("the cgroup root is no delegation")?
@@ -273,14 +276,51 @@ mod linux {
                 fs::create_dir(&path).map_err(|e| say(&path, e))?;
             }
             let group = MachineGroup { path };
-            for (file, content) in limits.files() {
-                if let Err(error) = fs::write(group.path.join(file), &content) {
-                    let _ = fs::remove_dir(&group.path);
-                    return Err(say(&group.path.join(file), format!("{content}: {error}")));
+            let limited = limits.files().into_iter().try_for_each(|(file, content)| {
+                let path = group.path.join(file);
+                if file == super::SWAP_MAX && !path.exists() {
+                    let swaps = fs::read_to_string(SWAPS).map_err(|e| format!("{SWAPS}: {e}"))?;
+                    return super::without_swap_account(&swaps);
                 }
+                fs::write(&path, &content).map_err(|e| say(&path, format!("{content}: {e}")))
+            });
+            if let Err(error) = limited {
+                let _ = fs::remove_dir(&group.path);
+                return Err(error);
             }
             Ok(group)
         }
+    }
+
+    /// This process's cgroup, as a path under the unified hierarchy's mount.
+    pub fn own() -> Result<PathBuf, String> {
+        own_under(Path::new(MOUNT))
+    }
+
+    fn own_under(mount: &Path) -> Result<PathBuf, String> {
+        let text = fs::read_to_string("/proc/self/cgroup").map_err(|e| format!("/proc/self/cgroup: {e}"))?;
+        Ok(mount.join(own_path(&text)?.trim_start_matches('/')))
+    }
+
+    /// Moves every process of this one's cgroup into its `host` leaf, this one with them, so that the Runners it
+    /// starts find the delegation as their cgroup's parent: what a test suite that shares its delegated cgroup with
+    /// its `cargo` does first. A process already in a `host` leaf stays.
+    pub fn enter_host() -> Result<(), String> {
+        let own = own()?;
+        if own.file_name().is_some_and(|name| name == HOST) {
+            return Ok(());
+        }
+        let host = own.join(HOST);
+        make(&host).map_err(|e| format!("{e}; is {} delegated to this user?", own.display()))?;
+        let procs = fs::read_to_string(own.join("cgroup.procs")).map_err(|e| say(&own, e))?;
+        for pid in procs.lines() {
+            // A process that ended meanwhile is no matter.
+            let _ = fs::write(host.join("cgroup.procs"), pid);
+        }
+        if self::own()? != host {
+            return Err(format!("this process could not move into {}", host.display()));
+        }
+        Ok(())
     }
 
     fn make(path: &Path) -> Result<(), String> {
@@ -402,6 +442,23 @@ mod linux {
         }
     }
 }
+/// Whether a machine may run where its cgroup has no [`SWAP_MAX`]: only when the host swaps to nothing, as
+/// `/proc/swaps` (a line of headings, then one line per device) says. Otherwise the refusal says what to do.
+pub fn without_swap_account(proc_swaps: &str) -> Result<(), String> {
+    let devices: Vec<&str> = proc_swaps
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    if devices.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "this kernel keeps no account of swap per cgroup (a machine's cgroup has no {SWAP_MAX}) and the host swaps \
+         to {}, where a machine's memory could go: turn swap off, or boot the kernel with swapaccount=1",
+        devices.join(" and ")
+    ))
+}
 
 #[cfg(test)]
 mod tests {
@@ -422,6 +479,24 @@ mod tests {
         );
         let without = Limits::of(1 << 30, 0, None).unwrap();
         assert!(without.files().iter().all(|(file, _)| *file != "cpuset.cpus"));
+    }
+
+    #[test]
+    fn without_a_swap_account_a_machine_runs_only_on_a_host_that_swaps_to_nothing() {
+        let headings = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        assert_eq!(without_swap_account(headings), Ok(()));
+        assert_eq!(without_swap_account(""), Ok(()));
+        let one =
+            format!("{headings}/dev/zram0                              partition\t4029436\t\t0\t\t100\n");
+        let refused = without_swap_account(&one).unwrap_err();
+        assert!(refused.contains("swaps to /dev/zram0, where"), "{refused}");
+        assert!(refused.contains("swapaccount=1"), "{refused}");
+        let two = format!("{one}/swap\\040file                                file\t1048572\t\t0\t\t-2\n");
+        assert!(
+            without_swap_account(&two)
+                .unwrap_err()
+                .contains("/dev/zram0 and /swap\\040file,"),
+        );
     }
 
     #[test]

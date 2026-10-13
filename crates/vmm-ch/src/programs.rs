@@ -40,7 +40,8 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// is refused.
 pub fn unpack(dir: &Path) -> Result<PathBuf, String> {
     let embedded = embedded().ok_or(
-        "this build carries no cloud-hypervisor: build it after `cargo xtask cloud-hypervisor` on Linux",
+        "this build carries no cloud-hypervisor: build it after `cargo xtask cloud-hypervisor` on Linux for arm64, \
+         the one architecture it is pinned for",
     )?;
     unpack_these(dir, &embedded)
 }

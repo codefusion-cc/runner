@@ -2278,6 +2278,7 @@ dependencies = [
  "cf-image",
  "cf-scaleset",
  "cf-secret",
+ "cf-vmm-ch",
  "ed25519-dalek",
  "flate2",
  "proptest",

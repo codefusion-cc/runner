@@ -16,14 +16,13 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use cf_vmm::{Network, Vm, VmExit, VmSpec, Vmm};
+    use cf_vmm_ch::cgroup::{self, Delegation};
     use cf_vmm_ch::sandbox::SUBCOMMAND;
     use cf_vmm_ch::{ChVmm, Config};
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
-
-    const MOUNT: &str = "/sys/fs/cgroup";
 
     type Check<'a> = dyn Fn() -> Result<(), String> + 'a;
     /// How long any end may take to be told.
@@ -56,7 +55,7 @@ mod linux {
         if let Err(error) = fs::OpenOptions::new().read(true).write(true).open("/dev/kvm") {
             skip(format!("/dev/kvm: {error}"));
         }
-        if let Err(why) = enter_host_cgroup() {
+        if let Err(why) = cgroup::enter_host() {
             skip(why);
         }
         let base = tempfile::Builder::new()
@@ -207,18 +206,9 @@ mod linux {
         vm.wait(WAIT).ok_or_else(|| format!("not ended within {WAIT:?}"))
     }
 
-    fn own_cgroup() -> Result<PathBuf, String> {
-        let text = fs::read_to_string("/proc/self/cgroup").map_err(|e| e.to_string())?;
-        let path = text
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .ok_or("no cgroup v2")?;
-        Ok(Path::new(MOUNT).join(path.trim().trim_start_matches('/')))
-    }
-
     /// The one machine's cgroup there is now.
     fn machine_group() -> Result<PathBuf, String> {
-        let machines = own_cgroup()?.parent().ok_or("no parent cgroup")?.join("machines");
+        let machines = Delegation::claim()?.machines().to_path_buf();
         fs::read_dir(&machines)
             .map_err(|e| e.to_string())?
             .flatten()
@@ -228,30 +218,5 @@ mod linux {
                     .is_some_and(|name| name.to_string_lossy().starts_with("vm-"))
             })
             .ok_or_else(|| "no machine cgroup".to_string())
-    }
-
-    /// Moves every process of this one's cgroup, cargo with it, into its `host` leaf, where a monitor finds its
-    /// delegation as its cgroup's parent.
-    fn enter_host_cgroup() -> Result<(), String> {
-        let own = own_cgroup()?;
-        if own.file_name().is_some_and(|name| name == "host") {
-            return Ok(());
-        }
-        let host = own.join("host");
-        if let Err(error) = fs::create_dir(&host)
-            && error.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(format!(
-                "no cgroup delegated to this user ({}: {error})",
-                host.display()
-            ));
-        }
-        for pid in fs::read_to_string(own.join("cgroup.procs"))
-            .map_err(|e| e.to_string())?
-            .lines()
-        {
-            let _ = fs::write(host.join("cgroup.procs"), pid);
-        }
-        Ok(())
     }
 }

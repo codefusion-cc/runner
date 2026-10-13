@@ -1,6 +1,6 @@
 //! Embeds cloud-hypervisor, which `cargo xtask cloud-hypervisor` left in `target/vmm-programs` (or in
-//! `$CF_VMM_PROGRAMS_DIR`), into a build for Linux. It must be the pinned file. Without it, or for another system,
-//! the build still works and carries no monitor.
+//! `$CF_VMM_PROGRAMS_DIR`), into a build for Linux on arm64, the one architecture it is pinned for. It must be the
+//! pinned file. Without it, or for another system or architecture, the build still works and carries no monitor.
 
 use sha2::{Digest, Sha256};
 use std::env;
@@ -20,9 +20,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dir.display());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("embedded.rs");
     let linux = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "linux");
+    let arm64 = env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|arch| arch == "aarch64");
     let ch = dir.join("cloud-hypervisor");
-    let code = if !linux || !ch.exists() {
-        if linux {
+    let code = if !linux || !arm64 || !ch.exists() {
+        if linux && arm64 {
             println!(
                 "cargo:warning=no cloud-hypervisor in {}: building without it (cargo xtask cloud-hypervisor)",
                 dir.display()
