@@ -607,7 +607,7 @@ echo x 2>/dev/null > /proc/sys/kernel/hostname || echo procsys=ro
 sudo -n sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward' 2>/dev/null || echo procsys-root=ro
 sudo -n sh -c 'echo b > /proc/sysrq-trigger' 2>/dev/null; echo sysrq=tried
 "$ACTIONS_RUNNER_HOOK_JOB_STARTED"
-echo github=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com)
+echo github=$(curl -s -o /dev/null -w '%{http_code} curl=%{exitcode}' --max-time 15 https://github.com)
 echo ci=$CI; sleep 5"#;
     let finished = job(bench, "it-lifecycle", 1024, 120, script)?;
     ended(&finished, "ok")?;
@@ -1185,7 +1185,7 @@ fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
         "it-other",
         512,
         120,
-        r#"node -e 'require("http").createServer((q, s) => s.end("x")).listen(8000, "0.0.0.0")' & echo github=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com); sleep 45"#,
+        r#"node -e 'require("http").createServer((q, s) => s.end("x")).listen(8000, "0.0.0.0")' & echo github=$(curl -s -o /dev/null -w '%{http_code} curl=%{exitcode}' --max-time 15 https://github.com); sleep 45"#,
         &[],
     )?;
     let mut address = None;
@@ -1206,7 +1206,7 @@ fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
 try() {{ timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null; echo "$3=$?"; }}
 try $gw 22 gateway-ssh; try $gw 445 gateway-files; try 10.1.2.3 80 private; try 169.254.169.254 80 metadata
 {tries}echo names=$(getent hosts github.com | wc -l)
-echo github=$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 15 https://github.com)
+echo github=$(curl -s -o /dev/null -w '%{{http_code}} curl=%{{exitcode}}' --max-time 15 https://github.com)
 echo ip=$(command -v ip)
 sudo -n ip route add 10.0.0.0/8 via $gw 2>/dev/null; echo route=$?
 sudo -n ip link set lo down 2>/dev/null; echo link=$?

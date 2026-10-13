@@ -5,7 +5,7 @@ use crate::command::{self, Files};
 use crate::cpus::{self, List};
 use crate::ending::{self, Ending, Recent, Status};
 use crate::events::{Event, Events};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{self, Access, Sandbox};
 use crate::vsock;
 use cf_nft::Ip;
 use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
@@ -142,11 +142,18 @@ impl Vmm for ChVmm {
             &self.cores,
         )
         .map_err(VmmError::Spec)?;
-        let sandbox = Sandbox {
-            network: spec.network,
-            host: self.config.host_networks.clone(),
+        let mut sandbox = Sandbox::for_machine(
+            spec,
+            &self.config.cloud_hypervisor,
+            &dir,
+            self.config.host_networks.clone(),
+        );
+        for fact in sandbox::HOST_FACTS {
+            if Path::new(fact).exists() {
+                sandbox.show(fact, Access::Read);
+            }
         }
-        .command(&self.config.sandbox, monitor);
+        let sandbox = sandbox.command(&self.config.sandbox, monitor);
         let command = match spec.network {
             Network::Nat => command::pasta(&self.config.pasta, sandbox),
             Network::None => sandbox,
@@ -166,6 +173,16 @@ impl Vmm for ChVmm {
             .mode(0o700)
             .create(&dir)
             .map_err(|e| VmmError::Start(format!("{}: {e}", dir.display())))?;
+        // The monitor is shown its console, which must be there to be shown.
+        if let Err(error) = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&spec.console)
+        {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(VmmError::Start(format!("{}: {error}", spec.console.display())));
+        }
         let group = match self.delegation.machine(&name, &limits) {
             Ok(group) => group,
             Err(error) => {

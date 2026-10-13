@@ -23,5 +23,10 @@ cf-vmhost = { path = "../vmhost" }
 proptest.workspace = true
 tempfile.workspace = true
 
+# The sandbox it runs must be the only thread of its process, which a test harness is not.
+[[test]]
+name = "monitor_root"
+harness = false
+
 [lints]
 workspace = true

@@ -32,15 +32,15 @@ pub enum End {
     Ok,
     /// The kernel stopped a process of the job for memory.
     Oom,
-    /// Stopped because the Mac ran low on memory.
+    /// Stopped because the host ran low on memory.
     EvictedMemory,
-    /// Stopped because the Mac ran low on disk space.
+    /// Stopped because the host ran low on disk space.
     EvictedDisk,
     /// Stopped at its deadline.
     Timeout,
     /// The guest stopped answering, or the machine went without a word.
     GuestLost,
-    /// Stopped because the Mac slept through it.
+    /// Stopped because the host slept through it.
     HostSlept,
     /// The workload ended with something else than 0.
     Failed,
@@ -92,7 +92,7 @@ pub struct Ended {
 /// A job, as its vm-host knows it. Holds nothing secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobState {
-    /// The job's name on this Mac.
+    /// The job's name on this host.
     pub job: String,
     /// The vm-host's process.
     pub pid: u32,
@@ -100,7 +100,7 @@ pub struct JobState {
     pub started_at: u64,
     /// Where the job is.
     pub stage: Stage,
-    /// The machine's memory, which the Mac holds for as long as the machine runs.
+    /// The machine's memory, which the host holds for as long as the machine runs.
     pub vm_bytes: u64,
     /// The job's own memory limit inside the machine.
     pub limit_bytes: u64,
@@ -116,8 +116,8 @@ pub struct JobState {
     /// What the job uses, as of the guest's last heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// What of the Mac's memory the machine holds, in bytes, when this state was written ([`cf_vmm::Vm::resident`]).
-    /// This, and not the job's own peak, is what the machine took from the Mac: the guest's kernel and its page
+    /// What of the host's memory the machine holds, in bytes, when this state was written ([`cf_vmm::Vm::resident`]).
+    /// This, and not the job's own peak, is what the machine took from the host: the guest's kernel and its page
     /// cache touch memory the job never counts, and the guest gives none of it back. `None` while no machine runs,
     /// or when its process could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]

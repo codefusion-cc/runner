@@ -170,15 +170,17 @@ CF_REQUIRE_EMBEDDED=1 cargo test --workspace
 cargo deny check
 ```
 
-and on an arm64 Linux host, where the tests of `cf-host-linux` also read the host's own `/proc`:
+and on an arm64 Linux host with pasta (`apt install passt`) and user namespaces (on Ubuntu 24.04,
+`sysctl kernel.apparmor_restrict_unprivileged_userns=0`), for the crates CI lists in `LINUX_CRATES`:
 
 ```sh
-cargo clippy -p cf-host-linux -p cf-budget -p cf-clock --all-targets -- -D warnings
-cargo test -p cf-host-linux -p cf-budget -p cf-clock
+cargo clippy -p cf-host-linux -p cf-vmm-ch -p cf-vmhost --all-targets -- -D warnings
+cargo test -p cf-host-linux -p cf-vmm-ch -p cf-vmhost
 cargo run -p cf-host-linux --example linux-probe
 ```
 
-CI's Macs cannot boot a machine, so the jobs in real machines run on a Mac of your own:
+CI cannot boot a machine, so the jobs in real machines run on a Mac of your own, or on an arm64 Linux host with
+KVM, in a cgroup delegated to you (`systemd-run --user --scope -p Delegate=yes cargo xtask it`):
 
 ```sh
 gh release download <image tag> -R codefusion-cc/runner -D target/it/release
