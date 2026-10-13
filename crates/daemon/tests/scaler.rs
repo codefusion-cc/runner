@@ -375,6 +375,8 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
         "retired runners still inside their grace period"
     );
 
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE);
     h.scaler.scale(None).await.unwrap();
     let mut idle: Vec<String> = all.iter().skip(1).map(|(n, ..)| n.clone()).collect();
@@ -399,7 +401,7 @@ async fn surplus_runners_are_retired_after_the_grace_period() {
     );
     assert_eq!(h.slots.used(), 3, "a slot went back before its machine was gone");
     // GitHub removed one at the sweep's request; the other's removal GitHub has not answered.
-    h.machines.unregistered(&idle[0], true);
+    h.machines.answered(&idle[0], cf_daemon::Answer::Removed);
     for kept in [&busy, &"adopted".to_string(), &idle[1]] {
         assert!(h.roster.get(kept).is_some(), "{kept} must stay");
     }
@@ -443,6 +445,8 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
         h.hosts.retired().is_empty(),
         "inside the grace period the runner may still be wanted"
     );
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE);
     h.scaler.scale(None).await.unwrap();
     let name = h.hosts.started()[0].0.clone();
@@ -456,7 +460,7 @@ async fn a_job_cancelled_after_its_runner_was_registered_leaves_a_surplus_that_g
         vec![name.clone()],
         "the sweep removes its registration"
     );
-    h.machines.unregistered(&name, true);
+    h.machines.answered(&name, cf_daemon::Answer::Removed);
     pass(&h.machines, 1);
     assert_eq!(h.slots.used(), 0);
 }
@@ -632,6 +636,8 @@ async fn a_runner_whose_job_is_done_is_never_retired_as_surplus() {
     };
     h.scaler.scale(Some(&done)).await.unwrap();
     // Both assigned jobs are gone from the counts, long past the grace period.
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE * 3);
     h.scaler.scale(Some(&stats(0))).await.unwrap();
     assert_eq!(
@@ -861,11 +867,13 @@ async fn a_surplus_machine_that_does_not_stop_keeps_its_slot() {
     let mut h = harness(2).await;
     h.scaler.scale(Some(&stats(1))).await.unwrap();
     let (name, _, ticket) = h.hosts.started()[0].clone();
+    // Only a machine that came up asks for its removal.
+    h.hosts.boot_all();
     h.clock.advance(IDLE_GRACE);
     h.scaler.scale(Some(&stats(0))).await.unwrap();
     assert_eq!(h.hosts.retired(), vec![name.clone()]);
     // GitHub removed its registration at the sweep's request; the machine is told to stop and still stands.
-    h.machines.unregistered(&name, true);
+    h.machines.answered(&name, cf_daemon::Answer::Removed);
     assert_eq!(
         h.slots.held(),
         vec![ticket],

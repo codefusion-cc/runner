@@ -103,9 +103,6 @@ impl World {
                 Effect::KillVm | Effect::Stuck if !self.vm => return Err(format!("{effect:?} with no VM")),
                 Effect::KillVm => self.killed = true,
                 Effect::Stuck if !self.killed => return Err("stuck without a kill before it".into()),
-                Effect::Unregister if self.starts == 0 => {
-                    return Err("unregistered what was never registered".into());
-                }
                 Effect::Release => {
                     if self.vm {
                         return Err("memory given back while the VM's process lives".into());
@@ -170,22 +167,36 @@ impl World {
         let before = self.slot.clone();
         let effects = self.slot.on(self.now, event);
         // A released slot does nothing more; it only keeps a word of a job that came late.
-        let learned = |saved: Saved| Saved {
-            ran_job: saved.ran_job || matches!(event, Event::JobStarted | Event::JobCompleted),
-            ..saved
+        // A word of a job after the end proves it came up and ran one; an end of "no job" was wrong then.
+        let learned = |saved: Saved| {
+            if !matches!(event, Event::JobStarted | Event::JobCompleted) {
+                return saved;
+            }
+            Saved {
+                ran_job: true,
+                up: true,
+                end: saved
+                    .end
+                    .map(|end| if end == End::NoJob { End::Stopped } else { end }),
+                ..saved
+            }
         };
         if before.phase() == Phase::Released
             && (!effects.is_empty() || self.slot.saved() != learned(before.saved()))
         {
             return Err(format!("{event:?} did something to a released slot"));
         }
-        let had_unregister = effects.contains(&Effect::Unregister);
         self.apply(&effects)?;
-        if self.slot.phase() == Phase::Released
-            && before.phase() != Phase::Released
-            && had_unregister != (self.starts > 0)
+        // Only GitHub's 204 to our own removal says no job ran.
+        let no_job = |slot: &Slot| slot.saved().end == Some(End::NoJob);
+        if no_job(&self.slot) && !no_job(&before) && event != Event::Unregistered {
+            return Err(format!("{event:?} ended the slot as one that ran no job"));
+        }
+        if before.phase() == Phase::Running
+            && self.slot.phase() != Phase::Running
+            && matches!(event, Event::Unregistered | Event::Retire)
         {
-            return Err("a runner was registered and not unregistered, or the other way round".into());
+            return Err(format!("{event:?} stopped a running job"));
         }
         Ok(())
     }
@@ -291,6 +302,7 @@ fn actions() -> Vec<Action> {
         Event::Evict(EvictionCause::Disk),
         Event::Stop,
         Event::Unregistered,
+        Event::Retire,
         Event::Slept(Millis::mins(6)),
         Event::Tick,
     ];
@@ -339,7 +351,7 @@ fn every_reachable_state_keeps_the_rules_and_has_a_way_out() {
         }
     }
     // The search must have gone everywhere: every phase, every end, and far more states than there are phases.
-    assert_eq!(phases.len(), 9, "{phases:?}");
+    assert_eq!(phases.len(), 10, "{phases:?}");
     assert_eq!(ends.len(), 11, "{ends:?}");
     assert!(seen.len() > 1000, "only {} states", seen.len());
 }

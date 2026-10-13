@@ -495,7 +495,7 @@ async fn a_job_over_before_its_machine_was_retired_is_reported_as_finished() {
     let runner = w.start().await;
     w.parts.vms.ready(job_name(&runner));
     pass(&w.m, 2);
-    Hosts::retire(w.m.as_ref(), &runner);
+    w.retire(&runner);
     w.registered.remove(&runner);
     w.sweep();
     // The guest finishes (two minutes at most), and the wait for GitHub's word of the job is over.
@@ -513,7 +513,7 @@ async fn a_registration_found_gone_while_its_machine_is_being_stopped_is_a_job()
     let runner = w.start().await;
     w.parts.vms.ready(job_name(&runner));
     pass(&w.m, 2);
-    Hosts::retire(w.m.as_ref(), &runner);
+    w.retire(&runner);
     w.parts.vms.ignore_stops(true);
     w.m.stop(job_name(&runner));
     pass(&w.m, 1);
@@ -1016,9 +1016,14 @@ fn a_pause_and_a_drain_tell_the_polls_in_flight_once() {
 
 #[tokio::test]
 async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() {
-    let mut w = World::new(3);
-    // One dies before any word of a job came for it.
+    let mut w = World::new(4);
+    // One whose guest never came up dies: it took no job.
+    let never_up = w.start().await;
+    w.parts.vms.die(job_name(&never_up));
+    // One came up and dies before any word of a job came for it.
     let idle = w.start().await;
+    w.parts.vms.ready(job_name(&idle));
+    pass(&w.m, 1);
     w.parts.vms.die(job_name(&idle));
     // Two die under their jobs.
     let (first, second) = (w.start().await, w.start().await);
@@ -1028,10 +1033,11 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     w.parts.vms.die(job_name(&second));
     pass(&w.m, 2);
     assert_eq!(w.parts.vms.standing(), Vec::<String>::new());
-    // A start can go with a session of GitHub's: the one that died idle counts until GitHub was asked about it.
+    // A start can go with a session of GitHub's: the one that died idle counts until GitHub was asked about it, the
+    // one that never came up does not.
     assert_eq!(w.m.lost_with_job(REPO, SET), 3);
     w.registered.remove(&idle);
-    w.m.unregistered(&idle, true);
+    w.m.answered(&idle, cf_daemon::Answer::Removed);
     assert_eq!(w.m.lost_with_job(REPO, SET), 2, "GitHub still counts both jobs");
     assert_eq!(w.m.lost_with_job(REPO, SET + 1), 0, "and for this scale set only");
     assert_eq!(
@@ -1043,7 +1049,7 @@ async fn a_machine_lost_under_its_job_is_counted_until_github_lets_the_job_go() 
     w.github(EventKind::Completed, &first, "failed");
     assert_eq!(w.m.lost_with_job(REPO, SET), 1);
     w.registered.remove(&second);
-    w.m.unregistered(&second, false);
+    w.m.answered(&second, cf_daemon::Answer::Gone);
     assert_eq!(w.m.lost_with_job(REPO, SET), 0);
     w.assert_nothing_left();
 }
@@ -1562,7 +1568,6 @@ async fn a_machine_a_runner_before_wrote_as_not_to_ask_about_is_asked_about() {
         w.parts.vms.end(job_name(&runner), End::Ok);
         pass(&w.m, 2);
         for mut record in w.parts.store.load() {
-            record.ask_github = false;
             record.end_reported = settled;
             record.rules = 0;
             cf_daemon::Store::save(w.parts.store.as_ref(), &record);

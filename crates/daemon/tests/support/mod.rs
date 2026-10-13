@@ -194,6 +194,14 @@ impl Spy {
         self.seen().unanswered = true;
     }
 
+    /// Every machine started so far comes up: its Actions runner waits for a job.
+    pub fn boot_all(&self) {
+        for (runner, ..) in self.started() {
+            self.machines.vms().ready(job_name(&runner));
+        }
+        pass(&self.machines, 1);
+    }
+
     /// The Actions runner's machine ends by itself and the machines' side sees it go.
     pub fn gone(&self, runner: &str) {
         self.machines.vms().end(job_name(runner), cf_vmhost::End::Ok);
@@ -255,13 +263,16 @@ impl Hosts for Spy {
         self.machines.registration_unsure(name);
     }
 
-    fn retire(&self, name: &str) {
-        self.seen().retired.push(name.to_string());
-        self.machines.retire(name);
-    }
-
-    fn retiring(&self, name: &str) -> bool {
-        self.machines.retiring(name)
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]) {
+        // A machine that asks for its removal names its registration to the sweep.
+        let asking = || -> Vec<String> {
+            let names = self.machines.registrations_to_remove().into_iter();
+            names.map(|registration| registration.runner).collect()
+        };
+        let before = asking();
+        self.machines.retire(repo, scale_set_id, n, idle);
+        let asked = asking().into_iter().filter(|runner| !before.contains(runner));
+        self.seen().retired.extend(asked);
     }
 
     async fn start(&self, spec: RunnerSpec) -> Result<String, HostError> {

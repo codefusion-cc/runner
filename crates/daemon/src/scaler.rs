@@ -5,6 +5,7 @@ use cf_ghapp::Clock;
 use cf_scaleset::{Error, JobBase, Message, Statistics};
 use time::OffsetDateTime;
 
+use crate::machines::Answer;
 use crate::names::runner_name;
 use crate::roster::{JobInfo, Roster, Runner};
 use crate::traits::{Claim, EventKind, Events, Hosts, JobEvent, Jobs, Registry, RunnerSpec, Slots, Ticket};
@@ -457,28 +458,24 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
 
     /// Retires up to `n` Actions runners that waited past [`IDLE_GRACE`] for a job that never came, such as one
     /// cancelled before it started. Busy, finished and adopted Actions runners are left alone, and those already
-    /// retiring count.
+    /// asking for their removal count ([`Hosts::retire`]).
     ///
-    /// The scaler only asks: the sweep removes the registration, the one place that removes any, and GitHub's answer
-    /// decides. Removed, and the machine stops as one that had no job; refused for a job (422) or gone already (404),
-    /// and the job is heard, since a one-job Actions runner removes its own registration once its job is over
-    /// (`docs/job-state.md`). Nothing is written until GitHub answered.
+    /// The scaler only asks: the lifecycle asks for the registration's removal, the sweep sends it, and GitHub's
+    /// answer decides (`docs/job-state.md`).
     fn retire_surplus(&mut self, n: usize) {
         let (repo, set) = (self.config.repo.clone(), self.config.scale_set_id);
-        let (retiring, rest): (Vec<_>, Vec<_>) = self
+        let now = self.clock.now();
+        let idle: Vec<String> = self
             .roster
             .runners(&repo, set)
             .into_iter()
-            .partition(|runner| self.hosts.retiring(&runner.name));
-        let now = self.clock.now();
-        let idle = rest.iter().filter(|runner| {
-            let age = now.duration_since(runner.started).unwrap_or(Duration::ZERO);
-            !(runner.busy || runner.adopted || runner.done.is_some() || age < IDLE_GRACE)
-        });
-        for runner in idle.take(n.saturating_sub(retiring.len())) {
-            tracing::info!(runner = %runner.name, "surplus Actions runner retired");
-            self.hosts.retire(&runner.name);
-        }
+            .filter(|runner| {
+                let age = now.duration_since(runner.started).unwrap_or(Duration::ZERO);
+                !(runner.busy || runner.adopted || runner.done.is_some() || age < IDLE_GRACE)
+            })
+            .map(|runner| runner.name)
+            .collect();
+        self.hosts.retire(&repo, set, n, &idle);
     }
 
     /// The Actions runners GitHub counts for this scale set: those with a machine, and those whose machine is gone
@@ -523,46 +520,6 @@ fn heard(started_at: Option<OffsetDateTime>, now: OffsetDateTime) -> (String, i6
     )
 }
 
-/// GitHub says an Actions runner took a job whose start the Runner did not hear (busy, gone by itself, or a removal
-/// refused for its job): it is marked busy, and the start, dated `at`, goes to whoever hears of jobs. Which job it
-/// was, GitHub does not say.
-pub(crate) fn start_unheard(
-    roster: &Roster,
-    events: &dyn Events,
-    repo: &str,
-    scale_set_id: i64,
-    runner: &str,
-    at: SystemTime,
-) {
-    roster.mark_busy(
-        repo,
-        scale_set_id,
-        runner,
-        JobInfo {
-            repo: repo.to_string(),
-            name: String::new(),
-            workflow: String::new(),
-            run_id: 0,
-            started: at,
-        },
-    );
-    tracing::info!(%runner, "GitHub says the Actions runner took a job whose start was not heard");
-    events.job(&JobEvent {
-        kind: EventKind::Started,
-        runner: runner.to_string(),
-        repo: repo.to_string(),
-        job: String::new(),
-        workflow: String::new(),
-        run_id: 0,
-        event: String::new(),
-        queued_at: None,
-        started_at: None,
-        at: OffsetDateTime::from(at),
-        result: String::new(),
-        out_of_memory: false,
-    });
-}
-
 /// Before a scale set's session opens: whatever the session before it left unread may be gone, since GitHub drops a
 /// session's pending messages with it and those queued while there is none (`docs/github-protocol.md`). Each Actions
 /// runner of the scale set that waits for a job here is held against GitHub's REST view of it, and one that is busy
@@ -575,24 +532,16 @@ pub(crate) fn start_unheard(
 pub async fn reconcile<R: Registry>(
     registry: &R,
     roster: &Roster,
-    events: &Arc<dyn Events>,
     repo: &str,
     scale_set_id: i64,
-    clock: &dyn Clock,
+    answered: impl Fn(&str, Answer),
 ) {
     for runner in roster.runners(repo, scale_set_id) {
         if runner.busy || runner.done.is_some() {
             continue;
         }
         match registry.runner_busy(runner.runner_id).await {
-            Ok(Some(true)) => start_unheard(
-                roster,
-                events.as_ref(),
-                repo,
-                scale_set_id,
-                &runner.name,
-                clock.now(),
-            ),
+            Ok(Some(true)) => answered(&runner.name, Answer::Busy),
             Ok(Some(false) | None) => {}
             Err(error) => {
                 tracing::warn!(

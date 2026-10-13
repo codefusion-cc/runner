@@ -104,12 +104,10 @@ pub trait Hosts: Send + Sync {
     /// Whoever removes left-over registrations looks for it by name.
     fn registration_unsure(&self, name: &str);
 
-    /// The Actions runner of that name is not needed: its registration is to be removed, and its machine stopped once
-    /// GitHub removed it (`docs/job-state.md`). Nothing is written; a Runner that dies first retires it again.
-    fn retire(&self, name: &str);
-
-    /// Whether the Actions runner of that name is retiring: its removal is asked for and GitHub has not answered.
-    fn retiring(&self, name: &str) -> bool;
+    /// The scale set has `n` Actions runners more than GitHub's jobs need: up to `n` of these idle ones, less those
+    /// of the scale set already asking for their removal, ask for theirs. GitHub's answer decides whether the machine
+    /// stops (`docs/job-state.md`).
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]);
 
     /// Starts a machine for the Actions runner and returns its handle. After an error no machine stands and the
     /// slot is still the caller's: the host removed what it had begun before it answers. After a success the slot
@@ -144,12 +142,8 @@ impl<T: Hosts> Hosts for std::sync::Arc<T> {
         (**self).registration_unsure(name);
     }
 
-    fn retire(&self, name: &str) {
-        (**self).retire(name);
-    }
-
-    fn retiring(&self, name: &str) -> bool {
-        (**self).retiring(name)
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]) {
+        (**self).retire(repo, scale_set_id, n, idle);
     }
 
     fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {

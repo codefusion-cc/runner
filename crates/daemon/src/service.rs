@@ -23,12 +23,12 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::machines::{JobReport, Machines, Reports, Snapshot};
+use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
-use crate::traits::{EventKind, Events, Slots};
+use crate::traits::{EventKind, Slots};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -752,21 +752,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 self.sweep_later(registration.runner);
                 continue;
             };
-            if registration.ask_github
-                && let Some(id) = registration.runner_id
-            {
-                let again = match client.runner_busy(id).await {
-                    Ok(busy) => shared.machines.asked(&registration.runner, busy),
-                    Err(error) => {
-                        tracing::warn!(runner = %registration.runner, %error, "GitHub could not say whether a gone machine ran a job; it is asked again");
-                        true
-                    }
-                };
-                if again {
-                    self.sweep_later(registration.runner);
-                    continue;
-                }
-            }
             let id = match registration.runner_id {
                 Some(id) => Ok(Some(id)),
                 // Registered or not, nobody heard: GitHub is asked by name.
@@ -775,30 +760,31 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .await
                     .map(|found| found.map(|runner| runner.id)),
             };
-            // Ok(true): GitHub removed it at this request, so it held no job. Ok(false): it was gone already, which
-            // proves nothing of a job (`Machines::unregistered`). A refusal for a job (422) says one started, whatever
-            // was believed of this machine.
-            let removed = match id {
-                Ok(None) => Ok(false),
+            // GitHub's answer is what proves anything (`Machines::answered`); no answer (a 5xx, a timeout, a dropped
+            // connection) proves nothing, and the removal is sent again at a later sweep.
+            let answer = match id {
+                Ok(None) => Ok(machines::Answer::Gone),
                 Ok(Some(id)) => match client.remove_runner(id).await {
-                    Err(error) if error.status() == Some(422) => {
-                        shared.machines.ran_unheard(&registration.runner);
-                        Err(error)
-                    }
-                    Err(error) if error.is_not_found() => Ok(false),
+                    Ok(()) => Ok(machines::Answer::Removed),
+                    Err(error) if error.is_not_found() => Ok(machines::Answer::Gone),
+                    Err(error) if error.status() == Some(422) => Ok(machines::Answer::Refused),
                     Err(error) => Err(error),
-                    Ok(()) => Ok(true),
                 },
                 Err(error) => Err(error),
             };
-            match removed {
-                Ok(removed_idle) => {
-                    shared
-                        .refused
-                        .lock()
-                        .expect("refused")
-                        .remove(&registration.runner);
-                    shared.machines.unregistered(&registration.runner, removed_idle);
+            match answer {
+                Ok(answer) => {
+                    if answer == machines::Answer::Refused {
+                        // The job holds it until it is over: asked again later.
+                        self.sweep_later(registration.runner.clone());
+                    } else {
+                        shared
+                            .refused
+                            .lock()
+                            .expect("refused")
+                            .remove(&registration.runner);
+                    }
+                    shared.machines.answered(&registration.runner, answer);
                 }
                 Err(error) => {
                     tracing::warn!(runner = %registration.runner, %error, "a registration could not be removed; it is tried again");
@@ -1235,8 +1221,10 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     scale_set_id: set.id,
                 };
                 let machines = shared.machines.clone();
-                let events: Arc<dyn Events> = machines.clone();
-                reconcile(&registry, &shared.roster, &events, &repo, set.id, shared.clock.as_ref()).await;
+                reconcile(&registry, &shared.roster, &repo, set.id, |runner, answer| {
+                    machines.answered(runner, answer);
+                })
+                .await;
                 let session = client.open_session(set.id, &shared.config.machine).await?;
                 tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
                 let slots: Arc<dyn Slots> = machines.clone();

@@ -29,11 +29,11 @@ pub use log::{Lines, ROLL_AT};
 #[cfg(target_os = "macos")]
 pub use mac::{MacMachines, MacService, MacSetup, mac_service, records_dir};
 pub use machines::{
-    JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT, Registration,
-    Reports, Snapshot,
+    Answer, JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT,
+    Registration, Reports, Snapshot,
 };
 pub use records::{
-    DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade, never_up,
+    Disagrees, DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade,
 };
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};

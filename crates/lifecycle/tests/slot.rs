@@ -80,7 +80,7 @@ fn a_job_from_reservation_to_release() {
     assert!(slot.holds_memory(), "the VM is still there");
     assert_eq!(
         slot.on(s(542), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
     assert_eq!(
         (slot.phase(), slot.holds_memory(), slot.next_deadline()),
@@ -137,11 +137,7 @@ fn a_vm_that_does_not_get_ready_is_killed_and_started_once_more() {
     assert!(slot.holds_memory(), "not given back while the process may live");
     assert_eq!(
         slot.on(s(44), Event::VmExited),
-        [
-            Effect::Unregister,
-            Effect::Release,
-            ended(End::StartFailed, false)
-        ]
+        [Effect::Release, ended(End::StartFailed, false)]
     );
 }
 
@@ -163,7 +159,7 @@ fn a_retry_that_is_no_longer_wanted_starts_no_second_vm() {
         assert!(slot.holds_memory());
         assert_eq!(
             slot.on(s(23), Event::VmExited),
-            [Effect::Unregister, Effect::Release, ended(end, false)],
+            [Effect::Release, ended(end, false)],
             "{event:?}"
         );
     }
@@ -189,7 +185,6 @@ fn a_vm_that_dies_while_booting_counts_as_a_failed_start() {
         slot.on(s(3), Event::VmExited),
         [
             Effect::StartFailed,
-            Effect::Unregister,
             Effect::Release,
             ended(End::StartFailed, false)
         ]
@@ -229,7 +224,7 @@ fn a_process_that_survives_sigkill_is_killed_again_and_its_memory_kept() {
     let mut slot = idle();
     slot.on(s(100), Event::Heartbeat);
     assert_eq!(slot.on(Millis(121_999), Event::Tick), []);
-    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
+    assert_eq!(slot.on(s(122), Event::Tick), []);
     assert_eq!(
         slot.on(s(122), Event::Unregistered),
         [Effect::StopVm { grace: Millis::ZERO }]
@@ -254,7 +249,7 @@ fn a_process_that_survives_sigkill_is_killed_again_and_its_memory_kept() {
     }
     assert_eq!(
         slot.on(s(9000), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::NoJob, false)]
+        [Effect::Release, ended(End::NoJob, false)]
     );
 }
 
@@ -264,8 +259,8 @@ fn a_process_that_survives_sigkill_is_killed_again_and_its_memory_kept() {
 fn an_idle_runner_past_its_limit_is_unregistered_and_its_vm_stops_only_when_told() {
     let mut slot = idle();
     slot.on(s(100), Event::Heartbeat);
-    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
-    assert_eq!(slot.phase(), Phase::Idle);
+    assert_eq!(slot.on(s(122), Event::Tick), []);
+    assert_eq!(slot.phase(), Phase::Asking, "it asks for its removal");
     for second in 123..130 {
         slot.on(s(second), Event::Heartbeat);
         assert_eq!(
@@ -280,19 +275,19 @@ fn an_idle_runner_past_its_limit_is_unregistered_and_its_vm_stops_only_when_told
     );
     assert_eq!(
         slot.on(s(131), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::NoJob, false)]
+        [Effect::Release, ended(End::NoJob, false)]
     );
     // Stopped from the console before GitHub answered: no answer said there was no job.
     let mut slot = idle();
     slot.on(s(100), Event::Heartbeat);
-    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
+    assert_eq!(slot.on(s(122), Event::Tick), []);
     assert_eq!(
         slot.on(s(123), Event::Stop),
         [Effect::StopVm { grace: Millis::ZERO }]
     );
     assert_eq!(
         slot.on(s(124), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Stopped, false)]
+        [Effect::Release, ended(End::Stopped, false)]
     );
 }
 
@@ -302,13 +297,13 @@ fn an_idle_runner_past_its_limit_is_unregistered_and_its_vm_stops_only_when_told
 fn a_job_heard_after_the_idle_limit_runs_and_ends_as_a_job() {
     let mut slot = idle();
     slot.on(s(100), Event::Heartbeat);
-    assert_eq!(slot.on(s(122), Event::Tick), [Effect::Unregister]);
+    assert_eq!(slot.on(s(122), Event::Tick), []);
     assert_eq!(slot.on(s(123), Event::JobStarted), []);
     assert_eq!(slot.phase(), Phase::Running);
     assert_eq!(slot.on(s(124), Event::JobCompleted), []);
     assert_eq!(
         slot.on(s(125), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
 }
 
@@ -322,11 +317,7 @@ fn a_guest_that_goes_silent_is_killed() {
         assert_eq!(slot.phase(), Phase::Killing);
         assert_eq!(
             slot.on(s(111), Event::VmExited),
-            [
-                Effect::Unregister,
-                Effect::Release,
-                ended(End::GuestLost, ran_job)
-            ]
+            [Effect::Release, ended(End::GuestLost, ran_job)]
         );
     }
     // Heartbeats keep it alive for as long as they come.
@@ -344,12 +335,12 @@ fn a_vm_that_dies_under_a_job_is_guest_lost() {
     slot.on(s(5), Event::OutOfMemory);
     assert_eq!(
         slot.on(s(6), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::GuestLost, true)]
+        [Effect::Release, ended(End::GuestLost, true)]
     );
     let mut slot = idle();
     assert_eq!(
         slot.on(s(6), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::GuestLost, false)]
+        [Effect::Release, ended(End::GuestLost, false)]
     );
 }
 
@@ -376,7 +367,7 @@ fn a_job_is_stopped_after_six_hours_with_time_to_upload() {
     assert_eq!(slot.on(s(started + 21_630), Event::Tick), [Effect::KillVm]);
     assert_eq!(
         slot.on(s(started + 21_631), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Timeout, true)]
+        [Effect::Release, ended(End::Timeout, true)]
     );
 }
 
@@ -400,21 +391,21 @@ fn a_job_stopped_for_the_mac_is_told_why_and_keeps_that_end() {
         assert_eq!(slot.on(s(12), Event::Stop), []);
         assert_eq!(
             slot.on(s(13), Event::VmExited),
-            [Effect::Unregister, Effect::Release, ended(end, true)]
+            [Effect::Release, ended(end, true)]
         );
         // Without a job there is nobody to tell and nothing to upload.
         let mut slot = idle();
         assert_eq!(slot.on(s(10), event), [Effect::StopVm { grace: Millis::ZERO }]);
         assert_eq!(
             slot.on(s(11), Event::VmExited),
-            [Effect::Unregister, Effect::Release, ended(end, false)]
+            [Effect::Release, ended(end, false)]
         );
         // A VM that is still booting is killed outright.
         let mut slot = starting();
         assert_eq!(slot.on(s(2), event), [Effect::KillVm]);
         assert_eq!(
             slot.on(s(3), Event::VmExited),
-            [Effect::Unregister, Effect::Release, ended(end, false)]
+            [Effect::Release, ended(end, false)]
         );
     }
 }
@@ -425,7 +416,7 @@ fn stop_from_the_console_in_every_phase() {
     assert_eq!(slot.on(s(2), Event::Stop), [Effect::KillVm]);
     assert_eq!(
         slot.on(s(3), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Stopped, false)]
+        [Effect::Release, ended(End::Stopped, false)]
     );
     let mut slot = idle();
     assert_eq!(
@@ -439,7 +430,7 @@ fn stop_from_the_console_in_every_phase() {
     );
     assert_eq!(
         slot.on(s(6), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Stopped, true)]
+        [Effect::Release, ended(End::Stopped, true)]
     );
     // After the job's end the VM just goes sooner; the job's end stays what it was.
     let mut slot = finishing();
@@ -449,7 +440,7 @@ fn stop_from_the_console_in_every_phase() {
     );
     assert_eq!(
         slot.on(s(6), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
     // While the first VM of two is being killed: no second one.
     let mut slot = starting();
@@ -458,7 +449,7 @@ fn stop_from_the_console_in_every_phase() {
     assert_eq!(slot.phase(), Phase::Killing);
     assert_eq!(
         slot.on(s(23), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Stopped, false)]
+        [Effect::Release, ended(End::Stopped, false)]
     );
 }
 
@@ -474,13 +465,13 @@ fn out_of_memory_is_the_end_only_of_a_job_that_was_running() {
     slot.on(s(6), Event::JobCompleted);
     assert_eq!(
         slot.on(s(7), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Oom, true)]
+        [Effect::Release, ended(End::Oom, true)]
     );
     let mut slot = finishing();
     slot.on(s(6), Event::OutOfMemory);
     assert_eq!(
         slot.on(s(7), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
 }
 
@@ -495,14 +486,14 @@ fn a_guest_that_does_not_power_off_after_its_job_is_stopped() {
     assert_eq!(slot.on(s(134), Event::Tick), [Effect::KillVm]);
     assert_eq!(
         slot.on(s(135), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
     // Evicting a job that is already over changes nothing about how it ended.
     let mut slot = finishing();
     assert_eq!(slot.on(s(5), MEMORY), [Effect::StopVm { grace: Millis::ZERO }]);
     assert_eq!(
         slot.on(s(6), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
 }
 
@@ -513,7 +504,7 @@ fn a_long_sleep_ends_the_vm_and_a_short_one_only_pauses_the_watchdogs() {
     assert_eq!(slot.on(s(400), long), [Effect::StopVm { grace: Millis::ZERO }]);
     assert_eq!(
         slot.on(s(401), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::HostSlept, true)]
+        [Effect::Release, ended(End::HostSlept, true)]
     );
     let mut slot = idle();
     assert_eq!(slot.on(s(400), long), [Effect::StopVm { grace: Millis::ZERO }]);
@@ -521,13 +512,13 @@ fn a_long_sleep_ends_the_vm_and_a_short_one_only_pauses_the_watchdogs() {
     assert_eq!(slot.on(s(400), long), [Effect::KillVm]);
     assert_eq!(
         slot.on(s(401), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::HostSlept, false)]
+        [Effect::Release, ended(End::HostSlept, false)]
     );
     let mut slot = finishing();
     assert_eq!(slot.on(s(400), long), [Effect::StopVm { grace: Millis::ZERO }]);
     assert_eq!(
         slot.on(s(401), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
     // Exactly five minutes is not longer than five minutes. Every watchdog is due that much later: the guest
     // slept too.
@@ -584,7 +575,7 @@ fn messages_that_come_twice_late_or_not_at_all() {
     assert_eq!(slot.on(s(3), Event::JobCompleted), []);
     assert_eq!(
         slot.on(s(4), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Ok, true)]
+        [Effect::Release, ended(End::Ok, true)]
     );
     // After the end nothing does anything; a word of a job that comes late is kept as the fact that one ran.
     let (mut slot, _) = after(&[Event::Assigned, Event::VmExited, Event::VmExited]);
@@ -609,7 +600,9 @@ fn messages_that_come_twice_late_or_not_at_all() {
     assert!(!over.ran_job);
     for event in all {
         assert_eq!(slot.on(s(1_000_000), event), [], "{event:?}");
-        over.ran_job |= matches!(event, Event::JobStarted | Event::JobCompleted);
+        let job = matches!(event, Event::JobStarted | Event::JobCompleted);
+        over.ran_job |= job;
+        over.up |= job;
         assert_eq!(slot.saved(), over, "{event:?}");
     }
     assert!(slot.saved().ran_job, "the job heard after the end is kept");
@@ -640,15 +633,11 @@ fn a_restart_goes_on_with_a_live_vm_and_cleans_up_after_a_dead_one() {
         (Slot::reserved(limits), vec![ended(End::Lost, false)]),
         (
             starting(),
-            vec![
-                Effect::StartFailed,
-                Effect::Unregister,
-                ended(End::StartFailed, false),
-            ],
+            vec![Effect::StartFailed, ended(End::StartFailed, false)],
         ),
-        (idle(), vec![Effect::Unregister, ended(End::GuestLost, false)]),
-        (running(), vec![Effect::Unregister, ended(End::GuestLost, true)]),
-        (finishing(), vec![Effect::Unregister, ended(End::Ok, true)]),
+        (idle(), vec![ended(End::GuestLost, false)]),
+        (running(), vec![ended(End::GuestLost, true)]),
+        (finishing(), vec![ended(End::Ok, true)]),
     ] {
         let (restored, done) = Slot::restore(limits, s(900), saved(&slot), false);
         assert_eq!(done, effects, "{:?}", slot.phase());
@@ -664,7 +653,7 @@ fn a_restart_goes_on_with_a_live_vm_and_cleans_up_after_a_dead_one() {
     restored.on(s(901), Event::JobCompleted);
     assert_eq!(
         restored.on(s(902), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Oom, true)]
+        [Effect::Release, ended(End::Oom, true)]
     );
     // Being stopped: asked again. Being killed, or waiting for a second start that cannot come: killed.
     let mut stopping = running();
@@ -673,11 +662,7 @@ fn a_restart_goes_on_with_a_live_vm_and_cleans_up_after_a_dead_one() {
     assert_eq!(effects, [Effect::StopVm { grace: Millis::ZERO }]);
     assert_eq!(
         restored.on(s(901), Event::VmExited),
-        [
-            Effect::Unregister,
-            Effect::Release,
-            ended(End::EvictedMemory, true)
-        ]
+        [Effect::Release, ended(End::EvictedMemory, true)]
     );
     let mut retrying = starting();
     retrying.on(s(21), Event::Tick);
@@ -688,19 +673,12 @@ fn a_restart_goes_on_with_a_live_vm_and_cleans_up_after_a_dead_one() {
     );
     assert_eq!(
         restored.on(s(901), Event::VmExited),
-        [
-            Effect::Unregister,
-            Effect::Release,
-            ended(End::StartFailed, false)
-        ]
+        [Effect::Release, ended(End::StartFailed, false)]
     );
     let (restored, effects) = Slot::restore(limits, s(900), saved(&retrying), false);
     assert_eq!(
         (effects, restored.phase()),
-        (
-            vec![Effect::Unregister, ended(End::StartFailed, false)],
-            Phase::Released
-        )
+        (vec![ended(End::StartFailed, false)], Phase::Released)
     );
     // What is on disk may be wrong: a VM for a reservation is killed, a released slot stays released.
     let odd = Saved {
@@ -709,6 +687,8 @@ fn a_restart_goes_on_with_a_live_vm_and_cleans_up_after_a_dead_one() {
         end: None,
         oom: false,
         ran_job: false,
+        up: false,
+        completed: false,
     };
     let (mut restored, effects) = Slot::restore(limits, s(900), odd, true);
     assert_eq!(
@@ -717,7 +697,7 @@ fn a_restart_goes_on_with_a_live_vm_and_cleans_up_after_a_dead_one() {
     );
     assert_eq!(
         restored.on(s(901), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::GuestLost, false)]
+        [Effect::Release, ended(End::GuestLost, false)]
     );
     for alive in [true, false] {
         let (restored, effects) = Slot::restore(
@@ -790,7 +770,6 @@ fn a_restored_slot_never_starts_a_second_vm() {
         restored.on(s(901), Event::VmExited),
         [
             Effect::StartFailed,
-            Effect::Unregister,
             Effect::Release,
             ended(End::StartFailed, false)
         ]
@@ -803,11 +782,7 @@ fn a_restored_slot_never_starts_a_second_vm() {
     assert_eq!(restored.phase(), Phase::Killing);
     assert_eq!(
         restored.on(s(922), Event::VmExited),
-        [
-            Effect::Unregister,
-            Effect::Release,
-            ended(End::StartFailed, false)
-        ]
+        [Effect::Release, ended(End::StartFailed, false)]
     );
 }
 
@@ -843,7 +818,7 @@ fn a_word_of_a_job_is_kept_whatever_phase_it_meets() {
     assert_eq!(slot.on(s(22), Event::JobStarted), []);
     assert_eq!(
         slot.on(s(23), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::GuestLost, true)]
+        [Effect::Release, ended(End::GuestLost, true)]
     );
     // While the VM is stopped: a job ran, so the end is not one without a job.
     let mut slot = idle();
@@ -853,7 +828,7 @@ fn a_word_of_a_job_is_kept_whatever_phase_it_meets() {
     assert_eq!(slot.on(s(124), Event::JobStarted), []);
     assert_eq!(
         slot.on(s(125), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Stopped, true)]
+        [Effect::Release, ended(End::Stopped, true)]
     );
     // Stopped as one without a job, and then a word of one: the job's word wins over the end that assumed none.
     for word in [Event::JobStarted, Event::JobCompleted] {
@@ -865,7 +840,7 @@ fn a_word_of_a_job_is_kept_whatever_phase_it_meets() {
         assert_eq!(slot.on(s(124), word), []);
         assert_eq!(
             slot.on(s(125), Event::VmExited),
-            [Effect::Unregister, Effect::Release, ended(End::Stopped, true)],
+            [Effect::Release, ended(End::Stopped, true)],
             "{word:?}"
         );
     }
@@ -877,20 +852,22 @@ fn a_word_of_a_job_is_kept_whatever_phase_it_meets() {
 #[test]
 fn a_slot_restored_while_asking_asks_again() {
     let asking = Saved {
-        phase: Phase::Idle,
+        phase: Phase::Asking,
         starts: 1,
-        end: Some(End::NoJob),
+        end: None,
         oom: false,
         ran_job: false,
+        up: true,
+        completed: false,
     };
     let (mut slot, effects) = Slot::restore(Limits::default(), s(0), asking, true);
-    assert_eq!((effects, slot.phase()), (vec![Effect::Unregister], Phase::Idle));
+    assert_eq!((effects, slot.phase()), (vec![], Phase::Asking));
     slot.on(s(50), Event::Heartbeat);
     assert_eq!(slot.on(s(100), Event::Tick), [], "no second ask, no stop");
     assert_eq!(slot.on(s(101), Event::JobStarted), []);
     assert_eq!(slot.phase(), Phase::Running);
     let (_, effects) = Slot::restore(Limits::default(), s(0), asking, false);
-    assert_eq!(effects, [Effect::Unregister, ended(End::GuestLost, false)]);
+    assert_eq!(effects, [ended(End::GuestLost, false)]);
 }
 
 /// A removal GitHub never answers (no client for the repository, a GitHub that keeps failing) does not hold the VM
@@ -909,11 +886,11 @@ fn an_idle_runner_whose_removal_is_never_answered_stops_after_a_jobs_time() {
     };
     let mut slot = idle();
     slot.on(s(100), Event::Heartbeat);
-    assert_eq!(slot.on(s(asked_at), Event::Tick), [Effect::Unregister]);
+    assert_eq!(slot.on(s(asked_at), Event::Tick), []);
     heartbeats(&mut slot, asked_at + 1, over);
     slot.on(s(over - 1), Event::Heartbeat);
     assert_eq!(slot.on(s(over - 1), Event::Tick), []);
-    assert_eq!(slot.phase(), Phase::Idle);
+    assert_eq!(slot.phase(), Phase::Asking);
     assert_eq!(
         slot.on(s(over), Event::Tick),
         [
@@ -923,16 +900,18 @@ fn an_idle_runner_whose_removal_is_never_answered_stops_after_a_jobs_time() {
     );
     assert_eq!(
         slot.on(s(over + 1), Event::VmExited),
-        [Effect::Unregister, Effect::Release, ended(End::Timeout, false)]
+        [Effect::Release, ended(End::Timeout, false)]
     );
 
     // Restored while it asked: the job's time runs from the restart.
     let asking = Saved {
-        phase: Phase::Idle,
+        phase: Phase::Asking,
         starts: 1,
-        end: Some(End::NoJob),
+        end: None,
         oom: false,
         ran_job: false,
+        up: true,
+        completed: false,
     };
     let (mut slot, _) = Slot::restore(limits, s(0), asking, true);
     let over = limits.job.0 / 1000;

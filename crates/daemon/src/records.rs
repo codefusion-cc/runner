@@ -2,7 +2,9 @@
 //! machine, each registration and each job it still has to report.
 
 use cf_budget::Size;
-use cf_lifecycle::{End, Phase, Saved};
+use cf_lifecycle::{End, Event, Limits, Phase, Saved, Slot};
+
+use crate::EndKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,10 @@ pub struct GithubJob {
     pub result: Option<String>,
     /// When GitHub's completion arrived here.
     pub completed_at: Option<i64>,
+    /// No message of GitHub's named this job: its answers said a job ran (busy, refused for a job, or the registration
+    /// gone by itself under a VM that came up), not which.
+    #[serde(default)]
+    pub inferred: bool,
 }
 
 /// How a machine ended, with what was measured on the way.
@@ -95,35 +101,40 @@ pub struct Record {
     pub end_reported: bool,
     /// Whether a process of the job was stopped for memory.
     pub oom: bool,
-    /// The machine is gone and GitHub never said its Actions runner took a job: whether a job ran is GitHub's to say,
-    /// by whether the registration is still there (a one-job Actions runner removes its own once its job is over).
-    /// Asked once the wait for GitHub's word is over, and then by the removal itself: answered, no job ran; gone
-    /// already or refused for a job, one did.
-    #[serde(default)]
-    pub ask_github: bool,
-    /// The rules the record was written under: [`RULES`]. A record of an older Runner (0, by the field's absence)
-    /// is read once, by [`Record::upgrade`], and written under these rules from then on.
+    /// The rules the record was written under: [`RULES`]. A record of an older Runner is read once, by
+    /// [`Record::upgrade`], and written under these rules from then on.
     #[serde(default)]
     pub rules: u32,
 }
 
-/// The rules every record is written under now. 1: only a 204 to the Runner's own removal says no job ran, so
-/// `unregistered` with no word of a job is that answer, an end without a job is never decided before it, and what
-/// GitHub said of the job and the lifecycle agree at every write ([`Record::agrees`]).
-pub const RULES: u32 = 1;
+/// The rules every record is written under now.
+///
+/// 2: what the Runner knows of a machine is stored as facts, never inferred: whether its VM came up
+/// ([`Saved::up`]), whether GitHub said its job is over before the VM was up ([`Saved::completed`]), and an Actions
+/// runner whose registration's removal is asked for as a phase of its own ([`Phase::Asking`]). Only a 204 to the
+/// Runner's own removal says no job ran, and a job only GitHub's answers name is stored as such
+/// ([`GithubJob::inferred`]). What GitHub said of the job and the lifecycle agree at every write
+/// ([`Record::agrees`]).
+///
+/// 1 (earlier builds of this branch): the same evidence, with the removal asked for written as an idle slot that
+/// expects [`End::NoJob`], and no stored `up`. 0 (main): `unregistered`, a settled end and a stop for no job could
+/// stand for a belief.
+pub const RULES: u32 = 2;
 
 /// What restore makes of a record ([`Record::upgrade`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Upgrade {
-    /// Written under these rules, and its facts agree: it goes on as it is.
+    /// Written under these rules: it goes on as it is.
     Current,
-    /// Written by an older Runner and consistent under these rules once GitHub's word is applied: it goes on.
-    Consistent,
-    /// Written by an older Runner on a belief these rules do not allow: whether a job ran is GitHub's to say. A
-    /// machine that stands asks for its registration's removal and is not stopped before the answer; one that is
-    /// gone is asked about as one that ended unheard.
-    AskGithub,
+    /// Written by an older Runner: read once under these rules, and written so.
+    Upgraded,
 }
+
+/// A record written under these rules whose facts disagree ([`Record::agrees`]): a mistake of the Runner's, which
+/// restore says aloud and does not read as an older Runner's.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the record of {} was written under these rules and its facts disagree", .0.runner)]
+pub struct Disagrees(pub Box<Record>);
 
 impl Record {
     /// The machine's size.
@@ -131,18 +142,15 @@ impl Record {
         self.size.as_deref().and_then(Size::from_label)
     }
 
-    /// Whether the guest of this machine may have come up, and so run an Actions runner: a job started in it, the
-    /// vm-host measured its boot, or its slot was last written past booting and not as one that never got ready.
-    pub fn came_up(&self) -> bool {
-        self.slot
-            .map(|slot| slot.saved())
-            .is_some_and(|saved| saved.ran_job || !never_up(saved))
-            || self.ended.as_ref().is_some_and(|e| e.boot_ms.is_some())
+    /// Whether this machine's VM came up, so that its Actions runner may have taken a job.
+    pub fn up(&self) -> bool {
+        self.slot.is_some_and(|slot| slot.saved().up)
     }
 
-    /// Whether the machine went with no word of a job while it may have run one, so that GitHub is asked.
+    /// Whether a job ran is GitHub's to say: the VM came up, nobody heard of a job, and the registration is
+    /// still there. The answer to its removal says it ([`crate::Answer`]).
     pub fn unheard(&self) -> bool {
-        self.ask_github && self.github.is_none()
+        self.github.is_none() && !self.unregistered && self.up()
     }
 
     /// Whether nothing is left to do for this Actions runner.
@@ -150,128 +158,132 @@ impl Record {
         self.unregistered && self.end_reported && (self.ended.is_some() || self.slot.is_none())
     }
 
-    /// Whether what GitHub said of the job and what the lifecycle wrote agree, in whatever phase: a job GitHub
-    /// named ran, no slot waits for a job (to boot, to retry, idle) beside one, none runs one GitHub said is over,
-    /// and no end without a job was decided beside a job or before GitHub answered the removal.
+    /// Whether the facts of this record agree, as every write must leave them:
+    ///
+    /// - a registration with no machine has no job and no end;
+    /// - the machine's end is written exactly when its slot is over;
+    /// - a slot that waits for, asks about, runs or finishes a job has a VM that came up;
+    /// - one asking for its registration's removal has heard of no job and still has the registration;
+    /// - an end without a job stands only beside GitHub's 204 (the registration gone) and no job;
+    /// - a job GitHub named ran, on a slot that no longer waits for one or boots, and none runs a job GitHub said
+    ///   is over.
     pub fn agrees(&self) -> bool {
         let Some(slot) = self.slot else {
-            // Only a registration: no machine, so no job.
             return self.github.is_none() && self.ended.is_none();
         };
         let saved = slot.saved();
-        let no_job_decided =
-            saved.end == Some(End::NoJob) && matches!(saved.phase, Phase::Stopping | Phase::Killing);
-        let Some(github) = &self.github else {
-            return !no_job_decided || self.unregistered;
-        };
-        let over = github.result.is_some();
-        saved.ran_job
-            && !no_job_decided
-            && !matches!(saved.phase, Phase::Starting | Phase::Retrying | Phase::Idle)
-            && !(over && saved.phase == Phase::Running)
+        let waits_or_works = matches!(
+            saved.phase,
+            Phase::Idle | Phase::Asking | Phase::Running | Phase::Finishing
+        );
+        let no_job = saved.end == Some(End::NoJob);
+        let job_agrees = self.github.as_ref().is_none_or(|github| {
+            saved.ran_job
+                && !matches!(
+                    saved.phase,
+                    Phase::Starting | Phase::Retrying | Phase::Idle | Phase::Asking
+                )
+                && !(github.result.is_some() && saved.phase == Phase::Running)
+        });
+        self.ended.is_some() == (saved.phase == Phase::Released)
+            && (!waits_or_works || saved.up)
+            && (saved.phase != Phase::Asking || (self.github.is_none() && !self.unregistered))
+            && (!no_job || (self.github.is_none() && !saved.ran_job && self.unregistered))
+            && job_agrees
     }
 
-    /// Reads a record as these rules ([`RULES`]) would have written it; restore's one place for what an older
-    /// Runner left (`docs/job-state.md`). What it believed and these rules do not allow is never acted on:
+    /// Reads a record as these rules ([`RULES`]) would have written it: restore's one place for what an older Runner
+    /// left (`docs/job-state.md`). A record of these rules is taken as it is, and one whose facts disagree is an
+    /// error, never read as an older Runner's.
     ///
-    /// - GitHub's word of a job is a fact whoever wrote it down. A lifecycle that lags behind it (written apart
-    ///   from it, or not taken in the phase it met) is brought to it.
-    /// - Without that word, an older Runner's `unregistered` may stand for a 404 (a job ran), its settled end for
-    ///   a job it never asked about, and its stop of a machine for its belief that no job came (the idle limit, a
-    ///   surplus removal). None of them is evidence here, so GitHub is asked: by the sweep's look at a machine
-    ///   that is gone, or by the removal of the registration of one that stands, which is not stopped before the
-    ///   answer.
+    /// An older record is changed in two steps and no more:
     ///
-    /// Fields an older Runner wrote that no longer exist (`removing`) are not read: under these rules nothing it
-    /// meant to do is evidence.
-    pub fn upgrade(mut self) -> (Record, Upgrade) {
-        if self.rules >= RULES && self.agrees() {
-            return (self, Upgrade::Current);
+    /// 1. **Its beliefs are cleared.** What it lacks as a fact (whether the VM came up) is read once from what it
+    ///    holds. Without GitHub's word of a job, main's `unregistered`, settled end and stop for no job of a VM that
+    ///    came up may each stand for a belief: they are dropped, so GitHub's answer to the removal decides, and a
+    ///    VM that stands asks for it rather than being stopped. An end without a job beside a job, or without the
+    ///    registration gone, is a stop.
+    /// 2. **GitHub's stored word is replayed through the lifecycle** ([`Slot::hear`]), as if heard now: its start,
+    ///    its end, and the registration gone under a machine that stands.
+    pub fn upgrade(mut self) -> Result<(Record, Upgrade), Disagrees> {
+        if self.rules >= RULES {
+            return if self.agrees() {
+                Ok((self, Upgrade::Current))
+            } else {
+                Err(Disagrees(Box::new(self)))
+            };
         }
+        // Under rules 1 `unregistered` and an end without a job were written only on GitHub's answer.
+        let trusted = self.rules >= 1;
         self.rules = RULES;
         let Some(slot) = self.slot else {
-            // A registration with no machine took no job: removing it is all that is left.
-            return (self, Upgrade::Consistent);
+            return Ok((self, Upgrade::Upgraded));
         };
         let mut saved = slot.saved();
-        let came_up = self.came_up();
-        if self.ended.is_some() {
-            // The machine is gone, so the slot is over, whatever phase was written.
+        let gone = self.ended.is_some();
+
+        // 1. Facts it lacks, and beliefs it held.
+        saved.up = saved.ran_job
+            || self.github.is_some()
+            || self.ended.as_ref().is_some_and(|e| e.boot_ms.is_some())
+            || matches!(saved.phase, Phase::Idle | Phase::Running | Phase::Finishing)
+            || (matches!(saved.phase, Phase::Stopping | Phase::Killing | Phase::Released)
+                && !matches!(saved.end, Some(End::StartFailed | End::Lost)));
+        saved.completed = false;
+        saved.ran_job |= self.github.is_some() || matches!(saved.phase, Phase::Running | Phase::Finishing);
+        if gone {
             saved.phase = Phase::Released;
+        } else if saved.phase == Phase::Released {
+            // Over, with its end never written: ended again at restore.
+            saved.phase = Phase::Killing;
         }
-        let no_job = crate::EndKind::NoJob.name();
-        if let Some(github) = &self.github {
-            let over = github.result.is_some();
-            let finished = if saved.oom { End::Oom } else { End::Ok };
-            saved.ran_job = true;
-            match saved.phase {
-                Phase::Reserved | Phase::Starting | Phase::Retrying | Phase::Idle | Phase::Running
-                    if over =>
+        if saved.phase == Phase::Idle && saved.end == Some(End::NoJob) {
+            saved.phase = Phase::Asking;
+            saved.end = None;
+        }
+        if !trusted && self.github.is_none() {
+            let stopped_for_no_job = matches!(saved.phase, Phase::Stopping | Phase::Killing)
+                && matches!(saved.end, Some(End::NoJob | End::Stopped));
+            let believed = self.unregistered || stopped_for_no_job || saved.end == Some(End::NoJob);
+            if !gone {
+                // Its VM may be up even where the record says it boots: a crash can come before that write.
+                self.unregistered = false;
+                if believed
+                    && saved.up
+                    && matches!(saved.phase, Phase::Idle | Phase::Stopping | Phase::Killing)
                 {
-                    saved.phase = Phase::Finishing;
-                    saved.end = Some(finished);
-                }
-                Phase::Reserved | Phase::Starting | Phase::Retrying | Phase::Idle => {
-                    saved.phase = Phase::Running;
+                    saved.phase = Phase::Asking;
                     saved.end = None;
                 }
-                Phase::Running | Phase::Finishing | Phase::Stopping | Phase::Killing | Phase::Released => {}
+            } else if saved.up {
+                self.unregistered = false;
+                self.end_reported = false;
             }
-            // A stop for no job beside a job, heard while the machine was being stopped: the job ran, and the
-            // Runner stopped it.
+        }
+        let not_no_job = self.github.is_some() || saved.ran_job || !self.unregistered;
+        if not_no_job {
             if saved.end == Some(End::NoJob) {
                 saved.end = Some(End::Stopped);
             }
-            if let Some(ending) = self.ended.as_mut().filter(|e| e.kind == no_job) {
-                ending.kind = crate::EndKind::Stopped.name().to_string();
+            if let Some(ending) = self.ended.as_mut().filter(|e| e.kind == EndKind::NoJob.name()) {
+                ending.kind = EndKind::Stopped.name().to_string();
             }
-            self.slot = Some(saved.into());
-            return (self, Upgrade::Consistent);
         }
-        if self.ended.is_some() && !came_up {
-            // A machine gone before its guest came up took no job, whatever was written of its registration.
-            self.slot = Some(saved.into());
-            self.ask_github = false;
-            return (self, Upgrade::Consistent);
-        }
-        if let Some(ending) = &mut self.ended {
-            self.slot = Some(saved.into());
-            self.unregistered = false;
-            self.end_reported = false;
-            self.ask_github = true;
-            // Stopped by the Runner, on a belief this record no longer holds.
-            if ending.kind == no_job {
-                ending.kind = crate::EndKind::Stopped.name().to_string();
-            }
-            return (self, Upgrade::AskGithub);
-        }
-        let stopped_for_no_job = matches!(saved.phase, Phase::Stopping | Phase::Killing)
-            && matches!(saved.end, Some(End::NoJob | End::Stopped));
-        if self.unregistered || stopped_for_no_job || saved.end == Some(End::NoJob) {
-            self.unregistered = false;
-            // One that waited or was being stopped asks now; one that runs or finishes a job the guest saw keeps
-            // it, and is asked about once it is gone.
-            if matches!(
-                saved.phase,
-                Phase::Starting | Phase::Idle | Phase::Stopping | Phase::Killing
-            ) {
-                saved.phase = Phase::Idle;
-                saved.end = Some(End::NoJob);
-            } else if saved.end == Some(End::NoJob) {
-                saved.end = None;
-            }
-            self.slot = Some(saved.into());
-            return (self, Upgrade::AskGithub);
-        }
-        (self, Upgrade::Consistent)
-    }
-}
 
-/// Whether the guest of a slot written so never came up, so that its Actions runner took no job: it was last written
-/// booting, or ended as one that never got ready.
-pub fn never_up(saved: Saved) -> bool {
-    matches!(saved.phase, Phase::Reserved | Phase::Starting | Phase::Retrying)
-        || matches!(saved.end, Some(End::StartFailed | End::Lost))
+        // 2. GitHub's word, as the lifecycle takes it.
+        let mut words = Vec::new();
+        if let Some(github) = &self.github {
+            words.push(Event::JobStarted);
+            if github.result.is_some() {
+                words.push(Event::JobCompleted);
+            }
+        }
+        if self.unregistered && !gone && saved.phase != Phase::Reserved {
+            words.push(Event::Unregistered);
+        }
+        self.slot = Some(Slot::hear(Limits::default(), saved, &words).into());
+        Ok((self, Upgrade::Upgraded))
+    }
 }
 
 /// [`cf_lifecycle::Saved`] as it is written.
@@ -287,9 +299,15 @@ pub struct SavedSlot {
     pub oom: bool,
     /// Whether a job started.
     pub ran_job: bool,
+    /// Whether the VM came up.
+    #[serde(default)]
+    pub up: bool,
+    /// Whether GitHub said the job is over before the VM was up.
+    #[serde(default)]
+    pub completed: bool,
 }
 
-const PHASES: [Phase; 9] = [
+const PHASES: [Phase; 10] = [
     Phase::Reserved,
     Phase::Starting,
     Phase::Retrying,
@@ -299,6 +317,7 @@ const PHASES: [Phase; 9] = [
     Phase::Stopping,
     Phase::Killing,
     Phase::Released,
+    Phase::Asking,
 ];
 
 const ENDS: [End; 11] = [
@@ -324,6 +343,8 @@ impl From<Saved> for SavedSlot {
             end: saved.end.map(|end| index(ENDS.iter().position(|e| *e == end))),
             oom: saved.oom,
             ran_job: saved.ran_job,
+            up: saved.up,
+            completed: saved.completed,
         }
     }
 }
@@ -343,6 +364,8 @@ impl SavedSlot {
                 .map(|end| ENDS.get(usize::from(end)).copied().unwrap_or(End::GuestLost)),
             oom: self.oom,
             ran_job: self.ran_job,
+            up: self.up,
+            completed: self.completed,
         }
     }
 }

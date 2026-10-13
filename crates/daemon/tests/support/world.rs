@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicUsize;
 use cf_budget::Size;
 use cf_daemon::testing::{FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
-    Claim, EndKind, EventKind, Events, HostError, Hosts, JobEvent, JobReport, MemoryStore, RESULT_WAIT,
-    Roster, RunnerSpec, Slots, Ticket,
+    Answer, Claim, EndKind, EventKind, Events, HostError, Hosts, JobEvent, JobReport, MemoryStore,
+    RESULT_WAIT, Roster, RunnerSpec, Slots, Ticket,
 };
 use cf_fake_github::harness::TestClock;
 use cf_secret::Secret;
@@ -138,9 +138,18 @@ impl World {
     pub fn sweep(&mut self) {
         for registration in self.m.registrations_to_remove() {
             // GitHub answers a removal of what it has; one gone already is a 404.
-            let there = self.registered.remove(&registration.runner);
-            self.m.unregistered(&registration.runner, there);
+            let answer = if self.registered.remove(&registration.runner) {
+                Answer::Removed
+            } else {
+                Answer::Gone
+            };
+            self.m.answered(&registration.runner, answer);
         }
+    }
+
+    /// The scaler finds this idle machine surplus.
+    pub fn retire(&self, runner: &str) {
+        self.m.retire(REPO, SET, 1, &[runner.to_string()]);
     }
 
     pub fn reports(&self) -> Vec<JobReport> {

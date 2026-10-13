@@ -2376,9 +2376,11 @@ async fn a_surplus_removed_just_before_the_runner_died_is_not_taken_for_a_job_by
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (removed_before, stopped_before) = (removals(&rig), stops(&rig));
-    // As a Runner before this rule could leave it: the registration written gone, and its stop not yet.
+    // As a Runner of rules 1 could leave it, which wrote `unregistered` only on GitHub's answer: the registration
+    // written gone, and its stop not yet.
     rig.restart_after(|rig| {
         for mut record in rig.parts.store.load() {
+            record.rules = 1;
             if let Some(slot) = record.slot.as_mut().filter(|_| record.unregistered) {
                 let mut saved = slot.saved();
                 saved.phase = cf_lifecycle::Phase::Idle;
@@ -2651,6 +2653,7 @@ async fn a_runner_that_dies_as_it_hears_a_start_leaves_the_job_its_machine() {
     );
     rig.restart_after(|rig| {
         for mut record in stored {
+            record.rules = 0;
             if let Some(slot) = record.slot.as_mut() {
                 let mut saved = slot.saved();
                 saved.phase = cf_lifecycle::Phase::Idle;

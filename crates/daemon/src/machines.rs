@@ -21,9 +21,8 @@ use cf_vmhost::{JobRequest, JobState, OutOfMemory};
 
 use crate::ends::{EndKind, machine_end};
 use crate::names::job_name;
-use crate::records::{Ending, GithubJob, RULES, Record, Store, Upgrade};
+use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, Upgrade};
 use crate::roster::{JobInfo, Roster, Runner};
-use crate::scaler::start_unheard;
 use crate::secs;
 use crate::traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
@@ -151,9 +150,19 @@ pub struct Registration {
     pub scale_set_id: i64,
     /// `owner/name`.
     pub repo: String,
-    /// The machine is gone and nobody heard whether its Actions runner took a job: before the registration is
-    /// removed, GitHub is asked whether it still has it, and [`Machines::ran_unheard`] told when it does not.
-    pub ask_github: bool,
+}
+
+/// What GitHub answered about an Actions runner's registration ([`Machines::answered`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// 204 to the Runner's removal: GitHub removed it, which it does only for one that holds no job.
+    Removed,
+    /// 404 to the removal, or to the REST view: it was gone already.
+    Gone,
+    /// 422 to the removal: GitHub refused it, for the job it holds.
+    Refused,
+    /// The REST view says it is busy: it holds a job.
+    Busy,
 }
 
 /// One machine, for a report.
@@ -235,13 +244,8 @@ struct Job {
     last: Option<JobState>,
     /// When the machine was gone, on the Mac's own clock.
     ended_at: Option<Millis>,
-    /// Whether the registration is to be removed.
-    unregister: bool,
     /// The end a restored slot is reported with, when its machine was not there any more.
     restored_end: Option<EndKind>,
-    /// GitHub's REST view said the Actions runner of this machine, gone with no word of a job, was idle: once more at a
-    /// later sweep, and its registration is removed ([`Machines::asked`]).
-    idle_seen: bool,
 }
 
 struct Inner<H> {
@@ -323,7 +327,7 @@ const fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::Reserved => "reserved",
         Phase::Starting | Phase::Retrying => "starting",
-        Phase::Idle => "idle",
+        Phase::Idle | Phase::Asking => "idle",
         Phase::Running => "running",
         Phase::Finishing => "finishing",
         Phase::Stopping | Phase::Killing => "stopping",
@@ -407,11 +411,19 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             }
         }
         for record in records {
-            let (record, upgrade) = record.upgrade();
-            if upgrade != Upgrade::Current {
-                tracing::info!(runner = %record.runner, ?upgrade, "a record of an older Runner was read under these rules");
-                self.store.save(&record);
-            }
+            let record = match record.upgrade() {
+                Ok((record, Upgrade::Current)) => record,
+                Ok((record, Upgrade::Upgraded)) => {
+                    tracing::info!(runner = %record.runner, "a record of an older Runner was read under these rules");
+                    self.store.save(&record);
+                    record
+                }
+                // A mistake of the Runner's own: said aloud, and the record taken as it was written.
+                Err(Disagrees(record)) => {
+                    tracing::error!(runner = %record.runner, ?record, "a record of these rules disagrees with itself");
+                    *record
+                }
+            };
             let Some(saved) = record.slot else {
                 if record.unregistered {
                     self.store.remove(&record.job);
@@ -421,7 +433,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 continue;
             };
             let name = record.job.clone();
-            let saved = saved.saved();
+            let mut saved = saved.saved();
             if record.ended.is_some() {
                 let (life, _) = Slot::restore(self.config.limits, now.elapsed, saved, false);
                 self.vms.clean(&name);
@@ -433,9 +445,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                         life,
                         last: None,
                         ended_at: Some(now.elapsed),
-                        unregister: true,
                         restored_end: None,
-                        idle_seen: false,
                     },
                 );
                 self.settle(&mut inner, &name, now);
@@ -467,19 +477,18 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 }
                 _ => None,
             };
+            // The vm-host saw the guest up although the Runner before did not hear it.
+            saved.up |= state.as_ref().is_some_and(|s| s.boot_ms.is_some());
             let (life, effects) = Slot::restore(self.config.limits, now.elapsed, saved, alive);
-            // The end an idle slot expects was never GitHub's answer.
-            let decided = saved.end.filter(|_| saved.phase != Phase::Idle);
             let restored_end = (!alive).then(|| match state.as_ref().and_then(|s| s.end.as_ref()) {
-                Some(ended) => machine_end(decided.unwrap_or(End::Ok), Some(ended.end), false),
+                Some(ended) => machine_end(saved.end.unwrap_or(End::Ok), Some(ended.end), false),
                 None if !same_boot => EndKind::HostShutdown,
                 None if matches!(saved.phase, Phase::Reserved | Phase::Starting | Phase::Retrying) => {
                     EndKind::DaemonRestart
                 }
                 None => EndKind::GuestLost,
             });
-            // Derived from the one fact it depends on: a registration that is gone leaves its machine nothing to wait
-            // for. What GitHub said of the job agrees with the lifecycle already ([`Record::upgrade`]).
+            // A registration that is gone takes no job, and its machine no longer counts.
             let done = alive && record.unregistered;
             if alive {
                 tracing::info!(runner = %record.runner, job = %name, "a machine of the Runner before was adopted");
@@ -517,15 +526,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     life,
                     last: state,
                     ended_at: None,
-                    unregister: false,
                     restored_end,
-                    idle_seen: false,
                 },
             );
             self.apply(&mut inner, &name, now, effects);
-            if done {
-                self.step(&mut inner, &name, now, Event::Unregistered);
-            }
         }
     }
 
@@ -810,7 +814,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 if let Some(ended) = &state.end {
                     use cf_vmhost::End as VmEnd;
                     let ran = matches!(ended.end, VmEnd::Ok | VmEnd::Oom | VmEnd::Failed);
-                    if ran && phase == Phase::Starting {
+                    // The vm-host saw the guest up, though the Runner had not yet.
+                    if (ran || state.boot_ms.is_some()) && phase == Phase::Starting {
                         events.push(Event::VmReady);
                     }
                     if state.oom.is_some() && !had_oom {
@@ -897,7 +902,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     }
                 }
                 Effect::KillVm => self.vms.kill(name),
-                Effect::Unregister => job.unregister = true,
                 Effect::Release => {
                     if let Some(slot) = job.slot.take() {
                         let _ = inner.budget.release(slot);
@@ -942,18 +946,12 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             wall_ms: summary.map(|s| s.wall_ms),
             message: vm_end.and_then(|e| e.message.clone()),
         });
-        // Only a guest that came up can have run an Actions runner, read from the slot as last written.
-        let came_up = ran_job || job.record.came_up();
         job.record.slot = Some(job.life.saved().into());
         job.ended_at = Some(now.elapsed);
-        job.unregister = true;
         let oom = job.record.oom;
         let runner = job.record.runner.clone();
         tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
         self.roster.remove(&runner);
-        // Whether GitHub removed the registration, and what that said of a job, is decided once it is gone
-        // (`Machines::unregistered`); until then GitHub is asked.
-        job.record.ask_github = came_up && job.record.github.is_none();
         self.store.save(&job.record);
         self.vms.clean(name);
         if oom {
@@ -981,7 +979,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             if result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
                 return false;
             }
-            if job.record.unheard() && !job.record.unregistered && !deaf {
+            // Whether a job ran is GitHub's to say, by its answer to the removal.
+            if job.record.unheard() && !deaf {
                 return false;
             }
             if let Some(github) = job.record.github.clone() {
@@ -1008,138 +1007,153 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         opened
     }
 
-    /// The registrations at GitHub that have to go: of machines that are gone, and of Actions runners that were
-    /// registered and never got a machine. Whoever holds the scale set clients removes them and says so with
-    /// [`Machines::unregistered`].
+    /// The registrations at GitHub that have to go: of Actions runners asking for their removal, of machines that
+    /// are gone, and of Actions runners that were registered and never got a machine. Whoever holds the scale set
+    /// clients removes them and says what GitHub answered with [`Machines::answered`].
     pub fn registrations_to_remove(&self) -> Vec<Registration> {
         let inner = self.lock();
         let now = inner.host.now();
-        let of = |record: &Record, ask_github: bool| Registration {
+        let of = |record: &Record| Registration {
             runner: record.runner.clone(),
             runner_id: record.runner_id,
             scale_set_id: record.scale_set_id,
             repo: record.repo.clone(),
-            ask_github,
         };
         inner
             .jobs
             .values()
-            .filter(|job| job.unregister && !job.record.unregistered)
-            .filter_map(|job| {
-                let unheard = job.record.unheard();
-                let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
-                // GitHub's word may still come: its messages say a job started up to a minute late.
-                (!unheard || inner.deaf || duration(waited) >= RESULT_WAIT).then(|| of(&job.record, unheard))
+            .filter(|job| !job.record.unregistered)
+            .filter(|job| match job.life.phase() {
+                Phase::Asking => true,
+                // GitHub's word of a job that went unheard may still come: its messages say a job started up to a
+                // minute late. Until the wait is over, the removal would only stand in for it.
+                Phase::Released => {
+                    let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
+                    !job.record.unheard() || inner.deaf || duration(waited) >= RESULT_WAIT
+                }
+                _ => false,
             })
+            .map(|job| of(&job.record))
             .chain(
                 inner
                     .intents
                     .values()
                     .filter(|(_, stale)| *stale)
-                    .map(|(record, _)| of(record, false)),
+                    .map(|(record, _)| of(record)),
             )
             .collect()
     }
 
-    /// What GitHub's REST view said of the Actions runner of a machine that is gone with no word of a job
-    /// ([`Registration::ask_github`]): busy, idle, or `None` for gone. Says whether to ask again at a later sweep before
-    /// the registration is removed (`docs/job-state.md`).
+    /// What GitHub answered about an Actions runner's registration: to the Runner's removal of it, or when its REST
+    /// view was asked (`docs/job-state.md`). The one place GitHub's answers move a machine and its job.
     ///
-    /// Busy means a job started. Gone means the same: a one-job Actions runner removes its own registration once its
-    /// job is over, and a removal of the Runner's own that GitHub answered is written in the step that heard it, so
-    /// this one is not asked about. Idle is evidence only for its moment, which may lie before the machine went: only
-    /// when a second read, at a later sweep, says idle again is the registration removed, and GitHub's answer to that
-    /// removal decides ([`Machines::unregistered`]).
-    pub fn asked(&self, runner: &str, busy: Option<bool>) -> bool {
-        if busy != Some(false) {
-            self.ran_unheard(runner);
-            return false;
-        }
-        let mut inner = self.lock();
-        let Some(job) = inner
-            .jobs
-            .get_mut(job_name(runner))
-            .filter(|job| job.record.runner == runner && job.record.ask_github)
-        else {
-            return false;
-        };
-        if !std::mem::replace(&mut job.idle_seen, true) {
-            return true;
-        }
-        tracing::info!(%runner, "GitHub says twice that the Actions runner of a gone machine is idle; its removal decides");
-        false
-    }
-
-    /// GitHub says an Actions runner of a machine whose start nobody heard took a job: busy, gone by itself, or a
-    /// removal refused for its job. The job is reported as one whose end GitHub never told, by what the Mac knows.
-    pub fn ran_unheard(&self, runner: &str) {
-        let known = {
-            let inner = self.lock();
-            inner
-                .jobs
-                .get(job_name(runner))
-                .filter(|job| job.record.runner == runner && job.record.github.is_none())
-                .map(|job| {
-                    (
-                        job.record.repo.clone(),
-                        job.record.scale_set_id,
-                        job.record.ended.as_ref().map(|e| e.at),
-                    )
-                })
-        };
-        let Some((repo, set, ended_at)) = known else {
-            return;
-        };
-        // A machine that stands holds the job now; one that is gone, when it went.
-        let at = ended_at.map_or_else(
-            || self.clock.now(),
-            |at| UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or(0)),
-        );
-        start_unheard(&self.roster, self, &repo, set, runner, at);
-    }
-
-    /// GitHub no longer has a registration of this name. `removed_idle`: GitHub answered the Runner's own removal,
-    /// which it refuses for an Actions runner that holds a job, so the registration was there and no job ran on it.
-    /// Without that word, a registration that is gone under a machine whose guest came up and of which GitHub said
-    /// nothing is a job's: a one-job Actions runner removes its own once its job is over (`docs/job-state.md`).
-    pub fn unregistered(&self, runner: &str, removed_idle: bool) {
-        let unheard = {
-            let inner = self.lock();
-            inner
-                .jobs
-                .get(job_name(runner))
-                .filter(|job| job.record.runner == runner && job.record.github.is_none() && !removed_idle)
-                .is_some_and(|job| {
-                    job.record.unheard() || (job.record.ended.is_none() && job.record.came_up())
-                })
-        };
-        if unheard {
-            self.ran_unheard(runner);
-        }
+    /// - [`Answer::Removed`]: no job holds it, so none ran. A machine that stands stops as one without a job.
+    /// - [`Answer::Gone`]: the registration was gone already. Under a VM that came up, its one job is over, since a
+    ///   one-job Actions runner removes its own once its job is over; under one that never came up, no job ran.
+    /// - [`Answer::Refused`], [`Answer::Busy`]: a job holds it. The registration stays, and is asked about again.
+    ///
+    /// A job only these answers name is stored as such ([`GithubJob::inferred`]) and reported started and ended once.
+    pub fn answered(&self, runner: &str, answer: Answer) {
         let mut inner = self.lock();
         let now = inner.host.now();
-        if let Some((record, _)) = inner.intents.remove(runner) {
+        if matches!(answer, Answer::Removed | Answer::Gone)
+            && let Some((record, _)) = inner.intents.remove(runner)
+        {
             self.store.remove(&record.job);
         }
         let name = job_name(runner).to_string();
-        if let Some(job) = inner.jobs.get_mut(&name)
-            && job.record.runner == runner
-        {
+        let Some(job) = inner
+            .jobs
+            .get_mut(&name)
+            .filter(|job| job.record.runner == runner)
+        else {
+            return;
+        };
+        let stands = job.record.ended.is_none();
+        let (repo, set) = (job.record.repo.clone(), job.record.scale_set_id);
+        let word = match answer {
+            Answer::Removed => Event::Unregistered,
+            Answer::Gone if job.record.up() || job.record.github.is_some() => Event::JobCompleted,
+            Answer::Gone => Event::Unregistered,
+            Answer::Refused | Answer::Busy => Event::JobStarted,
+        };
+        if matches!(answer, Answer::Removed | Answer::Gone) {
             job.record.unregistered = true;
-            // An Actions runner whose registration is gone takes no job and no longer counts: its machine has nothing
-            // left to wait for. The stop and the fact it follows from are one write.
-            let stands = job.record.ended.is_none();
             if stands {
-                let (repo, set) = (job.record.repo.clone(), job.record.scale_set_id);
                 self.roster.mark_done(&repo, set, runner, self.clock.now());
             }
-            if !(stands && self.feed(&mut inner, &name, now, Event::Unregistered))
+        }
+        if word == Event::Unregistered {
+            if !self.feed(&mut inner, &name, now, word)
                 && let Some(job) = inner.jobs.get(&name)
             {
                 self.store.save(&job.record);
             }
             self.settle(&mut inner, &name, now);
+            return;
         }
+        // A machine that stands holds the job now; one that is gone, when it went.
+        let at = job.record.ended.as_ref().map_or_else(|| self.wall(), |e| e.at);
+        if job.record.github.is_none() {
+            tracing::info!(%runner, ?answer, "GitHub's answer says the Actions runner took a job nobody heard of");
+            job.record.github = Some(GithubJob {
+                repo: repo.clone(),
+                started_at: Some(at),
+                inferred: true,
+                ..GithubJob::default()
+            });
+            if stands {
+                let started = UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or(0));
+                self.roster.mark_busy(
+                    &repo,
+                    set,
+                    runner,
+                    JobInfo {
+                        repo: repo.clone(),
+                        name: String::new(),
+                        workflow: String::new(),
+                        run_id: 0,
+                        started,
+                    },
+                );
+            }
+        }
+        let opened = self.hear(&mut inner, &name, now, word, at);
+        drop(inner);
+        if opened {
+            self.ring();
+        }
+    }
+
+    /// A word of the job on this machine, from GitHub's messages or its answers, once what it says of the job is in
+    /// the record: the start is reported once, and the record and the lifecycle step the word causes are one write.
+    /// Says whether a slot opened.
+    fn hear(&self, inner: &mut Inner<H>, name: &str, now: Now, word: Event, at: i64) -> bool {
+        let Some(job) = inner.jobs.get_mut(name) else {
+            return false;
+        };
+        if !job.record.start_reported {
+            job.record.start_reported = true;
+            // Settled as having had no job, by a path that could not wait for GitHub (an uninstall): no completion
+            // went out, since one needs a reported start, so the end is reported once from here on.
+            job.record.end_reported &= job.record.ended.is_none();
+            self.reports.job(JobReport {
+                id: format!("{}/started", job.record.runner),
+                kind: EventKind::Started,
+                runner: job.record.runner.clone(),
+                github: job.record.github.clone().unwrap_or_default(),
+                end: None,
+                out_of_memory: false,
+                at,
+                machine: facts(&job.record),
+            });
+        }
+        if !self.feed(inner, name, now, word)
+            && let Some(job) = inner.jobs.get(name)
+        {
+            self.store.save(&job.record);
+        }
+        self.settle(inner, name, now)
     }
 
     /// Whether an Actions runner that is gone had lost a process for memory.
@@ -1407,7 +1421,6 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             ended: None,
             end_reported: true,
             oom: false,
-            ask_github: false,
             rules: RULES,
         };
         self.store.save(&record);
@@ -1426,24 +1439,30 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
         }
     }
 
-    fn retire(&self, name: &str) {
+    fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]) {
         let mut inner = self.lock();
-        if let Some(job) = inner.jobs.get_mut(job_name(name)).filter(|job| {
-            job.record.runner == name
-                && job.record.ended.is_none()
-                && matches!(job.life.phase(), Phase::Starting | Phase::Idle)
-        }) {
-            job.unregister = true;
+        let now = inner.host.now();
+        let of_set =
+            |job: &Job| job.record.scale_set_id == scale_set_id && job.record.repo.eq_ignore_ascii_case(repo);
+        let asking = inner
+            .jobs
+            .values()
+            .filter(|job| of_set(job) && job.life.phase() == Phase::Asking)
+            .count();
+        let names: Vec<String> = idle
+            .iter()
+            .filter(|runner| {
+                inner.jobs.get(job_name(runner)).is_some_and(|job| {
+                    of_set(job) && job.record.runner == **runner && job.life.phase() == Phase::Idle
+                })
+            })
+            .take(n.saturating_sub(asking))
+            .map(|runner| job_name(runner).to_string())
+            .collect();
+        for name in names {
+            tracing::info!(job = %name, "surplus Actions runner retired: its removal is asked for");
+            self.feed(&mut inner, &name, now, Event::Retire);
         }
-    }
-
-    fn retiring(&self, name: &str) -> bool {
-        self.lock().jobs.get(job_name(name)).is_some_and(|job| {
-            job.record.runner == name
-                && job.unregister
-                && !job.record.unregistered
-                && job.record.ended.is_none()
-        })
     }
 
     fn lost_with_job(&self, repo: &str, scale_set_id: i64) -> usize {
@@ -1458,8 +1477,8 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
                     && !record.unregistered
                     && match &record.github {
                         Some(github) => github.result.is_none(),
-                        // Its start went unheard: GitHub may count its job as assigned until the sweep asked.
-                        None => record.ask_github,
+                        // Its start may have gone unheard: GitHub may count its job as assigned until it answered.
+                        None => record.up(),
                     }
             })
             .count()
@@ -1521,7 +1540,6 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             ended: None,
             end_reported: false,
             oom: false,
-            ask_github: false,
             rules: RULES,
         };
         // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
@@ -1547,9 +1565,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
                 life,
                 last: None,
                 ended_at: None,
-                unregister: false,
                 restored_end: None,
-                idle_seen: false,
             },
         );
         Ok(name)
@@ -1600,43 +1616,18 @@ impl<H: Host + Send, V: Vms> Events for Machines<H, V> {
         github.event.clone_from(&event.event);
         github.queued_at = event.queued_at.map(|t| t.unix_timestamp());
         github.started_at = event.started_at.map(|t| t.unix_timestamp()).or(github.started_at);
+        github.inferred = false;
         if event.kind == EventKind::Completed {
             github.result = Some(event.result.clone());
             github.completed_at = Some(event.at.unix_timestamp());
             job.record.oom |= event.out_of_memory;
         }
-        // A job that runs: the removal its idle limit asked for is void while the machine stands.
-        if job.record.ended.is_none() {
-            job.unregister = false;
-        }
-        if !job.record.start_reported {
-            job.record.start_reported = true;
-            // Settled as having had no job, by a path that could not wait for GitHub (an uninstall): no completion went
-            // out, since one needs a reported start, so the end is reported once from here on.
-            job.record.end_reported &= job.record.ended.is_none();
-            self.reports.job(JobReport {
-                id: format!("{}/started", job.record.runner),
-                kind: EventKind::Started,
-                runner: job.record.runner.clone(),
-                github: job.record.github.clone().unwrap_or_default(),
-                end: None,
-                out_of_memory: false,
-                at: event.started_at.unwrap_or(event.at).unix_timestamp(),
-                machine: facts(&job.record),
-            });
-        }
-        let step = match event.kind {
+        let word = match event.kind {
             EventKind::Started => Event::JobStarted,
             EventKind::Completed => Event::JobCompleted,
         };
-        // GitHub's word and what it does to the machine are one write: a Runner that dies between two would leave a
-        // record whose job started on a machine that still waits for one.
-        if !self.feed(&mut inner, &name, now, step)
-            && let Some(job) = inner.jobs.get(&name)
-        {
-            self.store.save(&job.record);
-        }
-        let opened = self.settle(&mut inner, &name, now);
+        let at = event.started_at.unwrap_or(event.at).unix_timestamp();
+        let opened = self.hear(&mut inner, &name, now, word, at);
         drop(inner);
         if opened {
             self.ring();
