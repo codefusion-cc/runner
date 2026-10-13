@@ -5,13 +5,15 @@
 //! test drives them one at a time; [`Service::run`] is the loop that calls them until it is told to stop.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status,
+    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_host_macos::Battery;
@@ -29,6 +31,7 @@ use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
 use crate::traits::{EventKind, Slots};
+use crate::update::{Pending, SelfUpdate};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -83,6 +86,9 @@ pub struct ServiceConfig {
     /// The first and the longest wait after a listener failed, and how long one must work for the wait to start
     /// small again.
     pub backoff: (Duration, Duration, Duration),
+    /// The longest an update may take from the console's command to the install, the wait for the machines that
+    /// stand included. Under the hour the console waits for a command's result.
+    pub update_limit: Duration,
 }
 
 impl ServiceConfig {
@@ -106,6 +112,7 @@ impl ServiceConfig {
                 Duration::from_secs(300),
                 Duration::from_secs(300),
             ),
+            update_limit: Duration::from_secs(50 * 60),
         }
     }
 }
@@ -200,6 +207,11 @@ pub struct ServiceParts<H, V> {
     pub config: ServiceConfig,
     /// Reads what the console's page shows beside the budget's reading.
     pub extras: Box<dyn Fn() -> HostExtras + Send + Sync>,
+    /// How the Runner updates itself; none where it cannot.
+    pub updates: Option<Arc<dyn SelfUpdate>>,
+    /// Where what came of the console's commands is kept until the console has it, so that a Runner that starts
+    /// again still says it, and does not do a command twice; none to keep it in memory only.
+    pub results: Option<PathBuf>,
 }
 
 struct Shared<H, V> {
@@ -225,6 +237,28 @@ struct Shared<H, V> {
     told: Mutex<(u64, bool)>,
     /// Jobs that wait while the Mac could run them, since the first look that saw them.
     stall: Mutex<Option<Stall>>,
+    updates: Option<Arc<dyn SelfUpdate>>,
+    results_file: Option<PathBuf>,
+    update: Mutex<Updating>,
+    /// Set when the Runner is to end so that launchd starts it again: a restart, or an update installed.
+    restart: AtomicBool,
+    restarting: Notify,
+    /// Set while the Runner ends: the last report says so instead of serving nothing.
+    ending: AtomicBool,
+}
+
+/// What the Runner's updates have come to.
+#[derive(Debug, Default)]
+struct Updating {
+    /// The command of the update under way, which is not done again while it is.
+    command: Option<String>,
+    /// What it does now, for the console, while new jobs wait for it.
+    doing: Option<String>,
+    /// When the console last asked for one.
+    asked_at: Option<i64>,
+    /// The last failure, and when, while updates keep failing.
+    error: Option<(String, i64)>,
+    failures: u32,
 }
 
 /// Jobs this Mac serves that wait while it could run them.
@@ -261,6 +295,25 @@ fn cut(text: String, max: usize) -> String {
     let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
     cut.push('\u{2026}');
     cut
+}
+
+/// The results a Runner before kept for the console. A file that cannot be read keeps nothing: the console sends
+/// its commands again until it has their results.
+fn kept_results(path: Option<&std::path::Path>) -> Vec<CommandResult> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<Vec<CommandResult>>(&bytes).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the results kept for the console cannot be read");
+            Vec::new()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            tracing::warn!(%error, "the results kept for the console cannot be read");
+            Vec::new()
+        }
+    }
 }
 
 /// A moment as the console reads it.
@@ -352,12 +405,80 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 clients: Mutex::new(BTreeMap::new()),
                 discovery_error: Mutex::new(None),
                 not_serving: Mutex::new(None),
-                results: Mutex::new(Vec::new()),
                 refused: Mutex::new(BTreeMap::new()),
                 console_paused: Mutex::new(false),
                 told: Mutex::new((0, false)),
                 stall: Mutex::new(None),
+                updates: parts.updates,
+                update: Mutex::new(Updating::default()),
+                restart: AtomicBool::new(false),
+                restarting: Notify::new(),
+                ending: AtomicBool::new(false),
+                results: Mutex::new(kept_results(parts.results.as_deref())),
+                results_file: parts.results,
             }),
+        }
+    }
+
+    /// Says what came of a command that is not one of a report's answer: an update the Runner that starts finishes.
+    /// Kept until the console has it.
+    pub fn said(&self, id: &str, ok: bool, message: &str) {
+        let shared = &self.shared;
+        {
+            let mut update = shared.update.lock().expect("update");
+            if update.command.as_deref() == Some(id) {
+                update.command = None;
+            }
+        }
+        self.push_result(id.to_string(), ok, message.to_string());
+    }
+
+    /// Takes on an update a Runner before installed, which this one finishes: its command is not done again
+    /// meanwhile.
+    pub fn take_up(&self, pending: &Pending) {
+        self.shared.update.lock().expect("update").command = Some(pending.id.clone());
+    }
+
+    /// Whether the Runner is to end so that launchd starts it again.
+    pub fn restart_requested(&self) -> bool {
+        self.shared.restart.load(Ordering::SeqCst)
+    }
+
+    /// Ends [`Service::run`] so that launchd starts the Runner again.
+    fn restart(&self) {
+        self.shared.restart.store(true, Ordering::SeqCst);
+        self.shared.restarting.notify_one();
+    }
+
+    fn push_result(&self, id: String, ok: bool, message: String) {
+        let shared = &self.shared;
+        tracing::info!(%id, ok, %message, "a result for the console");
+        let mut results = shared.results.lock().expect("results");
+        // One command, one result: a Runner that starts again may come to say it once more.
+        if results.iter().any(|result| result.id == id) {
+            return;
+        }
+        if results.len() < cf_console_client::MAX_RESULTS {
+            results.push(CommandResult {
+                id,
+                ok,
+                message: cut(message, STATUS_TEXT_MAX),
+                at: iso(secs(shared.clock.now())),
+            });
+        }
+        self.keep(&results);
+    }
+
+    /// Writes the results that wait for the console to their file, when there is one.
+    fn keep(&self, results: &[CommandResult]) {
+        let Some(path) = &self.shared.results_file else {
+            return;
+        };
+        let written = serde_json::to_vec(results)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| cf_secret::replace_private(path, &bytes).map_err(|error| error.to_string()));
+        if let Err(error) = written {
+            tracing::warn!(%error, "the results for the console could not be kept; a Runner that starts again does not say them");
         }
     }
 
@@ -894,9 +1015,28 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .map(|set| set.size)
             .min_by_key(|size| size.index())
             .and_then(|smallest| shared.machines.short_of(smallest));
-        let (open, reason) = match no_room {
-            Some(why) => (false, Some(why.to_string())),
-            None => (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone())),
+        let updating = shared.update.lock().expect("update");
+        let (open, reason) = match (&updating.doing, no_room) {
+            (Some(doing), _) => (false, Some(doing.clone())),
+            (None, Some(why)) => (false, Some(why.to_string())),
+            (None, None) => (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone())),
+        };
+        let update = shared.updates.as_ref().map(|updates| Update {
+            source: updates.source(),
+            moved_from: None,
+            checked_at: updating.asked_at.map(iso),
+            error: updating
+                .error
+                .as_ref()
+                .map(|(error, _)| cut(error.clone(), STATUS_TEXT_MAX)),
+            error_at: updating.error.as_ref().map(|(_, at)| iso(*at)),
+            failures: updating.failures,
+        });
+        drop(updating);
+        let not_serving = if shared.ending.load(Ordering::SeqCst) {
+            Some("the Runner ends; the one that starts next serves them again".to_string())
+        } else {
+            shared.not_serving.lock().expect("not serving").clone()
         };
         Report {
             status: Status {
@@ -918,8 +1058,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     })
                     .map(|error| cut(error, HOST_ERROR_MAX)),
                 discovery_error: self.discovery_error().map(|error| cut(error, STATUS_TEXT_MAX)),
-                update: None,
-                not_serving: shared.not_serving.lock().expect("not serving").clone(),
+                update,
+                not_serving,
                 idle_with_jobs_waiting_seconds,
                 idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
                     .map(|reason| cut(reason, STATUS_TEXT_MAX)),
@@ -1006,7 +1146,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let delivered = console.client.deliver(&console.outbox, report).await;
         *shared.told.lock().expect("told") = (queued, delivered.is_ok());
         match delivered {
-            Ok(answer) => self.answered(answer).await,
+            Ok(answer) => {
+                if !results.is_empty() {
+                    // The console has them: they are kept no longer.
+                    let kept = shared.results.lock().expect("results");
+                    self.keep(&kept);
+                }
+                self.answered(answer).await
+            }
             Err(error) => {
                 // What was done for the console is said again with the next report.
                 let mut kept = shared.results.lock().expect("results");
@@ -1055,28 +1202,38 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 .expect("results")
                 .iter()
                 .any(|result| result.id == command.id);
-            if done {
+            let under_way = shared.update.lock().expect("update").command.as_deref() == Some(&command.id);
+            if done || under_way || self.restart_requested() {
                 continue;
             }
-            let (ok, message) = self.command(&command).await;
-            tracing::info!(id = %command.id, kind = %command.kind, ok, %message, "a command of the console");
-            let mut results = shared.results.lock().expect("results");
-            if results.len() < cf_console_client::MAX_RESULTS {
-                results.push(CommandResult {
-                    id: command.id,
-                    ok,
-                    message: cut(message, STATUS_TEXT_MAX),
-                    at: iso(secs(shared.clock.now())),
-                });
+            tracing::info!(id = %command.id, kind = %command.kind, "a command of the console");
+            // An update says what came of it when it is over.
+            let Some((ok, message)) = self.command(&command).await else {
+                continue;
+            };
+            self.push_result(command.id, ok, message);
+            if command.kind == "restart" && ok {
+                // Said and kept first: the Runner that starts reports it, and does not restart again.
+                self.restart();
             }
         }
         Duration::from_secs(answer.report_every.clamp(1, 600))
     }
 
-    /// Does one command of the console's. Only what this Runner can do today is done; the rest is answered as
-    /// not done, so that the console's page says so instead of waiting.
-    async fn command(&self, command: &Command) -> (bool, String) {
-        match command.kind.as_str() {
+    /// Does one command of the console's, and says what came of it; an update says so when it is over. Only what
+    /// this Runner can do today is done; the rest is answered as not done, so that the console's page says so
+    /// instead of waiting.
+    async fn command(&self, command: &Command) -> Option<(bool, String)> {
+        Some(match command.kind.as_str() {
+            "restart" if self.shared.update.lock().expect("update").command.is_some() => (
+                false,
+                "an update is under way; it starts the Runner again itself".into(),
+            ),
+            "restart" => (
+                true,
+                format!("{} ends and launchd starts it again", self.shared.config.version),
+            ),
+            "update" => return self.update(&command.id),
             "stop-runner" => {
                 let name = command
                     .args
@@ -1084,7 +1241,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .and_then(|args| args.get("name").or_else(|| args.get("runner")))
                     .and_then(|name| name.as_str());
                 let Some(name) = name else {
-                    return (false, "the command names no Actions runner".into());
+                    return Some((false, "the command names no Actions runner".into()));
                 };
                 let stands = self
                     .shared
@@ -1094,13 +1251,109 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .iter()
                     .any(|machine| machine.runner == name);
                 if !stands {
-                    return (false, format!("{name} is not on this Mac"));
+                    return Some((false, format!("{name} is not on this Mac")));
                 }
                 self.shared.machines.stop(crate::names::job_name(name));
                 (true, format!("{name} is being stopped"))
             }
             kind => (false, format!("this Runner does not do `{kind}` yet")),
+        })
+    }
+
+    /// Starts an update in the background, or says at once why none starts.
+    fn update(&self, id: &str) -> Option<(bool, String)> {
+        let Some(updates) = self.shared.updates.clone() else {
+            return Some((false, "this Runner has nowhere to update from".into()));
+        };
+        {
+            let mut update = self.shared.update.lock().expect("update");
+            update.asked_at = Some(secs(self.shared.clock.now()));
+            if update.command.is_some() {
+                return Some((false, "an update is under way already".into()));
+            }
+            update.command = Some(id.to_string());
+            update.doing = Some("updating: building".into());
         }
+        let service = Service {
+            shared: self.shared.clone(),
+        };
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let outcome = service.updating(&id, updates).await;
+            let mut update = service.shared.update.lock().expect("update");
+            update.doing = None;
+            match outcome {
+                // Installed: the Runner that starts next says how it went.
+                Ok(None) => {}
+                Ok(Some(message)) => {
+                    update.command = None;
+                    update.error = None;
+                    update.failures = 0;
+                    drop(update);
+                    service.push_result(id, true, message);
+                }
+                Err(message) => {
+                    update.command = None;
+                    update.error = Some((message.clone(), secs(service.shared.clock.now())));
+                    update.failures = update.failures.saturating_add(1);
+                    drop(update);
+                    service.shared.machines.hold_for_update(false);
+                    tracing::warn!(%message, "the update did not take; the Runner goes on as it was");
+                    service.push_result(id, false, message);
+                }
+            }
+        });
+        None
+    }
+
+    /// Builds, waits for the machines that stand to end, installs and ends the Runner. Answers what to tell the
+    /// console when it is over without an install, `None` once the new program is in place.
+    async fn updating(&self, id: &str, updates: Arc<dyn SelfUpdate>) -> Result<Option<String>, String> {
+        let shared = &self.shared;
+        let began = Instant::now();
+        let running = shared.config.version.clone();
+        let built = {
+            let updates = updates.clone();
+            tokio::task::spawn_blocking(move || updates.build())
+                .await
+                .map_err(|error| format!("the build stopped: {error}"))??
+        };
+        if built == running {
+            return Ok(Some(format!("{running} runs already: there is nothing newer")));
+        }
+        tracing::info!(from = %running, to = %built, "an update is built; no new job until the machines that stand are gone");
+        shared.machines.hold_for_update(true);
+        loop {
+            let standing = shared.machines.unsettled();
+            if standing == 0 {
+                break;
+            }
+            if began.elapsed() >= shared.config.update_limit {
+                return Err(format!(
+                    "{built} was not installed: {standing} {} still {} after {}",
+                    if standing == 1 { "machine" } else { "machines" },
+                    if standing == 1 { "stands" } else { "stand" },
+                    crate::update::spoken(shared.config.update_limit),
+                ));
+            }
+            shared.update.lock().expect("update").doing = Some(format!(
+                "updating to {built}: waiting for {standing} {} to end",
+                if standing == 1 { "machine" } else { "machines" }
+            ));
+            tokio::time::sleep(shared.config.tick_every).await;
+        }
+        shared.update.lock().expect("update").doing = Some(format!("updating to {built}: installing"));
+        let pending = Pending {
+            id: id.to_string(),
+            from: running,
+            to: built,
+            starts: 0,
+        };
+        tokio::task::spawn_blocking(move || updates.install(&pending))
+            .await
+            .map_err(|error| format!("the install stopped: {error}"))??;
+        self.restart();
+        Ok(None)
     }
 
     /// Runs the service until `stop` is set: the machines' tick every second, a look at GitHub's repositories now
@@ -1134,6 +1387,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         loop {
             tokio::select! {
                 () = stop.wait() => break,
+                () = self.shared.restarting.notified() => {
+                    tracing::info!("the Runner ends to start again");
+                    break;
+                }
                 _ = discover.tick() => self.discover().await,
                 _ = sweep.tick() => self.sweep().await,
                 () = &mut report => {
@@ -1175,6 +1432,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// they are.
     pub async fn shutdown(&self) {
         self.shared.machines.drain();
+        self.shared.ending.store(true, Ordering::SeqCst);
         self.close_all().await;
         self.sweep().await;
         if self.shared.console.is_some() {

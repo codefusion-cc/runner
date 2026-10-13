@@ -11,6 +11,8 @@ mod launchd;
 #[cfg(target_os = "macos")]
 mod service;
 #[cfg(target_os = "macos")]
+mod update;
+#[cfg(target_os = "macos")]
 mod vm;
 
 use std::process::ExitCode;
