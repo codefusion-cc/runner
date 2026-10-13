@@ -30,7 +30,8 @@ mod mac;
 #[cfg(target_os = "macos")]
 pub use backup::exclude_from_backup;
 pub use backup::{ATTRIBUTE, Attributes, Exclusion, VALUE, exclude_with};
-pub use convert::{Battery, Raw, battery_in, model_name, reading};
+pub use cf_budget::Battery;
+pub use convert::{Raw, battery_in, model_name, reading};
 pub use fake::FakeHost;
 #[cfg(target_os = "macos")]
 pub use mac::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, program_of};
