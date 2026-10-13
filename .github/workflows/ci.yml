@@ -34,9 +34,10 @@ jobs:
       - name: Guest image
         run: cargo xtask guest
       - run: cargo clippy --locked --workspace --all-targets -j3 -- -D warnings
-      # The supervisor's Linux half is compiled for the guest only, so the line above never sees it.
+      # The guest's Linux code for its own target: musl's libc types are not glibc's, so the Linux job below does
+      # not stand in for this.
       - name: Lint the guest supervisor for its own target
-        run: cargo clippy --locked -p cf-supervisor --target aarch64-unknown-linux-musl --bins -j3 -- -D warnings
+        run: cargo clippy --locked -p cf-supervisor -p cf-nft --target aarch64-unknown-linux-musl --bins --lib -j3 -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace -j3
         env:
@@ -76,8 +77,9 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Ubuntu 24.04 gives an unprivileged user namespace no capabilities unless AppArmor allows the program, so
-      # cf-nft's kernel tests could not change the rules of their own network namespace. Lift that, for this VM only.
+      # Ubuntu 24.04 holds unprivileged user namespaces to what AppArmor allows a program, and this runner image has
+      # it on: cf-nft's kernel tests then cannot even map their user ("Permission denied" on uid_map). Lift that, for
+      # this VM only.
       - name: Unprivileged user namespaces
         run: |
           restricted="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"

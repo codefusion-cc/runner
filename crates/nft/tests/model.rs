@@ -1,23 +1,15 @@
 //! What rules do with packets, which tables the encoder refuses, and that the netlink form means what `decide` says.
 
+mod common;
+
 use cf_nft::{
     ARP, Chain, Error, Family, Hook, IPV4, IPV6, Interface, Load, Match, Packet, Rule, TCP, Table, UDP,
     Verdict, batch, decide, network, read,
 };
+use common::{device, messages, rule};
 use proptest::prelude::*;
 
 const TAP: &str = "tap0";
-
-fn device(name: &str) -> Interface {
-    Interface::new(name).unwrap()
-}
-
-fn rule(when: &[Match], then: Verdict) -> Rule {
-    Rule {
-        when: when.to_vec(),
-        then,
-    }
-}
 
 fn packet(ether_type: u16, dest: [u8; 4], protocol: u8, dest_port: u16) -> Packet {
     Packet {
@@ -400,17 +392,10 @@ fn a_batch_is_one_transaction_with_an_answer_for_each_change() {
         ),
     ];
     let kinds_of = |bytes: &[u8]| {
-        let mut kinds = Vec::new();
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let length = u32::from_ne_bytes(rest[..4].try_into().unwrap()) as usize;
-            kinds.push((
-                u16::from_ne_bytes([rest[4], rest[5]]),
-                u32::from_ne_bytes(rest[8..12].try_into().unwrap()),
-            ));
-            rest = &rest[length.next_multiple_of(4)..];
-        }
-        kinds
+        messages(bytes)
+            .into_iter()
+            .map(|(kind, sequence, _)| (kind, sequence))
+            .collect::<Vec<_>>()
     };
     for (load, removal) in [(Load::Add, 0), (Load::Replace, 1)] {
         let written = batch(&tables, load).unwrap();
@@ -429,8 +414,9 @@ fn a_batch_is_one_transaction_with_an_answer_for_each_change() {
         );
         assert_eq!(read(&written.bytes).unwrap(), tables);
     }
-    // A rule's expressions are one attribute of at most 65535 bytes: the most conditions, each the longest there is,
-    // still read back, and one more is refused instead of written with a length that wrapped.
+    // A rule's expressions are one attribute of at most 65535 bytes: the most conditions that fit, each the longest
+    // there is, still read back, and one more is refused instead of written with a length that wrapped. A rule of 256
+    // such conditions is well inside it.
     let longest = |conditions: usize| {
         let when = vec![
             Match::DestIn {
@@ -441,10 +427,13 @@ fn a_batch_is_one_transaction_with_an_answer_for_each_change() {
         ];
         table(Family::Inet, Hook::Output, vec![rule(&when, Verdict::Drop)])
     };
-    let most = batch(&[longest(256)], Load::Add).unwrap();
-    assert_eq!(read(&most.bytes).unwrap(), [longest(256)]);
+    let most = (256..400)
+        .find(|conditions| batch(&[longest(conditions + 1)], Load::Add).is_err())
+        .expect("a rule too long for netlink was written");
+    let written = batch(&[longest(most)], Load::Add).unwrap();
+    assert_eq!(read(&written.bytes).unwrap(), [longest(most)]);
     assert!(matches!(
-        batch(&[longest(257)], Load::Add),
+        batch(&[longest(most + 1)], Load::Add),
         Err(Error::Rule { rule: 0, .. })
     ));
     // No tables at all is a transaction that changes nothing, or removes everything.
@@ -587,24 +576,7 @@ fn what_the_crate_does_not_write_is_not_read_as_its_own() {
 /// the crate's reader, with the packet's bytes laid out as the kernel would find them.
 mod kernel_model {
     use super::*;
-
-    /// `(kind, payload)` of each attribute, the kind without its flags.
-    fn attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
-        let mut found = Vec::new();
-        while !bytes.is_empty() {
-            let length = usize::from(u16::from_ne_bytes([bytes[0], bytes[1]]));
-            found.push((
-                u16::from_ne_bytes([bytes[2], bytes[3]]) & 0x3fff,
-                &bytes[4..length],
-            ));
-            bytes = &bytes[length.next_multiple_of(4).min(bytes.len())..];
-        }
-        found
-    }
-
-    fn get<'a>(attributes: &[(u16, &'a [u8])], kind: u16) -> &'a [u8] {
-        attributes.iter().find(|(found, _)| *found == kind).unwrap().1
-    }
+    use crate::common::{attributes, get};
 
     fn number(attributes: &[(u16, &[u8])], kind: u16) -> u32 {
         u32::from_be_bytes(get(attributes, kind).try_into().unwrap())
@@ -678,12 +650,11 @@ mod kernel_model {
             other => panic!("verdict {other}"),
         };
         let mut policy = None;
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let length = u32::from_ne_bytes(rest[..4].try_into().unwrap()) as usize;
-            let kind = u16::from_ne_bytes([rest[4], rest[5]]);
-            let message = attributes(&rest[20..length]);
-            rest = &rest[length.next_multiple_of(4)..];
+        for (kind, _, body) in messages(bytes) {
+            if body.len() < 4 {
+                continue;
+            }
+            let message = attributes(&body[4..]);
             if kind == 0x0a03 && get(&message, 3) == [chain.as_bytes(), b"\0"].concat() {
                 policy = Some(verdict(number(&message, 5)));
             }

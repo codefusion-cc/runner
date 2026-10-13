@@ -49,9 +49,8 @@ pub fn network(address: Ip, prefix: u8) -> Ip {
 pub struct Interface([u8; 16]);
 
 impl Interface {
-    /// A name the kernel would give a device: 1 to 15 bytes, not `.` or `..`, with no NUL, `/`, `:` or byte the
-    /// kernel's `isspace` takes for white space (the vertical tab and 0xa0 among them, so a UTF-8 character that holds
-    /// that byte too).
+    /// A name the kernel would give a device, as its `dev_valid_name` says: 1 to 15 bytes, not `.` or `..`, with no
+    /// NUL, `/`, `:` or byte its `isspace` takes for white space (a UTF-8 character holding 0xa0 among them).
     pub fn new(name: &str) -> Result<Self, Error> {
         let bytes = name.as_bytes();
         let valid = !bytes.is_empty()
@@ -60,7 +59,7 @@ impl Interface {
             && name != ".."
             && !bytes
                 .iter()
-                .any(|byte| matches!(byte, 0 | b'/' | b':' | 0x0b | 0xa0) || byte.is_ascii_whitespace());
+                .any(|byte| matches!(byte, 0 | b'/' | b':' | b'\t'..=b'\r' | b' ' | 0xa0));
         if !valid {
             return Err(Error::Interface(name.to_string()));
         }
@@ -69,12 +68,22 @@ impl Interface {
         Ok(Self(padded))
     }
 
+    /// The device whose name the kernel keeps as these bytes, if it could be one: a name, then only zeros.
+    pub(crate) fn from_kernel(bytes: &[u8]) -> Option<Self> {
+        let device = Self::new(std::str::from_utf8(until_nul(bytes)).ok()?).ok()?;
+        (device.0 == bytes).then_some(device)
+    }
+
     /// The name.
     pub fn name(&self) -> &str {
-        let end = self.0.iter().position(|byte| *byte == 0).unwrap_or(16);
         // Made from a `str` by `new`, cut at a NUL that only the padding has.
-        std::str::from_utf8(&self.0[..end]).unwrap_or_default()
+        std::str::from_utf8(until_nul(&self.0)).unwrap_or_default()
     }
+}
+
+fn until_nul(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    &bytes[..end]
 }
 
 impl fmt::Debug for Interface {
@@ -309,12 +318,12 @@ impl fmt::Display for Error {
             Self::Interface(name) => write!(formatter, "no device can be called {name:?}"),
             Self::Table(problem) => formatter.write_str(problem),
             Self::Rule { chain, rule, problem } => write!(formatter, "rule {rule} of {chain}: {problem}"),
-            Self::Unreadable(problem) => write!(formatter, "unreadable rules: {problem}"),
+            Self::Unreadable(problem) => write!(formatter, "unreadable messages: {problem}"),
             Self::Io(what, error) => write!(formatter, "{what}: {error}"),
             Self::Refused { message, error } => {
                 write!(formatter, "the kernel refused message {message}: {error}")
             }
-            Self::Interrupted => formatter.write_str("the rules changed while they were listed"),
+            Self::Interrupted => formatter.write_str("what the kernel holds changed while it was listed"),
         }
     }
 }

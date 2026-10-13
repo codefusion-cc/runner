@@ -10,11 +10,9 @@ use crate::encode::{
     NFT_META_OIF, NFT_META_PROTOCOL, NFT_MSG_DELTABLE, NFT_MSG_NEWCHAIN, NFT_MSG_NEWRULE, NFT_MSG_NEWTABLE,
     NFT_PAYLOAD_NETWORK_HEADER, NFT_PAYLOAD_TRANSPORT_HEADER, NFT_REG_1, NFT_REG_VERDICT,
 };
-use crate::netlink::{NLM_F_APPEND, NLM_F_REQUEST, NLMSG_DONE, attributes, messages};
+use crate::netlink::{NLM_F_APPEND, NLM_F_REPLACE, NLM_F_REQUEST, NLMSG_DONE, attributes, messages};
 use crate::{Chain, Error, Family, Hook, IPV4, Interface, Match, Rule, Table, Verdict};
 
-/// Replaces the rule a request names, from the kernel's `netlink.h`.
-const NLM_F_REPLACE: u16 = 0x100;
 /// A rule's place by the handle of another, from `nf_tables.h`.
 const NFTA_RULE_POSITION: u16 = 6;
 /// A rule's place by the id of another in the same batch.
@@ -137,16 +135,36 @@ fn hook(family: Family, attributes: &Attributes<'_>) -> Result<Hook, Error> {
     }
 }
 
-/// The value a comparison for equality holds a register's bytes against.
-fn equal_to<'a>(expression: Option<&Expression<'a>>) -> Result<&'a [u8], Error> {
+/// The value a comparison of register 1 by `operation` holds it against.
+fn compared<'a>(expression: Option<&Expression<'a>>, operation: u32) -> Result<&'a [u8], Error> {
     match expression {
         Some(compare)
-            if compare.is("cmp") && compare.on_register_1(1) && compare.data.number(2)? == NFT_CMP_EQ =>
+            if compare.is("cmp") && compare.on_register_1(1) && compare.data.number(2)? == operation =>
         {
             compare.data.value(3)
         }
         _ => Err(unreadable("a load without its comparison")),
     }
+}
+
+/// The value a comparison for equality holds register 1 against.
+fn equal_to<'a>(expression: Option<&Expression<'a>>) -> Result<&'a [u8], Error> {
+    compared(expression, NFT_CMP_EQ)
+}
+
+/// The mask of a bitwise expression that ands register 1's 4 bytes with it in place, xor 0.
+fn mask_of(bitwise: &Expression<'_>) -> Option<u32> {
+    let plain = bitwise.is("bitwise")
+        && bitwise.on_register_1(1)
+        && bitwise.on_register_1(2)
+        && bitwise.data.number(3).ok() == Some(4)
+        && bitwise.data.value(5).ok() == Some(&[0; 4][..])
+        && bitwise
+            .data
+            .get(6)
+            .is_none_or(|_| bitwise.data.number(6).ok() == Some(0));
+    let mask = <[u8; 4]>::try_from(bitwise.data.value(4).ok()?).ok()?;
+    plain.then_some(u32::from_be_bytes(mask))
 }
 
 /// Whether this expression loads the IPv4 destination.
@@ -157,34 +175,20 @@ fn loads_destination(load: &Expression<'_>) -> bool {
             == [Some(NFT_PAYLOAD_NETWORK_HEADER), Some(16), Some(4)]
 }
 
-/// A destination network from `expressions[at..]`, which start with the load of the IPv4 destination: the network
-/// and how many expressions it took.
-fn destination(expressions: &[Expression<'_>], at: usize) -> Result<(Match, usize), Error> {
-    if !expressions.get(at).is_some_and(loads_destination) {
+/// A destination network from the check for IPv4 that starts `expressions`, followed by the load of the IPv4
+/// destination: the network and how many expressions it took.
+fn destination(expressions: &[Expression<'_>]) -> Result<(Match, usize), Error> {
+    if !expressions.get(2).is_some_and(loads_destination) {
         return Err(unreadable("an IPv4 check with no destination after it"));
     }
-    let (mask, used) = match expressions.get(at + 1) {
-        Some(bitwise) if bitwise.is("bitwise") => {
-            let operation = bitwise.data.get(6).map_or(Ok(0), |_| bitwise.data.number(6))?;
-            let xor = bitwise.data.value(5)?;
-            let mask = <[u8; 4]>::try_from(bitwise.data.value(4)?).map(u32::from_be_bytes);
-            match mask {
-                Ok(mask)
-                    if operation == 0
-                        && bitwise.on_register_1(1)
-                        && bitwise.on_register_1(2)
-                        && bitwise.data.number(3)? == 4
-                        && xor == [0; 4]
-                        && mask.leading_ones() + mask.trailing_zeros() == 32 =>
-                {
-                    (mask, 2)
-                }
-                _ => return Err(unreadable("a destination under a mask that is no prefix")),
-            }
-        }
+    let (mask, used) = match expressions.get(3) {
+        Some(bitwise) if bitwise.is("bitwise") => match mask_of(bitwise) {
+            Some(mask) if mask.leading_ones() + mask.trailing_zeros() == 32 => (mask, 2),
+            _ => return Err(unreadable("a destination under a mask that is no prefix")),
+        },
         _ => (u32::MAX, 1),
     };
-    let value = <[u8; 4]>::try_from(equal_to(expressions.get(at + used))?)
+    let value = <[u8; 4]>::try_from(equal_to(expressions.get(2 + used))?)
         .map(u32::from_be_bytes)
         .map_err(|_| unreadable("an address that is not 4 bytes"))?;
     if value & !mask != 0 {
@@ -194,7 +198,7 @@ fn destination(expressions: &[Expression<'_>], at: usize) -> Result<(Match, usiz
         network: value.to_be_bytes(),
         prefix: mask.leading_ones() as u8,
     };
-    Ok((found, at + used + 1))
+    Ok((found, 2 + used + 1))
 }
 
 /// The condition `expressions` start with, and how many expressions it took.
@@ -206,26 +210,18 @@ fn condition(expressions: &[Expression<'_>], family: Family) -> Result<(Match, u
         let found = match (first.data.number(2)?, value) {
             (NFT_META_OIF, value) if value == loopback => Match::OutLoopback,
             (NFT_META_IIF, value) if value == loopback => Match::InLoopback,
-            (NFT_META_IIFNAME, value) if value.len() == 16 => {
-                let end = value.iter().position(|byte| *byte == 0).unwrap_or(16);
-                let name = std::str::from_utf8(&value[..end])
-                    .map_err(|_| unreadable("a device name that is not text"))?;
-                let device = Interface::new(name).map_err(|error| unreadable(error.to_string()))?;
-                if device.0 != value {
-                    return Err(unreadable("a device name with bytes after its end"));
-                }
-                Match::InInterface(device)
-            }
+            (NFT_META_IIFNAME, value) => Match::InInterface(
+                Interface::from_kernel(value)
+                    .ok_or_else(|| unreadable("a device name no device could have"))?,
+            ),
             (NFT_META_NFPROTO, [NFPROTO_IPV6]) if family == Family::Inet => Match::Ipv6,
-            (NFT_META_NFPROTO, [NFPROTO_IPV4]) if family == Family::Inet => {
-                return destination(expressions, 2);
-            }
+            (NFT_META_NFPROTO, [NFPROTO_IPV4]) if family == Family::Inet => return destination(expressions),
             (NFT_META_PROTOCOL, value)
                 if family != Family::Inet
                     && value == IPV4.to_be_bytes()
                     && expressions.get(2).is_some_and(loads_destination) =>
             {
-                return destination(expressions, 2);
+                return destination(expressions);
             }
             (NFT_META_PROTOCOL, &[high, low]) => Match::EtherType(u16::from_be_bytes([high, low])),
             (NFT_META_L4PROTO, &[protocol]) => Match::Protocol(protocol),
@@ -253,25 +249,10 @@ fn condition(expressions: &[Expression<'_>], family: Family) -> Result<(Match, u
         )));
     }
     if first.is("ct") && first.on_register_1(1) && first.data.number(2)? == NFT_CT_STATE {
-        let states = CT_ESTABLISHED_OR_RELATED.to_ne_bytes();
-        let masked = expressions.get(1).is_some_and(|bitwise| {
-            bitwise.is("bitwise")
-                && bitwise.on_register_1(1)
-                && bitwise.on_register_1(2)
-                && bitwise.data.number(3).ok() == Some(4)
-                && bitwise.data.value(4).is_ok_and(|mask| mask == states)
-                && bitwise.data.value(5).is_ok_and(|xor| xor == [0; 4])
-                && bitwise
-                    .data
-                    .get(6)
-                    .is_none_or(|_| bitwise.data.number(6).ok() == Some(0))
-        });
-        let not_zero = expressions.get(2).is_some_and(|compare| {
-            compare.is("cmp")
-                && compare.on_register_1(1)
-                && compare.data.number(2).ok() == Some(NFT_CMP_NEQ)
-                && compare.data.value(3).is_ok_and(|value| value == [0; 4])
-        });
+        // The states are a bit field in the host's byte order; `mask_of` reads masks as addresses, big-endian.
+        let states = u32::from_be_bytes(CT_ESTABLISHED_OR_RELATED.to_ne_bytes());
+        let masked = expressions.get(1).and_then(mask_of) == Some(states);
+        let not_zero = compared(expressions.get(2), NFT_CMP_NEQ).is_ok_and(|value| value == [0; 4]);
         if masked && not_zero {
             return Ok((Match::Established, 3));
         }
@@ -364,11 +345,7 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Table>, Error> {
                         .nested(4)
                         .map_err(|_| unreadable(format!("chain {name:?} has no hook")))?,
                 )?;
-                let chains = &mut tables[table].chains;
-                if chains.iter().any(|chain| chain.name == name) {
-                    return Err(unreadable(format!("chain {name:?} twice")));
-                }
-                chains.push(Chain {
+                tables[table].chains.push(Chain {
                     name: name.to_string(),
                     hook,
                     policy: verdict(attributes.number(5)?)?,
@@ -405,5 +382,7 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Table>, Error> {
             (kind, _) => return Err(unreadable(format!("an nf_tables message of kind {kind}"))),
         }
     }
+    // What `batch` would refuse to write, this crate could not have written.
+    crate::encode::check(&tables).map_err(|error| unreadable(error.to_string()))?;
     Ok(tables)
 }

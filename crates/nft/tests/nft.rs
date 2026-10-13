@@ -11,9 +11,10 @@
 //! each chain's attributes one by one, and the tables `read` makes of nft's own bytes.
 #![cfg(target_endian = "little")]
 
-use cf_nft::{
-    ARP, Chain, Family, Hook, IPV4, IPV6, Interface, Load, Match, Rule, TCP, Table, UDP, Verdict, batch, read,
-};
+mod common;
+
+use cf_nft::{ARP, Chain, Family, Hook, IPV4, IPV6, Load, Match, TCP, Table, UDP, Verdict, batch, read};
+use common::{attributes, dest, device, get, rule};
 use std::collections::BTreeMap;
 
 fn hex(text: &str) -> Vec<u8> {
@@ -24,40 +25,13 @@ fn hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// `(kind, payload)` of each attribute, the kind without its flags. Written here, apart from the crate's reader.
-fn attributes(mut bytes: &[u8]) -> Vec<(u16, &[u8])> {
-    let mut found = Vec::new();
-    while !bytes.is_empty() {
-        let length = usize::from(u16::from_ne_bytes([bytes[0], bytes[1]]));
-        assert!(
-            length >= 4 && length <= bytes.len(),
-            "an attribute runs past its end"
-        );
-        found.push((
-            u16::from_ne_bytes([bytes[2], bytes[3]]) & 0x3fff,
-            &bytes[4..length],
-        ));
-        bytes = &bytes[length.next_multiple_of(4).min(bytes.len())..];
-    }
-    found
-}
-
 /// `(kind, nfnetlink family, attributes)` of each nf_tables message.
-fn messages(mut bytes: &[u8]) -> Vec<(u16, u8, &[u8])> {
-    let mut found = Vec::new();
-    while !bytes.is_empty() {
-        let length = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as usize;
-        let kind = u16::from_ne_bytes([bytes[4], bytes[5]]);
-        if kind >> 8 == 10 {
-            found.push((kind & 0xff, bytes[16], &bytes[20..length]));
-        }
-        bytes = &bytes[length.next_multiple_of(4)..];
-    }
-    found
-}
-
-fn get<'a>(attributes: &[(u16, &'a [u8])], kind: u16) -> &'a [u8] {
-    attributes.iter().find(|(found, _)| *found == kind).unwrap().1
+fn messages(bytes: &[u8]) -> Vec<(u16, u8, &[u8])> {
+    common::messages(bytes)
+        .into_iter()
+        .filter(|(kind, _, _)| kind >> 8 == 10)
+        .map(|(kind, _, body)| (kind & 0xff, body[0], &body[4..]))
+        .collect()
 }
 
 /// Each rule as `(family, chain, its expressions' bytes)`.
@@ -94,21 +68,6 @@ fn chains(bytes: &[u8]) -> Vec<(u8, ByKind, ByKind)> {
             (family, chain, hook)
         })
         .collect()
-}
-
-fn rule(when: &[Match], then: Verdict) -> Rule {
-    Rule {
-        when: when.to_vec(),
-        then,
-    }
-}
-
-fn device(name: &str) -> Interface {
-    Interface::new(name).unwrap()
-}
-
-fn dest(network: [u8; 4], prefix: u8) -> Match {
-    Match::DestIn { network, prefix }
 }
 
 /// `nft/inet.nft`: the guest's kinds of rules.

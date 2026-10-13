@@ -1,5 +1,5 @@
 //! Netlink as any of its protocols has it: messages, attributes, and on Linux a socket that sends requests and
-//! reads the kernel's answers. nf_tables is one user; the host's network setup (rtnetlink) is another.
+//! reads the kernel's answers. nf_tables is one user; any other protocol, such as rtnetlink, can use it the same way.
 
 /// An error or an acknowledgement.
 pub const NLMSG_ERROR: u16 = 2;
@@ -7,8 +7,6 @@ pub const NLMSG_ERROR: u16 = 2;
 pub const NLMSG_DONE: u16 = 3;
 /// A request.
 pub const NLM_F_REQUEST: u16 = 0x1;
-/// One of many answers.
-pub const NLM_F_MULTI: u16 = 0x2;
 /// Asks for an acknowledgement.
 pub const NLM_F_ACK: u16 = 0x4;
 /// A listing changed while it was dumped.
@@ -17,16 +15,25 @@ pub const NLM_F_DUMP_INTR: u16 = 0x10;
 pub const NLM_F_DUMP: u16 = 0x300;
 /// Makes what is not there.
 pub const NLM_F_CREATE: u16 = 0x400;
+/// Replaces what the request names.
+pub const NLM_F_REPLACE: u16 = 0x100;
 /// Adds at the end.
 pub const NLM_F_APPEND: u16 = 0x800;
 /// The flag of an attribute that holds attributes.
 pub const NLA_F_NESTED: u16 = 0x8000;
 /// The bits of an attribute's kind that are flags.
 const NLA_FLAGS: u16 = 0xc000;
+/// The longest payload an attribute holds: its length, header included, is 16 bits.
+pub const LONGEST_PAYLOAD: usize = u16::MAX as usize - 4;
 
 /// Appends an attribute: its length, its kind, the payload, padded to 4 bytes.
+///
+/// # Panics
+///
+/// When the payload is longer than [`LONGEST_PAYLOAD`]; a caller that cannot know checks first.
 pub fn attribute(to: &mut Vec<u8>, kind: u16, payload: &[u8]) {
-    to.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+    let length = u16::try_from(4 + payload.len()).expect("an attribute longer than netlink holds");
+    to.extend_from_slice(&length.to_ne_bytes());
     to.extend_from_slice(&kind.to_ne_bytes());
     to.extend_from_slice(payload);
     to.resize(to.len().next_multiple_of(4), 0);
@@ -63,54 +70,57 @@ pub struct Message<'a> {
     pub body: &'a [u8],
 }
 
-/// The messages in `bytes`, or an error at the first whose length does not fit.
-pub fn messages(bytes: &[u8]) -> impl Iterator<Item = Result<Message<'_>, String>> {
+/// The pieces of `bytes` that each start with their own length, read by `length` and at least `header` bytes long,
+/// or an error at the first whose length does not fit. Each is followed by padding to 4 bytes.
+fn pieces<'a>(
+    bytes: &'a [u8],
+    header: usize,
+    what: &'static str,
+    length: fn(&[u8]) -> usize,
+) -> impl Iterator<Item = Result<&'a [u8], String>> {
     let mut rest = bytes;
     std::iter::from_fn(move || {
         if rest.is_empty() {
             return None;
         }
-        let length = rest.get(..4).map_or(0, |length| {
-            u32::from_ne_bytes(length.try_into().unwrap_or_default()) as usize
-        });
-        if length < 16 || length > rest.len() {
+        let size = if rest.len() < header { 0 } else { length(rest) };
+        if size < header || size > rest.len() {
             let left = rest.len();
             rest = &[];
-            return Some(Err(format!("a message of {length} bytes where {left} are left")));
+            return Some(Err(format!("{what} of {size} bytes where {left} are left")));
         }
-        let message = Message {
-            kind: u16::from_ne_bytes([rest[4], rest[5]]),
-            flags: u16::from_ne_bytes([rest[6], rest[7]]),
-            sequence: u32::from_ne_bytes([rest[8], rest[9], rest[10], rest[11]]),
-            body: &rest[16..length],
-        };
-        rest = &rest[length.next_multiple_of(4).min(rest.len())..];
-        Some(Ok(message))
+        let piece = &rest[..size];
+        rest = &rest[size.next_multiple_of(4).min(rest.len())..];
+        Some(Ok(piece))
+    })
+}
+
+/// The messages in `bytes`, or an error at the first whose length does not fit.
+pub fn messages(bytes: &[u8]) -> impl Iterator<Item = Result<Message<'_>, String>> {
+    pieces(bytes, 16, "a message", |header| {
+        u32::from_ne_bytes([header[0], header[1], header[2], header[3]]) as usize
+    })
+    .map(|piece| {
+        piece.map(|message| Message {
+            kind: u16::from_ne_bytes([message[4], message[5]]),
+            flags: u16::from_ne_bytes([message[6], message[7]]),
+            sequence: u32::from_ne_bytes([message[8], message[9], message[10], message[11]]),
+            body: &message[16..],
+        })
     })
 }
 
 /// The attributes in `bytes` as `(kind without its flags, payload)`, or an error at the first whose length does not
 /// fit.
 pub fn attributes(bytes: &[u8]) -> impl Iterator<Item = Result<(u16, &[u8]), String>> {
-    let mut rest = bytes;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let length = rest.get(..2).map_or(0, |length| {
-            usize::from(u16::from_ne_bytes([length[0], length[1]]))
-        });
-        if length < 4 || length > rest.len() {
-            let left = rest.len();
-            rest = &[];
-            return Some(Err(format!(
-                "an attribute of {length} bytes where {left} are left"
-            )));
-        }
-        let kind = u16::from_ne_bytes([rest[2], rest[3]]) & !NLA_FLAGS;
-        let payload = &rest[4..length];
-        rest = &rest[length.next_multiple_of(4).min(rest.len())..];
-        Some(Ok((kind, payload)))
+    pieces(bytes, 4, "an attribute", |header| {
+        usize::from(u16::from_ne_bytes([header[0], header[1]]))
+    })
+    .map(|piece| {
+        piece.map(|attribute| {
+            let kind = u16::from_ne_bytes([attribute[2], attribute[3]]) & !NLA_FLAGS;
+            (kind, &attribute[4..])
+        })
     })
 }
 

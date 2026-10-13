@@ -4,10 +4,12 @@
 //! unless `CF_REQUIRE_NAMESPACES` is set (CI sets it, so a runner that cannot do this goes red, not quiet).
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use cf_nft::{
-    ARP, Chain, Error, Family, Hook, IPV4, IPV6, Interface, Load, Match, Rule, TCP, Table, UDP, Verdict,
-    apply, batch, list,
+    ARP, Chain, Error, Family, Hook, IPV4, IPV6, Load, Match, TCP, Table, UDP, Verdict, apply, batch, list,
 };
+use common::{dest, device, rule};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -98,17 +100,6 @@ fn apply_tables(tables: &[Table], load: Load) {
     apply(&batch(tables, load).unwrap()).unwrap();
 }
 
-fn device(name: &str) -> Interface {
-    Interface::new(name).unwrap()
-}
-
-fn rule(when: &[Match], then: Verdict) -> Rule {
-    Rule {
-        when: when.to_vec(),
-        then,
-    }
-}
-
 /// A bridge firewall in front of a tap, as the host puts it there.
 fn bridge() -> Table {
     let tap = Match::InInterface(device("tap0"));
@@ -118,10 +109,7 @@ fn bridge() -> Table {
         rule(
             &[
                 tap,
-                Match::DestIn {
-                    network: [10, 0, 2, 3],
-                    prefix: 32,
-                },
+                dest([10, 0, 2, 3], 32),
                 Match::Protocol(UDP),
                 Match::DestPort(53),
             ],
@@ -140,7 +128,7 @@ fn bridge() -> Table {
         ([224, 0, 0, 0], 4),
         ([203, 0, 113, 7], 32),
     ] {
-        rules.push(rule(&[tap, Match::DestIn { network, prefix }], Verdict::Drop));
+        rules.push(rule(&[tap, dest(network, prefix)], Verdict::Drop));
     }
     rules.push(rule(&[Match::Protocol(TCP), Match::Established], Verdict::Accept));
     Table {
@@ -168,10 +156,7 @@ fn netdev() -> Table {
                 rule(&[Match::EtherType(ARP)], Verdict::Accept),
                 rule(
                     &[
-                        Match::DestIn {
-                            network: [127, 0, 0, 0],
-                            prefix: 8,
-                        },
+                        dest([127, 0, 0, 0], 8),
                         Match::Protocol(TCP),
                         Match::DestPort(443),
                     ],

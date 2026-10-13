@@ -1,6 +1,9 @@
 //! Tables as one nf_tables transaction. Each match is written as `nft` writes it (`tests/nft.rs`).
 
-use crate::netlink::{NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, attribute, message, nested};
+use crate::netlink::{
+    LONGEST_PAYLOAD, NLA_F_NESTED, NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, attribute, message,
+    nested,
+};
 use crate::{Batch, Chain, Error, Family, Hook, IPV4, Load, Match, Rule, TCP, Table, UDP, Verdict, mask};
 
 // Numbers from the kernel's `nfnetlink.h`, `netfilter.h` and `nf_tables.h`.
@@ -201,15 +204,8 @@ fn check_name(what: &str, name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The most conditions in one rule. A rule's expressions are one attribute, whose length netlink keeps in 16 bits;
-/// the longest condition takes 244 bytes, so 256 of them and the verdict fit.
-const MOST_CONDITIONS: usize = 256;
-
 /// Why a rule in this chain would not do what it says, if it would not.
 fn rule_problem(family: Family, hook: Hook, rule: &Rule) -> Option<&'static str> {
-    if rule.when.len() > MOST_CONDITIONS {
-        return Some("more conditions than one rule holds");
-    }
     let receives = !matches!(hook, Hook::Output);
     let sends = matches!(hook, Hook::Output | Hook::Forward);
     let mut transport = false;
@@ -238,7 +234,9 @@ fn rule_problem(family: Family, hook: Hook, rule: &Rule) -> Option<&'static str>
     None
 }
 
-fn check(tables: &[Table]) -> Result<(), Error> {
+/// Whether these tables are ones this crate writes: names the kernel takes, each table and chain once, hooks the
+/// family has, and rules that do what they say.
+pub(crate) fn check(tables: &[Table]) -> Result<(), Error> {
     for (index, table) in tables.iter().enumerate() {
         check_name("table", &table.name)?;
         if tables[..index]
@@ -306,7 +304,12 @@ impl Builder {
         );
     }
 
-    fn chain(&mut self, table: &Table, chain: &Chain) {
+    /// The begin or end of the batch.
+    fn marker(&mut self, kind: u16) {
+        self.message(kind, NLM_F_REQUEST, NFPROTO_UNSPEC, NFNL_SUBSYS_NFTABLES, |_| {});
+    }
+
+    fn chain(&mut self, table: &Table, chain: &Chain) -> Result<(), Error> {
         let family = family_number(table.family);
         self.nftables(NFT_MSG_NEWCHAIN, NLM_F_CREATE, family, |body| {
             text(body, 1, &table.name); // NFTA_CHAIN_TABLE
@@ -321,24 +324,32 @@ impl Builder {
             number(body, 5, verdict_code(chain.policy)); // NFTA_CHAIN_POLICY
             text(body, 7, FILTER); // NFTA_CHAIN_TYPE
         });
-        for rule in &chain.rules {
+        for (index, rule) in chain.rules.iter().enumerate() {
+            let mut expressions = Vec::new();
+            for when in &rule.when {
+                condition(&mut expressions, table.family, when);
+            }
+            expression(&mut expressions, "immediate", |data| {
+                number(data, 1, NFT_REG_VERDICT); // NFTA_IMMEDIATE_DREG
+                // NFTA_IMMEDIATE_DATA { NFTA_DATA_VERDICT { NFTA_VERDICT_CODE } }
+                nested(data, 2, |inner| {
+                    nested(inner, 2, |verdict| number(verdict, 1, verdict_code(rule.then)));
+                });
+            });
+            if expressions.len() > LONGEST_PAYLOAD {
+                return Err(Error::Rule {
+                    chain: format!("{}/{}", table.name, chain.name),
+                    rule: index,
+                    problem: "more conditions than one netlink attribute holds",
+                });
+            }
             self.nftables(NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, family, |body| {
                 text(body, 1, &table.name); // NFTA_RULE_TABLE
                 text(body, 2, &chain.name); // NFTA_RULE_CHAIN
-                nested(body, 4, |expressions| {
-                    for when in &rule.when {
-                        condition(expressions, table.family, when);
-                    }
-                    expression(expressions, "immediate", |data| {
-                        number(data, 1, NFT_REG_VERDICT); // NFTA_IMMEDIATE_DREG
-                        // NFTA_IMMEDIATE_DATA { NFTA_DATA_VERDICT { NFTA_VERDICT_CODE } }
-                        nested(data, 2, |inner| {
-                            nested(inner, 2, |verdict| number(verdict, 1, verdict_code(rule.then)));
-                        });
-                    });
-                });
+                attribute(body, 4 | NLA_F_NESTED, &expressions); // NFTA_RULE_EXPRESSIONS
             });
         }
+        Ok(())
     }
 }
 
@@ -352,13 +363,7 @@ pub fn batch(tables: &[Table], load: Load) -> Result<Batch, Error> {
         sequence: 1,
         acknowledged: 0,
     };
-    builder.message(
-        NFNL_MSG_BATCH_BEGIN,
-        NLM_F_REQUEST,
-        NFPROTO_UNSPEC,
-        NFNL_SUBSYS_NFTABLES,
-        |_| {},
-    );
+    builder.marker(NFNL_MSG_BATCH_BEGIN);
     if load == Load::Replace {
         // No family and no name: every table of every family, as `nft flush ruleset` does.
         builder.nftables(NFT_MSG_DELTABLE, 0, NFPROTO_UNSPEC, |_| {});
@@ -373,16 +378,10 @@ pub fn batch(tables: &[Table], load: Load) -> Result<Batch, Error> {
             },
         );
         for chain in &table.chains {
-            builder.chain(table, chain);
+            builder.chain(table, chain)?;
         }
     }
-    builder.message(
-        NFNL_MSG_BATCH_END,
-        NLM_F_REQUEST,
-        NFPROTO_UNSPEC,
-        NFNL_SUBSYS_NFTABLES,
-        |_| {},
-    );
+    builder.marker(NFNL_MSG_BATCH_END);
     Ok(Batch {
         bytes: builder.bytes,
         acknowledged: builder.acknowledged,
