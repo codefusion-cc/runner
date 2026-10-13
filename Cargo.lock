@@ -288,6 +288,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-nft"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "proptest",
+]
+
+[[package]]
 name = "cf-scaleset"
 version = "0.1.0"
 dependencies = [
@@ -318,6 +326,7 @@ name = "cf-supervisor"
 version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
+ "cf-nft",
  "libc",
  "proptest",
  "serde",

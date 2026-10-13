@@ -34,9 +34,10 @@ jobs:
       - name: Guest image
         run: cargo xtask guest
       - run: cargo clippy --locked --workspace --all-targets -j3 -- -D warnings
-      # The supervisor's Linux half is compiled for the guest only, so the line above never sees it.
+      # The guest's Linux code for its own target: musl's libc types are not glibc's, so the Linux job below does
+      # not stand in for this.
       - name: Lint the guest supervisor for its own target
-        run: cargo clippy --locked -p cf-supervisor --target aarch64-unknown-linux-musl --bins -j3 -- -D warnings
+        run: cargo clippy --locked -p cf-supervisor -p cf-nft --target aarch64-unknown-linux-musl --bins --lib -j3 -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace -j3
         env:
@@ -62,12 +63,13 @@ jobs:
           path: target/release/codefusion-runner
           retention-days: 7
 
-  # The crates that run on a Linux host, linted and tested on the architecture of the boards the Runner serves.
-  # Their tests read this machine's /proc and compare it with free, df and getconf.
   linux:
     name: Linux (arm64)
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      # The crates that build and pass on Linux. Add a crate here once it does.
+      LINUX_CRATES: -p cf-budget -p cf-clock -p cf-guest-proto -p cf-host-linux -p cf-image -p cf-lifecycle -p cf-nft -p cf-secret -p cf-supervisor -p cf-vmm -p cf-workflows
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -75,8 +77,22 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo clippy --locked -p cf-host-linux -p cf-budget -p cf-clock --all-targets -- -D warnings
-      - run: cargo test --locked -p cf-host-linux -p cf-budget -p cf-clock
+      # Ubuntu 24.04 holds unprivileged user namespaces to what AppArmor allows a program, and this runner image has
+      # it on: cf-nft's kernel tests then cannot even map their user ("Permission denied" on uid_map). Lift that, for
+      # this VM only.
+      - name: Unprivileged user namespaces
+        run: |
+          restricted="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+          echo "kernel.apparmor_restrict_unprivileged_userns: $restricted"
+          if [ "$restricted" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: cargo clippy --locked $LINUX_CRATES --all-targets -j4 -- -D warnings
+      - name: Tests
+        run: cargo test --locked $LINUX_CRATES -j4
+        env:
+          # A kernel test that cannot make its namespace fails here instead of passing as skipped.
+          CF_REQUIRE_NAMESPACES: '1'
       - name: The probe reads this host
         run: cargo run --locked -p cf-host-linux --example linux-probe
 
