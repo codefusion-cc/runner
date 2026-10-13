@@ -2,11 +2,11 @@
 //! machine's own network namespace, so it sees every frame the guest sends before the bridge and pasta do.
 //!
 //! It holds whatever the guest does to its own firewall. It lets through ARP, the guest's DHCP to pasta, DNS to
-//! pasta's forwarder, and IPv4 to the internet; it drops IPv4 to the private and special ranges
+//! pasta's forwarder on the gateway, and IPv4 to the internet; it drops IPv4 to the private and special ranges
 //! ([`cf_nft::BLOCKED`]), to the loopback range, and to every network the host itself is in (which covers its
 //! public addresses too), and anything that is not ARP or IPv4: IPv6 is not there for a guest at all.
 
-use crate::command::{DNS, GATEWAY};
+use crate::command::GATEWAY;
 use cf_nft::{ARP, BLOCKED, Chain, Hook, IPV4, Interface, Ip, Match, Rule, TCP, Table, UDP, Verdict};
 
 /// The table's name in the namespace.
@@ -49,11 +49,11 @@ pub fn rules(host: &[(Ip, u8)]) -> Vec<Rule> {
             Verdict::Accept,
         ),
         rule(
-            &[ipv4, to(DNS), Match::Protocol(UDP), Match::DestPort(53)],
+            &[ipv4, to(GATEWAY), Match::Protocol(UDP), Match::DestPort(53)],
             Verdict::Accept,
         ),
         rule(
-            &[ipv4, to(DNS), Match::Protocol(TCP), Match::DestPort(53)],
+            &[ipv4, to(GATEWAY), Match::Protocol(TCP), Match::DestPort(53)],
             Verdict::Accept,
         ),
     ];
@@ -126,10 +126,11 @@ mod tests {
 
     #[test]
     fn dns_reaches_pasta_and_nothing_else_of_it() {
-        assert_eq!(udp(DNS, 53), Verdict::Accept);
-        assert_eq!(tcp(DNS, 53), Verdict::Accept);
-        assert_eq!(tcp(DNS, 80), Verdict::Drop);
-        assert_eq!(udp(DNS, 5353), Verdict::Drop);
+        assert_eq!(udp(GATEWAY, 53), Verdict::Accept);
+        assert_eq!(tcp(GATEWAY, 53), Verdict::Accept);
+        assert_eq!(udp(GATEWAY, 5353), Verdict::Drop);
+        // The address pasta forwarded on before is no longer anything.
+        assert_eq!(udp([10, 0, 2, 3], 53), Verdict::Drop);
     }
 
     #[test]
@@ -143,8 +144,9 @@ mod tests {
 
     #[test]
     fn the_gateway_is_no_way_to_the_host() {
-        for port in [22, 80, 443, 8080] {
+        for port in [22, 52, 54, 80, 443, 8080] {
             assert_eq!(tcp(GATEWAY, port), Verdict::Drop, "{port}");
+            assert_eq!(udp(GATEWAY, port), Verdict::Drop, "{port}");
         }
     }
 
@@ -228,7 +230,7 @@ mod tests {
             let (network, prefix) = *BLOCKED.iter().chain(HOST).chain([&LOOPBACK]).nth(range).unwrap();
             let free = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
             let dest = ((u32::from_be_bytes(network) & !free) | (host & free)).to_be_bytes();
-            let pasta = (dest == DNS && port == 53 && (protocol == TCP || protocol == UDP))
+            let pasta = (dest == GATEWAY && port == 53 && (protocol == TCP || protocol == UDP))
                 || ((dest == GATEWAY || dest == [255; 4]) && port == DHCP && protocol == UDP);
             let expected = if pasta { Verdict::Accept } else { Verdict::Drop };
             prop_assert_eq!(verdict(&packet(IPV4, dest, protocol, port)), expected);

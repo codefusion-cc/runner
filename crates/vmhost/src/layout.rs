@@ -118,7 +118,7 @@ impl Layout {
         self.0.join("machines")
     }
 
-    /// `programs/`: on Linux, cloud-hypervisor and pasta as the Runner carries them, unpacked.
+    /// `programs/`: on Linux, cloud-hypervisor as the Runner carries it, unpacked.
     pub fn programs(&self) -> PathBuf {
         self.0.join("programs")
     }

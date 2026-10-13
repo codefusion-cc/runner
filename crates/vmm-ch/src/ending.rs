@@ -1,20 +1,45 @@
-//! How a machine ended, from what is known once its monitor's process has: the exit status, whether the host
-//! asked for the stop, whether the kernel killed in its cgroup for want of memory, whether the guest reset it, and
-//! the last lines the monitor wrote.
+//! How a machine ended, from what is known once its monitor's process has: how the monitor ended as the sandbox
+//! reports it, the exit status of the machine's first process, whether the host asked for the stop, whether the
+//! kernel killed in its cgroup for want of memory, whether the guest reset it, and the last lines the processes
+//! wrote.
 
 use cf_vmm::VmExit;
 
 /// The exit code of `codefusion-runner vm-sandbox` when it could not set the machine's sandbox up: no monitor ran.
 pub const SANDBOX_FAILED: i32 = 125;
 
-/// How the first process of the machine ended, as `waitpid` says.
+/// How a process ended, as `waitpid` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
-    /// It exited with this code. pasta exits with the code of the program it runs, and with 128 and the signal's
-    /// number when a signal ended it.
+    /// It exited with this code.
     Code(i32),
     /// A signal ended it.
     Signal(i32),
+}
+
+/// What the sandbox writes last, once the monitor has ended, to say how it did. The exit status of the machine's
+/// first process does not say it on its own: pasta of before 2024 exits 0 when the program it runs dies of a signal.
+const REPORT: &str = "vm-sandbox: the monitor ended with ";
+
+/// The line the sandbox writes of a monitor that ended so.
+pub fn report(monitor: Status) -> String {
+    match monitor {
+        Status::Code(code) => format!("{REPORT}code {code}"),
+        Status::Signal(signal) => format!("{REPORT}signal {signal}"),
+    }
+}
+
+/// How the monitor ended, as the last report in `output` says, if there is one. The sandbox writes its report
+/// after the monitor and everything in its PID namespace are gone, so no line the monitor wrote comes after it.
+pub fn reported(output: &str) -> Option<Status> {
+    let said = output.lines().rev().find_map(|line| line.strip_prefix(REPORT))?;
+    let (kind, number) = said.split_once(' ')?;
+    let number: i32 = number.parse().ok()?;
+    match kind {
+        "code" => Some(Status::Code(number)),
+        "signal" => Some(Status::Signal(number)),
+        _ => None,
+    }
 }
 
 /// What is known of a machine that ended.
@@ -22,7 +47,7 @@ pub enum Status {
 pub struct Ending<'a> {
     /// The host asked for its end ([`cf_vmm::Vm::stop`] or [`cf_vmm::Vm::kill`]).
     pub stop_asked: bool,
-    /// How its first process ended.
+    /// How the machine's first process (pasta, or the sandbox without a network) ended.
     pub status: Status,
     /// How often the kernel killed in its cgroup for want of memory.
     pub oom_kills: u64,
@@ -30,17 +55,18 @@ pub struct Ending<'a> {
     pub reset: bool,
     /// The machine's memory and what its cgroup allowed beyond it, for the message of an out-of-memory end.
     pub memory_max: u64,
-    /// The last of what the monitor, pasta and the sandbox wrote.
+    /// The last of what the monitor, pasta and the sandbox wrote, the sandbox's report ([`report`]) among it.
     pub output: &'a str,
 }
 
 /// The machine's end. The host's stop comes first: whatever the machine did meanwhile, it was asked to end.
-/// Only a monitor that exits 0 of its own was a guest's power-off; every other end is an error that says why.
+/// Only a monitor that the sandbox saw exit 0 of its own was a guest's power-off; every other end is an error
+/// that says why.
 pub fn exit_of(ending: &Ending<'_>) -> VmExit {
     if ending.stop_asked {
         return VmExit::Stopped;
     }
-    let said = tail(ending.output, 8);
+    let said = tail(&without_reports(ending.output), 8);
     let and_said = if said.is_empty() {
         String::new()
     } else {
@@ -57,20 +83,32 @@ pub fn exit_of(ending: &Ending<'_>) -> VmExit {
             "the guest reset its machine (a kernel panic, or a reboot), and the host ended it{and_said}"
         ));
     }
-    match ending.status {
-        Status::Code(0) => VmExit::Guest,
-        Status::Code(SANDBOX_FAILED) => {
-            VmExit::Error(format!("the machine's sandbox could not be set up{and_said}"))
+    match (reported(ending.output), ending.status) {
+        (Some(Status::Code(0)), _) => VmExit::Guest,
+        (Some(Status::Code(code)), _) => {
+            VmExit::Error(format!("the monitor exited with code {code}{and_said}"))
         }
-        Status::Code(code) if code > 128 && code < 128 + 65 => VmExit::Error(format!(
-            "the monitor was ended by signal {} (exit code {code}){and_said}",
-            code - 128
-        )),
-        Status::Code(code) => VmExit::Error(format!("the monitor exited with code {code}{and_said}")),
-        Status::Signal(signal) => {
+        (Some(Status::Signal(signal)), _) => {
             VmExit::Error(format!("the monitor was ended by signal {signal}{and_said}"))
         }
+        (None, Status::Code(SANDBOX_FAILED)) => {
+            VmExit::Error(format!("the machine's sandbox could not be set up{and_said}"))
+        }
+        (None, Status::Code(code)) => VmExit::Error(format!(
+            "the machine ended without its sandbox saying how the monitor did (exit code {code}){and_said}"
+        )),
+        (None, Status::Signal(signal)) => VmExit::Error(format!(
+            "the machine ended without its sandbox saying how the monitor did (signal {signal}){and_said}"
+        )),
     }
+}
+
+fn without_reports(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| !line.starts_with(REPORT))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The last `lines` lines of `text` that say something, joined by ` | `, at most 1000 characters.
@@ -122,14 +160,22 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn ending(status: Status) -> Ending<'static> {
+    const POWERED_OFF: &str = "vm-sandbox: the monitor ended with code 0\n";
+
+    fn ending(status: Status, output: &'static str) -> Ending<'static> {
         Ending {
             stop_asked: false,
             status,
             oom_kills: 0,
             reset: false,
             memory_max: 2208 << 20,
-            output: "",
+            output,
+        }
+    }
+
+    impl<'a> Ending<'a> {
+        fn with(self, output: &'a str) -> Ending<'a> {
+            Ending { output, ..self }
         }
     }
 
@@ -141,23 +187,66 @@ mod tests {
     }
 
     #[test]
-    fn a_monitor_that_exits_0_of_its_own_was_a_power_off() {
-        assert_eq!(exit_of(&ending(Status::Code(0))), VmExit::Guest);
+    fn a_monitor_the_sandbox_saw_exit_0_was_a_power_off() {
+        assert_eq!(exit_of(&ending(Status::Code(0), POWERED_OFF)), VmExit::Guest);
+        // pasta's own status does not change what the sandbox saw.
+        assert_eq!(exit_of(&ending(Status::Code(3), POWERED_OFF)), VmExit::Guest);
+    }
+
+    #[test]
+    fn a_monitor_killed_under_an_old_pasta_that_exits_0_is_an_error() {
+        let why = error(exit_of(&ending(
+            Status::Code(0),
+            "vm-sandbox: the monitor ended with signal 9\n",
+        )));
+        assert_eq!(why, "the monitor was ended by signal 9");
+    }
+
+    #[test]
+    fn an_exit_0_without_the_sandbox_saying_so_is_no_power_off() {
+        let why = error(exit_of(&ending(Status::Code(0), "")));
+        assert_eq!(
+            why,
+            "the machine ended without its sandbox saying how the monitor did (exit code 0)"
+        );
+        let why = error(exit_of(&ending(Status::Signal(9), "pasta: no tap\n")));
+        assert_eq!(
+            why,
+            "the machine ended without its sandbox saying how the monitor did (signal 9): pasta: no tap"
+        );
+    }
+
+    #[test]
+    fn the_last_report_counts_and_a_broken_one_is_none() {
+        let output =
+            "vm-sandbox: the monitor ended with code 0\nnoise\nvm-sandbox: the monitor ended with code 2\n";
+        assert_eq!(reported(output), Some(Status::Code(2)));
+        for broken in [
+            "vm-sandbox: the monitor ended with code\n",
+            "vm-sandbox: the monitor ended with code x\n",
+            "vm-sandbox: the monitor ended with exit 0\n",
+            " vm-sandbox: the monitor ended with code 0\n",
+            "vm-sandbox: the monitor ended with code 99999999999\n",
+        ] {
+            assert_eq!(reported(broken), None, "{broken}");
+        }
+        assert_eq!(reported(&report(Status::Signal(11))), Some(Status::Signal(11)));
+        assert_eq!(reported(&report(Status::Code(-1))), Some(Status::Code(-1)));
     }
 
     #[test]
     fn a_stop_the_host_asked_for_is_stopped_however_the_monitor_ended() {
-        for status in [
-            Status::Code(0),
-            Status::Code(1),
-            Status::Signal(9),
-            Status::Code(137),
+        for (status, output) in [
+            (Status::Code(0), POWERED_OFF),
+            (Status::Code(1), ""),
+            (Status::Signal(9), ""),
+            (Status::Code(137), "vm-sandbox: the monitor ended with signal 9"),
         ] {
             let stopped = Ending {
                 stop_asked: true,
                 oom_kills: 1,
                 reset: true,
-                ..ending(status)
+                ..ending(status, output)
             };
             assert_eq!(exit_of(&stopped), VmExit::Stopped, "{status:?}");
         }
@@ -167,16 +256,17 @@ mod tests {
     fn a_machine_out_of_memory_says_so_with_its_limit() {
         let why = error(exit_of(&Ending {
             oom_kills: 1,
-            output: "x\n",
-            ..ending(Status::Signal(9))
+            ..ending(Status::Signal(9), "x\n")
         }));
-        assert!(why.contains("2208 MiB"), "{why}");
-        assert!(why.ends_with(": x"), "{why}");
-        // Even when the kill took pasta first and it exited with the code of a signal.
+        assert_eq!(
+            why,
+            "the machine used more than the 2208 MiB its cgroup allows, and the kernel ended it: x"
+        );
+        // Even when the monitor seemed to end well before the kill took the rest.
         assert!(
             error(exit_of(&Ending {
                 oom_kills: 2,
-                ..ending(Status::Code(137))
+                ..ending(Status::Code(0), POWERED_OFF)
             }))
             .contains("MiB")
         );
@@ -184,47 +274,37 @@ mod tests {
 
     #[test]
     fn a_reset_is_an_error_even_though_the_monitor_was_killed_for_it() {
-        let why = error(exit_of(&Ending {
-            reset: true,
-            ..ending(Status::Signal(9))
-        }));
-        assert!(why.contains("reset"), "{why}");
-        let why = error(exit_of(&Ending {
-            reset: true,
-            ..ending(Status::Code(0))
-        }));
-        assert!(why.contains("reset"), "{why}");
+        for (status, output) in [(Status::Signal(9), ""), (Status::Code(0), POWERED_OFF)] {
+            let why = error(exit_of(&Ending {
+                reset: true,
+                ..ending(status, output)
+            }));
+            assert!(why.starts_with("the guest reset its machine"), "{why}");
+        }
     }
 
     #[test]
     fn a_crash_or_a_kill_from_elsewhere_is_an_error_with_the_last_lines() {
-        let crashed = Ending {
-            output: "\nError booting VM: no kernel\n\n",
-            ..ending(Status::Code(1))
-        };
+        let crashed = ending(
+            Status::Code(1),
+            "\nError booting VM: no kernel\n\nvm-sandbox: the monitor ended with code 1\n",
+        );
         assert_eq!(
             exit_of(&crashed),
             VmExit::Error("the monitor exited with code 1: Error booting VM: no kernel".into())
         );
         assert_eq!(
-            exit_of(&ending(Status::Signal(11))),
+            exit_of(&ending(
+                Status::Code(139),
+                "vm-sandbox: the monitor ended with signal 11\n"
+            )),
             VmExit::Error("the monitor was ended by signal 11".into())
         );
-        assert_eq!(
-            exit_of(&ending(Status::Code(137))),
-            VmExit::Error("the monitor was ended by signal 9 (exit code 137)".into())
-        );
-        for code in [128, 255, -1] {
-            assert!(error(exit_of(&ending(Status::Code(code)))).contains(&format!("code {code}")));
-        }
     }
 
     #[test]
     fn a_sandbox_that_could_not_be_set_up_says_so() {
-        let why = error(exit_of(&Ending {
-            output: "bridge: refused",
-            ..ending(Status::Code(SANDBOX_FAILED))
-        }));
+        let why = error(exit_of(&ending(Status::Code(SANDBOX_FAILED), "bridge: refused")));
         assert_eq!(why, "the machine's sandbox could not be set up: bridge: refused");
     }
 
@@ -265,10 +345,17 @@ mod tests {
         }
 
         #[test]
-        fn every_end_that_is_not_a_clean_exit_is_an_error(code in any::<i32>(), signal in 1i32..65, oom in 0u64..3, reset: bool) {
-            for status in [Status::Code(code), Status::Signal(signal)] {
-                let exit = exit_of(&Ending { oom_kills: oom, reset, ..ending(status) });
-                let clean = status == Status::Code(0) && oom == 0 && !reset;
+        fn only_a_reported_exit_0_with_nothing_else_wrong_is_a_power_off(
+            first in any::<i32>(),
+            reports in proptest::collection::vec(any::<i32>(), 0..3),
+            signal in 1i32..65,
+            oom in 0u64..3,
+            reset: bool,
+        ) {
+            let output: String = reports.iter().map(|code| report(Status::Code(*code)) + "\n").collect();
+            for status in [Status::Code(first), Status::Signal(signal)] {
+                let exit = exit_of(&Ending { oom_kills: oom, reset, ..ending(status, "") }.with(&output));
+                let clean = reports.last() == Some(&0) && oom == 0 && !reset;
                 prop_assert_eq!(exit == VmExit::Guest, clean);
                 prop_assert!(exit != VmExit::Stopped);
             }

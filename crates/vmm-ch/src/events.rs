@@ -4,7 +4,7 @@
 //! Only three events matter. `booted` is when [`crate::ChVmm`]'s start returns. `rebooting` is a guest that reset
 //! its machine (a kernel panic restarts it at once, see [`cf_vmm::COMMAND_LINE`]): a machine runs one boot, so the
 //! host ends it. `shutdown` comes before the monitor exits for a guest's power-off, when its writer gets to it: the
-//! monitor's exit status is what says how the machine ended, never an event that may be lost.
+//! monitor's exit status, as the sandbox reports it, says how the machine ended, never an event that may be lost.
 //!
 //! The stream is read as it comes, in pieces of any size. What cannot be read (a broken object, one larger than
 //! [`MAX_EVENT`]) is skipped up to the next object; it never stops the reading of what follows.

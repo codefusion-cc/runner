@@ -7,10 +7,11 @@ use std::path::Path;
 
 /// The guest's address, which pasta hands out by DHCP.
 pub const GUEST: [u8; 4] = [10, 0, 2, 15];
-/// The gateway pasta answers as. It maps to nothing of the host (`--no-map-gw`).
+/// The gateway pasta answers as, and the guest's name server: pasta forwards what the guest sends to its port 53 to
+/// the host's resolver (`--dns-forward`), and maps nothing else of it to the host (`--no-map-gw`). Its DHCP names no
+/// name server, so the guest asks its gateway. pasta of every version forwards so, also to a resolver on the host's
+/// loopback; with `--dns` given, 2023-03's and later's both forward nothing.
 pub const GATEWAY: [u8; 4] = [10, 0, 2, 2];
-/// The name server pasta answers as and forwards to the host's resolver.
-pub const DNS: [u8; 4] = [10, 0, 2, 3];
 /// The prefix length of the guest's network.
 pub const PREFIX: u8 = 24;
 /// The guest's MAC address: every machine has a namespace of its own, so they never meet.
@@ -98,15 +99,17 @@ pub fn monitor(
     Ok(command)
 }
 
-/// The network device of a machine, on the tap device open as `fd`.
+/// The network device of a machine, on the tap device open as `fd`. Its MTU is the tap's, which the sandbox set:
+/// the monitor runs without the capability to set it (`mtu=` here would have it try, and fail).
 pub fn net(fd: i32) -> [String; 2] {
-    ["--net".into(), format!("fd=[{fd}],mac={MAC},mtu={MTU}")]
+    ["--net".into(), format!("fd=[{fd}],mac={MAC}")]
 }
 
 /// pasta's command line in front of `then`: a user and network namespace of its own, IPv4 alone, the guest's
-/// DHCP and DNS answered by pasta, and nothing of the host reachable through it. No port of the host leads in,
-/// the gateway's and the guest's own addresses map to nothing of the host, and neither does any to the host's
-/// loopback.
+/// DHCP answered and DNS forwarded by pasta ([`GATEWAY`]), and nothing of the host reachable through it. No port of the host leads in, and
+/// no address maps to the host (`--no-map-gw`: in pasta since 2024 that also means `--map-host-loopback none`, and
+/// `--map-guest-addr` maps nothing unless given). Every option here is in pasta since 2023-03, the oldest one this
+/// runs with (Debian 12's); newer options are left out, since an older pasta refuses to start with one it lacks.
 pub fn pasta(program: &Path, then: Vec<OsString>) -> Vec<OsString> {
     let mut command: Vec<OsString> = vec![program.as_os_str().to_owned()];
     let args = [
@@ -123,15 +126,9 @@ pub fn pasta(program: &Path, then: Vec<OsString>) -> Vec<OsString> {
         &PREFIX.to_string(),
         "--gateway",
         &ip(GATEWAY),
-        "--dns",
-        &ip(DNS),
         "--dns-forward",
-        &ip(DNS),
+        &ip(GATEWAY),
         "--no-map-gw",
-        "--map-host-loopback",
-        "none",
-        "--map-guest-addr",
-        "none",
         "--tcp-ports",
         "none",
         "--udp-ports",
@@ -314,11 +311,8 @@ mod tests {
     }
 
     #[test]
-    fn the_network_device_is_the_sandbox_descriptor() {
-        assert_eq!(
-            net(3),
-            ["--net".to_string(), format!("fd=[3],mac={MAC},mtu=1500")]
-        );
+    fn the_network_device_is_the_sandbox_descriptor_and_sets_nothing_on_it() {
+        assert_eq!(net(3), ["--net".to_string(), format!("fd=[3],mac={MAC}")]);
     }
 
     #[test]
@@ -330,19 +324,19 @@ mod tests {
         assert!(args.contains(&"--ipv4-only"));
         assert!(args.contains(&"--no-map-gw"));
         assert!(args.contains(&"--foreground"));
-        for flag in [
-            "--map-host-loopback",
-            "--map-guest-addr",
-            "--tcp-ports",
-            "--udp-ports",
-            "--tcp-ns",
-            "--udp-ns",
-        ] {
+        // A name server given or handed out by DHCP stops the forwarding; the guest asks its gateway.
+        assert!(
+            !args.iter().any(|arg| ["--dns", "-D", "--dhcp-dns"].contains(arg)),
+            "{args:?}"
+        );
+        // Options of 2024 and later, which Debian 12's pasta refuses to start with.
+        assert!(!args.iter().any(|arg| arg.starts_with("--map-")), "{args:?}");
+        for flag in ["--tcp-ports", "--udp-ports", "--tcp-ns", "--udp-ns"] {
             assert_eq!(after(flag), "none", "{flag}");
         }
         assert_eq!(after("--address"), "10.0.2.15");
         assert_eq!(after("--gateway"), "10.0.2.2");
-        assert_eq!(after("--dns-forward"), "10.0.2.3");
+        assert_eq!(after("--dns-forward"), "10.0.2.2");
         assert_eq!(after("--ns-ifname"), PASTA_DEVICE);
         assert_eq!(&args[args.len() - 3..], ["--", "/bin/sandbox", "nat"]);
     }

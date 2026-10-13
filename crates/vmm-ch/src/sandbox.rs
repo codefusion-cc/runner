@@ -5,7 +5,8 @@
 //! Without one it makes an empty user and network namespace of its own. Either way it then makes a cgroup and a
 //! PID namespace and starts cloud-hypervisor in them with no capability left: the monitor cannot change the
 //! firewall or the devices, leave its cgroup, or see or signal any process outside its machine. The sandbox waits
-//! for it and exits as it did, or with [`crate::ending::SANDBOX_FAILED`] when it could not set up.
+//! for it, writes how it ended ([`crate::ending::report`]) and exits as it did, or with
+//! [`crate::ending::SANDBOX_FAILED`] when it could not set up.
 
 use cf_nft::Ip;
 use cf_vmm::Network;
@@ -106,7 +107,7 @@ pub use linux::main;
 mod linux {
     use super::Sandbox;
     use crate::command::{MTU, PASTA_DEVICE, net};
-    use crate::ending::SANDBOX_FAILED;
+    use crate::ending::{SANDBOX_FAILED, Status, report};
     use crate::firewall::{self, GUEST_DEVICE};
     use cf_nft::Ip;
     use cf_vmm::Network;
@@ -184,6 +185,12 @@ mod linux {
         let status = child
             .wait()
             .map_err(|e| format!("waiting for the monitor: {e}"))?;
+        let ended = match status.code() {
+            Some(code) => Status::Code(code),
+            None => Status::Signal(status.signal().unwrap_or(0)),
+        };
+        // The monitor was the first process of its PID namespace: all of it is gone, and this line comes last.
+        eprintln!("{}", report(ended));
         Ok(status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))

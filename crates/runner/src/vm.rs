@@ -53,16 +53,17 @@ fn monitor(_machines: &Path, _programs: &Path, _host: &Host) -> Result<cf_vmm_vz
     cf_vmm_vz::VzVmm::new().map_err(|error| error.to_string())
 }
 
-/// The monitor of this host's machines: cloud-hypervisor and pasta as this binary carries them, unpacked into
-/// `programs`, each machine with a folder of its own in `machines`, its sandbox this same binary.
+/// The monitor of this host's machines: cloud-hypervisor as this binary carries it, unpacked into `programs`,
+/// with the system's pasta, each machine with a folder of its own in `machines`, its sandbox this same binary.
 #[cfg(target_os = "linux")]
 fn monitor(machines: &Path, programs: &Path, host: &Host) -> Result<cf_vmm_ch::ChVmm, String> {
-    let programs = cf_vmm_ch::programs::unpack(programs)?;
+    let cloud_hypervisor = cf_vmm_ch::programs::unpack(programs)?;
+    let pasta = cf_vmm_ch::programs::pasta()?;
     let sandbox = std::env::current_exe().map_err(|error| format!("this program's path: {error}"))?;
     cf_vmm_ch::ChVmm::new(cf_vmm_ch::Config {
         dir: machines.to_path_buf(),
-        cloud_hypervisor: programs.cloud_hypervisor,
-        pasta: programs.pasta,
+        cloud_hypervisor,
+        pasta,
         sandbox,
         host_cpus: host.cpus.clone(),
         host_networks: cf_vmhost::host_networks(),
