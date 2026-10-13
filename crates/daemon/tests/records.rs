@@ -292,7 +292,7 @@ fn what_main_wrote_is_read_by_these_rules() {
         writer: Writer::Main,
     };
     use Word::{Completed, None as Unheard, Started};
-    let rows: [(&str, Old, Phase, bool); 16] = [
+    let rows: [(&str, Old, Phase, bool); 17] = [
         (
             "`start`: a machine boots",
             main(Phase::Starting, None, Unheard, false, None, false),
@@ -320,6 +320,12 @@ fn what_main_wrote_is_read_by_these_rules() {
         (
             "`Events::job` died between the completion and its step",
             main(Phase::Running, None, Completed, false, None, false),
+            Phase::Finishing,
+            false,
+        ),
+        (
+            "`retire_surplus`'s removal met 404 under a job whose start came late: the job is over",
+            main(Phase::Running, None, Started, true, None, false),
             Phase::Finishing,
             false,
         ),

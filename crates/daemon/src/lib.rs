@@ -51,3 +51,8 @@ pub(crate) fn secs(at: std::time::SystemTime) -> i64 {
     at.duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
 }
+
+/// The moment of [`secs`]; one before 1970 is 1970.
+pub(crate) fn time_of(secs: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(secs).unwrap_or(0))
+}

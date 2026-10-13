@@ -18,12 +18,10 @@ use std::sync::Arc;
 
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{CrashingStore, pass, settings_for};
-use cf_daemon::{
-    Answer, Claim, EventKind, Hosts, RESULT_WAIT, Record, RunnerSpec, Seen, Slots, Upgrade, Vms,
-};
+use cf_daemon::{Answer, Claim, EventKind, Hosts, RESULT_WAIT, Record, Slots, Upgrade};
 use cf_lifecycle::{End, Phase};
-use cf_secret::Secret;
 use proptest::prelude::*;
+use support::pick;
 use support::world::{REPO, SET, SIZE, World};
 
 /// What GitHub says to one removal.
@@ -114,14 +112,6 @@ struct Model {
     runners: BTreeMap<String, Truth>,
 }
 
-fn pick<T: Clone>(from: &[T], i: u8) -> Option<T> {
-    (!from.is_empty()).then(|| from[usize::from(i) % from.len()].clone())
-}
-
-fn up(w: &World, runner: &str) -> bool {
-    matches!(w.parts.vms.look(job_name(runner)), Seen::Alive(state) if state.boot_ms.is_some())
-}
-
 fn stops(w: &World, runner: &str) -> usize {
     let job = job_name(runner);
     let stopped = w.parts.vms.stopped().iter().filter(|(j, ..)| j == job).count();
@@ -198,11 +188,11 @@ async fn apply(w: &mut World, model: &mut Model, crash: &CrashingStore, op: Op) 
                 Claim::Waits { ticket, .. } => return w.m.withdraw(ticket),
                 Claim::Never(_) => return,
             };
-            let runner = w.name();
-            w.m.registering(&runner, REPO, SET);
+            let runner = w.register();
             // A daemon that died writing its intent never asked GitHub.
-            if !crash.crashed() {
-                w.registered.insert(runner.clone());
+            if crash.crashed() {
+                w.registered.remove(&runner);
+            } else {
                 model.runners.insert(
                     runner.clone(),
                     Truth {
@@ -210,16 +200,7 @@ async fn apply(w: &mut World, model: &mut Model, crash: &CrashingStore, op: Op) 
                         ..Truth::default()
                     },
                 );
-                let spec = RunnerSpec {
-                    name: runner.clone(),
-                    repo: REPO.into(),
-                    scale_set_id: SET,
-                    runner_id: i64::try_from(model.runners.len()).expect("few"),
-                    size: SIZE,
-                    ticket,
-                    jit_config: Secret::new("jit".to_string()),
-                };
-                let _ = w.m.start(spec).await;
+                let _ = w.start_registered(&runner, ticket, SIZE).await;
             }
         }
         Op::Boots(i) => {
@@ -238,7 +219,7 @@ async fn apply(w: &mut World, model: &mut Model, crash: &CrashingStore, op: Op) 
                 .iter()
                 .filter(|r| {
                     let truth = &model.runners[*r];
-                    truth.registered && truth.job.is_none() && up(w, r)
+                    truth.registered && truth.job.is_none() && w.up(r)
                 })
                 .cloned()
                 .collect();
@@ -365,6 +346,13 @@ fn rest(w: &mut World, model: &mut Model, crash: &CrashingStore) {
         }
     }
     for _ in 0..40 {
+        let left = !w.parts.vms.standing().is_empty()
+            || !w.registered.is_empty()
+            || !w.parts.store.load().is_empty()
+            || !w.m.snapshot().budget.slots.is_empty();
+        if !left {
+            break;
+        }
         pass(&w.m, 30);
         sweep(w, model, crash, 0);
     }
@@ -492,7 +480,7 @@ fn pinned_schedules() {
             ],
         ),
         (
-            "main's `unregistered` beside a standing machine whose job ran unheard",
+            "main's record of a standing machine whose job only GitHub's REST view named",
             &[
                 Assign,
                 Boots(0),

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use cf_budget::Size;
+use cf_daemon::names::job_name;
 use cf_daemon::testing::{FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
     Answer, Claim, EndKind, EventKind, Events, HostError, Hosts, JobEvent, JobReport, MemoryStore,
-    RESULT_WAIT, Roster, RunnerSpec, Slots, Store, Ticket,
+    RESULT_WAIT, Roster, RunnerSpec, Seen, Slots, Store, Ticket, Vms,
 };
 use cf_fake_github::harness::TestClock;
 use cf_secret::Secret;
@@ -96,22 +97,42 @@ impl World {
 
     /// A machine of this size on a slot.
     pub async fn start_as(&mut self, ticket: Ticket, size: Size) -> Result<String, HostError> {
+        let runner = self.register();
+        self.start_registered(&runner, ticket, size).await.map(|_| runner)
+    }
+
+    /// A new Actions runner's intent is written, and GitHub registers it.
+    pub fn register(&mut self) -> String {
         let runner = self.name();
         self.m.registering(&runner, REPO, SET);
         self.registered.insert(runner.clone());
-        let id = i64::from(self.next);
+        runner
+    }
+
+    /// The machine of an Actions runner [`World::register`] registered, on a slot.
+    pub async fn start_registered(
+        &mut self,
+        runner: &str,
+        ticket: Ticket,
+        size: Size,
+    ) -> Result<(), HostError> {
         self.m
             .start(RunnerSpec {
-                name: runner.clone(),
+                name: runner.to_string(),
                 repo: REPO.into(),
                 scale_set_id: SET,
-                runner_id: id,
+                runner_id: i64::from(self.next),
                 size,
                 ticket,
                 jit_config: Secret::new("jit".to_string()),
             })
             .await
-            .map(|_| runner)
+            .map(|_| ())
+    }
+
+    /// Whether this Actions runner's guest is up.
+    pub fn up(&self, runner: &str) -> bool {
+        matches!(self.parts.vms.look(job_name(runner)), Seen::Alive(state) if state.boot_ms.is_some())
     }
 
     /// GitHub says a job started on the Actions runner, or completed with this result.

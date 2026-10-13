@@ -4,6 +4,11 @@
 
 pub mod world;
 
+/// The `i`th of these, round and round: how a generated number picks among what is there; `None` when nothing is.
+pub fn pick<T: Clone>(from: &[T], i: u8) -> Option<T> {
+    (!from.is_empty()).then(|| from[usize::from(i) % from.len()].clone())
+}
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -113,7 +113,8 @@ Restore reads an older record once, in one place (`Record::upgrade`), in two ste
    standing machine main stopped for no job, or idle with `unregistered`, asks instead. Rules 1's idle slot with an
    end of `no-job` asks.
 2. **GitHub's stored word is replayed through the lifecycle** (`Slot::hear`), as if heard now: its start, its end,
-   and the registration gone under a machine that stands.
+   and the registration gone under a machine that stands, read as an answer is: with no job named, GitHub's 204;
+   under a job GitHub named, that job over.
 
 A record of rules 2 is taken as it is. One whose facts disagree is a mistake of the Runner's: restore logs it as an
 error and takes it as written, never through the older rules. `crates/daemon/tests/records.rs` reads every record

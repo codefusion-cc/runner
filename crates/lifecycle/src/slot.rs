@@ -279,18 +279,10 @@ impl Slot {
     /// A VM that was still booting goes on booting. One that was waiting to be started a second time is not
     /// started again: what the Actions runner needs to register was never on disk.
     pub fn restore(limits: Limits, now: Millis, saved: Saved, vm_alive: bool) -> (Slot, Vec<Effect>) {
-        let mut slot = Slot::reserved(limits);
-        slot.starts = saved.starts;
-        slot.end = saved.end;
-        slot.oom = saved.oom;
-        slot.ran_job = saved.ran_job;
-        slot.up = saved.up;
-        slot.completed = saved.completed;
+        let mut slot = Slot::from_saved(limits, saved);
         slot.memory = vm_alive && saved.phase != Phase::Released;
-        slot.restored = true;
         let mut effects = Vec::new();
         if saved.phase == Phase::Released {
-            slot.phase = Phase::Released;
             return (slot, effects);
         }
         // How a slot ends whose VM is not to go on, unless its phase says more.
@@ -359,6 +351,15 @@ impl Slot {
     /// What a slot saved so becomes once it hears these words of its job from GitHub, as [`Slot::on`] takes them:
     /// for a record whose lifecycle was written apart from GitHub's word.
     pub fn hear(limits: Limits, saved: Saved, words: &[Event]) -> Saved {
+        let mut slot = Slot::from_saved(limits, saved);
+        for word in words {
+            slot.on(Millis::ZERO, *word);
+        }
+        slot.saved()
+    }
+
+    /// A slot that came back from disk as it was saved, with no timer running.
+    fn from_saved(limits: Limits, saved: Saved) -> Slot {
         let mut slot = Slot::reserved(limits);
         slot.phase = saved.phase;
         slot.starts = saved.starts;
@@ -368,10 +369,7 @@ impl Slot {
         slot.up = saved.up;
         slot.completed = saved.completed;
         slot.restored = true;
-        for word in words {
-            slot.on(Millis::ZERO, *word);
-        }
-        slot.saved()
+        slot
     }
 
     /// Where the slot is.

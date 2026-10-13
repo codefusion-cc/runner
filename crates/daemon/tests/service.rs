@@ -28,6 +28,7 @@ use cf_secret::Secret;
 use cf_vmhost::End;
 use proptest::prelude::*;
 use serde_json::{Value, json};
+use support::pick;
 
 const MACHINE: &str = "mac-b";
 const WORKFLOW: &str = "on: push\njobs:\n  build:\n    runs-on: [self-hosted, cf-2g]\n    steps: []\n";
@@ -171,8 +172,7 @@ impl Rig {
         if self.store.crashed() {
             // The listeners end at their next wait; until then GitHub and the vm-hosts keep refusing them.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            self.parts.vms.fail_start(0);
-            self.parts.vms.ignore_stops(false);
+            self.parts.vms.freeze(false);
         }
         self.store.revive();
         edit(self);
@@ -210,8 +210,7 @@ impl Rig {
         self.store.crash_at(writes, kept, move || {
             dead.store(true, Ordering::Relaxed);
             github.set_down(true);
-            vms.fail_start(usize::MAX);
-            vms.ignore_stops(true);
+            vms.freeze(true);
         });
     }
 
@@ -1705,10 +1704,6 @@ const SECOND: &str = "org/second";
 
 /// What GitHub's removal of an Actions runner is asked at.
 const REMOVAL: &str = "distributedtask/pools/0/agents/";
-
-fn pick<T: Clone>(items: &[T], n: u8) -> Option<T> {
-    (!items.is_empty()).then(|| items[usize::from(n) % items.len()].clone())
-}
 
 /// The Runner died, or dies: it starts again, and opens every scale set's session anew. Says which registrations
 /// GitHub removed at the dead Runner's request without that Runner having written the answer down: it died between

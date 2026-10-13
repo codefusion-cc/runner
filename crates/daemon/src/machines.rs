@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use cf_budget::{
     Assigned, Budget, Grant, Hold, Host, HostReading, Level, Millis, Now, Settings, Size, SlotId, Status,
@@ -23,11 +23,11 @@ use crate::ends::{EndKind, machine_end};
 use crate::names::job_name;
 use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, Upgrade};
 use crate::roster::{JobInfo, Roster, Runner};
-use crate::secs;
 use crate::traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
 };
 use crate::vms::{Seen, Vms};
+use crate::{secs, time_of};
 
 /// How long a machine that is gone waits for GitHub to say how its job ended before the job is reported with what
 /// the Mac knows.
@@ -499,18 +499,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     repo: record.repo.clone(),
                     scale_set_id: record.scale_set_id,
                     ticket: slot,
-                    started: UNIX_EPOCH + Duration::from_secs(u64::try_from(record.created_at).unwrap_or(0)),
+                    started: time_of(record.created_at),
                     busy: record.github.is_some(),
                     adopted: true,
                     done: done.then(|| self.clock.now()),
-                    job: record.github.as_ref().map(|g| JobInfo {
-                        repo: g.repo.clone(),
-                        name: g.job.clone(),
-                        workflow: g.workflow.clone(),
-                        run_id: g.run_id,
-                        started: UNIX_EPOCH
-                            + Duration::from_secs(u64::try_from(g.started_at.unwrap_or(0)).unwrap_or(0)),
-                    }),
+                    job: record.github.as_ref().map(JobInfo::from),
                 });
             } else {
                 tracing::warn!(
@@ -969,9 +962,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let Some(job) = inner.jobs.get_mut(name) else {
             return false;
         };
-        let Some(ending) = job.record.ended.clone() else {
+        let Some(ending) = job.record.ended.as_ref() else {
             return false;
         };
+        let (kind, at) = (EndKind::from_name(&ending.kind), ending.at);
         let mut opened = false;
         if !job.record.end_reported {
             let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
@@ -984,7 +978,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 return false;
             }
             if let Some(github) = job.record.github.clone() {
-                let base = EndKind::from_name(&ending.kind).unwrap_or(EndKind::GuestLost);
+                let base = kind.unwrap_or(EndKind::GuestLost);
                 self.reports.job(JobReport {
                     id: format!("{}/completed", job.record.runner),
                     kind: EventKind::Completed,
@@ -992,12 +986,15 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     github,
                     end: Some(base.with_result(result.as_deref())),
                     out_of_memory: job.record.oom,
-                    at: ending.at,
+                    at,
                     machine: facts(&job.record),
                 });
             }
             job.record.end_reported = true;
-            self.store.save(&job.record);
+            // A record with nothing left to do is removed below, not written first.
+            if !job.record.finished() {
+                self.store.save(&job.record);
+            }
             opened = true;
         }
         if job.record.finished() {
@@ -1056,19 +1053,14 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     pub fn answered(&self, runner: &str, answer: Answer) {
         let mut inner = self.lock();
         let now = inner.host.now();
-        if matches!(answer, Answer::Removed | Answer::Gone)
-            && let Some((record, _)) = inner.intents.remove(runner)
-        {
-            self.store.remove(&record.job);
+        let unregistered = matches!(answer, Answer::Removed | Answer::Gone);
+        if unregistered {
+            self.forget_intent(&mut inner, runner);
         }
-        let name = job_name(runner).to_string();
-        let Some(job) = inner
-            .jobs
-            .get_mut(&name)
-            .filter(|job| job.record.runner == runner)
-        else {
+        let Some(name) = Self::job_of(&inner, runner) else {
             return;
         };
+        let job = inner.jobs.get_mut(&name).expect("just found");
         let stands = job.record.ended.is_none();
         let (repo, set) = (job.record.repo.clone(), job.record.scale_set_id);
         let word = match answer {
@@ -1077,62 +1069,66 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             Answer::Gone => Event::Unregistered,
             Answer::Refused | Answer::Busy => Event::JobStarted,
         };
-        if matches!(answer, Answer::Removed | Answer::Gone) {
+        if unregistered {
             job.record.unregistered = true;
             if stands {
                 self.roster.mark_done(&repo, set, runner, self.clock.now());
             }
         }
-        if word == Event::Unregistered {
-            if !self.feed(&mut inner, &name, now, word)
-                && let Some(job) = inner.jobs.get(&name)
-            {
-                self.store.save(&job.record);
+        let opened = if word == Event::Unregistered {
+            self.land(&mut inner, &name, now, word, true)
+        } else {
+            // A machine that stands holds the job now; one that is gone, when it went.
+            let at = job.record.ended.as_ref().map_or_else(|| self.wall(), |e| e.at);
+            let inferred = job.record.github.is_none();
+            if inferred {
+                tracing::info!(%runner, ?answer, "GitHub's answer says the Actions runner took a job nobody heard of");
+                let github = job.record.github.insert(GithubJob {
+                    repo: repo.clone(),
+                    started_at: Some(at),
+                    inferred: true,
+                    ..GithubJob::default()
+                });
+                if stands {
+                    self.roster.mark_busy(&repo, set, runner, JobInfo::from(&*github));
+                }
             }
-            self.settle(&mut inner, &name, now);
-            return;
-        }
-        // A machine that stands holds the job now; one that is gone, when it went.
-        let at = job.record.ended.as_ref().map_or_else(|| self.wall(), |e| e.at);
-        if job.record.github.is_none() {
-            tracing::info!(%runner, ?answer, "GitHub's answer says the Actions runner took a job nobody heard of");
-            job.record.github = Some(GithubJob {
-                repo: repo.clone(),
-                started_at: Some(at),
-                inferred: true,
-                ..GithubJob::default()
-            });
-            if stands {
-                let started = UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or(0));
-                self.roster.mark_busy(
-                    &repo,
-                    set,
-                    runner,
-                    JobInfo {
-                        repo: repo.clone(),
-                        name: String::new(),
-                        workflow: String::new(),
-                        run_id: 0,
-                        started,
-                    },
-                );
-            }
-        }
-        let opened = self.hear(&mut inner, &name, now, word, at);
+            self.hear(&mut inner, &name, now, word, at, unregistered || inferred)
+        };
         drop(inner);
         if opened {
             self.ring();
         }
     }
 
+    /// A registration that is gone, or was never made, leaves no intent behind.
+    fn forget_intent(&self, inner: &mut Inner<H>, runner: &str) {
+        if let Some((record, _)) = inner.intents.remove(runner) {
+            self.store.remove(&record.job);
+        }
+    }
+
+    /// The handle of this Actions runner's machine, while it is this Mac's.
+    fn job_of(inner: &Inner<H>, runner: &str) -> Option<String> {
+        let name = job_name(runner);
+        inner
+            .jobs
+            .get(name)
+            .is_some_and(|job| job.record.runner == runner)
+            .then(|| name.to_string())
+    }
+
     /// A word of the job on this machine, from GitHub's messages or its answers, once what it says of the job is in
-    /// the record: the start is reported once, and the record and the lifecycle step the word causes are one write.
-    /// Says whether a slot opened.
-    fn hear(&self, inner: &mut Inner<H>, name: &str, now: Now, word: Event, at: i64) -> bool {
+    /// the record (`changed`: the caller wrote something new there): the start is reported once, and the record and
+    /// the lifecycle step the word causes are one write. Says whether a slot opened.
+    fn hear(&self, inner: &mut Inner<H>, name: &str, now: Now, word: Event, at: i64, changed: bool) -> bool {
         let Some(job) = inner.jobs.get_mut(name) else {
             return false;
         };
+        // Written with the lifecycle's step, which takes the same word as a job that ran.
+        let mut changed = changed | job.record.ended.as_mut().is_some_and(Ending::job_ran);
         if !job.record.start_reported {
+            changed = true;
             job.record.start_reported = true;
             // Settled as having had no job, by a path that could not wait for GitHub (an uninstall): no completion
             // went out, since one needs a reported start, so the end is reported once from here on.
@@ -1148,7 +1144,14 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 machine: facts(&job.record),
             });
         }
+        self.land(inner, name, now, word, changed)
+    }
+
+    /// The lifecycle's step for a word, written with what changed in the record (`changed`) in one write, then
+    /// what that settles. Says whether a slot opened.
+    fn land(&self, inner: &mut Inner<H>, name: &str, now: Now, word: Event, changed: bool) -> bool {
         if !self.feed(inner, name, now, word)
+            && changed
             && let Some(job) = inner.jobs.get(name)
         {
             self.store.save(&job.record);
@@ -1428,9 +1431,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
     }
 
     fn not_registered(&self, name: &str) {
-        if let Some((record, _)) = self.lock().intents.remove(name) {
-            self.store.remove(&record.job);
-        }
+        self.forget_intent(&mut self.lock(), name);
     }
 
     fn registration_unsure(&self, name: &str) {
@@ -1441,22 +1442,26 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
 
     fn retire(&self, repo: &str, scale_set_id: i64, n: usize, idle: &[String]) {
         let mut inner = self.lock();
-        let now = inner.host.now();
-        let of_set =
-            |job: &Job| job.record.scale_set_id == scale_set_id && job.record.repo.eq_ignore_ascii_case(repo);
         let asking = inner
             .jobs
             .values()
-            .filter(|job| of_set(job) && job.life.phase() == Phase::Asking)
+            .filter(|job| job.record.is_of(repo, scale_set_id) && job.life.phase() == Phase::Asking)
             .count();
+        let more = n.saturating_sub(asking);
+        if more == 0 {
+            return;
+        }
+        let now = inner.host.now();
         let names: Vec<String> = idle
             .iter()
             .filter(|runner| {
                 inner.jobs.get(job_name(runner)).is_some_and(|job| {
-                    of_set(job) && job.record.runner == **runner && job.life.phase() == Phase::Idle
+                    job.record.is_of(repo, scale_set_id)
+                        && job.record.runner == **runner
+                        && job.life.phase() == Phase::Idle
                 })
             })
-            .take(n.saturating_sub(asking))
+            .take(more)
             .map(|runner| job_name(runner).to_string())
             .collect();
         for name in names {
@@ -1471,8 +1476,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             .values()
             .filter(|job| {
                 let record = &job.record;
-                record.scale_set_id == scale_set_id
-                    && record.repo.eq_ignore_ascii_case(repo)
+                record.is_of(repo, scale_set_id)
                     && record.ended.is_some()
                     && !record.unregistered
                     && match &record.github {
@@ -1599,15 +1603,11 @@ impl<H: Host + Send, V: Vms> Events for Machines<H, V> {
     fn job(&self, event: &JobEvent) {
         let mut inner = self.lock();
         let now = inner.host.now();
-        let name = job_name(&event.runner).to_string();
-        let Some(job) = inner
-            .jobs
-            .get_mut(&name)
-            .filter(|job| job.record.runner == event.runner)
-        else {
+        let Some(name) = Self::job_of(&inner, &event.runner) else {
             tracing::debug!(runner = %event.runner, "a job event for an Actions runner that is not this Mac's any more");
             return;
         };
+        let job = inner.jobs.get_mut(&name).expect("just found");
         let github = job.record.github.get_or_insert_with(GithubJob::default);
         github.repo.clone_from(&event.repo);
         github.job.clone_from(&event.job);
@@ -1627,7 +1627,7 @@ impl<H: Host + Send, V: Vms> Events for Machines<H, V> {
             EventKind::Completed => Event::JobCompleted,
         };
         let at = event.started_at.unwrap_or(event.at).unix_timestamp();
-        let opened = self.hear(&mut inner, &name, now, word, at);
+        let opened = self.hear(&mut inner, &name, now, word, at, true);
         drop(inner);
         if opened {
             self.ring();

@@ -58,6 +58,17 @@ pub struct Ending {
     pub message: Option<String>,
 }
 
+impl Ending {
+    /// A job ran on the machine after all: an end without a job was the Runner's stop. Says whether it was.
+    pub(crate) fn job_ran(&mut self) -> bool {
+        let was = self.kind == EndKind::NoJob.name();
+        if was {
+            self.kind = EndKind::Stopped.name().to_string();
+        }
+        was
+    }
+}
+
 /// One Actions runner of this Mac, from the moment its name is chosen to the moment nothing of it is left: no
 /// machine, no registration at GitHub, no job to report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +153,11 @@ impl Record {
         self.size.as_deref().and_then(Size::from_label)
     }
 
+    /// Whether it belongs to this repository's scale set of this number, as [`crate::Runner::is_of`] says.
+    pub fn is_of(&self, repo: &str, scale_set_id: i64) -> bool {
+        self.scale_set_id == scale_set_id && self.repo.eq_ignore_ascii_case(repo)
+    }
+
     /// Whether this machine's VM came up, so that its Actions runner may have taken a job.
     pub fn up(&self) -> bool {
         self.slot.is_some_and(|slot| slot.saved().up)
@@ -204,7 +220,7 @@ impl Record {
     ///    VM that stands asks for it rather than being stopped. An end without a job beside a job, or without the
     ///    registration gone, is a stop.
     /// 2. **GitHub's stored word is replayed through the lifecycle** ([`Slot::hear`]), as if heard now: its start,
-    ///    its end, and the registration gone under a machine that stands.
+    ///    its end, and the registration gone under a machine that stands (under a job GitHub named, that job over).
     pub fn upgrade(mut self) -> Result<(Record, Upgrade), Disagrees> {
         if self.rules >= RULES {
             return if self.agrees() {
@@ -230,7 +246,7 @@ impl Record {
             || (matches!(saved.phase, Phase::Stopping | Phase::Killing | Phase::Released)
                 && !matches!(saved.end, Some(End::StartFailed | End::Lost)));
         saved.completed = false;
-        saved.ran_job |= self.github.is_some() || matches!(saved.phase, Phase::Running | Phase::Finishing);
+        saved.ran_job |= matches!(saved.phase, Phase::Running | Phase::Finishing);
         if gone {
             saved.phase = Phase::Released;
         } else if saved.phase == Phase::Released {
@@ -265,8 +281,8 @@ impl Record {
             if saved.end == Some(End::NoJob) {
                 saved.end = Some(End::Stopped);
             }
-            if let Some(ending) = self.ended.as_mut().filter(|e| e.kind == EndKind::NoJob.name()) {
-                ending.kind = EndKind::Stopped.name().to_string();
+            if let Some(ending) = self.ended.as_mut() {
+                ending.job_ran();
             }
         }
 
@@ -279,7 +295,13 @@ impl Record {
             }
         }
         if self.unregistered && !gone && saved.phase != Phase::Reserved {
-            words.push(Event::Unregistered);
+            // Gone under a job GitHub named: a one-job Actions runner removes its own once its job is over, as
+            // `Machines::answered` reads a 404.
+            match &self.github {
+                None => words.push(Event::Unregistered),
+                Some(github) if github.result.is_none() => words.push(Event::JobCompleted),
+                Some(_) => {}
+            }
         }
         self.slot = Some(Slot::hear(Limits::default(), saved, &words).into());
         Ok((self, Upgrade::Upgraded))
