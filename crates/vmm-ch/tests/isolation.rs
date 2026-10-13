@@ -279,6 +279,8 @@ fn link_local_and_the_metadata_service_are_dropped() {
     );
 }
 
+/// On a host without IPv6 pasta has none either, and this holds whatever the firewall does; the firewall's unit
+/// tests carry its IPv6 rule there.
 #[test]
 fn ipv6_goes_nowhere() {
     let found = run(&[
