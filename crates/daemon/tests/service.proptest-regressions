@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a74bfd6b60ae8038de9c41d35474447e4d32d02fc90851cb7bcb3d8a9c431b83 # shrinks to script = [SlowBoot(true), WaitingCancelled, Minutes(28), LostWith(56, Start), WaitingCancelled, GithubLooks, Queued(true), GithubLooks, WaitingCancelled, Queued(false), RemovalsFail(false), Minutes(181), LostWith(248, Start), Cancelled(12, true), LostWith(247, Both), GithubLooks, Queued(true), Started(135), WaitingCancelled, Minutes(73), Crash(98, false), RemovalsFail(true), LostWith(150, Both), Queued(false), RestStale(true), LostWith(238, Both), GithubLooks]
+cc fb9c128abdd7bdbd0d6fcaae50eebf935ef713ec7e24674758fe5173e00c1813 # shrinks to script = [Up(83), Started(97), GithubLooks, GithubLooks, GithubLooks, Queued(false), RestFails(73), Started(13), Minutes(83), GithubLooks, SlowBoot(true), Cancelled(210, true), Cancelled(37, true), GithubLooks, GithubLooks, Up(20), Minutes(215), RemovalsFail(true), Cancelled(149, true), Cancelled(194, true), Queued(false), RemovalsFail(true), Minutes(51), Minutes(212), Crash(213, false), GithubLooks, RestFails(239), LostWith(157, End), RestStale(false), LostWith(140, Start), RemovalsFail(false), RemovalsFail(false)]

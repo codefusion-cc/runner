@@ -1826,6 +1826,11 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                 .collect()
         };
         let start = |runner: &str, ran: &mut BTreeSet<String>| {
+            // An Actions runner runs only in a guest that is up: the guest says so to its vm-host before it starts
+            // the workload, whether the Runner looked since or not.
+            if rig.booting().iter().any(|booting| booting == runner) {
+                rig.parts.vms.ready(job_name(runner));
+            }
             rig.github.start_job(runner);
             if running(&jobs).iter().any(|r| r == runner) {
                 ran.insert(runner.to_string());
@@ -2115,7 +2120,7 @@ fn running(rig: &Rig, jobs: &[i64]) -> Vec<String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 32, failure_persistence: None, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
 
     /// Whatever happens in whatever order, over long runs: no job gets two machines; a session opens again only
     /// when GitHub forgot it, it failed, or the Runner started again, so no state makes the Runner open sessions
