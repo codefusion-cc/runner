@@ -131,6 +131,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-clock"
+version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "libc",
+]
+
+[[package]]
 name = "cf-console-client"
 version = "0.1.0"
 dependencies = [
@@ -236,10 +244,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-host-linux"
+version = "0.1.0"
+dependencies = [
+ "cf-budget",
+ "cf-clock",
+ "libc",
+ "proptest",
+ "tempfile",
+]
+
+[[package]]
 name = "cf-host-macos"
 version = "0.1.0"
 dependencies = [
  "cf-budget",
+ "cf-clock",
  "libc",
  "tempfile",
 ]

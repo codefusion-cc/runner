@@ -38,7 +38,7 @@ pub use budget::{
     Assigned, Budget, Charge, Eviction, EvictionCause, Free, Grant, Held, Observed, Origin, Refusal,
     Released, SlotId, Status, Turn, UnknownSlot, Usage, Waiting, admit,
 };
-pub use host::{Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
+pub use host::{Battery, Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};
 pub use settings::{DEFER_LIMIT, Mode, Profile, Settings, SettingsError};
 pub use size::Size;

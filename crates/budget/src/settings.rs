@@ -187,7 +187,7 @@ impl Settings {
             idle_after: Millis::mins(15),
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
-            vcpus: [2, (all_but_two / 2).clamp(2, 4), 4, 4],
+            vcpus: vcpus_for(all_but_two),
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),
@@ -204,6 +204,59 @@ impl Settings {
             reservation_ttl: Millis::mins(2),
             stale_after: Millis::secs(5),
         }
+    }
+
+    /// What a lean Linux host with nobody at it holds for itself: the kernel, systemd, sshd and the Runner. 0.4 GB
+    /// measured with nothing to do on an RK3588 board with 7.75 GB (`MemTotal` less `MemAvailable`), Docker installed
+    /// and idle; half a gigabyte with a little room.
+    pub const HEADLESS_HOST_USE: u64 = GIB / 2;
+
+    /// The defaults for a Linux host nobody works at, such as a board on a shelf: the reserve is what the host
+    /// needs, not the Mac's.
+    ///
+    /// [`Settings::for_host`] keeps 25% and at least 3 GB, for macOS and a person's session, which hold several
+    /// gigabytes. A headless Linux host holds half a gigabyte ([`Settings::HEADLESS_HOST_USE`]); the Mac's rule
+    /// would leave a 7.75 GB board 4.75 GB, one cf-4g and never two cf-2g.
+    ///
+    /// `fast_cores` is how many cores the machines run on: the fast kind of a board whose cores are not all alike,
+    /// which machines are pinned to, so that a vCPU never moves between two kinds of core. On a host whose cores are
+    /// all alike it is all of them, or 0. One fast core holds no machine (a cf-2g has 2 vCPUs), so a host with a
+    /// single prime core counts as one whose cores are alike.
+    ///
+    /// - Floor: 1 GB and 1/32 of the memory, for the page cache that keeps the image the machines boot from and
+    ///   for what the host's programs do between two readings. 1.24 GB on 7.75 GB.
+    /// - Room for machines: all memory but the floor and [`Settings::HEADLESS_HOST_USE`]. 6.0 GB on 7.75 GB.
+    /// - Cap: that room less [`Settings::VM_HOST_OVERHEAD`] for each machine the CPUs let run side by side. The cap
+    ///   counts sizes while each machine costs its size and the overhead, so every set of machines under the cap
+    ///   fits the room with all their overheads. 5.64 GB on 7.75 GB with 4 fast cores: one cf-4g (4.2 GB with
+    ///   its overhead) or two cf-2g (4.4 GB) at a time; a cf-4g beside a cf-2g (6.4 GB) never, nor a cf-6g (6.2 GB
+    ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
+    /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
+    ///   two, as on a Mac. 2 vCPUs for cf-2g, half the CPUs for cf-4g (at least 2, at most 4), 4 for the larger
+    ///   sizes: on 4 fast cores, two machines of 2 vCPUs.
+    /// - Times and disk limits as on a dedicated Mac.
+    pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
+        let total = facts.total_bytes;
+        let mut settings = Settings::for_host(facts, Mode::Dedicated);
+        let cpus = if (2..facts.cores).contains(&fast_cores) {
+            fast_cores
+        } else {
+            settings.away.cpus
+        };
+        settings.vcpus = vcpus_for(cpus);
+        let floor = GIB + total / 32;
+        let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
+        let limits = Profile {
+            cap_bytes: total
+                .saturating_sub(floor)
+                .saturating_sub(Self::HEADLESS_HOST_USE)
+                .saturating_sub(side_by_side.saturating_mul(settings.vm_host_overhead_bytes)),
+            floor_bytes: floor,
+            cpus,
+        };
+        settings.away = limits;
+        settings.in_use = limits;
+        settings
     }
 
     /// The cap "Also while I work" gives a workstation: all memory but 60% (at least 5.5 GB). A 16 GB Mac: 6.4 GB.
@@ -304,4 +357,10 @@ impl Settings {
     pub fn host_bytes(&self, size: Size) -> u64 {
         size.vm_bytes().saturating_add(self.vm_host_overhead_bytes)
     }
+}
+
+/// The vCPUs of each size where CI may use `cpus`: 2 for cf-2g, half of them for cf-4g (at least 2, at most 4), so
+/// that two run side by side, and 4 for the larger sizes.
+fn vcpus_for(cpus: u32) -> [u32; 4] {
+    [2, (cpus / 2).clamp(2, 4), 4, 4]
 }

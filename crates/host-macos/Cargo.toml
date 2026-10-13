@@ -10,6 +10,7 @@ publish.workspace = true
 cf-budget = { path = "../budget" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cf-clock = { path = "../clock" }
 libc.workspace = true
 
 [dev-dependencies]
