@@ -228,7 +228,7 @@ impl Rig {
 
     /// Queues a job once the Mac's last two polls offered room, so GitHub hands it over at once.
     async fn queue(&self) -> i64 {
-        until("the Mac to offer room", || self.github.offers_room()).await;
+        until("the Mac to offer room", || self.github.offers_room(REPO)).await;
         self.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build")
     }
 
@@ -578,6 +578,8 @@ async fn two_repositories_that_ask_for_the_same_labels_each_get_their_jobs() {
     assert!(rig.github.scale_sets().iter().all(|s| s.has_session));
 
     rig.queue().await;
+    // GitHub hands a queued job only to a scale set whose polls showed room: the other repository's set too.
+    until("the other repository's set to offer room", || rig.github.offers_room(OTHER)).await;
     rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
     until("a machine for the job of each", || rig.standing().len() == 2).await;
     for runner in rig.standing() {
