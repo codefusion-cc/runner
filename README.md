@@ -170,6 +170,14 @@ CF_REQUIRE_EMBEDDED=1 cargo test --workspace
 cargo deny check
 ```
 
+and on an arm64 Linux host, where the tests of `cf-host-linux` also read the host's own `/proc`:
+
+```sh
+cargo clippy -p cf-host-linux -p cf-budget --all-targets -- -D warnings
+cargo test -p cf-host-linux -p cf-budget
+cargo run -p cf-host-linux --example host-probe
+```
+
 CI's Macs cannot boot a machine, so the jobs in real machines run on a Mac of your own:
 
 ```sh
