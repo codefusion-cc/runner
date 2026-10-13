@@ -20,6 +20,7 @@ use cf_lifecycle::{BreakerLimits, Effect, End, Event, Limits, Phase, Slot, Start
 use cf_vmhost::{JobRequest, JobState, OutOfMemory, Stage};
 
 use crate::ends::{EndKind, machine_end};
+use crate::making::{Making, theirs};
 use crate::names::job_name;
 use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, Upgrade};
 use crate::roster::{JobInfo, Roster, Runner};
@@ -322,6 +323,8 @@ struct Inner<H> {
     door: Option<(bool, &'static str)>,
     /// What the polls in flight may be offering GitHub.
     offer: Offer,
+    /// For which size room is made.
+    making: Making,
 }
 
 /// The Mac's slots and machines. The scalers see it as [`Slots`], [`Hosts`] and [`Events`]; the daemon's loop
@@ -408,6 +411,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 looked: None,
                 door: None,
                 offer: Offer::default(),
+                making: Making::default(),
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -579,6 +583,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         inner.budget.hold(Hold::StartFailures, failures);
         inner.budget.hold(Hold::Paused, inner.paused);
         inner.budget.hold(Hold::Draining, inner.draining);
+        inner.making.check(&mut inner.budget, now);
     }
 
     /// Takes new jobs or not, as the console or the person asks. The polls in flight are told, since each still
@@ -660,6 +665,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             nudge = true;
         }
         for grant in observed.started {
+            inner.making.started(grant.size);
             inner.breaker.admit(now.elapsed);
             inner.waiting.remove(&grant.slot);
             inner.ready.insert(grant.slot);
@@ -724,12 +730,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     }
 
     /// Whether a poll in flight may offer what is not true any more: a slot of a size of which no machine fits now
-    /// or, unless only room that is `gone` is asked for (which is all that taking a slot can change), none of a
-    /// size of which one fits. Whoever hears yes rings the bells ([`Machines::ring`]).
+    /// and that has no place in line, or, unless only room that is `gone` is asked for (which is all that taking a
+    /// slot can change), none of a size of which one fits or that has one. Whoever hears yes rings the bells
+    /// ([`Machines::ring`]).
     fn owed(inner: &Inner<H>, now: Now, gone: bool) -> bool {
         Size::ALL.into_iter().any(|size| {
             let at = size.index();
-            let fits = inner.budget.fits(now, size).is_ok();
+            let fits = inner.budget.fits(now, size).is_ok() || inner.making.place(&inner.budget, now, size);
             (inner.offer.room[at] && !fits) || (!gone && inner.offer.none[at] && fits)
         })
     }
@@ -766,7 +773,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         match inner.budget.fits(now, size) {
             Ok(()) => {}
             Err(refusal @ cf_budget::Refusal::Memory { short_bytes }) => {
-                room.why = Some(if Self::theirs(settings, status, size) {
+                room.why = Some(if theirs(settings, status, size) {
                     "full"
                 } else {
                     refusal.name()
@@ -786,16 +793,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         Self::room(inner, now, &inner.budget.status(now), size)
             .why
             .filter(|why| *why == "memory")
-    }
-
-    /// Whether the memory one more machine of this size lacks is held, or still to be taken, by the Mac's own
-    /// machines: a Mac that would carry it without them is full, not short.
-    fn theirs(settings: &Settings, status: &Status, size: Size) -> bool {
-        let without_machines = status
-            .reading
-            .map(|reading| reading.available_bytes.saturating_add(status.resident_bytes));
-        without_machines
-            .is_some_and(|available| cf_budget::admit(settings, &status.limits, available, &[], size).is_ok())
     }
 
     /// Writes a line when the Mac starts or stops taking new jobs, or stops for another reason than before. Without
@@ -1387,6 +1384,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         }
         match inner.budget.claim(now, size) {
             Ok(grant) => {
+                inner.making.started(size);
                 inner.grants.insert(grant.slot, grant);
                 let told = Self::owed(&inner, now, true);
                 drop(inner);
@@ -1429,12 +1427,15 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         }
         let claim = match inner.budget.assign_in_turn(now, size, turn) {
             Assigned::Start(grant) => {
+                inner.making.started(size);
                 inner.breaker.admit(now.elapsed);
                 inner.grants.insert(grant.slot, grant);
                 Claim::Start(grant.slot)
             }
             Assigned::Waits { slot, why } => {
                 inner.waiting.insert(slot);
+                // Room is made for it, if it is one to make room for, before another job asks.
+                self.holds(&mut inner, now);
                 Claim::Waits {
                     ticket: slot,
                     why: why.name().to_string(),
@@ -1467,6 +1468,9 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         }
         if inner.waiting.remove(&ticket) {
             let _ = inner.budget.withdraw(ticket);
+            // Room made for its size is now for a job GitHub took back: from now on, not from the next look.
+            let now = inner.host.now();
+            self.holds(&mut inner, now);
         } else if inner.ready.remove(&ticket) {
             inner.grants.remove(&ticket);
             let _ = inner.budget.release(ticket);
@@ -1480,7 +1484,8 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         let mut inner = self.lock();
         let now = inner.host.now();
         self.holds(&mut inner, now);
-        let free = inner.budget.free(now).of(size) as usize;
+        let Inner { making, budget, .. } = &mut *inner;
+        let free = making.offer(budget, now, size) as usize;
         let at = size.index();
         if free > 0 {
             inner.offer.room[at] = true;

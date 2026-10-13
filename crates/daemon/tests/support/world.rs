@@ -21,6 +21,18 @@ pub const REPO: &str = "org/app";
 pub const SET: i64 = 7;
 
 /// One Mac with its machines, and GitHub's list of the Actions runners registered from it.
+/// The Mac mini of 2026-10-13: 16 GB and 8 cores, given to CI. A cap of 12 GiB, a floor of 2 GiB, 6 vCPUs: a cf-2g
+/// machine takes 2 of them, a cf-4g 3, a cf-6g or cf-8g 4.
+pub fn mini() -> cf_budget::Settings {
+    cf_budget::Settings::for_host(
+        cf_budget::HostFacts {
+            total_bytes: 16 * cf_budget::GIB,
+            cores: 8,
+        },
+        cf_budget::Mode::Dedicated,
+    )
+}
+
 pub struct World {
     pub parts: TestParts,
     pub m: Arc<TestMachines>,

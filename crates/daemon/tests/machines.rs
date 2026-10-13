@@ -1701,20 +1701,10 @@ async fn the_minis_second_machine_its_first_keeps_out_is_full_with_what_it_needs
 /// that the Mac had already given, and refused a second machine whenever 6.4 to 8.8 GiB were available.
 mod mini {
     use super::*;
-    use cf_budget::{HostFacts, Mode, Settings};
+    pub use support::world::mini as settings;
 
     pub const PEAK: u64 = 1577 * MIB;
     pub const HELD: u64 = 4109 * MIB;
-
-    pub fn settings() -> Settings {
-        Settings::for_host(
-            HostFacts {
-                total_bytes: 16 * GIB,
-                cores: 8,
-            },
-            Mode::Dedicated,
-        )
-    }
 
     /// The mini with its first machine running, its job's peak and the vm-host's reading of the Mac as given.
     pub async fn with_one(peak: u64, held: Option<u64>) -> (World, String) {
