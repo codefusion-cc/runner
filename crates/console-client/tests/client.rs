@@ -150,6 +150,41 @@ async fn an_enrolment_answer_that_is_not_the_contracts_is_a_protocol_error_that_
 }
 
 #[tokio::test]
+async fn what_each_size_meets_arrives_under_the_names_the_console_reads() {
+    let w = world().await;
+    let size = |label: &str, free, why: Option<&str>, need, short| cf_console_client::SizeStatus {
+        size: label.into(),
+        free,
+        why: why.map(Into::into),
+        need_bytes: need,
+        short_bytes: short,
+    };
+    let mut report = report("mac-a");
+    report.status.sizes = vec![
+        size("cf-2g", 2, None, None, None),
+        size("cf-4g", 0, Some("memory"), Some(6_831_472_640), Some(1 << 30)),
+        size("cf-6g", 0, Some("cpus"), None, None),
+        size("cf-8g", -1, Some("never"), None, None),
+    ];
+    w.client.report(&report).await.expect("answer");
+    w.client.report(&support::report("mac-a")).await.expect("answer");
+    let sent = w.fake.reports();
+    assert_eq!(
+        sent[0]["status"]["sizes"],
+        json!([
+            {"size": "cf-2g", "free": 2},
+            {"size": "cf-4g", "free": 0, "why": "memory", "needBytes": 6_831_472_640u64, "shortBytes": 1u64 << 30},
+            {"size": "cf-6g", "free": 0, "why": "cpus"},
+            {"size": "cf-8g", "free": -1, "why": "never"},
+        ])
+    );
+    assert!(
+        sent[1]["status"].get("sizes").is_none(),
+        "a Runner with nothing to say sends no list"
+    );
+}
+
+#[tokio::test]
 async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
     let w = world().await;
     w.fake.pause(true);

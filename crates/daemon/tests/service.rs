@@ -234,7 +234,7 @@ impl Rig {
 
     /// Queues a job once the Mac's last two polls offered room, so GitHub hands it over at once.
     async fn queue(&self) -> i64 {
-        until("the Mac to offer room", || self.github.offers_room()).await;
+        until("the Mac to offer room", || self.github.offers_room(REPO)).await;
         self.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build")
     }
 
@@ -414,6 +414,16 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
         json!("2026-09-21T14:13:20Z")
     );
     assert_eq!(report["activity"]["cpuPercent"], json!(12.0));
+    // Beside the machine that runs, its 4 GB of machines take one more cf-2g and no cf-4g; larger sizes, never.
+    assert_eq!(
+        report["status"]["sizes"],
+        json!([
+            {"size": "cf-2g", "free": 1},
+            {"size": "cf-4g", "free": 0, "why": "full"},
+            {"size": "cf-6g", "free": -1, "why": "never"},
+            {"size": "cf-8g", "free": -1, "why": "never"},
+        ])
+    );
 
     rig.finish(&runner, "succeeded");
     until("the end at the console", || rig.events().len() == 2).await;
@@ -588,6 +598,11 @@ async fn two_repositories_that_ask_for_the_same_labels_each_get_their_jobs() {
     assert!(rig.github.scale_sets().iter().all(|s| s.has_session));
 
     rig.queue().await;
+    // GitHub hands a queued job only to a scale set whose polls showed room: the other repository's set too.
+    until("the other repository's set to offer room", || {
+        rig.github.offers_room(OTHER)
+    })
+    .await;
     rig.github.queue_job(OTHER, &["self-hosted", "cf-2g"], "build");
     until("a machine for the job of each", || rig.standing().len() == 2).await;
     for runner in rig.standing() {
@@ -1835,6 +1850,11 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                 .collect()
         };
         let start = |runner: &str, ran: &mut BTreeSet<String>| {
+            // An Actions runner runs only in a guest that is up: the guest says so to its vm-host before it starts
+            // the workload, whether the Runner looked since or not.
+            if rig.booting().iter().any(|booting| booting == runner) {
+                rig.parts.vms.ready(job_name(runner));
+            }
             rig.github.start_job(runner);
             if running(&jobs).iter().any(|r| r == runner) {
                 ran.insert(runner.to_string());
@@ -1853,13 +1873,9 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             Happens::Completed(n, github_first) => {
                 if let Some(runner) = pick(&running(&jobs), n) {
                     if github_first {
-                        // GitHub's word may come before the Runner saw a machine that boots slowly up.
+                        // GitHub's word may come before the Runner saw the machine up.
                         rig.github.complete_job(&runner, "succeeded");
                         tokio::time::sleep(Duration::from_millis(30)).await;
-                        if rig.booting().contains(&runner) {
-                            rig.parts.vms.ready(job_name(&runner));
-                            tokio::time::sleep(Duration::from_millis(30)).await;
-                        }
                         rig.parts.vms.end(job_name(&runner), End::Ok);
                     } else {
                         rig.parts.vms.end(job_name(&runner), End::Ok);
@@ -2124,7 +2140,7 @@ fn running(rig: &Rig, jobs: &[i64]) -> Vec<String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 32, failure_persistence: None, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
 
     /// Whatever happens in whatever order, over long runs: no job gets two machines; a session opens again only
     /// when GitHub forgot it, it failed, or the Runner started again, so no state makes the Runner open sessions

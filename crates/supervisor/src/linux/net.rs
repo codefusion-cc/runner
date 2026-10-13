@@ -231,7 +231,7 @@ pub struct Network {
 
 /// Brings the network up and loads the firewall. An error leaves the job without a start: a job never runs
 /// without the firewall.
-pub fn up(told: Vec<(firewall::Ip, u8)>) -> Result<Network, String> {
+pub fn up(told: Vec<(cf_nft::Ip, u8)>) -> Result<Network, String> {
     let started = Instant::now();
     let control = context("control socket", socket(libc::AF_INET, libc::SOCK_DGRAM, 0))?;
     context("loopback", bring_up(&control, "lo"))?;
@@ -302,67 +302,13 @@ pub fn up(told: Vec<(firewall::Ip, u8)>) -> Result<Network, String> {
     };
     // What is next to this machine, whatever range the Mac gives its machines, and the networks the Mac is in.
     let own = firewall::beside(lease.address, lease.netmask, lease.gateway, &told);
-    load_firewall(&firewall::netlink(&firewall::policy(&name_servers, &own)))?;
+    firewall::netlink(&firewall::policy(&name_servers, &own))
+        .and_then(|batch| cf_nft::apply(&batch))
+        .map_err(|error| format!("firewall: {error}"))?;
     Ok(Network {
         name_servers,
         address: lease.address,
         took: started.elapsed(),
         questions,
     })
-}
-
-/// Hands the firewall to the kernel and reads its answers: every message acknowledged, or the first refusal.
-fn load_firewall(batch: &firewall::Batch) -> Result<(), String> {
-    const NETLINK_NETFILTER: libc::c_int = 12;
-    const NLMSG_ERROR: u16 = 2;
-    let netlink = context(
-        "firewall socket",
-        socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_NETFILTER),
-    )?;
-    timeout(&netlink, Duration::from_secs(3));
-    // SAFETY: send reads the batch's bytes, which we own.
-    let sent = unsafe {
-        libc::send(
-            netlink.as_raw_fd(),
-            batch.bytes.as_ptr().cast(),
-            batch.bytes.len(),
-            0,
-        )
-    };
-    if sent != batch.bytes.len() as isize {
-        return Err(format!("firewall: {}", io::Error::last_os_error()));
-    }
-    let mut acknowledged = 0;
-    let mut buffer = vec![0u8; 16384];
-    while acknowledged < batch.acknowledged {
-        // SAFETY: recv fills at most the buffer's length.
-        let read = unsafe { libc::recv(netlink.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
-        let Ok(read) = usize::try_from(read) else {
-            return Err(format!(
-                "firewall: the kernel did not answer: {}",
-                io::Error::last_os_error()
-            ));
-        };
-        let mut messages = &buffer[..read];
-        while messages.len() >= 16 {
-            let length = u32::from_ne_bytes([messages[0], messages[1], messages[2], messages[3]]) as usize;
-            if length < 16 || length > messages.len() {
-                break;
-            }
-            let kind = u16::from_ne_bytes([messages[4], messages[5]]);
-            let sequence = u32::from_ne_bytes([messages[8], messages[9], messages[10], messages[11]]);
-            if kind == NLMSG_ERROR && length >= 20 {
-                let code = i32::from_ne_bytes([messages[16], messages[17], messages[18], messages[19]]);
-                if code != 0 {
-                    return Err(format!(
-                        "firewall: the kernel refused message {sequence}: {}",
-                        io::Error::from_raw_os_error(-code)
-                    ));
-                }
-                acknowledged += 1;
-            }
-            messages = &messages[length.next_multiple_of(4).min(messages.len())..];
-        }
-    }
-    Ok(())
 }

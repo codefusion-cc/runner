@@ -96,6 +96,17 @@ pub struct HostReading {
     pub disk_free_bytes: u64,
 }
 
+/// The host's battery, for the console's page: the budget itself reads only [`HostReading::on_battery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Battery {
+    /// Whether the host draws from its battery and not from a charger.
+    pub on_battery: bool,
+    /// The charge, 0 to 100.
+    pub percent: u32,
+    /// Whether it is charging.
+    pub charging: bool,
+}
+
 /// A reading that could not be taken. The budget treats every one of these the same way: the Mac is closed.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum HostError {

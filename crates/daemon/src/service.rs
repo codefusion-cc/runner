@@ -13,7 +13,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cf_budget::{Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, Status, Update,
+    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
+    Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_host_macos::Battery;
@@ -932,7 +933,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
         let why = if snapshot.open {
             sets.iter()
-                .find_map(|set| shared.machines.short_of(set.size))
+                .find_map(|set| snapshot.short_of(set.size))
                 .unwrap_or("no machine of their size fits")
                 .to_string()
         } else {
@@ -1012,7 +1013,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .iter()
             .map(|set| set.size)
             .min_by_key(|size| size.index())
-            .and_then(|smallest| shared.machines.short_of(smallest));
+            .and_then(|smallest| snapshot.short_of(smallest));
         let updating = shared.update.lock().expect("update");
         let (open, reason) = match (&updating.doing, no_room) {
             (Some(doing), _) => (false, Some(doing.clone())),
@@ -1061,6 +1062,17 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 idle_with_jobs_waiting_seconds,
                 idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
                     .map(|reason| cut(reason, STATUS_TEXT_MAX)),
+                sizes: snapshot
+                    .rooms
+                    .iter()
+                    .map(|room| SizeStatus {
+                        size: room.size.label().to_string(),
+                        free: room.free.map_or(-1, i64::from),
+                        why: room.why.map(str::to_string),
+                        need_bytes: room.need_bytes,
+                        short_bytes: room.short_bytes,
+                    })
+                    .collect(),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)
@@ -1069,7 +1081,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         name: set.name.clone(),
                         id: set.id,
                         labels: set.labels.iter().take(MAX_LABELS).cloned().collect(),
-                        capacity: u32::try_from(shared.machines.room(set.size)).unwrap_or(u32::MAX),
+                        capacity: snapshot.room(set.size).free.unwrap_or(0),
                         waiting: set.statistics.as_ref().map_or(0, |s| {
                             u32::try_from(s.total_available_jobs.max(0)).unwrap_or(u32::MAX)
                         }),

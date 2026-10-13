@@ -215,10 +215,34 @@ pub struct Status {
     /// What the Runner believes keeps those jobs from starting, while they wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_with_jobs_waiting_reason: Option<String>,
+    /// What one more machine of each size meets now. Left out by a Runner that does not say it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sizes: Vec<SizeStatus>,
     /// Its scale sets, at most 500.
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
     pub runners: Vec<RunnerStatus>,
+}
+
+/// What one more machine of a size meets on the Mac now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeStatus {
+    /// Its label, such as `cf-4g`.
+    pub size: String,
+    /// How many more fit now; -1 for a size the Mac never runs.
+    pub free: i64,
+    /// Why none fits, while none does: `never`, `memory`, `full`, `cpus`, `assigned-first`, or why the Mac is closed
+    /// (`paused`, `calming` and the like).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// For `memory`, and `full` for memory its own machines hold (not the cap): the memory the Mac must have available
+    /// for one more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub need_bytes: Option<u64>,
+    /// And how much of it it lacks now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_bytes: Option<u64>,
 }
 
 /// A power source reading.
