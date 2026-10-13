@@ -135,9 +135,10 @@ pub struct Released {
 /// What a running VM uses, as its vm-host measures it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
-    /// The physical memory the VM's process holds now: its resident size. Not its footprint, which also counts
-    /// pages macOS compressed or swapped out: those left the Mac's memory, show as available again, and come back
-    /// when the guest touches them, so they are still to come.
+    /// The physical memory the VM's process holds now: its resident size, which is its footprint less what macOS
+    /// compressed or swapped out of it. Not the footprint itself: those pages left the Mac's memory, show as
+    /// available again, and come back when the guest touches them, so they are still to come. Nor the resident
+    /// size `ps` shows, which counts a guest's memory more than once.
     pub resident_bytes: u64,
     /// The size of the job's scratch disk on the host.
     pub scratch_bytes: u64,
@@ -543,6 +544,14 @@ impl Budget {
         held.usage = Some((now.elapsed, usage));
         held.settled_bytes = held.settled_bytes.min(usage.resident_bytes);
         Ok(())
+    }
+
+    /// What a slot's VM is counted with on the host: the most of the Mac's memory it can take.
+    pub fn host_bytes(&self, slot: SlotId) -> Result<u64, UnknownSlot> {
+        self.slots
+            .get(&slot)
+            .map(|held| held.host_bytes)
+            .ok_or(UnknownSlot(slot))
     }
 
     /// Gives a slot's memory and CPUs back. Call it when the VM's process is gone, or when no VM was started. A

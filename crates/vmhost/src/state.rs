@@ -116,6 +116,12 @@ pub struct JobState {
     /// What the job uses, as of the guest's last heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// What of the Mac's memory the machine holds, in bytes, when this state was written ([`cf_vmm::Vm::resident`]).
+    /// This, and not the job's own peak, is what the machine took from the Mac: the guest's kernel and its page
+    /// cache touch memory the job never counts, and the guest gives none of it back. `None` while no machine runs,
+    /// or when its process could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_bytes: Option<u64>,
     /// The first process the kernel stopped for memory, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oom: Option<OomEvent>,

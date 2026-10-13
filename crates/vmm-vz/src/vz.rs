@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use block2::RcBlock;
 use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
+
+use crate::holder::Holder;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
@@ -63,11 +65,20 @@ impl Vmm for VzVmm {
         let mut built = None;
         queue.exec_sync(|| built = Some(build(spec, &queue, exit.clone()).map(OnQueue)));
         let OnQueue((machine, delegate)) = built.expect("the queue ran the block")?;
+        // The files only this machine opens; a read-only image may be open in every machine at once.
+        let mut own: Vec<&Path> = vec![&spec.kernel, &spec.console];
+        own.extend(
+            spec.disks
+                .iter()
+                .filter(|disk| !disk.read_only)
+                .map(|disk| disk.path.as_path()),
+        );
         let vm = VzVm {
             queue,
             machine: Mutex::new(Some(Arc::new(OnQueue(machine)))),
             _delegate: OnQueue(delegate),
             exit,
+            process: Holder::machine(&own),
         };
 
         let (started, result) = mpsc::channel();
@@ -107,6 +118,8 @@ struct VzVm {
     /// The machine holds its delegate weakly.
     _delegate: OnQueue<Retained<Delegate>>,
     exit: Arc<ExitCell>,
+    /// The framework's process that runs the machine.
+    process: Holder,
 }
 
 impl VzVm {
@@ -226,6 +239,10 @@ impl Vm for VzVm {
     fn kill(&self) {
         self.release();
         self.exit.end(VmExit::Stopped);
+    }
+
+    fn resident(&self) -> Option<u64> {
+        self.process.resident()
     }
 }
 

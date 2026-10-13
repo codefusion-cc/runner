@@ -17,7 +17,7 @@ use cf_budget::{
 use cf_ghapp::Clock;
 use cf_guest_proto::{StopReason, Workload};
 use cf_lifecycle::{BreakerLimits, Effect, End, Event, Limits, Phase, Slot, StartBreaker};
-use cf_vmhost::{JobRequest, JobState, OutOfMemory};
+use cf_vmhost::{JobRequest, JobState, OutOfMemory, Stage};
 
 use crate::ends::{EndKind, machine_end};
 use crate::names::job_name;
@@ -246,6 +246,17 @@ struct Job {
     ended_at: Option<Millis>,
     /// The end a restored slot is reported with, when its machine was not there any more.
     restored_end: Option<EndKind>,
+    /// What the log said of what the machine holds.
+    hold_said: HoldSaid,
+}
+
+/// What the log said of what a machine holds of the Mac's memory, so that each is said once until it changes.
+#[derive(Clone, Copy, Debug, Default)]
+struct HoldSaid {
+    /// That it is not known.
+    unknown: bool,
+    /// That it is more than the machine is counted with.
+    over: bool,
 }
 
 struct Inner<H> {
@@ -446,6 +457,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                         last: None,
                         ended_at: Some(now.elapsed),
                         restored_end: None,
+                        hold_said: HoldSaid::default(),
                     },
                 );
                 self.settle(&mut inner, &name, now);
@@ -520,6 +532,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     last: state,
                     ended_at: None,
                     restored_end,
+                    hold_said: HoldSaid::default(),
                 },
             );
             self.apply(&mut inner, &name, now, effects);
@@ -762,6 +775,55 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// Tells the budget what a running machine holds of the Mac's memory: what its vm-host read of the process that
+    /// runs it. The guest touches memory its job never counts (its kernel, its page cache) and gives none back, so the
+    /// job's peak is only the least the machine holds: it counts when the vm-host could not read the process (or is
+    /// of a Runner from before), and the rest of the machine's size stays still to come. Either way the log says once
+    /// when what a machine whose guest is up holds is not known, or is more than the budget counts it with.
+    fn count_held(inner: &mut Inner<H>, name: &str, slot: SlotId, now: Now, state: &JobState) {
+        let counted = inner.budget.host_bytes(slot).ok();
+        let resident = state.resident_bytes;
+        if let Some(job) = inner.jobs.get_mut(name) {
+            let said = &mut job.hold_said;
+            // A machine on its way down may have no process left to read before its vm-host is gone.
+            let unknown = resident.is_none() && matches!(state.stage, Stage::Running | Stage::Stopping);
+            if unknown && !said.unknown {
+                tracing::warn!(
+                    job = name,
+                    "what the Mac holds for a machine is not known: it counts by its job's peak"
+                );
+            }
+            said.unknown = unknown;
+            if let (Some(held), Some(counted)) = (resident, counted) {
+                let over = held > counted;
+                if over && !said.over {
+                    tracing::warn!(
+                        job = name,
+                        held_mib = held >> 20,
+                        counted_mib = counted >> 20,
+                        "a machine holds more than it is counted with"
+                    );
+                }
+                said.over = over;
+            }
+        }
+        let peak = state
+            .usage
+            .as_ref()
+            .map(|usage| usage.memory_peak_bytes.min(state.vm_bytes));
+        let Some(held) = resident.or(peak) else {
+            return;
+        };
+        let _ = inner.budget.usage(
+            now,
+            slot,
+            Usage {
+                resident_bytes: held,
+                scratch_bytes: state.usage.as_ref().map_or(0, |usage| usage.disk_bytes),
+            },
+        );
+    }
+
     /// Tells the lifecycle what a look at a job's vm-host showed. The look was taken without the lock, so the job
     /// may have moved on since: its phase is read here, and one that is gone by now is told nothing.
     fn watch(&self, inner: &mut Inner<H>, name: &str, now: Now, seen: Seen) {
@@ -790,17 +852,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 if state.oom.is_some() && !had_oom {
                     events.push(Event::OutOfMemory);
                 }
-                if let (Some(slot), Some(usage)) = (slot, state.usage.as_ref()) {
-                    // What the job ever held stays with the machine; the guest's own share on top of it is not
-                    // counted, so the budget never takes more off "still to come" than the Mac has given.
-                    let _ = inner.budget.usage(
-                        now,
-                        slot,
-                        Usage {
-                            resident_bytes: usage.memory_peak_bytes.min(state.vm_bytes),
-                            scratch_bytes: usage.disk_bytes,
-                        },
-                    );
+                if let Some(slot) = slot {
+                    Self::count_held(inner, name, slot, now, state);
                 }
             }
             Seen::Gone(state) => {
@@ -1570,6 +1623,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
                 last: None,
                 ended_at: None,
                 restored_end: None,
+                hold_said: HoldSaid::default(),
             },
         );
         Ok(name)

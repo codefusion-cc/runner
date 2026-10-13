@@ -82,6 +82,11 @@ pub trait Vm: Send + Sync {
 
     /// Lets go of the machine without waiting for anything: the last resort when [`Vm::stop`] does not end it.
     fn kill(&self);
+
+    /// What of the Mac's memory the machine holds now, in bytes: the physical footprint of the monitor's process that
+    /// runs it less what macOS compressed or swapped out of it. That is the guest's memory as far as the guest has
+    /// touched it, and the monitor's own. `None` when that process cannot be told apart or read.
+    fn resident(&self) -> Option<u64>;
 }
 
 /// A byte stream between the host and one port of the guest.

@@ -24,8 +24,9 @@ ran, each in a machine that was gone when the job ended. What is there:
   budget for memory, starts a machine and registers an Actions runner for that one job. When the job ends, however
   it ends, the machine is destroyed, the registration removed, the memory given back, and the console told once,
 - sizes from the label: `cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`; `self-hosted` alone is 4 GB. A machine is counted as
-  its size and 192 MB. A 16 GB Mac nobody works on runs two `cf-4g` at once; one somebody works on runs them only
-  while the person is away,
+  its size and 192 MB, of which what it already holds of the Mac's memory counts as given. A 16 GB Mac nobody
+  works on runs two `cf-4g` at once when its own programs leave it about 10.4 GB available (twice 4.2 GB and its
+  2 GB floor); one somebody works on runs them only while the person is away,
 - nothing stays behind: a Runner that starts finds the machines of the one before, goes on with those that run and
   removes what is left of the others, on the Mac and at GitHub,
 - never more machines than GitHub assigned jobs, and no machine stopped while its job runs. A machine idle for 10
