@@ -133,6 +133,13 @@ impl Curl {
     }
 }
 
+/// `duration` as the seconds curl is given, rounded down to its millisecond, or `None` below one millisecond: curl
+/// reads 0 as no limit at all, so what rounds to it must not become a request.
+fn curl_seconds(duration: Duration) -> Option<String> {
+    let millis = duration.as_millis();
+    (millis > 0).then(|| format!("{}.{:03}", millis / 1000, millis % 1000))
+}
+
 /// The most redirects a download follows.
 const MAX_REDIRECTS: usize = 5;
 /// The largest index read.
@@ -200,16 +207,17 @@ fn get(
             return Err(FetchError::Host(host));
         }
         let left = deadline.saturating_sub(started.elapsed());
-        if left.is_zero() {
+        // The connection gets its own limit, never more than what is left of the whole.
+        let (Some(total), Some(connect)) = (curl_seconds(left), curl_seconds(curl.connect.min(left))) else {
             return Err(FetchError::Transport(format!(
                 "no answer within {} s",
                 deadline.as_secs()
             )));
-        }
+        };
         let output = Command::new("curl")
             .args(["-sS", "--proto", curl.protocols])
-            .args(["--connect-timeout", &format!("{:.3}", curl.connect.as_secs_f64())])
-            .args(["--max-time", &format!("{:.3}", left.as_secs_f64())])
+            .args(["--connect-timeout", &connect])
+            .args(["--max-time", &total])
             // One byte more than allowed, so a longer body is cut off and refused, not stored whole.
             .args(["--max-filesize", &(max_bytes + 1).to_string()])
             .args(["-w", "%{http_code} %{redirect_url}", "-o"])
@@ -441,6 +449,56 @@ mod tests {
     use flate2::{Compression, write::GzEncoder};
 
     use super::*;
+
+    mod deadlines {
+        use std::time::Duration;
+
+        use proptest::prelude::*;
+
+        use super::super::curl_seconds;
+
+        /// What curl reads from the argument: seconds as a decimal number, 0 meaning no limit.
+        fn parsed(argument: &str) -> Duration {
+            Duration::from_secs_f64(argument.parse::<f64>().unwrap())
+        }
+
+        #[test]
+        fn what_rounds_to_zero_is_no_request() {
+            assert_eq!(curl_seconds(Duration::ZERO), None);
+            assert_eq!(curl_seconds(Duration::from_nanos(1)), None);
+            assert_eq!(curl_seconds(Duration::from_micros(499)), None);
+            assert_eq!(curl_seconds(Duration::from_micros(500)), None);
+            assert_eq!(curl_seconds(Duration::from_micros(999)), None);
+        }
+
+        #[test]
+        fn a_millisecond_and_more_is_rounded_down() {
+            assert_eq!(curl_seconds(Duration::from_millis(1)).as_deref(), Some("0.001"));
+            assert_eq!(
+                curl_seconds(Duration::from_micros(1_999)).as_deref(),
+                Some("0.001")
+            );
+            assert_eq!(
+                curl_seconds(Duration::from_micros(9_999_999)).as_deref(),
+                Some("9.999")
+            );
+            assert_eq!(curl_seconds(Duration::from_secs(300)).as_deref(), Some("300.000"));
+        }
+
+        proptest! {
+            #[test]
+            fn either_no_request_or_a_limit_within_what_is_left(nanos in 0u64..10_000_000_000_000) {
+                let left = Duration::from_nanos(nanos);
+                if let Some(argument) = curl_seconds(left) {
+                    let limit = parsed(&argument);
+                    prop_assert!(limit > Duration::ZERO, "{argument} reads as no limit");
+                    prop_assert!(limit <= left, "{argument} is more than {left:?}");
+                } else {
+                    prop_assert!(left < Duration::from_millis(1), "{left:?} made no request");
+                }
+            }
+        }
+    }
 
     mod fetching {
         use std::io::{BufRead, BufReader, Write};
@@ -750,6 +808,25 @@ mod tests {
                 asked.lock().unwrap().len(),
                 6,
                 "the first request and five redirects"
+            );
+            nothing_left(&dest);
+        }
+
+        #[test]
+        fn a_deadline_below_a_millisecond_asks_nothing() {
+            let (port, asked) = serve_logged(vec![("/good", ok(BODY))]);
+            let curl = Curl {
+                package: Duration::from_micros(500),
+                ..local(port)
+            };
+            let (_dir, dest) = scratch();
+            let hash = sha(BODY);
+            let error = download(&curl, &source(port, "/good"), pin(&hash), &dest).unwrap_err();
+            assert_eq!(error, FetchError::Transport("no answer within 0 s".into()));
+            assert!(
+                asked.lock().unwrap().is_empty(),
+                "asked {:?}",
+                asked.lock().unwrap()
             );
             nothing_left(&dest);
         }
