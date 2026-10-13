@@ -303,17 +303,15 @@ fn kept_results(path: Option<&std::path::Path>) -> Vec<CommandResult> {
     let Some(path) = path else {
         return Vec::new();
     };
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<Vec<CommandResult>>(&bytes).unwrap_or_else(|error| {
+    let read = match std::fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        read => read.map_err(|error| error.to_string()),
+    };
+    read.and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        .unwrap_or_else(|error| {
             tracing::warn!(%error, "the results kept for the console cannot be read");
             Vec::new()
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            tracing::warn!(%error, "the results kept for the console cannot be read");
-            Vec::new()
-        }
-    }
+        })
 }
 
 /// A moment as the console reads it.
@@ -1321,21 +1319,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         tracing::info!(from = %running, to = %built, "an update is built; no new job until the machines that stand are gone");
         shared.machines.hold_for_update(true);
         loop {
-            let standing = shared.machines.unsettled();
+            // A slot promised before the hold may still get its job: it is waited for as a machine that stands.
+            let standing = shared.machines.unsettled() + shared.machines.promised();
             if standing == 0 {
                 break;
             }
+            let (machines, stand) = if standing == 1 {
+                ("machine", "stands")
+            } else {
+                ("machines", "stand")
+            };
             if began.elapsed() >= shared.config.update_limit {
                 return Err(format!(
-                    "{built} was not installed: {standing} {} still {} after {}",
-                    if standing == 1 { "machine" } else { "machines" },
-                    if standing == 1 { "stands" } else { "stand" },
+                    "{built} was not installed: {standing} {machines} still {stand} after {}",
                     crate::update::spoken(shared.config.update_limit),
                 ));
             }
             shared.update.lock().expect("update").doing = Some(format!(
-                "updating to {built}: waiting for {standing} {} to end",
-                if standing == 1 { "machine" } else { "machines" }
+                "updating to {built}: waiting for {standing} {machines} to end"
             ));
             tokio::time::sleep(shared.config.tick_every).await;
         }

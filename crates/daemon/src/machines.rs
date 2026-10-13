@@ -1256,6 +1256,14 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         inner.jobs.len() + inner.intents.len()
     }
 
+    /// How many slots were promised to GitHub, or granted, with no machine yet: a job may still come for each, and
+    /// its machine stand, although no new slot is granted.
+    pub fn promised(&self) -> usize {
+        let inner = self.lock();
+        let held: BTreeSet<SlotId> = inner.jobs.values().filter_map(|job| job.slot).collect();
+        inner.grants.keys().filter(|slot| !held.contains(slot)).count()
+    }
+
     /// What there is to report.
     pub fn snapshot(&self) -> Snapshot {
         let mut inner = self.lock();

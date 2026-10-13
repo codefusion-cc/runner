@@ -58,6 +58,9 @@ pub struct MacUpdate {
     source: String,
     /// The process group of the build that runs, which [`MacUpdate::end_build`] ends.
     building: Mutex<Option<libc::pid_t>>,
+    /// The checkout the config names as the Runner's own (`build_folder`): only that one is fetched, checked out
+    /// and built.
+    build_folder: Option<PathBuf>,
 }
 
 impl MacUpdate {
@@ -67,6 +70,7 @@ impl MacUpdate {
         state_dir: &Path,
         installed: &Path,
         records: &Path,
+        build_folder: Option<&Path>,
         entitled: fn(&Path) -> Result<(), String>,
     ) -> Option<MacUpdate> {
         let checkout = PathBuf::from(option_env!("CF_SOURCE").filter(|s| !s.is_empty())?);
@@ -110,6 +114,7 @@ impl MacUpdate {
             entitled,
             source: String::new(),
             building: Mutex::new(None),
+            build_folder: build_folder.map(Path::to_path_buf),
         }
         .checked()
     }
@@ -149,6 +154,39 @@ impl MacUpdate {
 
     fn git(&self, args: &[&str]) -> Result<String, String> {
         git(&self.checkout, args)
+    }
+
+    /// Whether the checkout is the Runner's own, which an update may move: the config names it as the build folder
+    /// (`build_folder`), this program was built in it, nothing in it is changed, and it stays at a commit, not on
+    /// a branch someone works on. A person's checkout is never fetched, checked out or built in.
+    fn own(&self) -> Result<(), String> {
+        let folder = self.checkout.display();
+        let not = "nothing was fetched or built; update by hand";
+        let Some(named) = &self.build_folder else {
+            return Err(format!(
+                "the config names no build folder (`build_folder`), so {folder} is not the Runner's own; {not}"
+            ));
+        };
+        let real = |path: &Path| std::fs::canonicalize(path).ok();
+        if real(named).is_none() || real(named) != real(&self.checkout) {
+            return Err(format!(
+                "this Runner was built in {folder}, not in its build folder {}; {not}",
+                named.display()
+            ));
+        }
+        // What is checked out is the source of a build: changes of its own would go in unseen.
+        let changed = self.git(&["status", "--porcelain", "--untracked-files=no"])?;
+        if !changed.is_empty() {
+            return Err(format!("{folder} has changes of its own; {not}"));
+        }
+        let head = self.git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if head != "HEAD" {
+            return Err(format!(
+                "{folder} is on the branch {head}, which someone may work on: the Runner's build folder stays at a \
+                 commit; {not}"
+            ));
+        }
+        Ok(())
     }
 
     /// Ends the build that runs, with what it started. A Runner that ends does not wait for it: its process
@@ -219,14 +257,7 @@ impl SelfUpdate for MacUpdate {
                     self.running
                 )
             })?;
-        // What is checked out is the source of a build: changes of its own would go in unseen.
-        let changed = self.git(&["status", "--porcelain", "--untracked-files=no"])?;
-        if !changed.is_empty() {
-            return Err(format!(
-                "{} has changes of its own; nothing was built",
-                self.checkout.display()
-            ));
-        }
+        self.own()?;
         self.git(&["fetch", "-q", "origin", BRANCH])?;
         let target = self.git(&["rev-parse", "--verify", "-q", "FETCH_HEAD^{commit}"])?;
         let short = &target[..12.min(target.len())];
@@ -319,8 +350,15 @@ pub fn guard(state_dir: &Path, installed: &Path, running: &str) -> Result<Starte
                     previous.display()
                 ));
             }
-            std::fs::rename(&previous, installed)
-                .map_err(|error| format!("{}: {error}", installed.display()))?;
+            if let Err(error) = std::fs::rename(&previous, installed) {
+                // It would fail at every start, which launchd makes every few seconds: the update ends here.
+                let _ = file.remove();
+                return Err(format!(
+                    "{} did not stay up, and {} could not be put back: {error}",
+                    pending.to,
+                    previous.display()
+                ));
+            }
             file.write(&pending)?;
             return Err(format!(
                 "{} did not stay up {} times; {} is back in place and launchd starts it",
@@ -332,6 +370,19 @@ pub fn guard(state_dir: &Path, installed: &Path, running: &str) -> Result<Starte
             Started::Failed { id, message }
         }
     })
+}
+
+/// The program `running` ended as it was asked to, by a signal or a restart, before it stayed up: that start was no
+/// failure, and does not count against it.
+pub fn ended_in_order(state_dir: &Path, running: &str) -> Result<(), String> {
+    let file = UpdateFile::in_state(state_dir);
+    match file.read()? {
+        Some(mut pending) if pending.to == running && pending.starts > 0 => {
+            pending.starts -= 1;
+            file.write(&pending)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What [`guard`] found, for the service once it runs.
@@ -474,22 +525,25 @@ pub fn standing(records: &Path) -> usize {
 
 /// Copies `from` to `to` in one step.
 fn copy_whole(from: &Path, to: &Path) -> Result<(), String> {
-    let fresh = to.with_extension("copy");
-    std::fs::copy(from, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
-    std::fs::rename(&fresh, to).map_err(|error| format!("{}: {error}", to.display()))
+    copy_checked(from, to, |_| Ok(()))
 }
 
 /// Puts a copy of `program` at `at` in one step, once the copy is signed for virtual machines.
 pub fn place(program: &Path, at: &Path, entitled: fn(&Path) -> Result<(), String>) -> Result<(), String> {
     let folder = at.parent().ok_or("the program's folder has no parent")?;
     std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-    let fresh = at.with_extension("new");
-    std::fs::copy(program, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
-    if let Err(error) = entitled(&fresh) {
+    copy_checked(program, at, entitled)
+}
+
+/// Copies `from` beside `to`, and puts the copy in its place once `check` passes it.
+fn copy_checked(from: &Path, to: &Path, check: fn(&Path) -> Result<(), String>) -> Result<(), String> {
+    let fresh = to.with_extension("new");
+    std::fs::copy(from, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
+    if let Err(error) = check(&fresh) {
         let _ = std::fs::remove_file(&fresh);
         return Err(error);
     }
-    std::fs::rename(&fresh, at).map_err(|error| format!("{}: {error}", at.display()))
+    std::fs::rename(&fresh, to).map_err(|error| format!("{}: {error}", to.display()))
 }
 
 #[cfg(test)]
@@ -557,6 +611,8 @@ chmod +x target/release/codefusion-runner"#;
         run(&origin, &["commit", "-q", "-am", "two"]);
         let second = run(&origin, &["rev-parse", "HEAD"]);
         std::fs::write(checkout.join(".git/info/exclude"), "target/\n").expect("file");
+        // A build folder stays at a commit.
+        run(&checkout, &["checkout", "-q", "--detach"]);
 
         let cargo_home = root.join("cargo");
         std::fs::create_dir_all(cargo_home.join("bin")).expect("folder");
@@ -569,7 +625,7 @@ chmod +x target/release/codefusion-runner"#;
         let installed = state.join("bin/codefusion-runner");
         std::fs::write(&installed, "the one that runs").expect("program");
         let update = MacUpdate {
-            checkout,
+            checkout: checkout.clone(),
             cargo,
             env: vec![
                 ("PATH".into(), build_path(&cargo_home)),
@@ -584,6 +640,7 @@ chmod +x target/release/codefusion-runner"#;
             entitled: signed,
             source: String::new(),
             building: Mutex::new(None),
+            build_folder: Some(checkout.clone()),
         }
         .checked()
         .expect("a checkout");
@@ -643,13 +700,93 @@ chmod +x target/release/codefusion-runner"#;
         assert_eq!(bench.head(), bench.first, "nothing is checked out");
     }
 
+    /// What a refused update leaves: nothing fetched, nothing checked out, nothing built.
+    fn untouched(bench: &Bench, said: &str) {
+        assert!(
+            said.ends_with("nothing was fetched or built; update by hand"),
+            "{said}"
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+        let fetched = Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&bench.update.checkout)
+            .args(["cat-file", "-e", &bench.second])
+            .status()
+            .expect("git runs");
+        assert!(!fetched.success(), "main's new commit was fetched");
+    }
+
     #[test]
-    fn a_checkout_with_changes_of_its_own_is_not_built() {
+    fn a_checkout_with_changes_of_its_own_is_not_touched() {
         let bench = bench(BUILDS);
         std::fs::write(bench.update.checkout.join("Cargo.toml"), "mine").expect("file");
         let said = bench.update.build().expect_err("refused");
-        assert!(said.contains("has changes of its own"), "{said}");
-        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+        assert_eq!(
+            said,
+            format!(
+                "{} has changes of its own; nothing was fetched or built; update by hand",
+                bench.update.checkout.display()
+            )
+        );
+        untouched(&bench, &said);
+        assert_eq!(
+            std::fs::read_to_string(bench.update.checkout.join("Cargo.toml")).expect("file"),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn a_checkout_on_a_branch_is_someones_and_not_touched() {
+        let bench = bench(BUILDS);
+        for branch in ["main", "feat/mine"] {
+            run(&bench.update.checkout, &["checkout", "-q", "-B", branch]);
+            let said = bench.update.build().expect_err(branch);
+            assert_eq!(
+                said,
+                format!(
+                    "{} is on the branch {branch}, which someone may work on: the Runner's build folder stays at a \
+                     commit; nothing was fetched or built; update by hand",
+                    bench.update.checkout.display()
+                )
+            );
+            untouched(&bench, &said);
+        }
+    }
+
+    #[test]
+    fn a_checkout_the_config_does_not_name_as_the_build_folder_is_not_touched() {
+        let mut bench = bench(BUILDS);
+        bench.update.build_folder = None;
+        let said = bench.update.build().expect_err("no folder named");
+        assert_eq!(
+            said,
+            format!(
+                "the config names no build folder (`build_folder`), so {} is not the Runner's own; nothing was \
+                 fetched or built; update by hand",
+                bench.update.checkout.display()
+            )
+        );
+        untouched(&bench, &said);
+
+        // A folder named that is another, or none at all.
+        for named in [bench.root.join("origin"), bench.root.join("gone")] {
+            bench.update.build_folder = Some(named.clone());
+            let said = bench.update.build().expect_err("another folder");
+            assert_eq!(
+                said,
+                format!(
+                    "this Runner was built in {}, not in its build folder {}; nothing was fetched or built; update \
+                     by hand",
+                    bench.update.checkout.display(),
+                    named.display()
+                )
+            );
+            untouched(&bench, &said);
+        }
+
+        // The same folder by another way to it is the same.
+        bench.update.build_folder = Some(bench.root.join("checkout/../checkout"));
+        assert!(bench.update.build().is_ok());
     }
 
     #[test]
@@ -660,6 +797,7 @@ chmod +x target/release/codefusion-runner"#;
         std::fs::write(side.join("other"), "x").expect("file");
         run(side, &["add", "other"]);
         run(side, &["commit", "-q", "-m", "side"]);
+        run(side, &["checkout", "-q", "--detach"]);
         let running = run(side, &["rev-parse", "--short=12", "HEAD"]);
         bench.update.running = format!("0.1.0+{running}");
         let said = bench.update.build().expect_err("refused");
@@ -886,6 +1024,62 @@ chmod +x target/release/codefusion-runner"#;
             guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb"),
             Ok(Started::Nothing)
         );
+    }
+
+    #[test]
+    fn a_program_before_that_cannot_be_put_back_ends_the_update_and_is_not_tried_at_every_start() {
+        let folder = tempfile::tempdir().expect("folder");
+        let installed = folder.path().join("bin/codefusion-runner");
+        std::fs::create_dir_all(&installed).expect("a folder where the program would be");
+        std::fs::write(installed.join("x"), "").expect("a file in it");
+        std::fs::write(installed.with_extension(PREVIOUS), "old").expect("program");
+        let file = UpdateFile::in_state(folder.path());
+        file.write(&Pending {
+            id: "cmd-1".into(),
+            from: "0.1.0+aaaaaaaaaaaa".into(),
+            to: "0.1.0+bbbbbbbbbbbb".into(),
+            starts: cf_daemon::update::MAX_STARTS,
+        })
+        .expect("written");
+        let said = guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb").expect_err("no way back");
+        assert!(said.contains("could not be put back"), "{said}");
+        assert_eq!(file.read(), Ok(None), "the update ends");
+        assert_eq!(
+            guard(folder.path(), &installed, "0.1.0+bbbbbbbbbbbb"),
+            Ok(Started::Nothing)
+        );
+    }
+
+    /// A signal or a restart in the new program's first minute (a reboot, an install by hand) is no failed start.
+    #[test]
+    fn a_new_program_that_ends_in_order_before_it_stayed_up_does_not_count_that_start() {
+        let folder = tempfile::tempdir().expect("folder");
+        let state = folder.path();
+        let pending = Pending {
+            id: "cmd-1".into(),
+            from: "0.1.0+aaaaaaaaaaaa".into(),
+            to: "0.1.0+bbbbbbbbbbbb".into(),
+            starts: 2,
+        };
+        let file = UpdateFile::in_state(state);
+        assert_eq!(ended_in_order(state, &pending.to), Ok(()), "no update under way");
+        assert_eq!(file.read(), Ok(None));
+        file.write(&pending).expect("written");
+        ended_in_order(state, &pending.from).expect("another program");
+        assert_eq!(
+            file.read(),
+            Ok(Some(pending.clone())),
+            "the one before counts nothing"
+        );
+        ended_in_order(state, &pending.to).expect("uncounted");
+        let once = Pending {
+            starts: 1,
+            ..pending.clone()
+        };
+        assert_eq!(file.read(), Ok(Some(once)));
+        ended_in_order(state, &pending.to).expect("uncounted");
+        ended_in_order(state, &pending.to).expect("nothing below none");
+        assert_eq!(file.read(), Ok(Some(Pending { starts: 0, ..pending })));
     }
 
     #[test]

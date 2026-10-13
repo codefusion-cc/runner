@@ -16,7 +16,7 @@ use cf_daemon::testing::{
 };
 use cf_daemon::{
     Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
-    ServiceConfig, ServiceParts,
+    ServiceConfig, ServiceParts, Slots,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
@@ -3001,6 +3001,30 @@ async fn an_update_waits_for_the_machine_that_stands_installs_and_is_said_once_b
     assert_eq!(heard.len(), 1, "once: {heard:?}");
     assert_eq!(heard[0]["ok"], json!(true));
     assert_eq!(rig.updates.built(), 1);
+}
+
+/// A slot promised to GitHub before the update held new jobs back may still get its job: the update waits for it as
+/// for a machine that stands, and installs once it is given back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_waits_for_a_slot_promised_before_it_and_installs_once_it_is_given_back() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let promised = rig.machines.reserve(cf_budget::Size::G2).expect("a slot");
+    rig.updates.build_gives(Ok(NEWER));
+    rig.console.queue_command("update", None);
+    until("the update waits for the promised slot", || {
+        last_status(&rig.console)["reason"]
+            == json!(format!("updating to {NEWER}: waiting for 1 machine to end"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.updates.installed(),
+        [],
+        "nothing is installed while a job may still come"
+    );
+    rig.machines.release(promised);
+    until("installed", || rig.updates.installed().len() == 1).await;
 }
 
 /// Main has nothing newer: said, nothing installed, and the Mac never stopped taking jobs.

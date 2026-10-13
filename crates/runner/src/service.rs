@@ -207,7 +207,13 @@ pub fn daemon(config: &Path) -> Result<(), String> {
     // Only the installed program replaces itself: one run from elsewhere would replace another.
     let updates = (program == config.program())
         .then(|| {
-            MacUpdate::of_this_program(&config.state_dir, &config.program(), &config.records(), entitled)
+            MacUpdate::of_this_program(
+                &config.state_dir,
+                &config.program(),
+                &config.records(),
+                config.build_folder.as_deref(),
+                entitled,
+            )
         })
         .flatten()
         .map(Arc::new);
@@ -259,6 +265,12 @@ pub fn daemon(config: &Path) -> Result<(), String> {
         updates.end_build();
     }
     runtime.shutdown_timeout(Duration::from_secs(5));
+    if ran.is_ok()
+        && let Some(state) = installed_state(&program)
+        && let Err(error) = update::ended_in_order(state, VERSION)
+    {
+        tracing::warn!(%error, "the update under way still counts this start");
+    }
     ran
 }
 
