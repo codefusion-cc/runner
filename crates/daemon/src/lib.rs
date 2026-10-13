@@ -13,6 +13,7 @@ mod log;
 #[cfg(target_os = "macos")]
 mod mac;
 mod machines;
+mod making;
 pub mod names;
 mod records;
 mod roster;
