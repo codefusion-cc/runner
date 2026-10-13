@@ -30,6 +30,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
@@ -106,12 +107,18 @@ pub fn sources() -> [Source; 2] {
     ]
 }
 
-/// How a download goes over the network: curl, HTTPS only.
+/// How a download goes over the network: curl, HTTPS only, one request per hop with a deadline for the whole.
 pub struct Curl {
-    /// curl's `--proto` and `--proto-redir`.
+    /// curl's `--proto`.
     protocols: &'static str,
     /// More arguments, for tests (`--resolve`).
     extra: Vec<String>,
+    /// How long one connection may take to open.
+    connect: Duration,
+    /// How long the package may take, every hop of it.
+    package: Duration,
+    /// How long Alpine's index may take, every hop of it.
+    index: Duration,
 }
 
 impl Curl {
@@ -119,16 +126,24 @@ impl Curl {
         Curl {
             protocols: "=https",
             extra: Vec::new(),
+            connect: Duration::from_secs(15),
+            package: Duration::from_secs(300),
+            index: Duration::from_secs(60),
         }
     }
 }
 
+/// The most redirects a download follows.
+const MAX_REDIRECTS: usize = 5;
+/// The largest index read.
+const MAX_INDEX_BYTES: u64 = 16 << 20;
+
 /// Why a source did not give the pinned bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FetchError {
-    /// curl failed: no answer, an HTTP error status (404 among them), a body cut off, too long, too many redirects.
+    /// No answer, an HTTP error status (404 among them), a body cut off or too long, too many redirects, a deadline.
     Transport(String),
-    /// The answer came from a host the source does not name.
+    /// A hop would go to a host the source does not name. Nothing was asked of it.
     Host(String),
     /// The body has another length than the pin.
     Size(u64),
@@ -140,9 +155,10 @@ impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FetchError::Transport(why) => write!(f, "{why}"),
-            FetchError::Host(host) => {
-                write!(f, "the answer came from {host}, which the source does not name")
-            }
+            FetchError::Host(host) => write!(
+                f,
+                "it sends the request to {host}, which the source does not name"
+            ),
             FetchError::Size(size) => write!(f, "the package has {size} bytes, not the pinned size"),
             FetchError::Hash(hash) => write!(f, "the package has SHA-256 {hash}, not the pinned one"),
         }
@@ -157,49 +173,72 @@ pub fn download(
     dest: &Path,
 ) -> std::result::Result<(), FetchError> {
     let partial = dest.with_extension("partial");
-    let _ = fs::remove_file(&partial);
-    let result = download_to(curl, source, pin, &partial);
-    match result {
-        Ok(()) => fs::rename(&partial, dest).map_err(|e| FetchError::Transport(e.to_string())),
-        Err(error) => {
-            let _ = fs::remove_file(&partial);
-            Err(error)
-        }
+    let result = get(curl, source, pin.size, curl.package, &partial)
+        .and_then(|()| fs::read(&partial).map_err(|e| FetchError::Transport(e.to_string())))
+        .and_then(|bytes| pin.check(&bytes))
+        .and_then(|()| fs::rename(&partial, dest).map_err(|e| FetchError::Transport(e.to_string())));
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
     }
+    result
 }
 
-fn download_to(
+/// Asks `source` for its body, at most `max_bytes` of it, into `out`, within `deadline` for every hop together.
+/// Redirects are followed here, not by curl, so each hop's host is checked before its request leaves.
+fn get(
     curl: &Curl,
     source: &Source,
-    pin: Pin<'_>,
-    partial: &Path,
+    max_bytes: u64,
+    deadline: Duration,
+    out: &Path,
 ) -> std::result::Result<(), FetchError> {
-    let output = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "--max-redirs", "5"])
-        .args(["--proto", curl.protocols, "--proto-redir", curl.protocols])
-        // One byte more than the pin, so a longer body is cut off and refused below for its size.
-        .args(["--max-filesize", &(pin.size + 1).to_string()])
-        .args(["-w", "%{url_effective}", "-o"])
-        .arg(partial)
-        .args(&curl.extra)
-        .arg(&source.url)
-        .output()
-        .map_err(|e| FetchError::Transport(format!("curl could not start: {e}")))?;
-    if !output.status.success() {
-        let said = String::from_utf8_lossy(&output.stderr);
-        return Err(FetchError::Transport(format!(
-            "curl failed with {}: {}",
-            output.status,
-            said.trim()
-        )));
+    let started = Instant::now();
+    let mut url = source.url.clone();
+    for _ in 0..=MAX_REDIRECTS {
+        let host = host_of(&url).unwrap_or_default();
+        if !source.hosts.contains(&host.as_str()) {
+            return Err(FetchError::Host(host));
+        }
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(FetchError::Transport(format!(
+                "no answer within {} s",
+                deadline.as_secs()
+            )));
+        }
+        let output = Command::new("curl")
+            .args(["-sS", "--proto", curl.protocols])
+            .args(["--connect-timeout", &format!("{:.3}", curl.connect.as_secs_f64())])
+            .args(["--max-time", &format!("{:.3}", left.as_secs_f64())])
+            // One byte more than allowed, so a longer body is cut off and refused, not stored whole.
+            .args(["--max-filesize", &(max_bytes + 1).to_string()])
+            .args(["-w", "%{http_code} %{redirect_url}", "-o"])
+            .arg(out)
+            .args(&curl.extra)
+            .arg(&url)
+            .output()
+            .map_err(|e| FetchError::Transport(format!("curl could not start: {e}")))?;
+        if !output.status.success() {
+            let said = String::from_utf8_lossy(&output.stderr);
+            return Err(FetchError::Transport(format!(
+                "curl failed with {}: {}",
+                output.status,
+                said.trim()
+            )));
+        }
+        let written = String::from_utf8_lossy(&output.stdout);
+        let (status, location) = written.split_once(' ').unwrap_or((&written, ""));
+        match status {
+            "200" => return Ok(()),
+            "301" | "302" | "303" | "307" | "308" if !location.is_empty() => {
+                url = location.trim().to_string()
+            }
+            _ => return Err(FetchError::Transport(format!("the answer was HTTP {status}"))),
+        }
     }
-    let effective = String::from_utf8_lossy(&output.stdout);
-    let host = host_of(&effective).unwrap_or_default();
-    if !source.hosts.contains(&host.as_str()) {
-        return Err(FetchError::Host(host));
-    }
-    let bytes = fs::read(partial).map_err(|e| FetchError::Transport(e.to_string()))?;
-    pin.check(&bytes)
+    Err(FetchError::Transport(format!(
+        "more than {MAX_REDIRECTS} redirects"
+    )))
 }
 
 /// Tries each source in order and keeps the first that gives the pinned bytes; says what each one before it did.
@@ -236,69 +275,85 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-/// `cargo xtask kernel check`: every source of the pin, and what Alpine has now. Fails when our copy does not give
-/// the pinned bytes, since a build would then live on a URL Alpine deletes with the next patch.
+/// Alpine's index of the branch the package comes from.
+fn alpine_index() -> Source {
+    Source {
+        name: "Alpine's index",
+        url: format!("https://dl-cdn.alpinelinux.org/alpine/{ALPINE_BRANCH}/main/aarch64/APKINDEX.tar.gz"),
+        hosts: &["dl-cdn.alpinelinux.org"],
+    }
+}
+
+/// What `check` found: whether our copy (the first source) gives the pin, and what else is worth a look.
+#[derive(Debug)]
+struct Checked {
+    copy: std::result::Result<(), String>,
+    notices: Vec<String>,
+}
+
+/// `cargo xtask kernel check`: fails only when our copy does not give the pinned bytes, since a build would then
+/// live on a URL Alpine deletes with the next patch. Alpine slow, down or newer is a warning.
 pub fn check(root: &Path, args: &[String]) -> Result<()> {
     crate::no_options(args)?;
     let dir = root.join("target/kernel-check");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    let curl = Curl::https();
-    let mut copy_ok = true;
-    for (index, source) in sources().iter().enumerate() {
-        match download(&curl, source, PIN, &dir.join(format!("{index}.apk"))) {
+    let checked = check_sources(&Curl::https(), &sources(), PIN, &alpine_index(), &dir);
+    let _ = fs::remove_dir_all(&dir);
+    for text in &checked.notices {
+        notice(text);
+    }
+    checked.copy.map_err(|why| {
+        format!(
+            "our copy of the pinned kernel package does not answer: {why}. Publish it (xtask/src/kernel.rs)"
+        )
+        .into()
+    })
+}
+
+fn check_sources(curl: &Curl, sources: &[Source], pin: Pin<'_>, index: &Source, dir: &Path) -> Checked {
+    let mut copy = Ok(());
+    let mut notices = Vec::new();
+    for (position, source) in sources.iter().enumerate() {
+        match download(curl, source, pin, &dir.join(format!("{position}.apk"))) {
             Ok(()) => println!("{}: gives the pinned package {APK_VERSION}", source.name),
-            Err(error) => {
-                println!("{}: {error} ({})", source.name, source.url);
-                copy_ok &= index != 0;
-            }
+            Err(error) if position == 0 => copy = Err(format!("{error} ({})", source.url)),
+            Err(error) => notices.push(format!(
+                "{} does not give the pinned package: {error} ({})",
+                source.name, source.url
+            )),
         }
     }
-    let _ = fs::remove_dir_all(&dir);
-    match alpine_newest() {
+    let file = dir.join("APKINDEX.tar.gz");
+    let newest = get(curl, index, MAX_INDEX_BYTES, curl.index, &file)
+        .map_err(|e| e.to_string())
+        .and_then(|()| fs::read(&file).map_err(|e| e.to_string()))
+        .and_then(|bytes| newest_in_index(&bytes).map_err(|e| e.to_string()));
+    match newest {
         Ok(newest) if newest == APK_VERSION => println!("Alpine {ALPINE_BRANCH} has no newer linux-virt"),
-        Ok(newest) => notice(&format!(
+        Ok(newest) => notices.push(format!(
             "Alpine {ALPINE_BRANCH} has linux-virt {newest}, the pin is {APK_VERSION}: move the pin (xtask/src/kernel.rs)"
         )),
-        Err(error) => notice(&format!("could not read Alpine's index: {error}")),
+        Err(error) => notices.push(format!("could not read Alpine's index: {error}")),
     }
-    if copy_ok {
-        Ok(())
-    } else {
-        Err(
-            "our copy of the pinned kernel package is missing or wrong: publish it (xtask/src/kernel.rs)"
-                .into(),
-        )
-    }
+    Checked { copy, notices }
 }
 
+/// A warning: an annotation and a line of the job's summary on GitHub, a line here.
 fn notice(text: &str) {
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        println!("::warning::{text}");
-    } else {
-        println!("{text}");
+    if std::env::var_os("GITHUB_ACTIONS").is_none() {
+        println!("warning: {text}");
+        return;
     }
-}
-
-/// The version of `linux-virt` in the Alpine branch's index now. Read by `check` only, never by a build.
-fn alpine_newest() -> Result<String> {
-    let url = format!("https://dl-cdn.alpinelinux.org/alpine/{ALPINE_BRANCH}/main/aarch64/APKINDEX.tar.gz");
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "--retry",
-            "3",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-        ])
-        .arg(&url)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!("curl failed with {}", output.status).into());
+    println!("::warning::{text}");
+    if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        let line = format!("- {text}\n");
+        let _ = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(summary)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
     }
-    newest_in_index(&output.stdout)
 }
 
 /// The `linux-virt` version in an `APKINDEX.tar.gz`: gzip streams of one tar whose `APKINDEX` member holds records
@@ -417,6 +472,14 @@ mod tests {
 
         /// `serve`, with the paths asked for in order.
         fn serve_logged(routes: Vec<(&'static str, Vec<u8>)>) -> (u16, Arc<Mutex<Vec<String>>>) {
+            serve_after(routes, Duration::ZERO)
+        }
+
+        /// `serve_logged`, each answer given `delay` after its request.
+        fn serve_after(
+            routes: Vec<(&'static str, Vec<u8>)>,
+            delay: Duration,
+        ) -> (u16, Arc<Mutex<Vec<String>>>) {
             let asked = Arc::new(Mutex::new(Vec::new()));
             let log = asked.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -435,6 +498,7 @@ mod tests {
                     }
                     let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
                     log.lock().unwrap().push(path.clone());
+                    std::thread::sleep(delay);
                     let answer = routes
                         .iter()
                         .find(|(route, _)| *route == path)
@@ -466,6 +530,9 @@ mod tests {
             Curl {
                 protocols: "=http",
                 extra: vec!["--resolve".into(), format!("elsewhere.test:{port}:127.0.0.1")],
+                connect: Duration::from_secs(2),
+                package: Duration::from_secs(2),
+                index: Duration::from_secs(2),
             }
         }
 
@@ -582,6 +649,29 @@ mod tests {
         }
 
         #[test]
+        fn no_request_goes_to_an_unlisted_host_on_the_way_back_to_a_listed_one() {
+            let good = serve(vec![("/good", ok(BODY))]);
+            let (detour, asked_detour) = serve_logged(vec![(
+                "/back",
+                redirect(&format!("http://127.0.0.1:{good}/good")),
+            )]);
+            let first = serve(vec![(
+                "/moved",
+                redirect(&format!("http://elsewhere.test:{detour}/back")),
+            )]);
+            let (_dir, dest) = scratch();
+            let hash = sha(BODY);
+            let error = download(&local(detour), &source(first, "/moved"), pin(&hash), &dest).unwrap_err();
+            assert_eq!(error, FetchError::Host("elsewhere.test".into()));
+            assert!(
+                asked_detour.lock().unwrap().is_empty(),
+                "the unlisted host was asked {:?}",
+                asked_detour.lock().unwrap()
+            );
+            nothing_left(&dest);
+        }
+
+        #[test]
         fn a_redirect_within_the_named_hosts_is_followed() {
             let target = serve(vec![("/good", ok(BODY))]);
             let first = serve(vec![(
@@ -647,6 +737,185 @@ mod tests {
             )
             .unwrap();
             assert_eq!(*asked.lock().unwrap(), ["/copy"]);
+        }
+
+        #[test]
+        fn a_redirect_loop_ends() {
+            let (looping, asked) = serve_logged(vec![("/again", redirect("/again"))]);
+            let (_dir, dest) = scratch();
+            let hash = sha(BODY);
+            let error = download(&local(looping), &source(looping, "/again"), pin(&hash), &dest).unwrap_err();
+            assert_eq!(error, FetchError::Transport("more than 5 redirects".into()));
+            assert_eq!(
+                asked.lock().unwrap().len(),
+                6,
+                "the first request and five redirects"
+            );
+            nothing_left(&dest);
+        }
+
+        #[test]
+        fn the_deadline_covers_every_hop_together() {
+            // Each hop answers in 0.7 s, well inside the 2 s deadline; four of them are not.
+            let (port, _) = serve_after(
+                vec![
+                    ("/1", redirect("/2")),
+                    ("/2", redirect("/3")),
+                    ("/3", redirect("/4")),
+                    ("/4", ok(BODY)),
+                ],
+                Duration::from_millis(700),
+            );
+            let (_dir, dest) = scratch();
+            let hash = sha(BODY);
+            let started = Instant::now();
+            let error = download(&local(port), &source(port, "/1"), pin(&hash), &dest).unwrap_err();
+            assert!(matches!(error, FetchError::Transport(_)), "{error:?}");
+            assert!(
+                started.elapsed() < Duration::from_millis(2600),
+                "took {:?}",
+                started.elapsed()
+            );
+            nothing_left(&dest);
+        }
+
+        /// A server that takes connections and never answers.
+        fn stall() -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for stream in listener.incoming() {
+                    held.push(stream);
+                }
+            });
+            port
+        }
+
+        fn index_source(port: u16, path: &str) -> Source {
+            Source {
+                name: "Alpine's index",
+                ..source(port, path)
+            }
+        }
+
+        fn current_index() -> Vec<u8> {
+            index_archive(&format!("P:linux-virt\nV:{APK_VERSION}\n"))
+        }
+
+        #[test]
+        fn alpine_stalling_is_a_warning_and_waits_no_longer_than_the_deadline() {
+            let good = serve(vec![("/copy", ok(BODY))]);
+            let stalled = stall();
+            let dir = tempfile::tempdir().unwrap();
+            let hash = sha(BODY);
+            let started = Instant::now();
+            let checked = check_sources(
+                &local(good),
+                &[source(good, "/copy"), source(stalled, "/alpine")],
+                pin(&hash),
+                &index_source(stalled, "/APKINDEX.tar.gz"),
+                dir.path(),
+            );
+            assert_eq!(checked.copy, Ok(()));
+            assert_eq!(checked.notices.len(), 2, "{:?}", checked.notices);
+            assert!(
+                checked.notices[0].starts_with("test does not give the pinned package"),
+                "{:?}",
+                checked.notices
+            );
+            assert!(
+                checked.notices[1].starts_with("could not read Alpine's index"),
+                "{:?}",
+                checked.notices
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn alpine_gone_or_newer_is_a_warning() {
+            let port = serve(vec![
+                ("/copy", ok(BODY)),
+                (
+                    "/APKINDEX.tar.gz",
+                    ok(&index_archive("P:linux-virt\nV:9.9.9-r0\n")),
+                ),
+            ]);
+            let dir = tempfile::tempdir().unwrap();
+            let hash = sha(BODY);
+            let checked = check_sources(
+                &local(port),
+                &[source(port, "/copy"), source(port, "/gone")],
+                pin(&hash),
+                &index_source(port, "/APKINDEX.tar.gz"),
+                dir.path(),
+            );
+            assert_eq!(checked.copy, Ok(()));
+            assert!(checked.notices[0].contains("HTTP 404"), "{:?}", checked.notices);
+            assert!(
+                checked.notices[1].contains("has linux-virt 9.9.9-r0"),
+                "{:?}",
+                checked.notices
+            );
+            assert_eq!(checked.notices.len(), 2);
+        }
+
+        #[test]
+        fn everything_current_says_nothing() {
+            let port = serve(vec![
+                ("/copy", ok(BODY)),
+                ("/alpine", ok(BODY)),
+                ("/APKINDEX.tar.gz", ok(&current_index())),
+            ]);
+            let dir = tempfile::tempdir().unwrap();
+            let hash = sha(BODY);
+            let checked = check_sources(
+                &local(port),
+                &[source(port, "/copy"), source(port, "/alpine")],
+                pin(&hash),
+                &index_source(port, "/APKINDEX.tar.gz"),
+                dir.path(),
+            );
+            assert_eq!(checked.copy, Ok(()));
+            assert!(checked.notices.is_empty(), "{:?}", checked.notices);
+        }
+
+        #[test]
+        fn our_copy_missing_wrong_or_stalled_is_red_even_when_alpine_answers() {
+            let port = serve(vec![
+                ("/wrong", ok(b"THE BYTES OF A KERNEL PACKAGE")),
+                ("/alpine", ok(BODY)),
+                ("/APKINDEX.tar.gz", ok(&current_index())),
+            ]);
+            let stalled = stall();
+            let hash = sha(BODY);
+            for (copy, why) in [
+                (source(port, "/gone"), "HTTP 404"),
+                (source(port, "/wrong"), "SHA-256"),
+                (source(stalled, "/copy"), "curl failed"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let started = Instant::now();
+                let checked = check_sources(
+                    &local(port),
+                    &[copy, source(port, "/alpine")],
+                    pin(&hash),
+                    &index_source(port, "/APKINDEX.tar.gz"),
+                    dir.path(),
+                );
+                let error = checked.copy.unwrap_err();
+                assert!(error.contains(why), "{error}");
+                assert!(checked.notices.is_empty(), "{:?}", checked.notices);
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "took {:?}",
+                    started.elapsed()
+                );
+            }
         }
 
         #[test]

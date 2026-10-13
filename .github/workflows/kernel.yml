@@ -3,7 +3,7 @@ name: Kernel pin
 # Alpine keeps only the newest build of a package, so the guest build reads the pinned kernel package from our own
 # copy (a release tagged kernel-linux-virt-<version>). This goes red when that copy stops giving the pinned bytes,
 # weekly and on every change to the pin, so a pin is never merged before its copy exists. It warns when Alpine has a
-# newer kernel.
+# newer kernel or does not answer, never red for that.
 
 on:
   schedule:
@@ -25,7 +25,9 @@ jobs:
   check:
     name: Our copy of the pinned kernel package answers
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Above the sum of the check's own deadlines (5 min for each package, 1 min for the index) and the build, so a
+    # slow source ends as the check says, never at this limit.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
