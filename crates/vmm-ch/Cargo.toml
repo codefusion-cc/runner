@@ -28,5 +28,9 @@ tempfile.workspace = true
 name = "monitor_root"
 harness = false
 
+[[test]]
+name = "kvm"
+harness = false
+
 [lints]
 workspace = true

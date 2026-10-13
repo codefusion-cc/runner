@@ -40,8 +40,9 @@ const SCRATCH_BYTES: u64 = 30 << 30;
 /// The job's share of a machine of 1024 MB: the machine less what its kernel and supervisor keep.
 const LIMIT_OF_1024: &str = "805306368";
 /// Takes all the memory a job gets but 200 MB, in pieces it writes into, and prints what the guest has touched by
-/// then: all its memory but what is free. It holds on for six seconds, so that the Mac's count is read meanwhile.
-const HOLDS_ALL_IT_GETS: &str = r#"node -e 'const fs = require("fs"); const kb = (name) => Number(fs.readFileSync("/proc/meminfo", "utf8").match(new RegExp(name + ":\\s+(\\d+)"))[1]); const limit = Number(fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8")); const held = []; for (let left = limit - 200 * 1048576; left > 0; left -= 268435456) held.push(Buffer.alloc(Math.min(left, 268435456), 1)); console.log("touched_kb=" + (kb("MemTotal") - kb("MemFree")) + " total_kb=" + kb("MemTotal") + " limit_kb=" + limit / 1024); setTimeout(() => console.log("held=" + held.length), 6000)'"#;
+/// then: all its memory but what is free. It holds on for twelve seconds, so that the host's count is read meanwhile:
+/// the vm-host reads it at each heartbeat of the guest, which a guest this full can be seconds late with.
+const HOLDS_ALL_IT_GETS: &str = r#"node -e 'const fs = require("fs"); const kb = (name) => Number(fs.readFileSync("/proc/meminfo", "utf8").match(new RegExp(name + ":\\s+(\\d+)"))[1]); const limit = Number(fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8")); const held = []; for (let left = limit - 200 * 1048576; left > 0; left -= 268435456) held.push(Buffer.alloc(Math.min(left, 268435456), 1)); console.log("touched_kb=" + (kb("MemTotal") - kb("MemFree")) + " total_kb=" + kb("MemTotal") + " limit_kb=" + limit / 1024); setTimeout(() => console.log("held=" + held.length), 12000)'"#;
 #[cfg(target_os = "macos")]
 const AGENT: &str = "cc.codefusion.runner.it";
 const WAITS: &str = "trap '' TERM; echo waiting; sleep 600; echo woke";

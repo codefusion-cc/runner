@@ -187,5 +187,8 @@ gh release download <image tag> -R codefusion-cc/runner -D target/it/release
 cargo xtask build && cargo xtask it
 ```
 
+On Linux, `systemd-run --user --scope -p Delegate=yes cargo test -p cf-vmm-ch --test kvm` checks how a real
+machine ends (a panic, a stop, a kill, an out-of-memory in its cgroup, a monitor that dies).
+
 `it` installs nothing and calls neither GitHub nor a console: its `service` and `commands` scenarios run against
 fakes of both on the Mac itself.

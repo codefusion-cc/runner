@@ -58,7 +58,7 @@ pub struct ChVmm {
 impl ChVmm {
     /// Makes the monitor of this process: KVM must be there, and the cgroup this process runs in delegated to it
     /// ([`Delegation::claim`]). What hosts that are gone left behind is removed.
-    pub fn new(config: Config) -> Result<Self, VmmError> {
+    pub fn new(mut config: Config) -> Result<Self, VmmError> {
         fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -77,6 +77,11 @@ impl ChVmm {
             .mode(0o700)
             .create(&config.dir)
             .map_err(|e| VmmError::Unsupported(format!("{}: {e}", config.dir.display())))?;
+        // The sandbox shows the monitor each file at its own path, which must be the one path to it.
+        for path in [&mut config.dir, &mut config.cloud_hypervisor] {
+            *path = fs::canonicalize(&path)
+                .map_err(|e| VmmError::Unsupported(format!("{}: {e}", path.display())))?;
+        }
         delegation.sweep(alive);
         if let Ok(entries) = fs::read_dir(&config.dir) {
             for entry in entries.flatten() {
@@ -109,6 +114,21 @@ impl ChVmm {
     }
 }
 
+/// `spec` with each of its files named by its one path, without links, `.` or `..`: the sandbox shows the monitor
+/// each at that path.
+fn resolved(spec: &VmSpec) -> Result<VmSpec, VmmError> {
+    let resolve =
+        |path: &Path| fs::canonicalize(path).map_err(|e| VmmError::Spec(format!("{}: {e}", path.display())));
+    let mut resolved = spec.clone();
+    resolved.kernel = resolve(&spec.kernel)?;
+    resolved.initramfs = resolve(&spec.initramfs)?;
+    resolved.console = resolve(&spec.console)?;
+    for disk in &mut resolved.disks {
+        disk.path = resolve(&disk.path)?;
+    }
+    Ok(resolved)
+}
+
 /// Whether a process of this id is running.
 fn alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
@@ -123,6 +143,14 @@ fn alive(pid: u32) -> bool {
 impl Vmm for ChVmm {
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError> {
         spec.validate()?;
+        // The monitor is shown its console, which must be there to be shown.
+        fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&spec.console)
+            .map_err(|e| VmmError::Start(format!("{}: {e}", spec.console.display())))?;
+        let spec = &resolved(spec)?;
         let name = machine_name(std::process::id(), self.next.fetch_add(1, Ordering::Relaxed));
         let dir = self.config.dir.join(&name);
         let (vsock, events) = (dir.join("vsock"), dir.join("events"));
@@ -173,16 +201,6 @@ impl Vmm for ChVmm {
             .mode(0o700)
             .create(&dir)
             .map_err(|e| VmmError::Start(format!("{}: {e}", dir.display())))?;
-        // The monitor is shown its console, which must be there to be shown.
-        if let Err(error) = fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(&spec.console)
-        {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(VmmError::Start(format!("{}: {error}", spec.console.display())));
-        }
         let group = match self.delegation.machine(&name, &limits) {
             Ok(group) => group,
             Err(error) => {
