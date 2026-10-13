@@ -753,12 +753,13 @@ impl FakeGithub {
         self.lock().removed_at_request.clone()
     }
 
-    /// Whether a scale set with a session offered room beyond the jobs it holds in both of its last two polls: a
-    /// job queued now goes to it at once.
-    pub fn offers_room(&self) -> bool {
+    /// Whether a scale set of `repo` with a session offered room beyond the jobs it holds in both of its last two
+    /// polls: a job of that repository queued now goes to it at once. Another repository's room is no room for it.
+    pub fn offers_room(&self, repo: &str) -> bool {
         let st = self.lock();
         st.scale_sets.iter().any(|s| {
-            !s.deleted
+            s.repo == repo
+                && !s.deleted
                 && s.session.is_some()
                 && s.capacity
                     .zip(s.previous_capacity)
