@@ -6,6 +6,8 @@
 //! - `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--max-part BYTES]`:
 //!   the signed release folder with the root filesystem in parts, as the image workflow publishes it, verified
 //!   before the task ends. `--guest` is where the kernel and initramfs are (default `target/guest`).
+//! - `kernel check`: whether our copy of the pinned kernel package and Alpine still give it, and whether Alpine has
+//!   a newer one. Fails when our copy does not.
 //! - `build`: the guest, then the release binary, ad hoc signed with the entitlement.
 
 mod cpio;
@@ -38,7 +40,10 @@ fn run(args: &[String]) -> Result<()> {
         Some("release") => guest::release(&root, &args[1..]),
         Some("build") => no_options(&args[1..]).and_then(|()| build(&root)),
         Some("it") => it::run(&root, &args[1..]),
-        _ => Err("tasks: keygen, guest, release, build, it".into()),
+        Some("kernel") if args.get(1).map(String::as_str) == Some("check") => {
+            kernel::check(&root, &args[2..])
+        }
+        _ => Err("tasks: keygen, guest, release, build, it, kernel check".into()),
     }
 }
 

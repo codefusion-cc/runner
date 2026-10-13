@@ -1,0 +1,35 @@
+name: Kernel pin
+
+# Alpine keeps only the newest build of a package, so the guest build reads the pinned kernel package from our own
+# copy (a release tagged kernel-linux-virt-<version>). This goes red when that copy stops giving the pinned bytes,
+# weekly and on every change to the pin, so a pin is never merged before its copy exists. It warns when Alpine has a
+# newer kernel.
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - xtask/src/kernel.rs
+      - .github/workflows/kernel.yml
+  push:
+    branches: [main]
+    paths:
+      - xtask/src/kernel.rs
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Our copy of the pinned kernel package answers
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install
+      - run: cargo xtask kernel check
