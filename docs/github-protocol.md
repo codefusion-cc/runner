@@ -54,6 +54,7 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
   GitHub's next look: the next job queued or ended in the repository, or GitHub's own, which can take minutes.
 - A message lost with a session cannot be asked for again. The Runner asks the REST view of each Actions runner it
   believes awaits a job before a session opens (`reconcile`), and before it removes the registration of a machine
-  that ended unheard (`Service::sweep`) or of a surplus Actions runner. What each answer proves, and what is written
-  before what is done, is `docs/job-state.md`. The result of a job whose `JobCompleted` was lost cannot be read
+  that ended unheard (`Service::sweep`). A removal's own answer is evidence too: 204 only for a registration that held
+  no job, 422 under a job, 404 once a one-job Actions runner removed its own. What each answer proves, and what is
+  written before what is done, is `docs/job-state.md`. The result of a job whose `JobCompleted` was lost cannot be read
   without the App permission `actions: read`.

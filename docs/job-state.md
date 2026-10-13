@@ -18,25 +18,32 @@ The machine (vm-host) adds one fact: whether its guest came up. A guest that nev
 | State | Stored as | Moved by |
 |---|---|---|
 | Unknown | `github: None`, `start_reported: false` | Nothing yet: the machine stands, or it ended and no word came |
-| Started | `github: Some`, `start_reported: true` | A `JobStarted`; REST `busy: true`, at any moment; REST 404 with no removal written down; a `DELETE` refused with 422 |
+| Started | `github: Some`, `start_reported: true`, and the lifecycle's step in the same write | A `JobStarted`; REST `busy: true` or gone, at any moment; a `DELETE` answered 404 or refused with 422 |
 | Ended | `end_reported: true` after a completion report | A `JobCompleted`; or the machine gone and the wait for GitHub's word (`RESULT_WAIT`) over; or an uninstall, which waits for nothing |
-| No job | `github: None`, `removing: Some(why)`, `end_reported: true` without a report | The Runner decided so and wrote it down first (below) |
+| No job | `github: None`, `unregistered: true`, `end_reported: true` without a report | GitHub answered the Runner's own `DELETE` with 204 |
 
-Two ways lead to "No job":
+Only a 204 to the Runner's own `DELETE` says no job ran: GitHub refuses to remove an Actions runner that holds a job
+(422), and a one-job Actions runner removes its own registration once its job is over (then `DELETE` meets 404). An
+intention of the Runner's is never evidence, and nothing it wants to do stops GitHub from being asked.
 
-- **Surplus.** The scaler retires an idle Actions runner past `IDLE_GRACE` only after REST says `busy: false`. It
-  writes `removing: "surplus"`, then sends `DELETE`. A 422 means it took a job meanwhile: it is Started, and
-  `removing` is cleared.
-- **The verdict on a machine that ended unheard** (`ask_github`). The sweep asks REST once the wait is over.
-  `busy: true` or 404 means a job ran. `busy: false` is evidence only for its moment. The sweep decides "no job" on
-  a second `busy: false`, read at a later sweep than the first. Under a view one read behind, that answer is from
-  the moment of the first read, after the machine was gone. Then it writes `removing: "no job"` and sends `DELETE`.
+Three ways lead to a `DELETE`, all sent by the sweep (`Service::sweep`), the one place that removes a registration:
+
+- **Surplus.** The scaler retires an idle Actions runner past `IDLE_GRACE` (`Hosts::retire`). Nothing is written:
+  a Runner that dies first retires it again.
+- **The idle limit.** A machine idle past `limits.idle` is not stopped on that belief, since its start may have gone
+  with a session: the lifecycle asks for the registration's removal (`Effect::Unregister`) and stays idle. 204
+  stops it as `no-job`; 422 or 404 makes it Started.
+- **A machine that ended unheard** (`ask_github`). The sweep asks REST once the wait is over. `busy: true` or gone
+  means a job ran. `busy: false` is evidence only for its moment: on a second `busy: false`, read at a later sweep,
+  the sweep sends `DELETE`, and the answer decides.
+
+A start heard while a removal is pending voids it.
 
 ## The registration
 
-`registering` (written before GitHub is asked), then registered (the record has `runner_id`), then `removing` (written
-before `DELETE`), then `unregistered` (written after GitHub answered 204 or 404). The record is deleted once it is
-unregistered, its end is reported and its machine is gone.
+`registering` (written before GitHub is asked), then registered (the record has `runner_id`), then `unregistered`
+(written in the step that heard GitHub's 204 or 404, together with the machine's stop). The record is deleted once it
+is unregistered, its end is reported and its machine is gone.
 
 ## The rules
 
@@ -46,19 +53,20 @@ unregistered, its end is reported and its machine is gone.
    message, the session was lost, and the next opening counts afresh. The Runner's own count only ever lags behind
    GitHub's into fewer machines: a machine that went with its job unheard counts until it is settled
    (`lost_with_job`).
-2. **Nothing is deleted at GitHub before the fact that it is being deleted, and why, is stored.** That fact is
-   `removing` for an Actions runner the Runner gives up. A machine that is gone with its verdict stored needs no
-   `removing`: `ended` and the job fields say why.
-3. **A REST answer is evidence only for its moment.** A 404 after a `DELETE` of the Runner's own says nothing
-   about a job. A `DELETE` answered 404 says nothing either, since the HTTP client retries a `DELETE` whose answer
-   was lost. Only `busy: true`, a 422, or a 404 for a registration the Runner never set out to remove means a
-   job started.
+2. **Facts that must change together are one write, and a restart reads one fact.** GitHub's word of a start and the
+   lifecycle step it causes are one write (`Events::job`); a record an older Runner left with a start and an idle
+   lifecycle is restored as running. `unregistered` and the machine's stop are one write; a machine restored with
+   `unregistered` is stopped, whatever phase was written.
+3. **A REST answer is evidence only for its moment.** `busy: false` says nothing of a moment after it. A registration
+   that is gone, by REST or by a `DELETE`'s 404, means a job ran, unless a 204 to the Runner's own `DELETE` was heard
+   first; the HTTP client retries a `DELETE` whose answer was lost, so a lost 204 reads as a 404 (below).
 4. **An end is reported exactly once for every reported start, whichever path noticed it first.** Every start
    and end goes through `Machines` (`Events::job`, `settle`). A start reported for a record that was settled as
    "no job" opens its end again. No completion could have gone out before it, since a completion needs a
    reported start.
 5. **The fake takes back an assignment not taken within five minutes**, as GitHub does (`docs/github-protocol.md`,
-   probe J2): a `JobCompleted` `canceled` with no Actions runner, and the job is queued again.
+   probe J2): a `JobCompleted` `canceled` with no Actions runner, and the job is queued again. **Its removals fail
+   until GitHub recovers**, not for a count of tries the client's retries use up in milliseconds.
 
 ## Order of writes and acts, and what may repeat
 
@@ -66,18 +74,21 @@ unregistered, its end is reported and its machine is gone.
 |---|---|---|---|
 | Register | intent record (`registering`) | `generatejitconfig` | The sweep looks for the name and removes it |
 | Start a machine | the record with its slot | the vm-host starts | No machine: the record ends as `daemon-restart` |
-| Retire a surplus | `removing: "surplus"` | `DELETE`, then stop | Restore keeps the machine as done and the sweep sends `DELETE`. 204 or 404 stops the machine. 422 means Started |
-| Verdict "no job" | `removing: "no job"` | `DELETE` | The sweep sends `DELETE` again; 404 means nothing |
+| Hear a start | `github`, `start_reported` and the lifecycle, one write | the report | Reported again under the same id |
+| Remove a registration | nothing | `DELETE` | Retired or asked again; a 204 whose write was lost reads as a job (below) |
+| Hear a removal | `unregistered` and the stop, one write | the machine stops | Restore stops a machine whose record says `unregistered` |
 | Report a start | the report (outbox, id `<runner>/started`) | `start_reported` | Reported again under the same id; the outbox drops the copy |
 | Report an end | the report (id `<runner>/completed`) | `end_reported` | The same |
 | Unregistered | `unregistered` | the record removed | Removed at the next settle |
 
-Every REST read repeats safely. A `DELETE` repeats safely once its reason is stored.
+Every REST read repeats safely, and so does a `DELETE`: what it proves is read from its answer, not from a reason
+stored before it.
 
 ## What stays open
 
-- A job that starts and ends entirely between the REST read and the `DELETE` of a surplus Actions runner is not
-  seen. Its start message is still heard while the session lives. The window is one round trip.
+- A 204 that is lost, to a crash before its write or to a dropped connection whose retry meets 404, makes the next
+  look report a job that did not run: one start and one end too many, never a job lost. Telling the two apart needs
+  a second source, such as the guest saying whether `Runner.Worker` ever ran.
 - A machine that ran a job, and whose start and end both went with a session, is reported without GitHub's result.
   The result can be read only with the App permission `actions: read`.
 - GitHub removing an ephemeral registration that never ran a job, within the minutes of the wait, would read as a

@@ -572,8 +572,8 @@ fn start_unheard(
 ///
 /// It runs before the session opens, so the counts the session opens with are from after every answer acted on here:
 /// a job that ends meanwhile is not in them (`docs/job-state.md`, rule 1). Only `busy: true` moves anything. An idle
-/// answer is one moment's, and one that the Actions runner is gone is left to its machine's end and the sweep, which
-/// know whether the Runner removed it itself.
+/// answer is one moment's, and one that the Actions runner is gone is left to the sweep, which heard whether GitHub
+/// removed it at the Runner's request.
 pub async fn reconcile<R: Registry>(
     registry: &R,
     roster: &Roster,
