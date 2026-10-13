@@ -966,9 +966,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let runner = job.record.runner.clone();
         tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
         self.roster.remove(&runner);
-        // Only GitHub's own word that the registration held no job (its removal answered, not refused) settles a
-        // machine without one; a removal the Runner set out to make proves nothing.
-        job.record.ask_github = came_up && job.record.github.is_none() && !job.record.removed_idle;
+        // Whether GitHub removed the registration, and what that said of a job, is decided once it is gone
+        // (`Machines::unregistered`); until then GitHub is asked.
+        job.record.ask_github = came_up && job.record.github.is_none();
         self.store.save(&job.record);
         self.vms.clean(name);
         if oom {

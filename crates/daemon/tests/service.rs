@@ -159,6 +159,11 @@ impl Rig {
     /// The Runner's process dies and a new one starts: nothing is closed at GitHub, the vm-hosts go on. One that died
     /// at a write already ([`Rig::crash_at`]) is only started again.
     async fn restart(&mut self) {
+        self.restart_after(|_| {}).await;
+    }
+
+    /// Starts again as [`Rig::restart`] does, once `edit` changed what the dead Runner left on disk.
+    async fn restart_after(&mut self, edit: impl FnOnce(&Rig)) {
         self.stop_pump().await;
         self.service.kill();
         if self.store.crashed() {
@@ -168,6 +173,7 @@ impl Rig {
             self.parts.vms.ignore_stops(false);
         }
         self.store.revive();
+        edit(self);
         self.dead.store(false, Ordering::Relaxed);
         self.github.set_down(false);
         let host = self.machines.with_host(|host| host.clone());
@@ -2319,7 +2325,18 @@ async fn a_surplus_removed_just_before_the_runner_died_is_not_taken_for_a_job_by
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (removed_before, stopped_before) = (removals(&rig), stops(&rig));
-    rig.restart().await;
+    // As a Runner before this rule could leave it: the registration written gone, and its stop not yet.
+    rig.restart_after(|rig| {
+        for mut record in rig.parts.store.load() {
+            if let Some(slot) = record.slot.as_mut().filter(|_| record.unregistered) {
+                let mut saved = slot.saved();
+                saved.phase = cf_lifecycle::Phase::Idle;
+                *slot = saved.into();
+            }
+            rig.parts.store.save(&record);
+        }
+    })
+    .await;
     let set = rig.github.scale_sets()[0].id;
     rig.github.lose_session(set);
     rig.service.discover().await;
@@ -2531,16 +2548,25 @@ async fn a_runner_that_dies_as_it_hears_a_start_leaves_the_job_its_machine() {
                 .is_some_and(|s| s.saved().phase == cf_lifecycle::Phase::Running)),
         "the write that was kept: {stored:?}"
     );
-    // What a Runner from before this rule could have left: the job's start, and a lifecycle still idle.
-    for mut record in stored {
-        if let Some(slot) = record.slot.as_mut() {
-            let mut saved = slot.saved();
-            saved.phase = cf_lifecycle::Phase::Idle;
-            *slot = saved.into();
+    // What a Runner from before this rule could have left: the job's start, and a lifecycle still idle. GitHub's REST
+    // view is away and the session's messages are lost, so only the record can say the job runs.
+    let set = rig.github.scale_sets()[0].id;
+    rig.github.lose_session(set);
+    rig.github.fail_until_recovered(
+        "GET /repos/org/app/actions/runners/",
+        Reply::status_json(502, &json!({"message": "bad gateway"})),
+    );
+    rig.restart_after(|rig| {
+        for mut record in stored {
+            if let Some(slot) = record.slot.as_mut() {
+                let mut saved = slot.saved();
+                saved.phase = cf_lifecycle::Phase::Idle;
+                *slot = saved.into();
+            }
+            rig.parts.store.save(&record);
         }
-        rig.parts.store.save(&record);
-    }
-    rig.restart().await;
+    })
+    .await;
     until("the job's start read as a running job", || {
         rig.parts.store.load().iter().any(|r| {
             r.slot
@@ -2609,6 +2635,53 @@ async fn a_machine_past_its_idle_limit_whose_start_was_lost_keeps_its_job() {
     .await;
 }
 
+/// As below, but the job is over and its machine still stands when GitHub takes removals again: the registration
+/// is gone, the Actions runner removed it itself. That 404 is the job's, and the console hears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surplus_found_gone_while_its_machine_stands_ran_a_job() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let job = rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    rig.github.cancel_job(job);
+    rig.github
+        .fail_until_recovered(REMOVAL, Reply::status_json(500, &json!({"message": "try again"})));
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    until("the removal to fail", || {
+        rig.github.count(REMOVAL) >= PAST_RETRIES
+    })
+    .await;
+    let next = rig.queue().await;
+    until("the Actions runner to be needed again", || {
+        rig.github.job_state(next) == Some(JobState::Acquired(rig.github.scale_sets()[0].id))
+    })
+    .await;
+    let set = rig.github.scale_sets()[0].id;
+    no_session_for_a_while(&rig, set);
+    rig.github.lose_session(set);
+    rig.github.start_job(&runner);
+    rig.github.complete_job(&runner, "succeeded");
+    assert!(
+        !rig.github.runners().contains(&runner),
+        "a one-job Actions runner removes its own registration"
+    );
+    let removals = rig.github.count(REMOVAL);
+    rig.github.recover(REMOVAL);
+    until("the next removal, answered 404", || {
+        rig.github.count(REMOVAL) > removals
+    })
+    .await;
+    until("the start at the console", || heard(&rig, &runner).0).await;
+    rig.parts.vms.end(job_name(&runner), End::Ok);
+    for _ in 0..3 {
+        rig.later(RESULT_WAIT + Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    until("no record", || rig.parts.store.load().is_empty()).await;
+    assert_eq!(heard(&rig, &runner), (true, true), "{:?}", rig.events());
+}
+
 /// Sol, machines.rs:960: the removal of a surplus Actions runner fails at GitHub, which keeps the registration. A
 /// job comes, the Actions runner takes it, and its start and end go with the session; the job ends and the Actions
 /// runner removes its own registration. A removal the Runner meant to make is not GitHub's word that no job ran:
@@ -2621,14 +2694,11 @@ async fn a_surplus_whose_removal_failed_and_that_then_ran_a_job_is_heard() {
     until("a machine for the job", || rig.standing().len() == 1).await;
     let runner = rig.standing()[0].clone();
     rig.github.cancel_job(job);
-    rig.github.fail(
-        "distributedtask/pools/0/agents/",
-        Reply::status_json(500, &json!({"message": "try again"})),
-        PAST_RETRIES,
-    );
+    rig.github
+        .fail_until_recovered(REMOVAL, Reply::status_json(500, &json!({"message": "try again"})));
     rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
     until("the removal to fail", || {
-        rig.github.count("distributedtask/pools/0/agents/") >= PAST_RETRIES
+        rig.github.count(REMOVAL) >= PAST_RETRIES
     })
     .await;
     let next = rig.queue().await;
@@ -2644,6 +2714,7 @@ async fn a_surplus_whose_removal_failed_and_that_then_ran_a_job_is_heard() {
         rig.github.job_state(next),
         Some(JobState::Running(runner.clone()))
     );
+    rig.github.recover(REMOVAL);
     rig.github.complete_job(&runner, "succeeded");
     rig.parts.vms.end(job_name(&runner), End::Ok);
     until("the machine to be gone", || rig.standing().is_empty()).await;
