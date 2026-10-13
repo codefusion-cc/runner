@@ -35,7 +35,58 @@ mod machine;
 pub use machine::{ChVmm, Config};
 
 /// What a machine's cgroup holds beyond the guest's memory: cloud-hypervisor's own memory and the guest memory's
-/// page tables, pasta, and the sandbox.
+/// page tables, pasta, and the sandbox. Too little and a guest that fills its memory ends as an OOM it did not
+/// cause; too much and a machine may take more of the host than the budget gave it.
+///
+/// Measured with `cargo xtask it --only full-memory` on an RK3588 board (8 GB, Debian bookworm, kernel 6.1,
+/// cloud-hypervisor v53.0, 2026-10-13): a job takes all the memory its guest gets, and what the cgroup held at its
+/// most less what the guest had touched bounds what it holds beyond the guest's memory. 79 MiB for a 1 GiB machine,
+/// 102 MiB for 2 GiB, 187 MiB for 4 GiB: about 43 MiB and 36 MiB a GiB, the guest kernel's own tables (1/64 of its
+/// memory) counted in. This gives 160, 192 and 256 MiB, and 384 MiB to an 8 GiB machine, for which the line above
+/// says 331.
 pub fn overhead(memory_bytes: u64) -> u64 {
-    (192 << 20) + memory_bytes / 64
+    (128 << 20) + memory_bytes / 32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::overhead;
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn the_overhead_covers_what_full_machines_were_measured_to_hold_with_room_to_spare() {
+        // (size, the most measured beyond it), from the board run named at `overhead`.
+        for (size, measured) in [
+            (1024 * MIB, 79 * MIB),
+            (2048 * MIB, 102 * MIB),
+            (4096 * MIB, 187 * MIB),
+        ] {
+            let given = overhead(size);
+            assert!(
+                given >= measured + 64 * MIB,
+                "{} MiB for a {} MiB machine",
+                given / MIB,
+                size / MIB
+            );
+            // Not so much that a monitor grown to three times its size would go unnoticed.
+            assert!(
+                given <= measured * 3,
+                "{} MiB for a {} MiB machine",
+                given / MIB,
+                size / MIB
+            );
+        }
+    }
+
+    #[test]
+    fn a_larger_machine_gets_more_and_the_largest_no_overflow() {
+        let mut last = 0;
+        for gib in 1..=64 {
+            let given = overhead(gib << 30);
+            assert!(given > last);
+            last = given;
+        }
+        assert!(overhead(u64::MAX) > overhead(64 << 30));
+    }
 }
