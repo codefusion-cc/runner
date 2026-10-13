@@ -1139,7 +1139,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return shared.config.report_every;
         };
         let mut report = self.status();
-        let results: Vec<CommandResult> = std::mem::take(&mut *shared.results.lock().expect("results"));
+        // Kept until the console has them, so that one said meanwhile is written down beside them.
+        let results: Vec<CommandResult> = shared.results.lock().expect("results").clone();
         report.results.clone_from(&results);
         // Read before the events are taken for the report: one queued meanwhile is news after it.
         let queued = console.outbox.queued();
@@ -1149,18 +1150,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             Ok(answer) => {
                 if !results.is_empty() {
                     // The console has them: they are kept no longer.
-                    let kept = shared.results.lock().expect("results");
+                    let mut kept = shared.results.lock().expect("results");
+                    kept.retain(|result| !results.iter().any(|said| said.id == result.id));
                     self.keep(&kept);
                 }
                 self.answered(answer).await
             }
             Err(error) => {
                 // What was done for the console is said again with the next report.
-                let mut kept = shared.results.lock().expect("results");
-                let later = std::mem::replace(&mut *kept, results);
-                kept.extend(later);
-                kept.truncate(cf_console_client::MAX_RESULTS);
-                drop(kept);
                 match error {
                     cf_console_client::Error::Unauthorized => {
                         tracing::error!("the console does not know this Mac's token; enrol it again");

@@ -210,8 +210,10 @@ pub fn daemon(config: &Path) -> Result<(), String> {
             MacUpdate::of_this_program(&config.state_dir, &config.program(), &config.records(), entitled)
         })
         .flatten()
-        .map(|updates| Arc::new(updates) as Arc<dyn SelfUpdate>);
-    runtime(2)?.block_on(async {
+        .map(Arc::new);
+    let runtime = runtime(2)?;
+    let ran = runtime.block_on(async {
+        let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
         let (_machines, service) = service(&config, &program, updates)?;
         let (trigger, stop) = cf_scaleset::shutdown();
         watch_signals();
@@ -250,7 +252,14 @@ pub fn daemon(config: &Path) -> Result<(), String> {
         }
         tracing::info!("the Runner ends; machines that stand go on and are found again");
         Ok(())
-    })
+    });
+    // An update's build is ended with the Runner (the console sends its command again to the one that starts
+    // next), and a git call of one is not waited for.
+    if let Some(updates) = &updates {
+        updates.end_build();
+    }
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    ran
 }
 
 /// The console's one-time code from standard input. A person at a terminal is told what is waited for, and what

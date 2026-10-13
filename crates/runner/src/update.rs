@@ -8,6 +8,7 @@ use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use cf_daemon::update::{AtStart, Pending, SelfUpdate, UpdateFile, at_start, spoken};
@@ -23,6 +24,8 @@ const BUILD_LIMIT: Duration = Duration::from_secs(45 * 60);
 const GIT_LIMIT: Duration = Duration::from_secs(120);
 /// The name the kept program has beside the installed one.
 const PREVIOUS: &str = "prev";
+/// The name the program built and checked has beside the installed one until it is installed.
+const NEXT: &str = "next";
 
 /// The commit part of a version: `0.1.0+446125c0a1b2` → `446125c0a1b2`.
 fn commit_of(version: &str) -> Option<&str> {
@@ -53,6 +56,8 @@ pub struct MacUpdate {
     pub entitled: fn(&Path) -> Result<(), String>,
     /// `<origin> main`, for the console.
     source: String,
+    /// The process group of the build that runs, which [`MacUpdate::end_build`] ends.
+    building: Mutex<Option<libc::pid_t>>,
 }
 
 impl MacUpdate {
@@ -104,6 +109,7 @@ impl MacUpdate {
             build_limit: BUILD_LIMIT,
             entitled,
             source: String::new(),
+            building: Mutex::new(None),
         }
         .checked()
     }
@@ -135,8 +141,26 @@ impl MacUpdate {
         self.installed.with_extension(PREVIOUS)
     }
 
+    /// The program built and checked, put beside the installed one: the checkout is the person's too, and a build
+    /// of theirs while the machines end does not go in.
+    fn next(&self) -> PathBuf {
+        self.installed.with_extension(NEXT)
+    }
+
     fn git(&self, args: &[&str]) -> Result<String, String> {
         git(&self.checkout, args)
+    }
+
+    /// Ends the build that runs, with what it started. A Runner that ends does not wait for it: its process
+    /// group is its own, so it would go on after the Runner, and the Runner's runtime waits for the thread that
+    /// waits for it.
+    pub fn end_build(&self) {
+        if let Some(group) = *self.building.lock().expect("building") {
+            // SAFETY: a signal to the process group the build leads (`process_group(0)`); no memory is shared.
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
     }
 
     /// Runs the build, its output into the log, for at most the build's limit.
@@ -163,8 +187,10 @@ impl MacUpdate {
             .process_group(0)
             .spawn()
             .map_err(|error| format!("{}: {error}", self.cargo.display()))?;
-        let status =
-            wait_at_most(&mut child, self.build_limit).map_err(|error| format!("the build: {error}"))?;
+        *self.building.lock().expect("building") = libc::pid_t::try_from(child.id()).ok();
+        let status = wait_at_most(&mut child, self.build_limit);
+        *self.building.lock().expect("building") = None;
+        let status = status.map_err(|error| format!("the build: {error}"))?;
         match status {
             Some(status) if status.success() => Ok(()),
             Some(status) => Err(format!(
@@ -232,7 +258,8 @@ impl SelfUpdate for MacUpdate {
                 cut(printed.trim(), 100)
             ));
         }
-        (self.entitled)(&built)?;
+        copy_whole(&built, &self.next())?;
+        (self.entitled)(&self.next())?;
         Ok(version)
     }
 
@@ -252,10 +279,11 @@ impl SelfUpdate for MacUpdate {
         copy_whole(&self.installed, &self.previous())?;
         let file = UpdateFile::in_state(&self.state_dir);
         file.write(pending)?;
-        if let Err(error) = place(&self.built(), &self.installed, self.entitled) {
+        if let Err(error) = place(&self.next(), &self.installed, self.entitled) {
             let _ = file.remove();
             return Err(error);
         }
+        let _ = std::fs::remove_file(self.next());
         Ok(())
     }
 }
@@ -555,6 +583,7 @@ chmod +x target/release/codefusion-runner"#;
             build_limit: Duration::from_secs(60),
             entitled: signed,
             source: String::new(),
+            building: Mutex::new(None),
         }
         .checked()
         .expect("a checkout");
@@ -675,10 +704,40 @@ chmod +x target/release/codefusion-runner"#;
         let said = bench.update.build().expect_err("ended");
         assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
         assert_eq!(said, "the build took longer than 1 second and was ended");
-        let child = std::fs::read_to_string(bench.root.join("marks/child")).expect("the child");
+        let child: libc::pid_t = std::fs::read_to_string(bench.root.join("marks/child"))
+            .expect("the child")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // Killed, it may still be there a moment, until launchd, which it went to, collects it.
+        let began = Instant::now();
         // SAFETY: signal 0 only asks whether the process is there.
-        let alive = unsafe { libc::kill(child.trim().parse().expect("a pid"), 0) } == 0;
-        assert!(!alive, "the build's own children end with it");
+        while unsafe { libc::kill(child, 0) } == 0 {
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "the build's own children end with it"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_build_is_ended_with_what_it_started_when_the_runner_ends() {
+        let bench = bench("sleep 30 &\necho $! > \"$MARKS/child\"\nwait");
+        let marks = bench.root.join("marks/child");
+        let began = Instant::now();
+        std::thread::scope(|scope| {
+            let build = scope.spawn(|| bench.update.build());
+            while !std::fs::read_to_string(&marks).is_ok_and(|pid| pid.ends_with('\n')) {
+                assert!(began.elapsed() < Duration::from_secs(10), "the build started");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            bench.update.end_build();
+            let said = build.join().expect("the build").expect_err("ended");
+            assert!(said.starts_with("the build failed"), "{said}");
+        });
+        assert!(began.elapsed() < Duration::from_secs(20), "{:?}", began.elapsed());
+        bench.update.end_build();
     }
 
     #[test]
@@ -715,6 +774,20 @@ chmod +x target/release/codefusion-runner"#;
             .into_iter()
             .collect();
         assert_eq!(left, ["codefusion-runner", "codefusion-runner.prev"]);
+    }
+
+    /// The checkout is the person's too: a build of theirs while the update waits for machines does not go in.
+    #[test]
+    fn an_install_places_the_program_the_build_checked_not_what_the_checkout_has_since() {
+        let bench = bench(BUILDS);
+        bench.update.build().expect("built");
+        let checked = std::fs::read_to_string(bench.update.built()).expect("the program");
+        std::fs::write(bench.update.built(), "a build of another branch").expect("program");
+        bench.update.install(&bench.pending()).expect("installed");
+        assert_eq!(
+            std::fs::read_to_string(&bench.update.installed).expect("program"),
+            checked
+        );
     }
 
     #[test]

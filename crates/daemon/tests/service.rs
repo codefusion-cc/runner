@@ -3140,6 +3140,37 @@ async fn while_an_update_builds_it_runs_once_and_another_update_or_a_restart_is_
     );
 }
 
+/// A result said while a report that fails carries the ones before is kept with them: a Runner that dies then
+/// still says every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_said_while_a_report_is_under_way_keeps_the_ones_it_carries() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    rig.service.said("first", true, "one");
+    rig.console.down(true);
+    {
+        let report = rig.service.report();
+        tokio::pin!(report);
+        // Polled once: the report is on its way with the first result.
+        std::future::poll_fn(|cx| {
+            let _ = report.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        rig.service.said("second", true, "two");
+        report.await;
+    }
+    rig.restart().await;
+    rig.console.down(false);
+    rig.stop_pump().await;
+    rig.service.report().await;
+    let ids: BTreeSet<String> = results(&rig.console)
+        .iter()
+        .map(|result| result["id"].as_str().expect("an id").to_string())
+        .collect();
+    assert_eq!(ids, BTreeSet::from(["first".into(), "second".into()]));
+}
+
 /// The last report of a Runner that ends says so, and not that the Mac serves nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
