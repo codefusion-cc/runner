@@ -2,9 +2,10 @@
 //!
 //! With a network it runs under pasta, as root of pasta's user and network namespace. It makes the guest's tap
 //! device, loads the guest's firewall ([`crate::firewall`]) onto it, and joins it with pasta's device in a bridge.
-//! Without one it makes an empty user and network namespace of its own. Either way it then makes a cgroup, a PID
-//! and a mount namespace and starts cloud-hypervisor in them with no capability left, and no user namespace of its
-//! own to gain one in. The monitor's root is a read-only tmpfs that holds the files and folders it is shown
+//! The monitor then gets a network namespace of its own with nothing in it: the tap's descriptor is its only way
+//! out, through the firewall, and no socket of its own reaches pasta's side. Without a network the sandbox makes an
+//! empty user and network namespace of its own. Either way it then makes a cgroup, a PID and a mount namespace and
+//! starts cloud-hypervisor in them with no capability left, and no user namespace of its own to gain one in. The monitor's root is a read-only tmpfs that holds the files and folders it is shown
 //! ([`Shown`]), each at its own path, and a `/proc` of its own: it sees no other file of the host or of the user it
 //! runs as, and no process but itself. It cannot
 //! change the firewall or the devices, leave its cgroup, or see or signal any process outside its machine. The
@@ -313,6 +314,9 @@ mod linux {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    /// The largest file the monitor may write when no file it is shown to write is larger: room for its console,
+    /// which the vm-host ends a machine for long before.
+    const FILE_FLOOR: u64 = 64 << 20;
     /// How long pasta's device may take to show up in the namespace.
     const DEVICE_WAIT: Duration = Duration::from_secs(5);
     /// How many user namespaces may be made below the user namespace of the process that reads or writes it.
@@ -353,7 +357,10 @@ mod linux {
             Network::Nat => {
                 let tap = network(&sandbox.host)?;
                 monitor.extend(net(tap.as_raw_fd()).map(OsString::from));
-                unshare(namespaces)?;
+                // The tap stays in pasta's namespace and works through its descriptor. A monitor taken over that
+                // opened a socket in pasta's namespace could send through the bridge from no address, past the
+                // firewall on the tap: in a namespace of its own it has no device to send from.
+                unshare(namespaces | libc::CLONE_NEWNET)?;
                 Some(tap)
             }
             Network::None => {
@@ -382,13 +389,21 @@ mod linux {
         let mut command = Command::new(program);
         command.args(args);
         let inherited = tap.as_ref().map(AsRawFd::as_raw_fd);
+        let largest = largest_file(&sandbox.shown);
         // SAFETY: between fork and exec the child makes only system calls, on strings made before the fork: fcntl,
-        // prctl, mount, chdir, pivot_root, umount2 and capset.
+        // setrlimit, prctl, mount, chdir, pivot_root, umount2 and capset.
         unsafe {
             command.pre_exec(move || {
                 if let Some(fd) = inherited
                     && libc::fcntl(fd, libc::F_SETFD, 0) != 0
                 {
+                    return Err(io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: largest,
+                    rlim_max: largest,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
@@ -411,6 +426,19 @@ mod linux {
         // line of its own even when the monitor's last ended without a newline.
         eprintln!("\n{}", report(ended));
         Ok(ended.exit_code())
+    }
+
+    /// The largest file the monitor may write: what it is shown to write may stay as large as it is, and nothing
+    /// grows past that, so a monitor taken over cannot fill the host's disk with one file. The kernel then answers
+    /// a longer write with `SIGXFSZ`, which ends it.
+    fn largest_file(shown: &[Shown]) -> libc::rlim_t {
+        shown
+            .iter()
+            .filter(|one| one.access == Access::Write)
+            .filter_map(|one| fs::metadata(&one.path).ok())
+            .filter(fs::Metadata::is_file)
+            .map(|metadata| metadata.len())
+            .fold(FILE_FLOOR, u64::max)
     }
 
     fn unshare(flags: libc::c_int) -> Result<(), String> {

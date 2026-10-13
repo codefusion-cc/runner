@@ -1,10 +1,11 @@
 //! What the monitor sees of the host, as the sandbox gives it: this program is the monitor, run by the real
-//! sandbox ([`cf_vmm_ch::sandbox::main`]) without a network, so no pasta and no KVM are needed. It is shown a file to
-//! read, one to write, a folder, a copy of itself to read, two devices and its own folder, and tries what a monitor
-//! taken over by its guest would try. Each check below says what it must find.
+//! sandbox ([`cf_vmm_ch::sandbox::main`]), so no KVM is needed. Without a network it is shown a file to read, one to
+//! write, a folder, a copy of itself to read, two devices and its own folder, and tries what a monitor taken over by
+//! its guest would try. Then it runs once more under pasta with a network, and tries to send past its tap. Each check
+//! below says what it must find.
 //!
 //! It runs without a test harness: the sandbox makes namespaces only a process of one thread may make. It needs user
-//! namespaces.
+//! namespaces and pasta.
 
 fn main() {
     #[cfg(target_os = "linux")]
@@ -28,6 +29,8 @@ mod linux {
     const MARK: &str = "CF_MONITOR_ROOT_TEST";
     /// The monitor's subcommand.
     const PROBES: &str = "monitor-probes";
+    /// The monitor's subcommand in a sandbox with a network.
+    const NET_PROBES: &str = "monitor-net-probes";
     /// A descriptor of the host's root the sandbox is handed open, as a careless parent might.
     const LEAKED: i32 = 100;
 
@@ -45,6 +48,10 @@ mod linux {
             }
             Some(PROBES) if marked => {
                 probes(&args[2..]);
+                std::process::exit(0);
+            }
+            Some(NET_PROBES) if marked => {
+                net_probes(&args[2..]);
                 std::process::exit(0);
             }
             _ => check(),
@@ -85,14 +92,7 @@ mod linux {
             fs::copy(&program, &files.copy).unwrap();
         }
 
-        let mut sandbox = Sandbox::new(Network::None, vec![], files.machine.join(ROOT));
-        sandbox.show(&program, Access::Run);
-        // This program's loader and libraries, which cloud-hypervisor, linked statically, does without.
-        for libraries in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
-            if Path::new(libraries).exists() {
-                sandbox.show(libraries, Access::Run);
-            }
-        }
+        let mut sandbox = runnable(Network::None, &program, &files.machine);
         sandbox.show(&files.read, Access::Read);
         sandbox.show(&files.write, Access::Write);
         sandbox.show(&files.folder, Access::Write);
@@ -144,6 +144,7 @@ mod linux {
             ("a_device_to_write_is_written", "dev-null", "ok"),
             ("a_device_to_read_is_read", "dev-urandom", "ok"),
             ("the_monitor_makes_no_user_namespace", "userns", "28"),
+            ("the_monitor_grows_no_file_past_its_limit", "huge", "27"),
             ("the_monitor_ends_as_it_exits", "end", "ok"),
         ];
         let mut failed = Vec::new();
@@ -188,7 +189,41 @@ mod linux {
             println!("test the_sandbox_reports_on_a_line_of_its_own ... FAILED");
             failed.push("the_sandbox_reports_on_a_line_of_its_own");
         }
-        let checks = wanted.len() + 6;
+        // With a network, the sandbox runs under pasta, as a machine's does.
+        let networked = base.path().join("networked");
+        fs::create_dir(&networked).unwrap();
+        let pasta = cf_vmm_ch::programs::pasta().expect("pasta, which a machine with a network runs under");
+        let sandbox = runnable(Network::Nat, &program, &networked);
+        let command = cf_vmm_ch::command::pasta(
+            &pasta,
+            sandbox.command(&program, vec![program.clone().into(), NET_PROBES.into()]),
+        );
+        let net_done = Command::new(&command[0])
+            .args(&command[1..])
+            .env(MARK, "1")
+            .output()
+            .unwrap();
+        let net_said = String::from_utf8_lossy(&net_done.stdout);
+        let net_found: BTreeMap<&str, &str> =
+            net_said.lines().filter_map(|line| line.split_once('=')).collect();
+        let net_wanted: &[(&str, &str, &str)] = &[
+            ("the_monitor_keeps_its_tap", "tap", "ok"),
+            ("the_monitor_sees_no_device_of_pastas_namespace", "devices", "lo"),
+            ("the_monitor_sends_nothing_past_its_tap", "bridge", "19"),
+        ];
+        for (name, key, value) in net_wanted {
+            let got = net_found.get(key).copied().unwrap_or("nothing");
+            if got == *value {
+                println!("test {name} ... ok");
+            } else {
+                println!(
+                    "test {name} ... FAILED: {key}={got}, wanted {value}; the sandbox said: {}",
+                    String::from_utf8_lossy(&net_done.stderr)
+                );
+                failed.push(*name);
+            }
+        }
+        let checks = wanted.len() + 6 + net_wanted.len();
         if failed.is_empty() {
             println!("\ntest result: ok. {checks} passed");
         } else {
@@ -198,6 +233,70 @@ mod linux {
                 String::from_utf8_lossy(&done.stderr)
             );
         }
+    }
+
+    /// A sandbox rooted in `machine` that may run this program.
+    fn runnable(network: Network, program: &Path, machine: &Path) -> Sandbox {
+        let mut sandbox = Sandbox::new(network, vec![], machine.join(ROOT));
+        sandbox.show(program, Access::Run);
+        // This program's loader and libraries, which cloud-hypervisor, linked statically, does without.
+        for libraries in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
+            if Path::new(libraries).exists() {
+                sandbox.show(libraries, Access::Run);
+            }
+        }
+        sandbox
+    }
+
+    /// What a monitor with a network tries: its tap is open, it sees no device of pasta's namespace, and a socket of
+    /// its own cannot be sent through the bridge, which would go past the firewall on the tap.
+    fn net_probes(args: &[OsString]) {
+        let say = |key: &str, value: String| println!("{key}={value}");
+        let tap = args
+            .iter()
+            .filter_map(|arg| arg.to_str()?.strip_prefix("fd=[")?.split_once(']'))
+            .find_map(|(fd, _)| fd.parse::<i32>().ok());
+        // SAFETY: fcntl with F_GETFD takes no pointer.
+        let open = tap.is_some_and(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        say("tap", if open { "ok" } else { "closed" }.into());
+        let mut devices = Vec::new();
+        // SAFETY: if_nameindex returns an array ended by a zero index, read here and freed once.
+        unsafe {
+            let list = libc::if_nameindex();
+            if !list.is_null() {
+                let mut at = list;
+                while (*at).if_index != 0 {
+                    devices.push(
+                        std::ffi::CStr::from_ptr((*at).if_name)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    at = at.add(1);
+                }
+                libc::if_freenameindex(list);
+            }
+        }
+        say("devices", devices.join(","));
+        // SAFETY: socket takes no pointers; setsockopt reads the name, which lives through the call.
+        let bound = unsafe {
+            let socket = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+            let name = cf_vmm_ch::link::BRIDGE.as_bytes();
+            let done = libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.len() as libc::socklen_t,
+            );
+            let result = if done == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            libc::close(socket);
+            result
+        };
+        say("bridge", code(bound));
     }
 
     /// The error number of a failed call, or `ok`.
@@ -280,6 +379,13 @@ mod linux {
         say("read-write", code(fs::OpenOptions::new().write(true).open(read)));
         say("write", code(fs::write(write, "written")));
         say("folder", code(fs::write(Path::new(folder).join("made"), "made")));
+        // A file grown past the limit is refused (EFBIG), with the signal that would end a monitor ignored here.
+        // SAFETY: signal takes no pointers.
+        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        say(
+            "huge",
+            code(fs::File::create(Path::new(folder).join("huge")).and_then(|file| file.set_len(1 << 40))),
+        );
         say(
             "socket",
             code(UnixListener::bind(Path::new(machine).join("socket"))),
