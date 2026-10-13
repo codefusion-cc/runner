@@ -1,5 +1,41 @@
 //! Netlink as any of its protocols has it: messages, attributes, and on Linux a socket that sends requests and
-//! reads the kernel's answers. nf_tables is one user; any other protocol, such as rtnetlink, can use it the same way.
+//! reads the kernel's answers. nf_tables (`cf-nft`) is one user, rtnetlink (`cf-vmm-ch`'s bridge) another.
+
+use std::fmt;
+use std::io;
+
+/// What went wrong with a socket or what came through it.
+#[derive(Debug)]
+pub enum Error {
+    /// The socket failed.
+    Io(&'static str, io::Error),
+    /// Messages broken, or of a size the reader does not take.
+    Unreadable(String),
+    /// The kernel refused the message with this sequence number.
+    Refused {
+        /// The message's sequence number.
+        message: u32,
+        /// What the kernel said.
+        error: io::Error,
+    },
+    /// What the kernel holds changed while it was listed.
+    Interrupted,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(what, error) => write!(formatter, "{what}: {error}"),
+            Self::Unreadable(problem) => write!(formatter, "unreadable messages: {problem}"),
+            Self::Refused { message, error } => {
+                write!(formatter, "the kernel refused message {message}: {error}")
+            }
+            Self::Interrupted => formatter.write_str("what the kernel holds changed while it was listed"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// An error or an acknowledgement.
 pub const NLMSG_ERROR: u16 = 2;
@@ -37,6 +73,14 @@ pub fn attribute(to: &mut Vec<u8>, kind: u16, payload: &[u8]) {
     to.extend_from_slice(&kind.to_ne_bytes());
     to.extend_from_slice(payload);
     to.resize(to.len().next_multiple_of(4), 0);
+}
+
+/// Appends an attribute that holds `text` as C writes it, ended by a NUL.
+pub fn attribute_str(to: &mut Vec<u8>, kind: u16, text: &str) {
+    let mut payload = Vec::with_capacity(text.len() + 1);
+    payload.extend_from_slice(text.as_bytes());
+    payload.push(0);
+    attribute(to, kind, &payload);
 }
 
 /// Appends an attribute that holds the attributes `fill` writes.

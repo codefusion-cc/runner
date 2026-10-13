@@ -5,8 +5,8 @@ mod common;
 
 use cf_budget::{Pressure, Thermal};
 use cf_host_linux::parse::{
-    self, CpuTicks, Meminfo, Psi, boot_id, btime, cpu_list, cpu_ticks, loadavg, meminfo, millidegrees, psi,
-    start_ticks, text, vmstat,
+    self, CpuTicks, Meminfo, Psi, boot_id, btime, counter, cpu_list, cpu_ticks, loadavg, meminfo,
+    millidegrees, psi, start_ticks, text,
 };
 use cf_host_linux::{Trip, TripKind, Zone, cpu_percent, pressure_of, thermal_of};
 use proptest::prelude::*;
@@ -28,6 +28,28 @@ fn written(cpus: &[u32]) -> String {
         at = end + 1;
     }
     parts.join(",") + "\n"
+}
+
+#[test]
+fn a_counter_is_read_by_its_whole_name_and_only_once() {
+    let events = "low 0\nhigh 0\nmax 12\noom 1\noom_kill 3\noom_group_kill 1\n";
+    assert_eq!(counter(events, "oom_kill"), Some(3));
+    assert_eq!(counter(events, "oom"), Some(1));
+    assert_eq!(counter(events, "max"), Some(12));
+    assert_eq!(counter(events, "kill"), None);
+    assert_eq!(counter("populated x\n", "populated"), None);
+    assert_eq!(counter("populated -1\n", "populated"), None);
+    assert_eq!(counter("", "populated"), None);
+    assert_eq!(
+        counter("pswpout 1\npswpout 2\n", "pswpout"),
+        None,
+        "twice is no answer"
+    );
+    assert_eq!(
+        counter("pswpout 18446744073709551615\n", "pswpout"),
+        Some(u64::MAX)
+    );
+    assert_eq!(counter("pswpout 18446744073709551616\n", "pswpout"), None);
 }
 
 #[test]
@@ -275,7 +297,7 @@ proptest! {
     #[test]
     fn no_text_makes_a_parser_panic(text_in in "\\PC{0,200}", bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = meminfo(&text_in);
-        let _ = vmstat(&text_in, "pswpout");
+        let _ = counter(&text_in, "pswpout");
         let _ = psi(&text_in);
         let _ = cpu_list(&text_in);
         let _ = btime(&text_in);

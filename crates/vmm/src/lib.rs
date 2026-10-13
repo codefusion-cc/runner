@@ -17,6 +17,18 @@ use std::time::Duration;
 pub use exit::ExitCell;
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 
+/// The guest kernel's command line, the same under every monitor. `console=hvc0` is the virtio console the monitor
+/// writes to the console file. `quiet` keeps the kernel's own lines off the console; `panic=-1` restarts a guest
+/// whose kernel panics, which closes the channel, and the host takes a closed channel for a lost guest at once (a
+/// monitor that would boot the guest again ends the machine instead). `arm64.nosme` hides SME from the guest's
+/// programs (the kernel clears the SME and SME2 feature registers, so `/proc/cpuinfo` and `getauxval` stop listing
+/// them): on an M5 the guest's CPU reports it, but Chromium's code that uses it dies with SIGILL (a camera in
+/// Playwright's Chromium crashed its video capture). The guest reports no SVE, so `arm64.nosve` is not needed.
+pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 arm64.nosme";
+
+/// The longest a write to the guest's connection waits for the guest to read, under either monitor.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Why the monitor could not do what was asked.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VmmError {
@@ -83,9 +95,10 @@ pub trait Vm: Send + Sync {
     /// Lets go of the machine without waiting for anything: the last resort when [`Vm::stop`] does not end it.
     fn kill(&self);
 
-    /// What of the Mac's memory the machine holds now, in bytes: the physical footprint of the monitor's process that
-    /// runs it less what macOS compressed or swapped out of it. That is the guest's memory as far as the guest has
-    /// touched it, and the monitor's own. `None` when that process cannot be told apart or read.
+    /// What of the host's memory the machine holds now, in bytes: the guest's memory as far as the guest has touched
+    /// it, and the monitor's own. On a Mac the physical footprint of the monitor's process less what macOS compressed
+    /// or swapped out of it; on Linux what the machine's cgroup holds less the page cache the host takes back at will.
+    /// `None` when that cannot be told apart or read.
     fn resident(&self) -> Option<u64>;
 }
 

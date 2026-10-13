@@ -10,9 +10,9 @@ pub const VM_OVERHEAD: u64 = 256 << 20;
 /// One job, as the daemon hands it to a vm-host on its input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRequest {
-    /// The job's name on this Mac: lowercase letters, digits and `-`, at most 32. Names its files and its machine.
+    /// The job's name on this host: lowercase letters, digits and `-`, at most 32. Names its files and its machine.
     pub job: String,
-    /// What the Mac is called, for what the job is told.
+    /// What the host is called, for what the job is told.
     pub host: String,
     /// The machine's memory, the size the job asked for.
     pub memory_bytes: u64,

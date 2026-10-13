@@ -88,7 +88,9 @@ fn in_namespace(test: &str, body: impl FnOnce()) {
 /// unprivileged user namespaces to fewer capabilities does.
 fn allowed() {
     match apply(&batch(&[], Load::Replace).unwrap()) {
-        Err(Error::Refused { error, .. }) if error.raw_os_error() == Some(libc::EPERM) => {
+        Err(Error::Netlink(cf_netlink::Error::Refused { error, .. }))
+            if error.raw_os_error() == Some(libc::EPERM) =>
+        {
             println!("refused for want of permission: {error}");
             std::process::exit(NOT_ALLOWED);
         }
@@ -245,7 +247,7 @@ fn a_batch_the_kernel_refuses_changes_nothing() {
             .unwrap();
         refused.bytes[at + 7] = 9;
         match apply(&refused) {
-            Err(Error::Refused { message, .. }) => assert_eq!(message, 4),
+            Err(Error::Netlink(cf_netlink::Error::Refused { message, .. })) => assert_eq!(message, 4),
             other => panic!("{other:?}"),
         }
         assert_eq!(

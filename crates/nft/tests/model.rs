@@ -480,12 +480,12 @@ fn a_network_reads_back_as_its_prefix_and_rules_written_elsewhere_are_not_read()
     }
     // A message of another subsystem, and a removal of one table, are not this crate's.
     let mut foreign = Vec::new();
-    cf_nft::netlink::message(&mut foreign, 0x0b00, 1, 1, &[0, 0, 0, 0]);
+    cf_netlink::message(&mut foreign, 0x0b00, 1, 1, &[0, 0, 0, 0]);
     assert!(matches!(read(&foreign), Err(Error::Unreadable(_))));
     let mut one_table = Vec::new();
     let mut body = vec![1, 0, 0, 0];
-    cf_nft::netlink::attribute(&mut body, 1, b"t\0");
-    cf_nft::netlink::message(&mut one_table, 0x0a02, 1, 1, &body);
+    cf_netlink::attribute(&mut body, 1, b"t\0");
+    cf_netlink::message(&mut one_table, 0x0a02, 1, 1, &body);
     assert!(matches!(read(&one_table), Err(Error::Unreadable(_))));
 }
 
@@ -524,10 +524,10 @@ fn what_the_crate_does_not_write_is_not_read_as_its_own() {
     // A dormant table holds rules its chains never run: not the firewall it looks like.
     let table_with_flags = |flags: u32| {
         let mut body = vec![1, 0, 0, 0];
-        cf_nft::netlink::attribute(&mut body, 1, b"t\0");
-        cf_nft::netlink::attribute(&mut body, 2, &flags.to_be_bytes());
+        cf_netlink::attribute(&mut body, 1, b"t\0");
+        cf_netlink::attribute(&mut body, 2, &flags.to_be_bytes());
         let mut bytes = Vec::new();
-        cf_nft::netlink::message(&mut bytes, 0x0a00, 0x405, 1, &body);
+        cf_netlink::message(&mut bytes, 0x0a00, 0x405, 1, &body);
         bytes
     };
     assert_eq!(read(&table_with_flags(0)).unwrap().len(), 1, "nft says flags 0");

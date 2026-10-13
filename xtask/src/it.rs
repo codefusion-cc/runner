@@ -1,14 +1,19 @@
-//! `cargo xtask it`: the Runner against real virtual machines on this Mac, one small machine at a time.
+//! `cargo xtask it`: the Runner against real virtual machines on this host, one small machine at a time.
 //!
-//! GitHub's hosted Macs boot no machines, so this suite runs on a Mac by hand. It needs the built binary
-//! (`cargo xtask build`) and a signed image release in a folder (`gh release download <tag> -R <repository> -D
-//! target/it/release`), which it installs through the verifying store. Each scenario starts `codefusion-runner vm` the
-//! way the daemon does, with a shell script in place of the Actions runner, and judges the job's last state and what
-//! the job wrote to the machine's console. The numbers go to `target/it/report.txt`.
+//! GitHub's hosted runners boot no machines, so this suite runs by hand, on a Mac or on an arm64 Linux host with
+//! KVM. It needs the built binary (`cargo xtask build`) and a signed image release in a folder (`gh release download
+//! <tag> -R <repository> -D target/it/release`), which it installs through the verifying store. Each scenario
+//! starts `codefusion-runner vm` the way the daemon does, with a shell script in place of the Actions runner, and
+//! judges the job's last state and what the job wrote to the machine's console. The numbers go to
+//! `target/it/report.txt`. A scenario that needs more memory than the host has free says `SKIPPED` and why.
 //!
-//! `service` and `commands` (`it/service.rs`) run the whole service and the binary's own commands against the
-//! repository's fakes of GitHub and the console. A scenario that needs more memory than the Mac has free says
-//! `SKIPPED` and why.
+//! On a Mac, `service` and `commands` (`it/service.rs`) run the whole service and the binary's own commands against
+//! the repository's fakes of GitHub and the console, and `launchd` and `timers` what launchd does to the Runner.
+//!
+//! On Linux the suite runs in a cgroup delegated to its user (`systemd-run --user --scope -p Delegate=yes cargo
+//! xtask it`), moves itself into the `host` leaf of it, and each machine gets its cgroup beside that, as under the
+//! service. `full-memory` measures what a machine's cgroup holds beyond its size at 1, 2 and 4 GiB, and `firewall`
+//! reaches for every address of the host and every router it has, read when it runs.
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -21,21 +26,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+mod host;
 #[cfg(target_os = "macos")]
 mod service;
-/// The service runs on macOS only; the suite is built wherever the other tasks are.
-#[cfg(not(target_os = "macos"))]
-mod service {
-    use super::{Bench, Fallible};
-
-    pub fn service(_bench: &Bench) -> Fallible<Vec<String>> {
-        Err("the service runs on macOS only".into())
-    }
-
-    pub fn commands(_bench: &Bench) -> Fallible<Vec<String>> {
-        Err("the service runs on macOS only".into())
-    }
-}
+use host::*;
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
 /// A scenario answers with the lines of its report.
@@ -46,9 +40,10 @@ const SCRATCH_BYTES: u64 = 30 << 30;
 /// The job's share of a machine of 1024 MB: the machine less what its kernel and supervisor keep.
 const LIMIT_OF_1024: &str = "805306368";
 /// Takes all the memory a job gets but 200 MB, in pieces it writes into, and prints what the guest has touched by
-/// then: all its memory but what is free. It holds on for six seconds, so that the Mac's count is read meanwhile.
-const HOLDS_ALL_IT_GETS: &str = r#"node -e 'const fs = require("fs"); const kb = (name) => Number(fs.readFileSync("/proc/meminfo", "utf8").match(new RegExp(name + ":\\s+(\\d+)"))[1]); const limit = Number(fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8")); const held = []; for (let left = limit - 200 * 1048576; left > 0; left -= 268435456) held.push(Buffer.alloc(Math.min(left, 268435456), 1)); console.log("touched_kb=" + (kb("MemTotal") - kb("MemFree")) + " total_kb=" + kb("MemTotal") + " limit_kb=" + limit / 1024); setTimeout(() => console.log("held=" + held.length), 6000)'"#;
-const MACHINE_PROCESS: &str = "com.apple.Virtualization.VirtualMachine";
+/// then: all its memory but what is free. It holds on for twelve seconds, so that the host's count is read meanwhile:
+/// the vm-host reads it at each heartbeat of the guest, which a guest this full can be seconds late with.
+const HOLDS_ALL_IT_GETS: &str = r#"node -e 'const fs = require("fs"); const kb = (name) => Number(fs.readFileSync("/proc/meminfo", "utf8").match(new RegExp(name + ":\\s+(\\d+)"))[1]); const limit = Number(fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8")); const held = []; for (let left = limit - 200 * 1048576; left > 0; left -= 268435456) held.push(Buffer.alloc(Math.min(left, 268435456), 1)); console.log("touched_kb=" + (kb("MemTotal") - kb("MemFree")) + " total_kb=" + kb("MemTotal") + " limit_kb=" + limit / 1024); setTimeout(() => console.log("held=" + held.length), 12000)'"#;
+#[cfg(target_os = "macos")]
 const AGENT: &str = "cc.codefusion.runner.it";
 const WAITS: &str = "trap '' TERM; echo waiting; sleep 600; echo woke";
 /// Holds 700 MB for five seconds and prints what the guest has touched by then: all its memory but what is free.
@@ -80,7 +75,7 @@ try 10.1.2.3 80 private-again; try $gw 22 gateway-again"#;
 
 /// What a job's root tries against its own machine from inside the container: the pipe its end is reported on
 /// and the process that holds it, the kernel's settings and what is mounted read-only over them, a lower score
-/// for the kernel's choice under memory pressure, swap, and the socket the supervisor talks to the Mac on.
+/// for the kernel's choice under memory pressure, swap, and the socket the supervisor talks to the host on.
 /// `control` is the same kind of try on something a job may do, so a refusal is not just a `sudo` that is missing.
 const INSIDE_PROBES: &str = r#"
 sudo -n sh -c 'echo x > /tmp/control' 2>/dev/null; echo control=$?
@@ -115,6 +110,8 @@ struct Bench {
     state: PathBuf,
     work: PathBuf,
     image: String,
+    /// The release, for the scenarios that install it into a state folder of their own.
+    #[cfg(target_os = "macos")]
     release: PathBuf,
 }
 
@@ -133,10 +130,13 @@ struct Finished {
     machines: BTreeSet<u32>,
     machine_peak: u64,
     host_peak: u64,
-    /// The most the vm-host said its machine held of the Mac's memory (`resident_bytes` in its state).
+    /// The most the vm-host said its machine held of the host's memory (`resident_bytes` in its state).
     resident_peak: u64,
     available_before: u64,
     available_least: u64,
+    /// The limit of the machine's cgroup and the most it held, page cache in it.
+    #[cfg(target_os = "linux")]
+    group: Group,
 }
 
 /// Runs the scenarios named after `--only` (all of them otherwise) and fails when one did.
@@ -152,14 +152,18 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
             _ => return Err(format!("unknown option {option}").into()),
         }
     }
+    #[cfg(target_os = "linux")]
+    enter_host_cgroup()?;
     let bench = prepare(root, &release)?;
-    let scenarios: [(&str, Scenario); 15] = [
+    let scenarios: &[(&str, Scenario)] = &[
         ("boot", boot),
         ("lifecycle", lifecycle),
         ("exit-code", exit_code),
         ("oom", oom),
         ("full-memory", full_memory),
+        #[cfg(target_os = "macos")]
         ("service", service::service),
+        #[cfg(target_os = "macos")]
         ("commands", service::commands),
         ("timeout", timeout),
         ("stop", stop),
@@ -167,7 +171,9 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         ("sigkill", sigkill),
         ("firewall", firewall),
         ("inside", inside),
+        #[cfg(target_os = "macos")]
         ("launchd", launchd),
+        #[cfg(target_os = "macos")]
         ("timers", timers),
     ];
     if let Some(unknown) = only
@@ -180,7 +186,7 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
     let machines_before = machines();
     let mut report = String::new();
     let mut failed = Vec::new();
-    for (name, scenario) in scenarios {
+    for &(name, scenario) in scenarios {
         if only
             .as_ref()
             .is_some_and(|only| !only.iter().any(|wanted| wanted == name))
@@ -241,6 +247,7 @@ fn prepare(root: &Path, release: &Path) -> Fallible<Bench> {
         state,
         work,
         image,
+        #[cfg(target_os = "macos")]
         release: release.to_path_buf(),
     })
 }
@@ -303,14 +310,6 @@ fn output(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// The processes that each hold one machine's memory, whoever started them.
-fn machines() -> BTreeSet<u32> {
-    output("pgrep", &["-f", MACHINE_PROCESS])
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
-}
-
 /// `pid` as `kill` is given it, or `None` for a number `kill` reads as a group of processes: 0 is the caller's own
 /// group, and what passes `i32::MAX` wraps to a negative number, which names a group or every process.
 fn pid_arg(pid: u32) -> Option<String> {
@@ -331,55 +330,6 @@ fn signal(pid: u32, name: &str) {
     let _ = Command::new("kill").args([&format!("-{name}"), &pid]).status();
 }
 
-/// The memory a process holds, in bytes, as the system charges it: its footprint, or what `ps` says when that tool
-/// answers nothing.
-fn memory_of(pid: u32) -> u64 {
-    let report = output("footprint", &[&pid.to_string()]);
-    let footprint = report.split("Footprint: ").nth(1).and_then(|rest| {
-        let mut words = rest.split_whitespace();
-        let number: f64 = words.next()?.parse().ok()?;
-        let unit = match words.next()? {
-            "KB" => 1u64 << 10,
-            "MB" => 1 << 20,
-            "GB" => 1 << 30,
-            _ => 1,
-        };
-        Some((number * unit as f64) as u64)
-    });
-    footprint.unwrap_or_else(|| {
-        output("ps", &["-o", "rss=", "-p", &pid.to_string()])
-            .trim()
-            .parse::<u64>()
-            .unwrap_or(0)
-            << 10
-    })
-}
-
-/// The Mac's memory that is free or given back at once when asked for: free, inactive, speculative, purgeable.
-fn available() -> u64 {
-    let report = output("vm_stat", &[]);
-    let page: u64 = report
-        .split("page size of ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
-        .unwrap_or(16384);
-    let pages: u64 = report
-        .lines()
-        .filter(|line| {
-            [
-                "Pages free",
-                "Pages inactive",
-                "Pages speculative",
-                "Pages purgeable",
-            ]
-            .iter()
-            .any(|name| line.starts_with(name))
-        })
-        .filter_map(|line| line.rsplit(' ').next()?.trim_end_matches('.').parse::<u64>().ok())
-        .sum();
-    pages * page
-}
-
 fn mb(bytes: u64) -> String {
     format!("{} MB", bytes / MB)
 }
@@ -387,7 +337,7 @@ fn mb(bytes: u64) -> String {
 fn request(bench: &Bench, job: &str, memory_mb: u64, deadline_s: u64, script: &str) -> Value {
     json!({
         "job": job,
-        "host": "the-test-mac",
+        "host": "the-test-host",
         "memory_bytes": memory_mb * MB,
         "cpus": 2,
         "scratch_bytes": SCRATCH_BYTES,
@@ -486,6 +436,8 @@ fn finish(
     let mut seen = BTreeSet::new();
     let (mut machine_peak, mut host_peak, mut available_least) = (0, 0, running.available_before);
     let mut resident_peak = 0;
+    #[cfg(target_os = "linux")]
+    let mut group = Group::default();
     let exited = loop {
         if running.child.try_wait()?.is_some() {
             break true;
@@ -499,6 +451,11 @@ fn finish(
         let said = state_of(bench, &running.job)["resident_bytes"].as_u64();
         resident_peak = resident_peak.max(said.unwrap_or(0));
         available_least = available_least.min(available());
+        #[cfg(target_os = "linux")]
+        for one in groups_of(running.child.id()) {
+            group.max = group.max.max(one.max);
+            group.peak = group.peak.max(one.peak);
+        }
         seen.extend(now.iter().copied());
         if let Err(error) = during(&console_of(bench, &running.job), &now) {
             let _ = running.child.kill();
@@ -537,6 +494,8 @@ fn finish(
         resident_peak,
         available_before: running.available_before,
         available_least,
+        #[cfg(target_os = "linux")]
+        group,
     })
 }
 
@@ -607,7 +566,8 @@ fn ms_after(text: &str, before: &str) -> Option<f64> {
     }
 }
 
-/// The Mac's load average over the last minute, and how many CPUs it has.
+#[cfg(target_os = "macos")]
+/// The host's load average over the last minute, and how many CPUs it has.
 fn load() -> (f64, usize) {
     let printed = Command::new("sysctl")
         .args(["-n", "vm.loadavg"])
@@ -644,7 +604,7 @@ echo x 2>/dev/null > /proc/sys/kernel/hostname || echo procsys=ro
 sudo -n sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward' 2>/dev/null || echo procsys-root=ro
 sudo -n sh -c 'echo b > /proc/sysrq-trigger' 2>/dev/null; echo sysrq=tried
 "$ACTIONS_RUNNER_HOOK_JOB_STARTED"
-echo github=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com)
+echo github=$(curl -s -o /dev/null -w '%{http_code} curl=%{exitcode}' --max-time 15 https://github.com)
 echo ci=$CI; sleep 5"#;
     let finished = job(bench, "it-lifecycle", 1024, 120, script)?;
     ended(&finished, "ok")?;
@@ -663,7 +623,7 @@ echo ci=$CI; sleep 5"#;
             "procsys=ro",
             "procsys-root=ro",
             "sysrq=tried",
-            "This job runs on the-test-mac with 768 MB memory, 2 CPUs, 30 GB disk.",
+            "This job runs on the-test-host with 768 MB memory, 2 CPUs, 30 GB disk.",
             "github=200",
             "ci=true",
         ],
@@ -807,7 +767,7 @@ echo step=$?"#;
             mb(finished.host_peak)
         ),
         format!(
-            "the Mac's available memory: {} before, {} at its least, {} after",
+            "the host's available memory: {} before, {} at its least, {} after",
             mb(finished.available_before),
             mb(finished.available_least),
             mb(available())
@@ -816,7 +776,7 @@ echo step=$?"#;
     ])
 }
 
-/// A machine whose job took all it got, as the Mac and the guest counted it.
+/// A machine whose job took all it got, as the host and the guest counted it.
 struct Filled {
     size: u64,
     limit: u64,
@@ -827,14 +787,19 @@ struct Filled {
     host_peak: u64,
     /// What the vm-host read of the machine's process at its most: the number the budget counts the machine by.
     resident_peak: u64,
+    /// The limit of the machine's cgroup, and the most it held, page cache in it.
+    #[cfg(target_os = "linux")]
+    group: Group,
 }
 
 impl Filled {
+    #[cfg(target_os = "macos")]
     /// The memory of the machine the guest left free.
     fn free(&self) -> u64 {
         self.total.saturating_sub(self.touched)
     }
 
+    #[cfg(target_os = "macos")]
     /// What the machine's process and the vm-host hold beyond the machine's size if every page the guest left free
     /// were touched too, and the guest's kernel had touched all it keeps out of its own count (its map of the
     /// memory, its image): the least a full machine costs beyond its size.
@@ -842,12 +807,38 @@ impl Filled {
         (self.machine_peak + self.host_peak + self.free()).saturating_sub(self.size)
     }
 
+    #[cfg(target_os = "macos")]
     /// The same if the kernel had touched nothing of what it keeps out of its count: no full machine costs more
     /// beyond its size. The kernel's share grows with the machine, so the smallest machine says it closest.
     fn at_most(&self) -> u64 {
         self.machine_peak.saturating_sub(self.touched) + self.host_peak
     }
 
+    /// Linux: what the machine's cgroup would hold beyond the machine's size if the guest touched every page of it,
+    /// at most: all it held without page cache, less what the guest had touched of its own memory. The cgroup's
+    /// limit must leave that much room, or a guest that fills up is a cgroup that kills its machine.
+    #[cfg(target_os = "linux")]
+    fn group_at_most(&self) -> u64 {
+        self.resident_peak.saturating_sub(self.touched)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn line(&self) -> String {
+        format!(
+            "a {} machine whose job takes all it gets: the guest had touched {} of the {} its kernel counts; its cgroup held {} without page cache at its most ({} with it), its vm-host {}; a full one holds at most {} beyond its size, and its limit {} leaves {}",
+            mb(self.size),
+            mb(self.touched),
+            mb(self.total),
+            mb(self.resident_peak),
+            mb(self.group.peak),
+            mb(self.host_peak),
+            mb(self.group_at_most()),
+            mb(self.group.max),
+            mb(self.group.max.saturating_sub(self.size))
+        )
+    }
+
+    #[cfg(target_os = "macos")]
     fn line(&self) -> String {
         format!(
             "a {} machine whose job takes all it gets (limit {}): the guest had touched {} of the {} its kernel counts; the machine's process held {} at its most (its vm-host read {}), the vm-host itself {}; a full one costs between {} and {} beyond its size",
@@ -877,6 +868,8 @@ fn filled(bench: &Bench, job_name: &str, size_mb: u64) -> Fallible<Filled> {
         machine_peak: finished.machine_peak,
         host_peak: finished.host_peak,
         resident_peak: finished.resident_peak,
+        #[cfg(target_os = "linux")]
+        group: finished.group,
     };
     let least = filled.limit.saturating_sub(300 * MB);
     expect(
@@ -897,15 +890,16 @@ fn filled(bench: &Bench, job_name: &str, size_mb: u64) -> Fallible<Filled> {
     Ok(filled)
 }
 
-/// What a machine costs the Mac beyond its size when its job takes all the memory it gets: the number the budget
+/// What a machine costs the host beyond its size when its job takes all the memory it gets: the number the budget
 /// counts every machine with (`vm_host_overhead_bytes`). A `cf-4g`, the size most jobs run in, and a machine of
 /// 1024 MB, which bounds the cost from above most closely.
+#[cfg(target_os = "macos")]
 fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
     const SIZE_MB: u64 = 4096;
     let needed = (SIZE_MB + 2048) * MB;
     if available() < needed {
         return Ok(vec![format!(
-            "SKIPPED: {} of memory are available on this Mac and a cf-4g machine that fills up needs {} with the Mac's floor",
+            "SKIPPED: {} of memory are available on this host and a cf-4g machine that fills up needs {} with the floor it keeps",
             mb(available()),
             mb(needed)
         )]);
@@ -920,7 +914,7 @@ fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
         large.line(),
         small.line(),
         format!(
-            "the budget counts {} for a machine beyond its size; the Mac's available memory was {} before",
+            "the budget counts {} for a machine beyond its size; the host's available memory was {} before",
             mb(counted),
             mb(available_before)
         ),
@@ -928,7 +922,45 @@ fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
     expect(
         large.at_least() <= counted && small.at_least() <= counted && small.at_most() <= counted,
         format!(
-            "a machine costs the Mac more beyond its size than the budget counts:\n{}",
+            "a machine costs the host more beyond its size than the budget counts:\n{}",
+            indent(&lines)
+        ),
+    )?;
+    Ok(lines)
+}
+
+/// What a machine's cgroup holds beyond the machine's size when its job takes all the memory it gets, for the
+/// sizes most jobs run in: the numbers `cf_vmm_ch::overhead` is set from. A cgroup whose limit leaves less is one
+/// that kills its machine when the guest fills up.
+#[cfg(target_os = "linux")]
+fn full_memory(bench: &Bench) -> Fallible<Vec<String>> {
+    const SIZES_MB: [u64; 3] = [1024, 2048, 4096];
+    let needed = (SIZES_MB[2] + 2048) * MB;
+    if available() < needed {
+        return Ok(vec![format!(
+            "SKIPPED: {} of memory are available on this host and a cf-4g machine that fills up needs {} with a floor",
+            mb(available()),
+            mb(needed)
+        )]);
+    }
+    let mut lines = Vec::new();
+    let mut short = Vec::new();
+    for size in SIZES_MB {
+        let filled = filled(bench, &format!("it-full-{size}"), size)?;
+        expect(
+            filled.group.max > filled.size,
+            format!("no cgroup of the machine was read: {}", filled.line()),
+        )?;
+        if filled.group_at_most() > filled.group.max - filled.size {
+            short.push(mb(filled.size));
+        }
+        lines.push(filled.line());
+    }
+    expect(
+        short.is_empty(),
+        format!(
+            "the cgroup of a machine of {} leaves less beyond its size than a full one holds:\n{}",
+            short.join(", "),
             indent(&lines)
         ),
     )?;
@@ -941,7 +973,7 @@ fn timeout(bench: &Bench) -> Fallible<Vec<String>> {
     expect(!finished.console.contains("woke"), "the job went on")?;
     // The deadline (5 s) and its grace (20 s) count from the workload's start. The guest then ends the job
     // itself and says so; only a guest that does not is stopped by the host, 10 s later (`Limits::longest_run`).
-    // The job's time is the guest's own count: the vm-host's also holds what the Mac took to start the machine,
+    // The job's time is the guest's own count: the vm-host's also holds what the host took to start the machine,
     // which is seconds when the scenario before left it short of memory.
     let ran = finished.state["end"]["summary"]["wall_ms"]
         .as_f64()
@@ -1061,7 +1093,27 @@ fn sigkill(bench: &Bench) -> Fallible<Vec<String>> {
     )])
 }
 
-fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
+/// A place a job's machine must not reach: the name its probe prints, the address and the port.
+struct Target {
+    name: String,
+    address: String,
+    port: u16,
+}
+
+impl Target {
+    fn new(name: impl Into<String>, address: impl Into<String>, port: u16) -> Self {
+        Target {
+            name: name.into(),
+            address: address.into(),
+            port,
+        }
+    }
+}
+
+/// The Mac's own addresses no machine may reach, with a stand-in where it has none, and what the report says of
+/// them. The other machine is reached for at its own address: machines on a Mac share vmnet's network.
+#[cfg(target_os = "macos")]
+fn host_targets(other: Option<&str>) -> (Vec<Target>, String) {
     let lan = ["en0", "en1"]
         .iter()
         .map(|port| output("ipconfig", &["getifaddr", port]).trim().to_string())
@@ -1074,13 +1126,59 @@ fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
             let address = rest.split_whitespace().next()?;
             (64..128).contains(&second).then(|| format!("100.{address}"))
         });
+    let said = |found: bool| if found { "real" } else { "none here, a stand-in" };
+    let report = format!(
+        "the Mac's LAN address ({}), its tailnet address ({}), the other machine's port 8000",
+        said(lan.is_some()),
+        said(tailnet.is_some())
+    );
+    let targets = vec![
+        Target::new("lan", lan.as_deref().unwrap_or("192.168.1.1"), 22),
+        Target::new("tailnet", tailnet.as_deref().unwrap_or("100.100.100.100"), 22),
+        Target::new("other-machine", other.unwrap_or("192.168.64.250"), 8000),
+    ];
+    (targets, report)
+}
+
+/// Every address of the host and every router of its default routes, read here and now: whatever networks this
+/// host is on, a machine reaches none of them. Each machine has a pasta of its own, so the other machine is in no
+/// network this one is on, whatever its address.
+#[cfg(target_os = "linux")]
+fn host_targets(_other: Option<&str>) -> (Vec<Target>, String) {
+    let (addresses, routers) = own_addresses();
+    let mut targets: Vec<Target> = addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| Target::new(format!("host-{}", index + 1), address.as_str(), 22))
+        .collect();
+    for (index, router) in routers.iter().enumerate() {
+        targets.push(Target::new(
+            format!("router-{}-dns", index + 1),
+            router.as_str(),
+            53,
+        ));
+        targets.push(Target::new(
+            format!("router-{}-web", index + 1),
+            router.as_str(),
+            80,
+        ));
+    }
+    let report = format!(
+        "the host's {} addresses on port 22, its {} routers on ports 53 and 80",
+        addresses.len(),
+        routers.len()
+    );
+    (targets, report)
+}
+
+fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
     // Another job's machine, listening, for the first to reach for.
     let other = start(
         bench,
         "it-other",
         512,
         120,
-        r#"node -e 'require("http").createServer((q, s) => s.end("x")).listen(8000, "0.0.0.0")' & echo github=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com); sleep 45"#,
+        r#"node -e 'require("http").createServer((q, s) => s.end("x")).listen(8000, "0.0.0.0")' & echo github=$(curl -s -o /dev/null -w '%{http_code} curl=%{exitcode}' --max-time 15 https://github.com); sleep 45"#,
         &[],
     )?;
     let mut address = None;
@@ -1091,13 +1189,17 @@ fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
             .and_then(|rest| rest.split_whitespace().next().map(str::to_string));
         address.is_some()
     });
+    let (targets, reached_for) = host_targets(address.as_deref());
+    let tries: String = targets
+        .iter()
+        .map(|target| format!("try {} {} {}\n", target.address, target.port, target.name))
+        .collect();
     let script = format!(
         r#"gw=$(awk '/nameserver/{{print $2; exit}}' /etc/resolv.conf)
 try() {{ timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null; echo "$3=$?"; }}
 try $gw 22 gateway-ssh; try $gw 445 gateway-files; try 10.1.2.3 80 private; try 169.254.169.254 80 metadata
-try {lan} 22 lan; try {tailnet} 22 tailnet; try {other} 8000 other-machine
-echo names=$(getent hosts github.com | wc -l)
-echo github=$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 15 https://github.com)
+{tries}echo names=$(getent hosts github.com | wc -l)
+echo github=$(curl -s -o /dev/null -w '%{{http_code}} curl=%{{exitcode}}' --max-time 15 https://github.com)
 echo ip=$(command -v ip)
 sudo -n ip route add 10.0.0.0/8 via $gw 2>/dev/null; echo route=$?
 sudo -n ip link set lo down 2>/dev/null; echo link=$?
@@ -1107,9 +1209,6 @@ sudo -n nft flush ruleset 2>/dev/null; echo nft=$?
 sudo -n hostname other 2>/dev/null; echo hostname=$?
 sudo -n date -s 2001-01-01 >/dev/null 2>&1; echo clock=$?
 sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
-        lan = lan.as_deref().unwrap_or("192.168.1.1"),
-        tailnet = tailnet.as_deref().unwrap_or("100.100.100.100"),
-        other = address.as_deref().unwrap_or("192.168.64.250"),
     ) + NETWORK_PROBES;
     let first = start(bench, "it-firewall", 512, 120, &script, &[]).and_then(|running| {
         finish(bench, running, Duration::from_secs(120), &mut |_, machines| {
@@ -1123,6 +1222,14 @@ sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
     ended(&first, "ok")?;
     ended(&other, "ok")?;
     // 124 is `timeout` giving up: the packet was dropped. A refusal would be 1 and a connection 0.
+    let dropped: Vec<String> = targets
+        .iter()
+        .map(|target| format!("{}=124", target.name))
+        .collect();
+    shows(
+        &first.console,
+        &dropped.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
     shows(
         &first.console,
         &[
@@ -1130,9 +1237,6 @@ sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
             "gateway-files=124",
             "private=124",
             "metadata=124",
-            "lan=124",
-            "tailnet=124",
-            "other-machine=124",
             "names=1",
             "github=200",
             "packet=refused",
@@ -1170,24 +1274,15 @@ sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
         .and_then(|rest| rest.split_whitespace().next())
         .unwrap_or("none")
         .to_string();
-    expect(
-        own != address && own != "none",
-        "the two machines share an address",
-    )?;
+    // On a Mac the machines share vmnet's network, each at its own address. On Linux each is alone behind its own
+    // pasta, at the same address in a network of its own.
+    expect(own != "none", "the machine got no address")?;
+    #[cfg(target_os = "macos")]
+    expect(own != address, "the two machines share an address")?;
     Ok(vec![
-        "two machines at once under NAT, each with its own address, both reached github.com".to_string(),
+        format!("two machines at once, at {own} and {address}, both reached github.com"),
         format!(
-            "dropped (timeout's 124): the gateway's ports 22 and 445, 10.1.2.3, 169.254.169.254, the Mac's LAN address ({}), its tailnet address ({}), the other machine's port 8000",
-            if lan.is_some() {
-                "real"
-            } else {
-                "none here, a stand-in"
-            },
-            if tailnet.is_some() {
-                "real"
-            } else {
-                "none here, a stand-in"
-            }
+            "dropped (timeout's 124): the gateway's ports 22 and 445, 10.1.2.3, 169.254.169.254, {reached_for}"
         ),
         first
             .console
@@ -1286,6 +1381,7 @@ fn inside(bench: &Bench) -> Fallible<Vec<String>> {
     ])
 }
 
+#[cfg(target_os = "macos")]
 fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
     let job = "it-launchd";
     let uid = output("id", &["-u"]).trim().to_string();
@@ -1396,6 +1492,7 @@ fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
     ])
 }
 
+#[cfg(target_os = "macos")]
 fn timers(bench: &Bench) -> Fallible<Vec<String>> {
     // 1500 timers of 2 ms, how late each fired, then how many times a loop spins in a second.
     let script = r#"node -e '

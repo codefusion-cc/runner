@@ -4,7 +4,6 @@ use cf_guest_proto::Task;
 use cf_vmhost::task::run_task;
 use cf_vmhost::{Guest, JobRequest, Layout, Limits};
 use cf_vmm::{Network, VmSpec};
-use cf_vmm_vz::VzVmm;
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -16,6 +15,50 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn cancel(_signal: libc::c_int) {
     CANCEL.store(true, Ordering::Relaxed);
+}
+
+/// What the host chooses for its machines.
+#[derive(Debug, Default)]
+pub struct Host {
+    /// `--host-cpus`: the host CPUs the machines run on, a kernel CPU list such as `4-7`; by default the fastest
+    /// this process may use. Linux only.
+    pub cpus: Option<String>,
+}
+
+/// The monitor of this host's machines: Virtualization.framework.
+#[cfg(target_os = "macos")]
+fn monitor(_machines: &Path, _programs: &Path, host: &Host) -> Result<cf_vmm_vz::VzVmm, String> {
+    if host.cpus.is_some() {
+        return Err("--host-cpus is for Linux".into());
+    }
+    cf_vmm_vz::VzVmm::new().map_err(|error| error.to_string())
+}
+
+/// The monitor of this host's machines: cloud-hypervisor as this binary carries it, unpacked into `programs`,
+/// with the system's pasta, each machine with a folder of its own in `machines`, its sandbox this same binary.
+#[cfg(target_os = "linux")]
+fn monitor(machines: &Path, programs: &Path, host: &Host) -> Result<cf_vmm_ch::ChVmm, String> {
+    let host_cpus = match host.cpus.as_deref() {
+        Some(text) => {
+            let cpus = cf_vmm_ch::cpus::parse_list(text).map_err(|error| format!("--host-cpus: {error}"))?;
+            if cpus.is_empty() {
+                return Err("--host-cpus names no CPU".into());
+            }
+            Some(cpus)
+        }
+        None => None,
+    };
+    let cloud_hypervisor = cf_vmm_ch::programs::unpack(programs)?;
+    let sandbox = std::env::current_exe().map_err(|error| format!("this program's path: {error}"))?;
+    cf_vmm_ch::ChVmm::new(cf_vmm_ch::Config {
+        dir: machines.to_path_buf(),
+        cloud_hypervisor,
+        pasta: None,
+        sandbox,
+        host_cpus,
+        host_networks: cf_vmhost::host_networks(),
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// The guest this binary carries, verified before a byte of it reaches the hypervisor.
@@ -36,7 +79,7 @@ fn guest() -> Result<Guest<'static>, String> {
 
 /// The vm-host of one job. The job's request comes on standard input, since it holds the job's registration with
 /// GitHub; the job's last state goes to standard output as one line of JSON.
-pub fn host(state_dir: &str) -> Result<(), String> {
+pub fn host(state_dir: &str, host: &Host) -> Result<(), String> {
     // A session of its own: the job does not end with the daemon that started it.
     // SAFETY: setsid takes no arguments; it fails, harmlessly, when a shell started this process as a group's leader.
     unsafe { libc::setsid() };
@@ -52,10 +95,11 @@ pub fn host(state_dir: &str) -> Result<(), String> {
         // SAFETY: the handler only stores into an atomic, which a signal handler may do.
         unsafe { libc::signal(signal, cancel as extern "C" fn(libc::c_int) as libc::sighandler_t) };
     }
-    let vmm = VzVmm::new().map_err(|error| error.to_string())?;
+    let layout = Layout::new(state_dir);
+    let vmm = monitor(&layout.machines(), &layout.programs(), host)?;
     let limits = Limits::for_deadline(Duration::from_secs(request.deadline_s));
-    let state = cf_vmhost::run(&vmm, &Layout::new(state_dir), guest, request, limits, &CANCEL)
-        .map_err(|error| error.to_string())?;
+    let state =
+        cf_vmhost::run(&vmm, &layout, guest, request, limits, &CANCEL).map_err(|error| error.to_string())?;
     // The daemon may be gone by now; the state file has the same.
     let _ = writeln!(
         std::io::stdout(),
@@ -66,7 +110,7 @@ pub fn host(state_dir: &str) -> Result<(), String> {
 }
 
 /// Boots the embedded guest with no disk and no network, has it answer and power off, and prints what happened.
-pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
+pub fn boot_proof(memory_bytes: u64, timeout: Duration, host: &Host) -> Result<(), String> {
     let guest = guest()?;
     let scratch = Scratch::new("proof")?;
     let console = scratch.0.join("console.log");
@@ -79,12 +123,16 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
         network: Network::None,
         console: console.clone(),
     };
-    let vmm = VzVmm::new().map_err(|error| error.to_string())?;
+    let vmm = monitor(
+        &scratch.path().join("machines"),
+        &scratch.path().join("programs"),
+        host,
+    )?;
     let report = run_task(&vmm, &spec, Task::Probe, timeout, &|| false);
     print!("{}", std::fs::read_to_string(&console).unwrap_or_default());
     let report = report?;
     println!(
-        "kernel {}: ready after {:.2?}, ended after {:.2?} ({}); the machine held {} of the Mac's memory",
+        "kernel {}: ready after {:.2?}, ended after {:.2?} ({}); the machine held {} of the host's memory",
         report.kernel,
         report.ready_after,
         report.ended_after,

@@ -1,10 +1,10 @@
 //! The supervisor's decisions against what they must do and the inputs that break them.
 
 use cf_guest_proto::{Limits, OomEvent, Process as Used, StopReason};
-use cf_nft::{IPV4, IPV6, Packet, Verdict, decide};
+use cf_nft::{BLOCKED, IPV4, IPV6, Packet, Verdict, decide};
 use cf_supervisor::dhcp::{self, Lease, Reply};
 use cf_supervisor::environment::{find_user, workload_environment};
-use cf_supervisor::firewall::{self, BLOCKED, own_network, policy};
+use cf_supervisor::firewall::{self, own_network, policy};
 use cf_supervisor::oom::{Count, Kill, Log, kills_in_events, message_of};
 use cf_supervisor::processes::{Process, Table, parse_stat};
 use cf_supervisor::tell::{JobFacts, out_of_memory_line, out_of_memory_summary, size, started, stopped};

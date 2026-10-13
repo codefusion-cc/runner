@@ -21,7 +21,7 @@ pub struct TaskReport {
     pub ended_after: Duration,
     /// Whether the guest powered itself off (`false`: the host had to stop it).
     pub powered_off: bool,
-    /// What of the Mac's memory the machine held when the guest had done its task ([`Vm::resident`]).
+    /// What of the host's memory the machine held when the guest had done its task ([`Vm::resident`]).
     pub resident: Option<u64>,
 }
 

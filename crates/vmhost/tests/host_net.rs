@@ -1,4 +1,4 @@
-//! The networks a job is kept from because the Mac is in them.
+//! The networks a job is kept from because the host is in them.
 
 use cf_vmhost::{host_networks, network_of};
 use std::net::{IpAddr, UdpSocket};

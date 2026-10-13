@@ -99,8 +99,9 @@ pub(crate) fn midr_design(text: &str) -> Option<u64> {
     Some(u64::from_str_radix(digits, 16).ok()? & 0xff00_fff0)
 }
 
-/// One counter of `/proc/vmstat`, such as `pswpout`; `None` when it is not there once as a number.
-pub fn vmstat(text: &str, name: &str) -> Option<u64> {
+/// One counter of a file of `name value` lines: `pswpout` of `/proc/vmstat`, `oom_kill` of a cgroup's
+/// `memory.events`. `None` when it is not there once as a number.
+pub fn counter(text: &str, name: &str) -> Option<u64> {
     let mut values = text.lines().filter_map(|line| {
         let (key, value) = line.split_once(' ')?;
         (key == name).then_some(value)

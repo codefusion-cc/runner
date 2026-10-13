@@ -31,6 +31,14 @@ cf-vmm-vz = { path = "../vmm-vz" }
 libc.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+cf-guest-proto = { path = "../guest-proto" }
+cf-vmhost = { path = "../vmhost" }
+cf-vmm = { path = "../vmm" }
+cf-vmm-ch = { path = "../vmm-ch" }
+libc.workspace = true
+serde_json.workspace = true
+
 [dev-dependencies]
 ed25519-dalek.workspace = true
 tempfile.workspace = true
