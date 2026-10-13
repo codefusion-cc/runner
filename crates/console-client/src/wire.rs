@@ -236,7 +236,8 @@ pub struct SizeStatus {
     /// (`paused`, `calming` and the like).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
-    /// For `memory` and `full`: the memory the Mac must have available for one more.
+    /// For `memory`, and `full` for memory its own machines hold (not the cap): the memory the Mac must have available
+    /// for one more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need_bytes: Option<u64>,
     /// And how much of it it lacks now.

@@ -123,7 +123,7 @@ proptest! {
             pass(&w.m, 1);
             listeners.hear(&w);
         }
-        let room = w.m.room(SIZE) > 0;
+        let room = w.m.rooms().iter().any(|room| room.size == SIZE && room.free > Some(0));
         prop_assert_eq!(listeners.offers, [room; 4]);
     }
 }

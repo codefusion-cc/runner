@@ -1529,7 +1529,7 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     set(&w, floor + machine + GIB);
     pass(&w.m, 1);
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.room(SIZE), 0);
+    assert_eq!(room_of(&w, SIZE).free, Some(0));
     assert_eq!(
         w.m.short_of(SIZE),
         None,
