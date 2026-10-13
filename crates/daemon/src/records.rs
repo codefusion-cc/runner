@@ -131,6 +131,20 @@ impl Record {
         self.size.as_deref().and_then(Size::from_label)
     }
 
+    /// Whether the guest of this machine may have come up, and so run an Actions runner: a job started in it, the
+    /// vm-host measured its boot, or its slot was last written past booting and not as one that never got ready.
+    pub fn came_up(&self) -> bool {
+        self.slot
+            .map(|slot| slot.saved())
+            .is_some_and(|saved| saved.ran_job || !never_up(saved))
+            || self.ended.as_ref().is_some_and(|e| e.boot_ms.is_some())
+    }
+
+    /// Whether the machine went with no word of a job while it may have run one, so that GitHub is asked.
+    pub fn unheard(&self) -> bool {
+        self.ask_github && self.github.is_none()
+    }
+
     /// Whether nothing is left to do for this Actions runner.
     pub fn finished(&self) -> bool {
         self.unregistered && self.end_reported && (self.ended.is_some() || self.slot.is_none())
@@ -180,10 +194,12 @@ impl Record {
             return (self, Upgrade::Consistent);
         };
         let mut saved = slot.saved();
+        let came_up = self.came_up();
         if self.ended.is_some() {
             // The machine is gone, so the slot is over, whatever phase was written.
             saved.phase = Phase::Released;
         }
+        let no_job = crate::EndKind::NoJob.name();
         if let Some(github) = &self.github {
             let over = github.result.is_some();
             let finished = if saved.oom { End::Oom } else { End::Ok };
@@ -199,12 +215,23 @@ impl Record {
                     saved.phase = Phase::Running;
                     saved.end = None;
                 }
-                Phase::Stopping | Phase::Killing if saved.end == Some(End::NoJob) => {
-                    saved.end = Some(End::Stopped);
-                }
                 Phase::Running | Phase::Finishing | Phase::Stopping | Phase::Killing | Phase::Released => {}
             }
+            // A stop for no job beside a job, heard while the machine was being stopped: the job ran, and the
+            // Runner stopped it.
+            if saved.end == Some(End::NoJob) {
+                saved.end = Some(End::Stopped);
+            }
+            if let Some(ending) = self.ended.as_mut().filter(|e| e.kind == no_job) {
+                ending.kind = crate::EndKind::Stopped.name().to_string();
+            }
             self.slot = Some(saved.into());
+            return (self, Upgrade::Consistent);
+        }
+        if self.ended.is_some() && !came_up {
+            // A machine gone before its guest came up took no job, whatever was written of its registration.
+            self.slot = Some(saved.into());
+            self.ask_github = false;
             return (self, Upgrade::Consistent);
         }
         if let Some(ending) = &mut self.ended {
@@ -213,7 +240,7 @@ impl Record {
             self.end_reported = false;
             self.ask_github = true;
             // Stopped by the Runner, on a belief this record no longer holds.
-            if ending.kind == crate::EndKind::NoJob.name() {
+            if ending.kind == no_job {
                 ending.kind = crate::EndKind::Stopped.name().to_string();
             }
             return (self, Upgrade::AskGithub);
@@ -238,6 +265,13 @@ impl Record {
         }
         (self, Upgrade::Consistent)
     }
+}
+
+/// Whether the guest of a slot written so never came up, so that its Actions runner took no job: it was last written
+/// booting, or ended as one that never got ready.
+pub fn never_up(saved: Saved) -> bool {
+    matches!(saved.phase, Phase::Reserved | Phase::Starting | Phase::Retrying)
+        || matches!(saved.end, Some(End::StartFailed | End::Lost))
 }
 
 /// [`cf_lifecycle::Saved`] as it is written.

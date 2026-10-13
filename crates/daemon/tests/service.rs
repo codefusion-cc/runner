@@ -2545,6 +2545,48 @@ async fn a_surplus_that_takes_a_job_as_it_is_removed_keeps_its_machine_and_its_j
     until("the end at the console", || heard(&rig, &runner) == (true, true)).await;
 }
 
+/// As above, while the Runner goes on: the job GitHub's refusal named is dated when it was heard, and its
+/// Actions runner is busy from then on, so the scaler does not take it for a surplus again and ask for its removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_surplus_github_refuses_for_a_job_is_busy_from_then_on_and_its_start_dated_when_heard() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let job = rig.queue().await;
+    until("a machine for the job", || rig.standing().len() == 1).await;
+    let runner = rig.standing()[0].clone();
+    rig.github.cancel_job(job);
+    rig.github.fail(
+        REMOVAL,
+        Reply::status_json(422, &json!({"message": "the runner still has a job"})),
+        1,
+    );
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    until("the start at the console", || heard(&rig, &runner).0).await;
+    let started = rig
+        .console
+        .job_events()
+        .into_iter()
+        .find(|event| event["id"] == format!("{runner}/started"))
+        .expect("the start");
+    assert!(
+        !started["at"].as_str().unwrap_or("1970").starts_with("1970"),
+        "dated when GitHub said so: {started}"
+    );
+    assert!(
+        rig.parts.roster.get(&runner).is_some_and(|r| r.busy),
+        "the Actions runner has a job"
+    );
+    let removals = rig.github.count(REMOVAL);
+    rig.later(cf_daemon::IDLE_GRACE + Duration::from_secs(1));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        rig.github.count(REMOVAL),
+        removals,
+        "a job runs there: it is no surplus"
+    );
+    assert_eq!(rig.standing(), vec![runner], "the machine keeps its job");
+}
+
 /// A job's start goes with a session GitHub forgets, and its machine goes on with the job. When a session opens
 /// again, the console hears the start while the job runs, not only once its machine is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

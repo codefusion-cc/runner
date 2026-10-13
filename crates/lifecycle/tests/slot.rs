@@ -892,3 +892,57 @@ fn a_slot_restored_while_asking_asks_again() {
     let (_, effects) = Slot::restore(Limits::default(), s(0), asking, false);
     assert_eq!(effects, [Effect::Unregister, ended(End::GuestLost, false)]);
 }
+
+/// A removal GitHub never answers (no client for the repository, a GitHub that keeps failing) does not hold the VM
+/// for ever. A job whose start went unheard started before the ask, so it has had a job's whole time by
+/// [`Limits::job`] after it: the VM is stopped then, as a job over its time is, and not before.
+#[test]
+fn an_idle_runner_whose_removal_is_never_answered_stops_after_a_jobs_time() {
+    let limits = Limits::default();
+    let asked_at = 122;
+    let over = asked_at + limits.job.0 / 1000;
+    let heartbeats = |slot: &mut Slot, from: u64, to: u64| {
+        for second in (from..to).step_by(30) {
+            slot.on(s(second), Event::Heartbeat);
+            assert_eq!(slot.on(s(second), Event::Tick), [], "at {second}");
+        }
+    };
+    let mut slot = idle();
+    slot.on(s(100), Event::Heartbeat);
+    assert_eq!(slot.on(s(asked_at), Event::Tick), [Effect::Unregister]);
+    heartbeats(&mut slot, asked_at + 1, over);
+    slot.on(s(over - 1), Event::Heartbeat);
+    assert_eq!(slot.on(s(over - 1), Event::Tick), []);
+    assert_eq!(slot.phase(), Phase::Idle);
+    assert_eq!(
+        slot.on(s(over), Event::Tick),
+        [
+            Effect::Tell(Notice::TimedOut),
+            Effect::StopVm { grace: limits.grace }
+        ]
+    );
+    assert_eq!(
+        slot.on(s(over + 1), Event::VmExited),
+        [Effect::Unregister, Effect::Release, ended(End::Timeout, false)]
+    );
+
+    // Restored while it asked: the job's time runs from the restart.
+    let asking = Saved {
+        phase: Phase::Idle,
+        starts: 1,
+        end: Some(End::NoJob),
+        oom: false,
+        ran_job: false,
+    };
+    let (mut slot, _) = Slot::restore(limits, s(0), asking, true);
+    let over = limits.job.0 / 1000;
+    heartbeats(&mut slot, 1, over);
+    slot.on(s(over - 1), Event::Heartbeat);
+    assert_eq!(
+        slot.on(s(over), Event::Tick),
+        [
+            Effect::Tell(Notice::TimedOut),
+            Effect::StopVm { grace: limits.grace }
+        ]
+    );
+}

@@ -6,7 +6,7 @@ mod support;
 
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
-use cf_daemon::{RULES, Record, Store, Upgrade};
+use cf_daemon::{RULES, Record, Store, Upgrade, never_up};
 use cf_lifecycle::{End, Phase};
 use serde_json::{Value, json};
 use support::world::World;
@@ -170,14 +170,23 @@ fn acted_on_belief(before: &Record, after: &Record, upgrade: Upgrade) -> Option<
     if after.rules != RULES || !after.agrees() {
         return Some("left with facts that disagree");
     }
-    if after.github.is_none() && after.unregistered {
-        return Some("an older Runner's `unregistered` with no job taken as GitHub's 204");
+    // A machine gone before its guest came up took no job: what was written of it goes on.
+    let written = before.slot.expect("a slot").saved();
+    let gone_never_up =
+        before.github.is_none() && before.ended.is_some() && !written.ran_job && never_up(written);
+    if after.github.is_none() && !gone_never_up {
+        if after.unregistered {
+            return Some("an older Runner's `unregistered` with no job taken as GitHub's 204");
+        }
+        if after.finished() {
+            return Some("forgotten with no word of a job");
+        }
+        if after.ended.is_some() && !(after.ask_github && !after.end_reported) {
+            return Some("a machine gone with no word of a job is not asked about");
+        }
     }
-    if after.github.is_none() && after.finished() {
-        return Some("forgotten with no word of a job");
-    }
-    if after.github.is_none() && after.ended.is_some() && !(after.ask_github && !after.end_reported) {
-        return Some("a machine gone with no word of a job is not asked about");
+    if gone_never_up && (after.ask_github || after.unregistered != before.unregistered) {
+        return Some("a machine whose guest never came up asked about");
     }
     let standing = after.ended.is_none();
     let stopping = matches!(saved.phase, Phase::Stopping | Phase::Killing);
@@ -349,6 +358,64 @@ fn what_main_wrote_is_read_by_these_rules() {
             "{row}"
         );
         assert_eq!(acted_on_belief(&before, &after, upgrade), None, "{row}");
+    }
+}
+
+/// A job heard while an older Runner stopped its machine for no job (its start came late, as GitHub's messages do):
+/// the job ran, so neither the slot nor the machine's end says "no job", and its completion is not reported so.
+#[test]
+fn a_job_an_older_runner_heard_while_it_stopped_the_machine_for_no_job_did_not_end_as_no_job() {
+    for word in [Word::Started, Word::Completed] {
+        for (phase, ended) in [
+            (Phase::Released, Some("no-job")),
+            (Phase::Stopping, None),
+            (Phase::Killing, None),
+        ] {
+            let before = written(Old {
+                phase,
+                end: Some(End::NoJob),
+                word,
+                ran_job: false,
+                unregistered: false,
+                ended,
+                end_reported: false,
+                writer: Writer::Main,
+            });
+            let (after, _) = before.upgrade();
+            let case = format!("{word:?} {phase:?} {ended:?}");
+            assert_ne!(
+                after.slot.expect("a slot").saved().end,
+                Some(End::NoJob),
+                "{case}"
+            );
+            assert_ne!(after.ended.map(|e| e.kind), Some("no-job".to_string()), "{case}");
+        }
+    }
+}
+
+/// A machine an older Runner saw end before its guest came up ran no job, whatever that Runner wrote of its
+/// registration: GitHub is not asked, and a registration found gone is not taken for a job.
+#[test]
+fn a_machine_an_older_runner_saw_end_before_its_guest_came_up_is_not_asked_about() {
+    for (end, kind) in [(End::StartFailed, "start-failed"), (End::Lost, "lost")] {
+        for unregistered in [false, true] {
+            let before = written(Old {
+                phase: Phase::Released,
+                end: Some(end),
+                word: Word::None,
+                ran_job: false,
+                unregistered,
+                ended: Some(kind),
+                end_reported: false,
+                writer: Writer::Main,
+            });
+            let (after, upgrade) = before.upgrade();
+            let case = format!("{kind} unregistered: {unregistered}");
+            assert_eq!(upgrade, Upgrade::Consistent, "{case}");
+            assert!(!after.ask_github, "{case}");
+            assert_eq!(after.unregistered, unregistered, "{case}");
+            assert_eq!(after.clone().upgrade(), (after, Upgrade::Current), "{case}");
+        }
     }
 }
 

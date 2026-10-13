@@ -10,7 +10,8 @@ pub enum Phase {
     /// The first VM did not get ready and was killed; the second starts once its process is gone.
     Retrying,
     /// The Actions runner in the VM is up and waits for its job. After [`Limits::idle`] without one it asks for its
-    /// registration's removal and waits for GitHub's answer, with [`End::NoJob`] as the end it expects.
+    /// registration's removal and waits for GitHub's answer, with [`End::NoJob`] as the end it expects; with no
+    /// answer for [`Limits::job`], it is stopped as a job over its time.
     Idle,
     /// The job runs.
     Running,
@@ -309,7 +310,7 @@ impl Slot {
             // Asking GitHub to remove the registration: asked again, since the answer may have gone with the daemon.
             Phase::Idle if saved.end == Some(End::NoJob) => {
                 slot.idle(now);
-                slot.ask(&mut effects);
+                slot.ask(now, &mut effects);
             }
             Phase::Idle => slot.idle(now),
             Phase::Running => slot.run(now),
@@ -497,10 +498,13 @@ impl Slot {
             // No job came, as far as the Runner heard: its start may have gone unheard, so the VM is not stopped on
             // that belief. The registration is removed first, and GitHub's answer decides: removed, and the slot
             // ends without a job ([`Event::Unregistered`]); refused for a job, and the job is the Actions runner's.
-            (Idle, Tick) if due(self.deadline) => {
-                self.deadline = None;
-                self.ask(out);
+            // An answer that never comes (GitHub away, no client for the repository) does not hold the VM for ever: a
+            // job whose start went unheard began before the ask, so it is over its time once a job's time has passed.
+            (Idle, Tick) if due(self.deadline) && self.end == Some(End::NoJob) => {
+                out.push(Effect::Tell(Notice::TimedOut));
+                self.stop(now, End::Timeout, self.limits.grace, out);
             }
+            (Idle, Tick) if due(self.deadline) => self.ask(now, out),
             (Idle, Unregistered) => self.stop(now, End::NoJob, Millis::ZERO, out),
             (Idle, Stop) => self.stop(now, End::Stopped, Millis::ZERO, out),
             (Idle, Evict(cause)) => self.stop(now, evicted(cause), Millis::ZERO, out),
@@ -582,9 +586,10 @@ impl Slot {
         }
     }
 
-    /// Asks for the registration's removal; the end it expects is GitHub's to confirm.
-    fn ask(&mut self, out: &mut Vec<Effect>) {
+    /// Asks for the registration's removal; the end it expects is GitHub's to confirm, within a job's time.
+    fn ask(&mut self, now: Millis, out: &mut Vec<Effect>) {
         self.end = Some(End::NoJob);
+        self.deadline = Some(now.plus(self.limits.job));
         out.push(Effect::Unregister);
     }
 

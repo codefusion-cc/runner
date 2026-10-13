@@ -504,6 +504,32 @@ async fn a_job_over_before_its_machine_was_retired_is_reported_as_finished() {
     assert_eq!(w.ends(), [(runner, EndKind::Finished)]);
 }
 
+/// A machine retired as surplus is stopped from the console before GitHub answered the removal. Its Actions runner
+/// had taken a job nobody heard of and removed its own registration once the job was over: the 404 the sweep then
+/// meets, while the machine is still being stopped, is that job's, and the console hears its start and end.
+#[tokio::test]
+async fn a_registration_found_gone_while_its_machine_is_being_stopped_is_a_job() {
+    let mut w = World::new(1);
+    let runner = w.start().await;
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    Hosts::retire(w.m.as_ref(), &runner);
+    w.parts.vms.ignore_stops(true);
+    w.m.stop(job_name(&runner));
+    pass(&w.m, 1);
+    assert_eq!(w.parts.vms.standing(), [job_name(&runner)], "still being stopped");
+    w.registered.remove(&runner);
+    w.sweep();
+    w.parts.vms.ignore_stops(false);
+    pass(&w.m, 120 + RESULT_WAIT.as_secs() + 60);
+    w.sweep();
+    assert_eq!(
+        ids(&w.reports()),
+        [format!("{runner}/started"), format!("{runner}/completed")]
+    );
+    w.assert_nothing_left();
+}
+
 /// An idle machine is stopped from the console and the Runner dies; when it starts again nothing of the machine is
 /// left, not even how long it took to boot. It was up, so its start may have gone unheard: GitHub is asked, and the
 /// job its Actions runner ran is heard.

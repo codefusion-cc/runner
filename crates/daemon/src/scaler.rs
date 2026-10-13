@@ -465,18 +465,17 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// (`docs/job-state.md`). Nothing is written until GitHub answered.
     fn retire_surplus(&mut self, n: usize) {
         let (repo, set) = (self.config.repo.clone(), self.config.scale_set_id);
-        let runners = self.roster.runners(&repo, set);
-        let retiring = runners.iter().filter(|r| self.hosts.retiring(&r.name)).count();
+        let (retiring, rest): (Vec<_>, Vec<_>) = self
+            .roster
+            .runners(&repo, set)
+            .into_iter()
+            .partition(|runner| self.hosts.retiring(&runner.name));
         let now = self.clock.now();
-        let idle = runners.iter().filter(|runner| {
+        let idle = rest.iter().filter(|runner| {
             let age = now.duration_since(runner.started).unwrap_or(Duration::ZERO);
-            !(runner.busy
-                || runner.adopted
-                || runner.done.is_some()
-                || age < IDLE_GRACE
-                || self.hosts.retiring(&runner.name))
+            !(runner.busy || runner.adopted || runner.done.is_some() || age < IDLE_GRACE)
         });
-        for runner in idle.take(n.saturating_sub(retiring)) {
+        for runner in idle.take(n.saturating_sub(retiring.len())) {
             tracing::info!(runner = %runner.name, "surplus Actions runner retired");
             self.hosts.retire(&runner.name);
         }
@@ -524,15 +523,16 @@ fn heard(started_at: Option<OffsetDateTime>, now: OffsetDateTime) -> (String, i6
     )
 }
 
-/// GitHub says an Actions runner took a job whose start the Runner did not hear: it is marked busy, and the start
-/// goes to whoever hears of jobs. Which job it was, GitHub's REST view does not say.
-fn start_unheard(
+/// GitHub says an Actions runner took a job whose start the Runner did not hear (busy, gone by itself, or a removal
+/// refused for its job): it is marked busy, and the start, dated `at`, goes to whoever hears of jobs. Which job it
+/// was, GitHub does not say.
+pub(crate) fn start_unheard(
     roster: &Roster,
-    events: Option<&Arc<dyn Events>>,
+    events: &dyn Events,
     repo: &str,
     scale_set_id: i64,
     runner: &str,
-    now: SystemTime,
+    at: SystemTime,
 ) {
     roster.mark_busy(
         repo,
@@ -543,26 +543,24 @@ fn start_unheard(
             name: String::new(),
             workflow: String::new(),
             run_id: 0,
-            started: now,
+            started: at,
         },
     );
     tracing::info!(%runner, "GitHub says the Actions runner took a job whose start was not heard");
-    if let Some(events) = events {
-        events.job(&JobEvent {
-            kind: EventKind::Started,
-            runner: runner.to_string(),
-            repo: repo.to_string(),
-            job: String::new(),
-            workflow: String::new(),
-            run_id: 0,
-            event: String::new(),
-            queued_at: None,
-            started_at: None,
-            at: OffsetDateTime::from(now),
-            result: String::new(),
-            out_of_memory: false,
-        });
-    }
+    events.job(&JobEvent {
+        kind: EventKind::Started,
+        runner: runner.to_string(),
+        repo: repo.to_string(),
+        job: String::new(),
+        workflow: String::new(),
+        run_id: 0,
+        event: String::new(),
+        queued_at: None,
+        started_at: None,
+        at: OffsetDateTime::from(at),
+        result: String::new(),
+        out_of_memory: false,
+    });
 }
 
 /// Before a scale set's session opens: whatever the session before it left unread may be gone, since GitHub drops a
@@ -589,7 +587,7 @@ pub async fn reconcile<R: Registry>(
         match registry.runner_busy(runner.runner_id).await {
             Ok(Some(true)) => start_unheard(
                 roster,
-                Some(events),
+                events.as_ref(),
                 repo,
                 scale_set_id,
                 &runner.name,

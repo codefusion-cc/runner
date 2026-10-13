@@ -30,9 +30,11 @@ pub use log::{Lines, ROLL_AT};
 pub use mac::{MacMachines, MacService, MacSetup, mac_service, records_dir};
 pub use machines::{
     JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines, RESULT_WAIT, Registration,
-    Reports, Snapshot, Verdict,
+    Reports, Snapshot,
 };
-pub use records::{DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade};
+pub use records::{
+    DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade, never_up,
+};
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};
 pub use service::{

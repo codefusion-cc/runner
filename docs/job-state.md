@@ -33,11 +33,12 @@ Three ways lead to a `DELETE`, all sent by the sweep (`Service::sweep`), the one
 - **The idle limit.** A machine idle past `limits.idle` is not stopped on that belief, since its start may have gone
   with a session: the lifecycle asks for the registration's removal (`Effect::Unregister`) and stays idle. 204
   (`Event::Unregistered`) stops it as `no-job`, the one way a slot ends so; 422 or 404 makes it Started. Stopped
-  from the console before the answer, it ends as `stopped` and is asked about once it is gone.
+  from the console before the answer, it ends as `stopped`; a 404 met while it is still being stopped makes it
+  Started all the same. With no answer for `limits.job` (GitHub away, no client for the repository), it is stopped
+  as `timeout`: a job whose start went unheard began before the ask, so it is over its own time by then.
 - **A machine that ended unheard** (`ask_github`): gone with no word of a job, after its guest may have come up
-  (anything but a slot last written booting, or one that ended as never ready). The sweep asks REST once the wait
-  is over. `busy: true` or gone
-  means a job ran. `busy: false` is evidence only for its moment: on a second `busy: false`, read at a later sweep,
+  (anything but a slot last written booting, or one that ended as never ready: `never_up`). The sweep asks REST
+  once the wait is over. `busy: true` or gone means a job ran. `busy: false` is evidence only for its moment: on a second `busy: false`, read at a later sweep,
   the sweep sends `DELETE`, and the answer decides.
 
 A start heard while a removal is pending voids it.
@@ -103,9 +104,10 @@ under these rules; `crates/daemon/tests/records.rs` reads every combination thos
 | Written by an older Runner | Why it is not trusted | Read as |
 |---|---|---|
 | GitHub's start or end beside a lifecycle that boots, retries, waits or runs (two writes, a crash between) | The lifecycle lags behind GitHub's word | Consistent: running, or finishing once GitHub said the job is over |
+| GitHub's start or end beside a stop or an end for `no-job` (a start heard late, while the idle limit stopped the machine) | A job ran | Consistent: `stopped`, not `no-job` |
 | A standing machine stopping or killed for `no-job` or `stopped`, its registration not removed (the idle limit, a surplus removal after 204 or 404, a console stop) | A stop on the belief that no job came | Asks: idle, the registration's removal asked for at once, no stop before GitHub's answer |
 | A standing machine with `unregistered` and no word of a job | Main wrote `unregistered` on a 404 too | Asks, as above |
-| A machine gone with no word of a job, settled or not, with `unregistered` or not | Main settled it without asking, and removed it on 404 as on 204 | Asks: as one that ended unheard, its job reported if GitHub says one ran |
+| A machine gone with no word of a job, settled or not, with `unregistered` or not | Main settled it without asking, and removed it on 404 as on 204 | Asks: as one that ended unheard, its job reported if GitHub says one ran; one gone before its guest came up (booting, `start-failed`, `lost`) took no job and goes on as written |
 | A stop for the Mac's sake (memory, disk, sleep), a timeout, a lost guest, a failed start | A decision, not a belief about a job | Consistent; asked about once gone, like any other |
 | A registration with no machine | No machine, no job | Consistent: removed by the sweep |
 

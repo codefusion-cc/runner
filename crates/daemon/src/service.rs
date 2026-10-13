@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::machines::{JobReport, Machines, Reports, Snapshot, Verdict};
+use crate::machines::{JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
@@ -749,37 +749,22 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             let Some(client) = self.client_for(&registration.repo).await else {
                 // The App no longer reads its repository, or GitHub is away: asked again later.
                 tracing::debug!(runner = %registration.runner, repo = %registration.repo, "no client for a registration yet");
-                shared
-                    .refused
-                    .lock()
-                    .expect("refused")
-                    .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                self.sweep_later(registration.runner);
                 continue;
             };
             if registration.ask_github
                 && let Some(id) = registration.runner_id
             {
-                match client.runner_busy(id).await {
-                    Ok(busy) => match shared.machines.asked(&registration.runner, busy) {
-                        Verdict::Ran | Verdict::Idle => {}
-                        Verdict::AskAgain => {
-                            shared
-                                .refused
-                                .lock()
-                                .expect("refused")
-                                .insert(registration.runner, Instant::now() + shared.config.sweep_again);
-                            continue;
-                        }
-                    },
+                let again = match client.runner_busy(id).await {
+                    Ok(busy) => shared.machines.asked(&registration.runner, busy),
                     Err(error) => {
                         tracing::warn!(runner = %registration.runner, %error, "GitHub could not say whether a gone machine ran a job; it is asked again");
-                        shared
-                            .refused
-                            .lock()
-                            .expect("refused")
-                            .insert(registration.runner, Instant::now() + shared.config.sweep_again);
-                        continue;
+                        true
                     }
+                };
+                if again {
+                    self.sweep_later(registration.runner);
+                    continue;
                 }
             }
             let id = match registration.runner_id {
@@ -817,14 +802,16 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 Err(error) => {
                     tracing::warn!(runner = %registration.runner, %error, "a registration could not be removed; it is tried again");
-                    shared
-                        .refused
-                        .lock()
-                        .expect("refused")
-                        .insert(registration.runner, Instant::now() + shared.config.sweep_again);
+                    self.sweep_later(registration.runner);
                 }
             }
         }
+    }
+
+    /// Leaves a registration to a later sweep.
+    fn sweep_later(&self, runner: String) {
+        let again = Instant::now() + self.shared.config.sweep_again;
+        self.shared.refused.lock().expect("refused").insert(runner, again);
     }
 
     /// Why jobs GitHub handed to this Mac wait while nothing runs here, when they do. Jobs GitHub still holds are
