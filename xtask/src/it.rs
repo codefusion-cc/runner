@@ -133,6 +133,8 @@ struct Finished {
     machines: BTreeSet<u32>,
     machine_peak: u64,
     host_peak: u64,
+    /// The most the vm-host said its machine held of the Mac's memory (`resident_bytes` in its state).
+    resident_peak: u64,
     available_before: u64,
     available_least: u64,
 }
@@ -477,6 +479,7 @@ fn finish(
 ) -> Fallible<Finished> {
     let mut seen = BTreeSet::new();
     let (mut machine_peak, mut host_peak, mut available_least) = (0, 0, running.available_before);
+    let mut resident_peak = 0;
     let exited = loop {
         if running.child.try_wait()?.is_some() {
             break true;
@@ -487,6 +490,8 @@ fn finish(
         let now: BTreeSet<u32> = machines().difference(&running.machines_before).copied().collect();
         machine_peak = machine_peak.max(now.iter().map(|pid| memory_of(*pid)).sum());
         host_peak = host_peak.max(memory_of(running.child.id()));
+        let said = state_of(bench, &running.job)["resident_bytes"].as_u64();
+        resident_peak = resident_peak.max(said.unwrap_or(0));
         available_least = available_least.min(available());
         seen.extend(now.iter().copied());
         if let Err(error) = during(&console_of(bench, &running.job), &now) {
@@ -523,6 +528,7 @@ fn finish(
         machines: seen,
         machine_peak,
         host_peak,
+        resident_peak,
         available_before: running.available_before,
         available_least,
     })
@@ -813,6 +819,8 @@ struct Filled {
     touched: u64,
     machine_peak: u64,
     host_peak: u64,
+    /// What the vm-host read of the machine's process at its most: the number the budget counts the machine by.
+    resident_peak: u64,
 }
 
 impl Filled {
@@ -836,12 +844,13 @@ impl Filled {
 
     fn line(&self) -> String {
         format!(
-            "a {} machine whose job takes all it gets (limit {}): the guest had touched {} of the {} its kernel counts; the machine's process held {} at its most, its vm-host {}; a full one costs between {} and {} beyond its size",
+            "a {} machine whose job takes all it gets (limit {}): the guest had touched {} of the {} its kernel counts; the machine's process held {} at its most (its vm-host read {}), the vm-host itself {}; a full one costs between {} and {} beyond its size",
             mb(self.size),
             mb(self.limit),
             mb(self.touched),
             mb(self.total),
             mb(self.machine_peak),
+            mb(self.resident_peak),
             mb(self.host_peak),
             mb(self.at_least()),
             mb(self.at_most())
@@ -861,11 +870,23 @@ fn filled(bench: &Bench, job_name: &str, size_mb: u64) -> Fallible<Filled> {
         touched: kb("touched_kb=").ok_or("the job printed no memory")?,
         machine_peak: finished.machine_peak,
         host_peak: finished.host_peak,
+        resident_peak: finished.resident_peak,
     };
     let least = filled.limit.saturating_sub(300 * MB);
     expect(
         filled.touched > least && filled.machine_peak > least,
         format!("the measure is wrong: {}", filled.line()),
+    )?;
+    // The budget counts a machine by what its vm-host reads of the machine's process. A vm-host that finds no such
+    // process, or reads it wrong, leaves the budget with the job's peak only: safe, but one machine at a time.
+    expect(
+        filled.resident_peak > least && filled.resident_peak <= filled.machine_peak + 64 * MB,
+        format!(
+            "the vm-host read {} of its machine's process, which held {}: {}",
+            mb(filled.resident_peak),
+            mb(filled.machine_peak),
+            filled.line()
+        ),
     )?;
     Ok(filled)
 }

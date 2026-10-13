@@ -75,6 +75,7 @@ pub struct FakeVmm {
     scripts: Mutex<VecDeque<Script>>,
     started: Mutex<Vec<VmSpec>>,
     stops: Arc<Mutex<usize>>,
+    resident: Arc<Mutex<Option<u64>>>,
 }
 
 impl FakeVmm {
@@ -94,6 +95,12 @@ impl FakeVmm {
     /// How often a machine of this monitor was told to stop.
     pub fn stops(&self) -> usize {
         *self.stops.lock().unwrap()
+    }
+
+    /// What of the Mac's memory each machine of this monitor holds from now on ([`Vm::resident`]); `None`, the
+    /// start, when it cannot be told.
+    pub fn hold(&self, bytes: Option<u64>) {
+        *self.resident.lock().unwrap() = bytes;
     }
 }
 
@@ -119,6 +126,7 @@ impl Vmm for FakeVmm {
                 refuse_channel: Mutex::new(refuse_channel),
                 stop,
                 stops: self.stops.clone(),
+                resident: self.resident.clone(),
             })),
         }
     }
@@ -130,6 +138,7 @@ struct FakeVm {
     refuse_channel: Mutex<usize>,
     stop: Stop,
     stops: Arc<Mutex<usize>>,
+    resident: Arc<Mutex<Option<u64>>>,
 }
 
 impl Vm for FakeVm {
@@ -177,6 +186,14 @@ impl Vm for FakeVm {
 
     fn kill(&self) {
         self.power.end(VmExit::Stopped);
+    }
+
+    fn resident(&self) -> Option<u64> {
+        // A machine that ended has no process left to read.
+        if self.power.wait(Duration::ZERO).is_some() {
+            return None;
+        }
+        *self.resident.lock().unwrap()
     }
 }
 

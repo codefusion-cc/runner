@@ -182,18 +182,7 @@ fn ended_uncollected(pid: u32) -> bool {
 /// The program a process runs.
 #[cfg(target_os = "macos")]
 fn process_path(pid: u32) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: the buffer is this function's own and its true size is passed; the call writes at most that much.
-    let length = unsafe {
-        libc::proc_pidpath(
-            libc::c_int::try_from(pid).ok()?,
-            buffer.as_mut_ptr().cast(),
-            u32::try_from(buffer.len()).ok()?,
-        )
-    };
-    let length = usize::try_from(length).ok().filter(|n| *n > 0)?;
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..length])))
+    cf_host_macos::program_of(libc::c_int::try_from(pid).ok()?)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -537,6 +526,7 @@ mod tests {
             boots: 0,
             boot_ms: None,
             usage: None,
+            resident_bytes: None,
             oom: None,
             end: None,
         }

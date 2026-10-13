@@ -3,7 +3,8 @@
 //! - [`MacHost`] asks macOS (only on macOS): `host_statistics64` for the page counts, `sysctl` for the pressure
 //!   level and swap, the HID system for the time since the last key or mouse event, the thermal pressure
 //!   notification, the power source and `statfs`. It only reads; nothing here changes the Mac. The battery's
-//!   charge, which only the console's page shows, is what `pmset -g batt` prints ([`battery`]).
+//!   charge, which only the console's page shows, is what `pmset -g batt` prints ([`battery`]). [`program_of`] says
+//!   which program a process runs.
 //! - [`Raw`] is what macOS answered and [`reading`] what the budget gets from it, a pure function, so the
 //!   arithmetic is tested on every platform with numbers taken from real Macs.
 //! - [`exclude_from_backup`] marks a folder the Runner made as skipped by Time Machine, the way `tmutil addexclusion`
@@ -32,4 +33,4 @@ pub use backup::{ATTRIBUTE, Attributes, Exclusion, VALUE, exclude_with};
 pub use convert::{Battery, Raw, battery_in, model_name, reading};
 pub use fake::FakeHost;
 #[cfg(target_os = "macos")]
-pub use mac::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model};
+pub use mac::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, program_of};

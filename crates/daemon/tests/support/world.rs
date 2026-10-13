@@ -85,10 +85,15 @@ impl World {
 
     /// A job is assigned and there is room: a slot, a registration at GitHub, a machine.
     pub async fn start(&mut self) -> String {
-        let Claim::Start(ticket) = self.m.claim(SIZE, None) else {
+        self.start_sized(SIZE).await
+    }
+
+    /// [`World::start`] with a machine of this size.
+    pub async fn start_sized(&mut self, size: Size) -> String {
+        let Claim::Start(ticket) = self.m.claim(size, None) else {
             panic!("no room for the job");
         };
-        self.start_on(ticket).await.expect("the machine starts")
+        self.start_as(ticket, size).await.expect("the machine starts")
     }
 
     pub async fn start_on(&mut self, ticket: Ticket) -> Result<String, HostError> {
@@ -155,7 +160,12 @@ impl World {
 
     /// A job started on a new machine.
     pub async fn running(&mut self) -> String {
-        let runner = self.start().await;
+        self.running_sized(SIZE).await
+    }
+
+    /// [`World::running`] on a machine of this size.
+    pub async fn running_sized(&mut self, size: Size) -> String {
+        let runner = self.start_sized(size).await;
         self.github(EventKind::Started, &runner, "");
         runner
     }

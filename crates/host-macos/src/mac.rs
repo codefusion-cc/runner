@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::Read as _;
 use std::mem::{MaybeUninit, offset_of, size_of};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -239,6 +239,15 @@ pub fn battery() -> Option<Battery> {
 /// from the clock, so it moves when the clock is set. `None` when macOS will not say.
 pub fn boot_session() -> Option<String> {
     sysctl_text(c"kern.bootsessionuuid")
+}
+
+/// The program a process runs, by its full path; `None` once the process is gone.
+pub fn program_of(pid: c_int) -> Option<PathBuf> {
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is this function's own and its true size is passed; the call writes at most that much.
+    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    let length = usize::try_from(length).ok().filter(|&length| length > 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..length])))
 }
 
 /// The Mac's host name; `None` when macOS will not say.

@@ -11,11 +11,15 @@ cf-vmm = { path = "../vmm" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
+cf-host-macos = { path = "../host-macos" }
 dispatch2 = "0.3"
 libc.workspace = true
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSArray"] }
 objc2-virtualization = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

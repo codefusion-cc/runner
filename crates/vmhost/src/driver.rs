@@ -201,6 +201,7 @@ fn run_in(
         boots: machine.map_or(0, Machine::boots),
         boot_ms: machine.and_then(Machine::boot_ms),
         usage: machine.and_then(Machine::usage).cloned(),
+        resident_bytes: None,
         oom: machine.and_then(Machine::oom).cloned(),
         end: machine
             .filter(|_| stage == Stage::Ended)
@@ -359,7 +360,10 @@ fn run_in(
                         vm.kill();
                     }
                 }
-                Action::Publish => publish(&snapshot(Some(&machine), machine.stage())),
+                Action::Publish => publish(&JobState {
+                    resident_bytes: vm.as_ref().and_then(|vm| vm.resident()),
+                    ..snapshot(Some(&machine), machine.stage())
+                }),
                 Action::Finish => {
                     generation.fetch_add(1, Ordering::SeqCst);
                     done.store(true, Ordering::Relaxed);

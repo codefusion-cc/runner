@@ -21,6 +21,8 @@ pub struct TaskReport {
     pub ended_after: Duration,
     /// Whether the guest powered itself off (`false`: the host had to stop it).
     pub powered_off: bool,
+    /// What of the Mac's memory the machine held when the guest had done its task ([`Vm::resident`]).
+    pub resident: Option<u64>,
 }
 
 /// The time to hand a guest, in nanoseconds since 1970.
@@ -159,6 +161,7 @@ pub fn run_task(
                 _ => {}
             }
         };
+        let resident = vm.resident();
         channel.shutdown();
         let powered_off = vm.wait(
             left("the power-off")
@@ -171,6 +174,7 @@ pub fn run_task(
             ready_after: ready_after.unwrap_or_else(|| started.elapsed()),
             ended_after: started.elapsed(),
             powered_off,
+            resident,
         })
     })();
     put_down(vm.as_ref(), Duration::from_secs(5));

@@ -84,7 +84,7 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
     print!("{}", std::fs::read_to_string(&console).unwrap_or_default());
     let report = report?;
     println!(
-        "kernel {}: ready after {:.2?}, ended after {:.2?} ({})",
+        "kernel {}: ready after {:.2?}, ended after {:.2?} ({}); the machine held {} of the Mac's memory",
         report.kernel,
         report.ready_after,
         report.ended_after,
@@ -92,7 +92,13 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration) -> Result<(), String> {
             "guest powered itself off"
         } else {
             "stopped by the host"
-        }
+        },
+        report
+            .resident
+            .map_or("an amount nobody could read".into(), |bytes| format!(
+                "{} MiB",
+                bytes >> 20
+            ))
     );
     if report.powered_off {
         Ok(())

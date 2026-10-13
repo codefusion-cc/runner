@@ -430,6 +430,8 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
             finish(stream, summary(GuestEnd::Stopped(stop.reason), Some(143)));
         }),
     ]);
+    // A guest that touched more than its job ever held: the Mac holds what the guest touched.
+    vmm.hold(Some(4061 << 20));
     let asker = {
         let layout = layout.clone();
         std::thread::spawn(move || {
@@ -458,9 +460,11 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
     let state = go(&vmm, &layout, request("a"), limits).unwrap();
     let running = asker.join().unwrap();
     assert_eq!(
-        (running.pid, running.usage, running.end),
-        (std::process::id(), Some(usage()), None)
+        (running.pid, running.usage, running.resident_bytes, running.end),
+        (std::process::id(), Some(usage()), Some(4061 << 20), None)
     );
+    assert_eq!(state.resident_bytes, None, "a machine that is gone holds nothing");
+    assert_eq!(JobState::read(&layout, "a").unwrap().resident_bytes, None);
     let stop = stops.recv().unwrap();
     assert_eq!((stop.reason, stop.grace_ms), (StopReason::EvictedMemory, 20_000));
     assert_eq!(state.end.unwrap().end, End::EvictedMemory);

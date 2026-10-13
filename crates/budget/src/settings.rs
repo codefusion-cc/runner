@@ -37,8 +37,8 @@ pub struct Settings {
     pub in_use: Profile,
     /// How long the keyboard and the mouse must rest before the person counts as away.
     pub idle_after: Millis,
-    /// What one VM costs the host on top of its size: the VM's own process and the vm-host next to it.
-    /// M1 measures it; until then this is the estimate [`Settings::VM_HOST_OVERHEAD_ESTIMATE`].
+    /// What one VM costs the host on top of its size: the VM's own process and the vm-host next to it
+    /// ([`Settings::VM_HOST_OVERHEAD`], measured).
     pub vm_host_overhead_bytes: u64,
     /// What the guest's kernel and supervisor take of the VM's size before the job gets any.
     pub guest_overhead_bytes: u64,
@@ -124,6 +124,11 @@ impl Settings {
     /// costs between 76 MB and 131 MB beyond its size, plus the page tables of a larger guest (2 MB for each
     /// 4 GB). 64 MB, the estimate before the measurement, was below even the lower number; 192 MB is above the
     /// higher one for every size.
+    ///
+    /// Measured again on a 16 GB Mac mini running CI (macOS 26.6, 2026-10-13), with `footprint` and `vmmap`: a
+    /// cf-4g machine's process held 4109 MiB with 4061 MiB of guest memory touched, and 4136 MiB with 4088 MiB, so
+    /// 48 MiB of its own both times; its vm-host 48 MiB. 96 MiB in all, half of what is counted. The 6.3 GiB `ps`
+    /// shows as that process's resident size is no measure of it: it counts the guest's memory more than once.
     pub const VM_HOST_OVERHEAD: u64 = 192 * MIB;
 
     /// The plan's estimate of what the guest's kernel and supervisor take of a VM's size.
