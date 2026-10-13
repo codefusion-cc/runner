@@ -1396,7 +1396,7 @@ fn an_open_mac_with_no_room_for_a_size_says_so_once_and_when_one_fits_again() {
     let set = |bytes: u64| w.m.with_host(|host| host.set(|r| r.available_bytes = bytes));
     set(memory_for_no_machine(&w));
     pass(&w.m, 1);
-    assert_eq!(w.m.short_of(SIZE), Some("memory"));
+    assert_eq!(w.m.snapshot().short_of(SIZE), Some("memory"));
     for _ in 0..3 {
         assert_eq!(w.m.open_slots(SIZE), 0);
         pass(&w.m, 30);
@@ -1407,7 +1407,7 @@ fn an_open_mac_with_no_room_for_a_size_says_so_once_and_when_one_fits_again() {
 
     set(64 * GIB);
     pass(&w.m, 1);
-    assert_eq!(w.m.short_of(SIZE), None);
+    assert_eq!(w.m.snapshot().short_of(SIZE), None);
     assert_eq!(w.m.open_slots(SIZE), 2);
     assert_eq!(w.m.open_slots(SIZE), 2);
     assert_eq!(
@@ -1422,12 +1422,16 @@ fn a_mac_its_own_machines_fill_and_a_closed_mac_are_not_said_to_be_short_of_memo
     let log = Log::start();
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.short_of(SIZE), None, "full of its own machines");
+    assert_eq!(w.m.snapshot().short_of(SIZE), None, "full of its own machines");
     w.m.pause(true);
     w.m.with_host(|host| host.set(|r| r.available_bytes = w.parts.settings.away.floor_bytes + GIB));
     pass(&w.m, 1);
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.short_of(SIZE), None, "closed: the Mac says why itself");
+    assert_eq!(
+        w.m.snapshot().short_of(SIZE),
+        None,
+        "closed: the Mac says why itself"
+    );
     assert_eq!(log.lines("of this size"), Vec::<String>::new());
 }
 
@@ -1531,7 +1535,7 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     assert_eq!(w.m.open_slots(SIZE), 0);
     assert_eq!(room_of(&w, SIZE).free, Some(0));
     assert_eq!(
-        w.m.short_of(SIZE),
+        w.m.snapshot().short_of(SIZE),
         None,
         "without its own machine a second would fit"
     );
@@ -1542,7 +1546,7 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     pass(&w.m, 2);
     assert_eq!(w.m.open_slots(SIZE), 0);
     assert_eq!(
-        w.m.short_of(SIZE),
+        w.m.snapshot().short_of(SIZE),
         None,
         "what its own machine holds is not what else runs on the Mac"
     );
@@ -1552,7 +1556,7 @@ async fn a_mac_whose_own_machine_takes_the_memory_is_not_said_to_be_short_of_it(
     set(&w, floor + 256 * MIB);
     pass(&w.m, 1);
     assert_eq!(w.m.open_slots(SIZE), 0);
-    assert_eq!(w.m.short_of(SIZE), Some("memory"));
+    assert_eq!(w.m.snapshot().short_of(SIZE), Some("memory"));
     assert_eq!(log.lines("of this size").len(), 1);
 }
 
@@ -1570,11 +1574,7 @@ fn said(size: Size, free: Option<u32>, why: Option<&'static str>) -> SizeRoom {
 }
 
 fn room_of(w: &World, size: Size) -> SizeRoom {
-    let rooms = w.m.rooms();
-    let mut of = rooms.iter().filter(|room| room.size == size);
-    let room = *of.next().expect("the size is said");
-    assert!(of.next().is_none(), "and said once");
-    room
+    *w.m.snapshot().room(size)
 }
 
 #[test]
@@ -1591,7 +1591,7 @@ fn every_size_is_said_once_with_how_many_fit_and_sizes_over_the_cap_are_never_ru
     pass(&w.m, 2);
     let never = |size| said(size, None, Some("never"));
     assert_eq!(
-        w.m.rooms(),
+        w.m.snapshot().rooms,
         [
             said(Size::G2, Some(2), None),
             said(Size::G4, Some(1), None),
@@ -1602,7 +1602,7 @@ fn every_size_is_said_once_with_how_many_fit_and_sizes_over_the_cap_are_never_ru
     // A pause closes the sizes it runs, and a size it never runs stays never.
     w.m.pause(true);
     assert_eq!(
-        w.m.rooms(),
+        w.m.snapshot().rooms,
         [
             said(Size::G2, Some(0), Some("paused")),
             said(Size::G4, Some(0), Some("paused")),
@@ -1738,7 +1738,7 @@ async fn the_minis_own_reading_carries_no_second_machine() {
     let (w, _) = mini::with_one(mini::PEAK, Some(4136 * MIB)).await;
     assert!(!mini::second_fits(&w, 3676 * MIB));
     assert_eq!(
-        w.m.short_of(Size::G4),
+        w.m.snapshot().short_of(Size::G4),
         None,
         "the Mac's own machine is what is in the way"
     );

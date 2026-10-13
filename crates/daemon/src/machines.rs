@@ -201,6 +201,24 @@ pub struct Snapshot {
     pub stuck: Vec<String>,
     /// Jobs that wait in line for memory.
     pub waiting: usize,
+    /// What one more machine of each size meets, in the order of [`Size::ALL`].
+    pub rooms: [SizeRoom; 4],
+}
+
+impl Snapshot {
+    /// What one more machine of this size meets.
+    pub fn room(&self, size: Size) -> &SizeRoom {
+        &self.rooms[size.index()]
+    }
+
+    /// What keeps one more machine of this size from starting although the Mac takes jobs and has slots left, in
+    /// the budget's word: `memory`, when what else runs on the Mac leaves too little. Nothing while a machine fits,
+    /// while the Mac is closed (the budget then names why it is closed: a Mac that must stop a job is also under
+    /// pressure or short of disk), and while its own machines use up its slots or the memory a further one needs
+    /// (they are there to see).
+    pub fn short_of(&self, size: Size) -> Option<&'static str> {
+        self.room(size).why.filter(|why| *why == "memory")
+    }
 }
 
 /// What one more machine of a size meets on the Mac now ([`Machines::rooms`]).
@@ -728,79 +746,51 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         (self.nudge)();
     }
 
-    /// What keeps one more machine of this size from starting now although the Mac takes jobs and has slots left,
-    /// in the budget's word: `memory`, when what else runs on the Mac leaves too little. Nothing while a machine
-    /// fits, while the Mac is closed (it says why itself), and while its own machines use up its slots or the
-    /// memory a further one needs (they are there to see).
-    pub fn short_of(&self, size: Size) -> Option<&'static str> {
-        let mut inner = self.lock();
-        let now = inner.host.now();
-        self.holds(&mut inner, now);
-        Self::shortage(&inner, now, size)
-    }
-
-    /// What one more machine of each size meets now, for the console: how many more fit, and when none does, why
-    /// in the budget's word. A size these settings never run is `never`; memory the Mac's own machines hold is
-    /// `full`, not `memory`, as [`Machines::short_of`] says it. Unlike [`Slots::open_slots`] it tells no listener of
-    /// room and writes nothing to the log, since no poll is offering what a report reads.
-    pub fn rooms(&self) -> Vec<SizeRoom> {
-        let mut inner = self.lock();
-        let now = inner.host.now();
-        self.holds(&mut inner, now);
-        let status = inner.budget.status(now);
-        let available = status.reading.map(|reading| reading.available_bytes);
-        Size::ALL
-            .into_iter()
-            .map(|size| {
-                let room = SizeRoom {
-                    size,
-                    free: Some(status.free.of(size)),
-                    why: None,
-                    need_bytes: None,
-                    short_bytes: None,
-                };
-                if inner.budget.settings().can_run(size).is_err() {
-                    return SizeRoom {
-                        free: None,
-                        why: Some("never"),
-                        ..room
-                    };
-                }
-                match inner.budget.fits(now, size) {
-                    Ok(()) => room,
-                    Err(refusal @ cf_budget::Refusal::Memory { short_bytes }) => SizeRoom {
-                        why: Some(if Self::theirs(inner.budget.settings(), &status, size) {
-                            "full"
-                        } else {
-                            refusal.name()
-                        }),
-                        need_bytes: available.map(|available| available.saturating_add(short_bytes)),
-                        short_bytes: Some(short_bytes),
-                        ..room
-                    },
-                    Err(refusal) => SizeRoom {
-                        why: Some(refusal.name()),
-                        ..room
-                    },
-                }
-            })
-            .collect()
-    }
-
-    fn shortage(inner: &Inner<H>, now: Now, size: Size) -> Option<&'static str> {
-        if inner.budget.level(now) != Level::Open {
-            return None;
-        }
-        let refusal = match inner.budget.fits(now, size) {
-            Ok(()) | Err(cf_budget::Refusal::Full { .. } | cf_budget::Refusal::Cpus { .. }) => return None,
-            Err(refusal) => refusal,
+    /// What one more machine of this size meets now: how many more fit, and when none does, why in the budget's
+    /// word. A size these settings never run is `never`; memory the Mac's own machines hold, or have still to take,
+    /// is `full`, not `memory`: they are there to see.
+    fn room(inner: &Inner<H>, now: Now, status: &Status, size: Size) -> SizeRoom {
+        let settings = inner.budget.settings();
+        let mut room = SizeRoom {
+            size,
+            free: Some(status.free.of(size)),
+            why: None,
+            need_bytes: None,
+            short_bytes: None,
         };
-        (!Self::theirs(inner.budget.settings(), &inner.budget.status(now), size)).then(|| refusal.name())
+        if settings.can_run(size).is_err() {
+            room.free = None;
+            room.why = Some("never");
+            return room;
+        }
+        match inner.budget.fits(now, size) {
+            Ok(()) => {}
+            Err(refusal @ cf_budget::Refusal::Memory { short_bytes }) => {
+                room.why = Some(if Self::theirs(settings, status, size) {
+                    "full"
+                } else {
+                    refusal.name()
+                });
+                room.need_bytes = status
+                    .reading
+                    .map(|reading| reading.available_bytes.saturating_add(short_bytes));
+                room.short_bytes = Some(short_bytes);
+            }
+            Err(refusal) => room.why = Some(refusal.name()),
+        }
+        room
+    }
+
+    /// [`Snapshot::short_of`], for a look that makes no snapshot.
+    fn short(inner: &Inner<H>, now: Now, size: Size) -> Option<&'static str> {
+        Self::room(inner, now, &inner.budget.status(now), size)
+            .why
+            .filter(|why| *why == "memory")
     }
 
     /// Whether the memory one more machine of this size lacks is held, or still to be taken, by the Mac's own
     /// machines: a Mac that would carry it without them is full, not short.
-    fn theirs(settings: &cf_budget::Settings, status: &cf_budget::Status, size: Size) -> bool {
+    fn theirs(settings: &Settings, status: &Status, size: Size) -> bool {
         let without_machines = status
             .reading
             .map(|reading| reading.available_bytes.saturating_add(status.resident_bytes));
@@ -1303,6 +1293,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let now = inner.host.now();
         self.holds(&mut inner, now);
         let budget = inner.budget.status(now);
+        let rooms = Size::ALL.map(|size| Self::room(&inner, now, &budget, size));
         let open = budget.level == Level::Open;
         let reason = budget.closed_by.map_or("", |r| r.name()).to_string();
         Snapshot {
@@ -1329,6 +1320,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             host_error: inner.host_error.clone(),
             stuck: inner.stuck.iter().cloned().collect(),
             waiting: inner.waiting.len(),
+            rooms,
             budget,
         }
     }
@@ -1488,8 +1480,8 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         // A closed Mac said why when it closed. An open one that has no room for this size takes none of its jobs
         // and would say nothing: GitHub keeps them for another Mac, or until there is room here.
         let may_say = inner.offer.said[at].is_none_or(|said| now.elapsed.since(said) >= SAY_AGAIN_AFTER);
-        if let Some(why) = Self::shortage(&inner, now, size)
-            && may_say
+        if may_say
+            && let Some(why) = Self::short(&inner, now, size)
             && inner.offer.short[at] != Some(why)
         {
             inner.offer.short[at] = Some(why);

@@ -814,7 +814,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
         let why = if snapshot.open {
             sets.iter()
-                .find_map(|set| shared.machines.short_of(set.size))
+                .find_map(|set| snapshot.short_of(set.size))
                 .unwrap_or("no machine of their size fits")
                 .to_string()
         } else {
@@ -894,9 +894,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .iter()
             .map(|set| set.size)
             .min_by_key(|size| size.index())
-            .and_then(|smallest| shared.machines.short_of(smallest));
-        // One look for every size, so that the sizes and each scale set's capacity agree within a report.
-        let rooms = shared.machines.rooms();
+            .and_then(|smallest| snapshot.short_of(smallest));
         let (open, reason) = match no_room {
             Some(why) => (false, Some(why.to_string())),
             None => (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone())),
@@ -926,7 +924,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 idle_with_jobs_waiting_seconds,
                 idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
                     .map(|reason| cut(reason, STATUS_TEXT_MAX)),
-                sizes: rooms
+                sizes: snapshot
+                    .rooms
                     .iter()
                     .map(|room| SizeStatus {
                         size: room.size.label().to_string(),
@@ -944,11 +943,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         name: set.name.clone(),
                         id: set.id,
                         labels: set.labels.iter().take(MAX_LABELS).cloned().collect(),
-                        capacity: rooms
-                            .iter()
-                            .find(|room| room.size == set.size)
-                            .and_then(|room| room.free)
-                            .unwrap_or(0),
+                        capacity: snapshot.room(set.size).free.unwrap_or(0),
                         waiting: set.statistics.as_ref().map_or(0, |s| {
                             u32::try_from(s.total_available_jobs.max(0)).unwrap_or(u32::MAX)
                         }),
