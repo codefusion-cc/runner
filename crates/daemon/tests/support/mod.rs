@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cf_budget::Size;
+use cf_budget::{Size, Turn};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{Both, EventLog, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
 use cf_daemon::{
@@ -118,6 +118,8 @@ struct Seen {
     withdrawn: Vec<Ticket>,
     claimed: usize,
     started: Vec<(String, i64, Ticket)>,
+    /// The repository of each of those.
+    started_repos: Vec<String>,
     retired: Vec<String>,
     unanswered: bool,
 }
@@ -182,6 +184,11 @@ impl Spy {
         self.seen().started.clone()
     }
 
+    /// The repository of each Actions runner a machine was started for, in the order they started.
+    pub fn started_repos(&self) -> Vec<String> {
+        self.seen().started_repos.clone()
+    }
+
     /// The Actions runners the scaler retired as surplus.
     pub fn retired(&self) -> Vec<String> {
         self.seen().retired.clone()
@@ -225,12 +232,16 @@ impl Slots for Spy {
         self.machines.release(ticket);
     }
 
-    fn claim(&self, size: Size, promised: Option<Ticket>) -> Claim {
-        let claim = self.machines.claim(size, promised);
+    fn claim_in_turn(&self, size: Size, promised: Option<Ticket>, turn: Turn) -> Claim {
+        let claim = self.machines.claim_in_turn(size, promised, turn);
         if matches!(claim, Claim::Start(_)) {
             self.seen().claimed += 1;
         }
         claim
+    }
+
+    fn set_turn(&self, ticket: Ticket, turn: Turn) {
+        self.machines.set_turn(ticket, turn);
     }
 
     fn ready(&self, ticket: Ticket) -> bool {
@@ -282,8 +293,11 @@ impl Hosts for Spy {
 
     async fn start(&self, spec: RunnerSpec) -> Result<String, HostError> {
         let seen = (spec.name.clone(), spec.runner_id, spec.ticket);
+        let repo = spec.repo.clone();
         let handle = self.machines.start(spec).await?;
-        self.seen().started.push(seen);
+        let mut spied = self.seen();
+        spied.started.push(seen);
+        spied.started_repos.push(repo);
         Ok(handle)
     }
 
@@ -299,6 +313,7 @@ impl Hosts for Spy {
 
 pub struct Harness {
     pub fake: FakeGithub,
+    pub app: cf_ghapp::GitHubApp,
     pub client: ScaleSetClient,
     pub clock: Arc<TestClock>,
     pub set: ScaleSet,
@@ -326,7 +341,10 @@ pub async fn harness_with(machines: u32, options: Options) -> Harness {
 /// A machine with these budget settings.
 pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harness {
     let cf_fake_github::harness::Harness {
-        fake, client, clock, ..
+        fake,
+        app,
+        client,
+        clock,
     } = github(options, fast(), Duration::from_secs(10)).await;
     let labels = vec!["self-hosted".to_string(), SIZE.label().to_string()];
     let set = client
@@ -362,6 +380,7 @@ pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harn
     });
     Harness {
         fake,
+        app,
         client,
         clock,
         set,
@@ -390,10 +409,15 @@ pub struct Parts<'a> {
 }
 
 pub fn scaler_of(parts: &Parts<'_>) -> TestScaler {
+    scaler_for(parts, REPO)
+}
+
+/// A scaler of `repo`'s scale set on the parts' machines.
+pub fn scaler_for(parts: &Parts<'_>, repo: &str) -> TestScaler {
     Scaler::new(
         ScalerConfig {
             scale_set_id: parts.set.id,
-            repo: REPO.into(),
+            repo: repo.into(),
             machine: MACHINE.into(),
             size: SIZE,
         },
@@ -418,6 +442,37 @@ impl Harness {
     pub fn clock_now(&self) -> std::time::SystemTime {
         use cf_ghapp::Clock;
         self.clock.now()
+    }
+
+    /// The scaler of another repository's `cf-2g` scale set at the fake, on this harness's machines.
+    pub async fn another_repository(&self, repo: &str) -> TestScaler {
+        self.fake.add_repo(repo, true);
+        let client = ScaleSetClient::new(
+            self.app.clone(),
+            1,
+            repo,
+            &format!("{}/{repo}", self.fake.url()),
+            Duration::from_secs(10),
+        );
+        let labels = vec!["self-hosted".to_string(), SIZE.label().to_string()];
+        let set = client
+            .ensure_scale_set(&format!("mac-b--cf-2g--{}", repo.replace('/', "-")), &labels)
+            .await
+            .expect("scale set");
+        let session = client.open_session(set.id, MACHINE).await.expect("session");
+        scaler_for(
+            &Parts {
+                client: &client,
+                set: &set,
+                session: &session,
+                slots: &self.slots,
+                hosts: &self.hosts,
+                roster: &self.roster,
+                clock: &self.clock,
+                events: &self.events,
+            },
+            repo,
+        )
     }
 }
 

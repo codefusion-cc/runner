@@ -22,6 +22,12 @@ pub struct Profile {
     pub cpus: u32,
 }
 
+/// How long an assigned job may wait behind jobs that came after it (main-branch and deploy jobs, other
+/// repositories) before it goes first. Under the 5 minutes after which GitHub takes back a job no Actions runner
+/// took (`docs/github-protocol.md`), so a job passed over still starts before it is taken back. Not a setting: it
+/// follows from GitHub's take-back, which no Mac changes, and the scaler orders offered jobs by it too.
+pub const DEFER_LIMIT: Millis = Millis::mins(4);
+
 /// Every number the budget decides with. Nothing in the budget's code is a number of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {

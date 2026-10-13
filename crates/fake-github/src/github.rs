@@ -79,6 +79,8 @@ struct Job {
     repo: String,
     labels: Vec<String>,
     display_name: String,
+    /// The ref its workflow runs at, `refs/heads/main` or `refs/pull/<n>/merge`.
+    git_ref: String,
     run_id: i64,
     state: JobState,
     /// When it was last handed to a scale set, on the queue's clock ([`State::queue_now`]).
@@ -358,8 +360,9 @@ impl State {
         let mut v = json!({
             "messageType": kind, "runnerRequestId": job.request_id, "repositoryName": name, "ownerName": owner,
             "jobId": format!("job-{}", job.request_id),
-            "jobWorkflowRef": format!("{}/.github/workflows/ci.yml@refs/heads/main", job.repo),
-            "jobDisplayName": job.display_name, "workflowRunId": job.run_id, "eventName": "push",
+            "jobWorkflowRef": format!("{}/.github/workflows/ci.yml@{}", job.repo, job.git_ref),
+            "jobDisplayName": job.display_name, "workflowRunId": job.run_id,
+            "eventName": if job.git_ref.starts_with("refs/pull/") { "pull_request" } else { "push" },
             "requestLabels": job.labels, "queueTime": "2026-10-10T12:00:00Z",
             "scaleSetAssignTime": "2026-10-10T12:00:05Z", "runnerAssignTime": "2026-10-10T12:00:10Z",
             "finishTime": "2026-10-10T12:05:00Z",
@@ -581,8 +584,15 @@ impl FakeGithub {
 
     // ---- jobs ----
 
-    /// Queues a job asking for these labels; every matching scale set is offered it. Returns its request ID.
+    /// Queues a job of the main branch asking for these labels; every matching scale set is offered it. Returns its
+    /// request ID.
     pub fn queue_job(&self, repo: &str, labels: &[&str], display_name: &str) -> i64 {
+        self.queue_job_at(repo, labels, display_name, "refs/heads/main")
+    }
+
+    /// [`FakeGithub::queue_job`] for a job whose workflow runs at `git_ref`: a `refs/pull/...` ref is a pull request's
+    /// (event `pull_request`), any other a push's.
+    pub fn queue_job_at(&self, repo: &str, labels: &[&str], display_name: &str, git_ref: &str) -> i64 {
         let mut st = self.lock();
         st.next_job += 1;
         let job = Job {
@@ -590,6 +600,7 @@ impl FakeGithub {
             repo: repo.to_string(),
             labels: labels.iter().map(|l| l.to_lowercase()).collect(),
             display_name: display_name.to_string(),
+            git_ref: git_ref.to_string(),
             run_id: 7000 + st.next_job,
             state: JobState::Available,
             assigned_at: 0,

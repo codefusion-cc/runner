@@ -21,7 +21,9 @@
 //!   a stalled caller, a clock that went back) closes the Mac. Not knowing is never a reason to open.
 //! - A slot's memory is given back once: a second [`Budget::release`] is an error and changes nothing.
 //! - A job GitHub assigned without asking ([`Budget::assign`]) is never dropped and never started against the
-//!   rules above, the person being there excepted: it waits for the Mac to have room, first in line.
+//!   rules above, the person being there excepted: it waits for the Mac to have room, first in line. Among the
+//!   jobs that wait, main-branch and deploy jobs go first, repositories take turns, and none waits past
+//!   [`DEFER_LIMIT`] behind a later one ([`Budget::line`]).
 //!   [`Status`] names every slot with how it came to be ([`Origin`]) and every waiting job with what keeps it.
 //!
 //! The numbers are [`Settings`]; [`Settings::for_host`] has the defaults and where each comes from.
@@ -34,11 +36,11 @@ mod size;
 
 pub use budget::{
     Assigned, Budget, Charge, Eviction, EvictionCause, Free, Grant, Held, Observed, Origin, Refusal,
-    Released, SlotId, Status, UnknownSlot, Usage, Waiting, admit,
+    Released, SlotId, Status, Turn, UnknownSlot, Usage, Waiting, admit,
 };
 pub use host::{Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};
-pub use settings::{Mode, Profile, Settings, SettingsError};
+pub use settings::{DEFER_LIMIT, Mode, Profile, Settings, SettingsError};
 pub use size::Size;
 
 /// One mebibyte. The plan's "MB" and "GB" are these: a 16 GB Mac reports 16 × 2^30 bytes.
