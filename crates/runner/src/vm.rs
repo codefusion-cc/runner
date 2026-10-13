@@ -20,7 +20,8 @@ extern "C" fn cancel(_signal: libc::c_int) {
 /// What the host chooses for its machines.
 #[derive(Debug, Default)]
 pub struct Host {
-    /// On Linux, the host CPUs the machines run on; by default the fastest this process may use.
+    /// The host CPUs the machines run on; by default the fastest this process may use.
+    #[cfg(target_os = "linux")]
     pub cpus: Option<Vec<usize>>,
 }
 
