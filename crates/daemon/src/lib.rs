@@ -23,6 +23,7 @@ mod service;
 pub mod testing;
 mod traits;
 mod turns;
+pub mod update;
 mod vms;
 
 pub use adapters::SetRegistry;

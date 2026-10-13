@@ -14,6 +14,7 @@ use cf_host_macos::{MacHost, battery, boot_session, boot_time, cpu_percent, host
 use cf_secret::Secret;
 
 use crate::names::ServePolicy;
+use crate::update::SelfUpdate;
 use crate::{
     Console, DiskStore, HostExtras, LoggedReports, MachineConfig, MachineParts, Machines, Nudge,
     OutboxReports, Reports, Roster, Service, ServiceConfig, ServiceParts, VmHosts,
@@ -80,6 +81,8 @@ pub struct MacSetup {
     /// What runs in a machine in place of GitHub's Actions runner: the integration suite's command. `None` in
     /// service.
     pub stand_in: Option<Workload>,
+    /// How the Runner updates itself; none where it cannot.
+    pub updates: Option<Arc<dyn SelfUpdate>>,
 }
 
 /// Builds the machines and the service of this Mac, and finds what a Runner before left: records, vm-hosts,
@@ -170,6 +173,8 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
                 battery: *battery.lock().expect("battery"),
             }
         }),
+        updates: setup.updates,
+        results: Some(state.join("results.json")),
     });
     Ok((machines, service))
 }

@@ -668,3 +668,75 @@ impl Events for EventLog {
         self.oom.lock().expect("events").push(event.clone());
     }
 }
+
+/// An update a test scripts: what each build and each install answers, how long a build takes, and what was
+/// installed.
+#[derive(Debug, Default)]
+pub struct FakeUpdate(Mutex<UpdateScript>);
+
+#[derive(Debug, Default)]
+struct UpdateScript {
+    builds: std::collections::VecDeque<Result<String, String>>,
+    installs: std::collections::VecDeque<Result<(), String>>,
+    build_takes: Duration,
+    built: usize,
+    installed: Vec<crate::update::Pending>,
+}
+
+impl FakeUpdate {
+    /// The next build answers `answer`.
+    pub fn build_gives(&self, answer: Result<&str, &str>) {
+        let answer = answer.map(str::to_string).map_err(str::to_string);
+        self.0.lock().expect("update").builds.push_back(answer);
+    }
+
+    /// The next install answers `answer`.
+    pub fn install_gives(&self, answer: Result<(), &str>) {
+        let answer = answer.map_err(str::to_string);
+        self.0.lock().expect("update").installs.push_back(answer);
+    }
+
+    /// Every build takes this long.
+    pub fn build_takes(&self, time: Duration) {
+        self.0.lock().expect("update").build_takes = time;
+    }
+
+    /// How many builds ran.
+    pub fn built(&self) -> usize {
+        self.0.lock().expect("update").built
+    }
+
+    /// What was installed, in order.
+    pub fn installed(&self) -> Vec<crate::update::Pending> {
+        self.0.lock().expect("update").installed.clone()
+    }
+}
+
+impl crate::update::SelfUpdate for FakeUpdate {
+    fn source(&self) -> String {
+        "/src/runner main".into()
+    }
+
+    fn build(&self) -> Result<String, String> {
+        let (takes, answer) = {
+            let mut script = self.0.lock().expect("update");
+            script.built += 1;
+            let answer = script
+                .builds
+                .pop_front()
+                .unwrap_or_else(|| Err("no build scripted".into()));
+            (script.build_takes, answer)
+        };
+        std::thread::sleep(takes);
+        answer
+    }
+
+    fn install(&self, pending: &crate::update::Pending) -> Result<(), String> {
+        let mut script = self.0.lock().expect("update");
+        let answer = script.installs.pop_front().unwrap_or(Ok(()));
+        if answer.is_ok() {
+            script.installed.push(pending.clone());
+        }
+        answer
+    }
+}

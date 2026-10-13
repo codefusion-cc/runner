@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
-use cf_daemon::testing::{CrashingStore, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for};
+use cf_daemon::testing::{
+    CrashingStore, FakeUpdate, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for,
+};
 use cf_daemon::{
     Claim, Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
     ServiceConfig, ServiceParts, Slots,
@@ -52,6 +54,8 @@ struct Rig {
     folder: tempfile::TempDir,
     /// The battery the Mac says it has.
     battery: Arc<Mutex<Option<Battery>>>,
+    /// How the Runner updates itself.
+    updates: Arc<FakeUpdate>,
     /// Lets time pass on the Mac and runs the service's rounds, as its loop does.
     pump: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>)>,
 }
@@ -127,15 +131,16 @@ impl Rig {
             .forward_to(Arc::new(Gated(dead.clone(), OutboxReports(outbox.clone()))));
         let machines = parts.machines(None);
         let battery = Arc::new(Mutex::new(None));
+        let updates = Arc::new(FakeUpdate::default());
         let mut rig = Rig {
             service: Arc::new(service(
                 &github,
                 &console,
                 &parts,
                 &machines,
-                &outbox,
                 &enrolled.token,
                 &battery,
+                (&outbox, &updates, folder.path()),
             )),
             github,
             console,
@@ -148,6 +153,7 @@ impl Rig {
             token: enrolled.token,
             folder,
             battery,
+            updates,
             pump: None,
         };
         rig.pump();
@@ -213,9 +219,9 @@ impl Rig {
             &self.console,
             &self.parts,
             &self.machines,
-            &self.outbox,
             &self.token,
             &self.battery,
+            (&self.outbox, &self.updates, self.folder.path()),
         ));
         pass(&self.machines, 61);
         self.pump();
@@ -331,9 +337,10 @@ fn service(
     console: &FakeConsole,
     parts: &TestParts,
     machines: &Arc<TestMachines>,
-    outbox: &Arc<Outbox>,
     token: &Secret<String>,
     battery: &Arc<Mutex<Option<Battery>>>,
+    // What a daemon keeps across its starts: the outbox, the update it builds, the folder of its files.
+    (outbox, updates, folder): (&Arc<Outbox>, &Arc<FakeUpdate>, &std::path::Path),
 ) -> TestService {
     let battery = battery.clone();
     let mut config = ServiceConfig::new(
@@ -344,6 +351,7 @@ fn service(
     );
     config.poll_timeout = Duration::from_secs(5);
     config.sweep_again = Duration::from_millis(50);
+    config.update_limit = Duration::from_secs(4);
     config.backoff = (
         Duration::from_millis(20),
         Duration::from_millis(100),
@@ -368,6 +376,8 @@ fn service(
             boot: Some(1_790_000_000),
             battery: *battery.lock().expect("battery"),
         }),
+        updates: Some(updates.clone()),
+        results: Some(folder.join("results.json")),
     })
 }
 
@@ -861,7 +871,7 @@ async fn the_consoles_pause_takes_no_new_job_and_its_commands_are_done_or_answer
     let stop = rig
         .console
         .queue_command("stop-runner", Some(json!({"name": runner})));
-    let update = rig.console.queue_command("update", None);
+    let update = rig.console.queue_command("rebuild-image", None);
     until("the machine is stopped", || rig.standing().is_empty()).await;
     until("both commands are answered", || {
         let results: Vec<Value> = rig
@@ -873,7 +883,8 @@ async fn the_consoles_pause_takes_no_new_job_and_its_commands_are_done_or_answer
         let of = |id: &str| results.iter().find(|r| r["id"] == json!(id)).cloned();
         of(&stop).is_some_and(|r| r["ok"] == json!(true))
             && of(&update).is_some_and(|r| {
-                r["ok"] == json!(false) && r["message"] == json!("this Runner does not do `update` yet")
+                r["ok"] == json!(false)
+                    && r["message"] == json!("this Runner does not do `rebuild-image` yet")
             })
     })
     .await;
@@ -1070,7 +1081,7 @@ async fn what_was_done_for_the_console_is_said_again_and_not_done_again() {
     let stop = rig
         .console
         .queue_command("stop-runner", Some(json!({"name": runner})));
-    let other = rig.console.queue_command("restart", None);
+    let other = rig.console.queue_command("rebuild-image", None);
     assert_eq!(
         rig.service.report().await,
         Duration::from_secs(5),
@@ -1099,7 +1110,7 @@ async fn what_was_done_for_the_console_is_said_again_and_not_done_again() {
     assert_eq!(heard[1]["ok"], json!(false));
     assert_eq!(
         heard[1]["message"],
-        json!("this Runner does not do `restart` yet")
+        json!("this Runner does not do `rebuild-image` yet")
     );
 }
 
@@ -1147,9 +1158,9 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
         &rig.console,
         &rig.parts,
         &rig.machines,
-        &rig.outbox,
         &Secret::new("not-this-macs-token".to_string()),
         &rig.battery,
+        (&rig.outbox, &rig.updates, rig.folder.path()),
     );
     rig.finish(&runner, "succeeded");
     until("the end waits to be sent", || {
@@ -2925,5 +2936,333 @@ async fn a_stop_for_no_job_left_by_a_runner_before_is_asked_of_github_first() {
         rig.standing(),
         vec![runner.clone()],
         "the machine of a running job stands"
+    );
+}
+
+/// The version the rig's Runner runs.
+const RUNNING: &str = "0.1.0+446125c0a1b2";
+const NEWER: &str = "0.1.0+5c0ffee0a1b2";
+
+/// The newest status the console has.
+fn last_status(console: &FakeConsole) -> Value {
+    console.reports().last().expect("a report")["status"].clone()
+}
+
+/// What the console heard of one command, each time it heard of it.
+fn results_of(console: &FakeConsole, id: &str) -> Vec<Value> {
+    results(console)
+        .into_iter()
+        .filter(|r| r["id"] == json!(id))
+        .collect()
+}
+
+/// A restart is said and kept before the Runner ends; the one that starts next says it and does not restart again,
+/// though the console sends the command until it hears of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_is_said_by_the_runner_that_starts_next_and_not_done_again() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.stop_pump().await;
+    let restart = rig.console.queue_command("restart", None);
+    rig.service.report().await;
+    assert!(rig.service.restart_requested(), "the Runner is to end");
+    // It ends before any report carries the result.
+    rig.restart().await;
+    assert!(!rig.service.restart_requested());
+    until("the result at the console", || {
+        !results_of(&rig.console, &restart).is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let heard = results_of(&rig.console, &restart);
+    assert_eq!(heard.len(), 1, "once: {heard:?}");
+    assert_eq!(heard[0]["ok"], json!(true));
+    assert_eq!(
+        heard[0]["message"],
+        json!(format!("{RUNNING} ends and launchd starts it again"))
+    );
+    assert!(!rig.service.restart_requested(), "the command is not done again");
+}
+
+/// The whole update: built while a job runs, no new job while the machine stands, installed once it is gone, and
+/// the Runner ends. The Runner that starts next takes the update up: the console's command is not done again, and
+/// the result is said once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_waits_for_the_machine_that_stands_installs_and_is_said_once_by_the_next_runner() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.updates.build_gives(Ok(NEWER));
+    let update = rig.console.queue_command("update", None);
+    until("no new job while the machine stands", || {
+        last_status(&rig.console)["reason"]
+            == json!(format!("updating to {NEWER}: waiting for 1 machine to end"))
+    })
+    .await;
+    assert_eq!(last_status(&rig.console)["open"], json!(false));
+    rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    rig.github.github_looks();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.standing(), [runner.as_str()], "nothing new starts");
+    assert_eq!(
+        rig.updates.installed(),
+        [],
+        "nothing is installed while a machine stands"
+    );
+    assert!(!rig.service.restart_requested());
+
+    rig.finish(&runner, "succeeded");
+    until("installed", || rig.updates.installed().len() == 1).await;
+    let pending = rig.updates.installed()[0].clone();
+    assert_eq!(
+        pending,
+        cf_daemon::update::Pending {
+            id: update.clone(),
+            from: RUNNING.into(),
+            to: NEWER.into(),
+            starts: 0,
+            failed: None,
+        }
+    );
+    until("the Runner is to end", || rig.service.restart_requested()).await;
+    assert_eq!(
+        results_of(&rig.console, &update),
+        Vec::<Value>::new(),
+        "said by the next Runner"
+    );
+
+    rig.restart().await;
+    rig.service.take_up(&pending);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        rig.updates.built(),
+        1,
+        "the command that comes again is not done again"
+    );
+    // A Runner that dies after it said it says it again when it starts once more.
+    rig.service.said(&update, true, &format!("now runs {NEWER}"));
+    rig.service.said(&update, true, &format!("now runs {NEWER}"));
+    until("the result at the console", || {
+        !results_of(&rig.console, &update).is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let heard = results_of(&rig.console, &update);
+    assert_eq!(heard.len(), 1, "once: {heard:?}");
+    assert_eq!(heard[0]["ok"], json!(true));
+    assert_eq!(rig.updates.built(), 1);
+}
+
+/// A slot promised to GitHub before the update held new jobs back may still get its job: the update waits for it,
+/// and installs once it is given back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_waits_for_a_slot_promised_before_it_and_installs_once_it_is_given_back() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let promised = rig.machines.reserve(cf_budget::Size::G2).expect("a slot");
+    rig.updates.build_gives(Ok(NEWER));
+    rig.console.queue_command("update", None);
+    until("the update waits for the promised slot", || {
+        last_status(&rig.console)["reason"]
+            == json!(format!(
+                "updating to {NEWER}: waiting for 1 job that may still come"
+            ))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.updates.installed(),
+        [],
+        "nothing is installed while a job may still come"
+    );
+    rig.machines.release(promised);
+    until("installed", || rig.updates.installed().len() == 1).await;
+}
+
+/// Main has nothing newer: said, nothing installed, and the Mac never stopped taking jobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_with_nothing_newer_installs_nothing_and_holds_no_job() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.updates.build_gives(Ok(RUNNING));
+    let update = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    let heard = &results_of(&rig.console, &update)[0];
+    assert_eq!(heard["ok"], json!(true));
+    assert_eq!(
+        heard["message"],
+        json!(format!("{RUNNING} runs already: there is nothing newer"))
+    );
+    assert_eq!(rig.updates.installed(), []);
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+    assert_eq!(rig.standing().len(), 2, "a second job starts beside {runner}");
+}
+
+/// A build that fails is said with its words, shows in the report's update until one works, and changes nothing
+/// else: the Runner goes on taking jobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_that_fails_is_said_and_counted_and_the_mac_goes_on() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    for (round, failures) in [(1, 1), (2, 2)] {
+        rig.updates
+            .build_gives(Err("error[E0425]: cannot find value `x`"));
+        let update = rig.console.queue_command("update", None);
+        until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+        let heard = &results_of(&rig.console, &update)[0];
+        assert_eq!(heard["ok"], json!(false), "round {round}");
+        assert_eq!(heard["message"], json!("error[E0425]: cannot find value `x`"));
+        until("the failure in the report", || {
+            last_status(&rig.console)["update"]["failures"] == json!(failures)
+        })
+        .await;
+    }
+    let said = last_status(&rig.console)["update"].clone();
+    assert_eq!(said["source"], json!("/src/runner main"));
+    assert_eq!(said["error"], json!("error[E0425]: cannot find value `x`"));
+    assert!(
+        said["checkedAt"].is_string() && said["errorAt"].is_string(),
+        "{said}"
+    );
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+
+    rig.updates.build_gives(Ok(RUNNING));
+    let update = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    until("no failure once one works", || {
+        let said = last_status(&rig.console)["update"].clone();
+        said["failures"] == json!(0) && said.get("error").is_none()
+    })
+    .await;
+}
+
+/// Machines that do not end within the update's limit: nothing is installed, and the Mac takes jobs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_whose_machine_outlasts_its_limit_installs_nothing_and_takes_jobs_again() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.updates.build_gives(Ok(NEWER));
+    let update = rig.console.queue_command("update", None);
+    until("the hold", || last_status(&rig.console)["open"] == json!(false)).await;
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    let heard = &results_of(&rig.console, &update)[0];
+    assert_eq!(heard["ok"], json!(false));
+    assert_eq!(
+        heard["message"],
+        json!(format!(
+            "{NEWER} was not installed: still waiting for 1 machine to end after 4 seconds"
+        ))
+    );
+    assert_eq!(rig.updates.installed(), []);
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+    assert_eq!(rig.standing().len(), 2, "jobs start again beside {runner}");
+}
+
+/// An install that fails is said, and the Mac takes jobs again with the program it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_that_fails_is_said_and_the_mac_takes_jobs_again() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.updates.build_gives(Ok(NEWER));
+    rig.updates.install_gives(Err("2 machines have a record"));
+    let update = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    let heard = &results_of(&rig.console, &update)[0];
+    assert_eq!(heard["ok"], json!(false));
+    assert_eq!(heard["message"], json!("2 machines have a record"));
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+}
+
+/// While an update builds: the console's command that comes again is not done twice, another update and a restart
+/// are refused, and the console sees what it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn while_an_update_builds_it_runs_once_and_another_update_or_a_restart_is_refused() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.updates.build_takes(Duration::from_millis(1500));
+    rig.updates.build_gives(Ok(RUNNING));
+    let update = rig.console.queue_command("update", None);
+    until("building", || {
+        last_status(&rig.console)["reason"] == json!("updating: building")
+    })
+    .await;
+    let second = rig.console.queue_command("update", None);
+    let restart = rig.console.queue_command("restart", None);
+    until("both refused", || {
+        !results_of(&rig.console, &second).is_empty() && !results_of(&rig.console, &restart).is_empty()
+    })
+    .await;
+    assert_eq!(results_of(&rig.console, &second)[0]["ok"], json!(false));
+    assert_eq!(
+        results_of(&rig.console, &second)[0]["message"],
+        json!("an update is under way already")
+    );
+    assert_eq!(results_of(&rig.console, &restart)[0]["ok"], json!(false));
+    assert!(!rig.service.restart_requested());
+    until("the first is over", || {
+        !results_of(&rig.console, &update).is_empty()
+    })
+    .await;
+    assert_eq!(
+        rig.updates.built(),
+        1,
+        "built once though the console sent it with every answer"
+    );
+}
+
+/// A result said while a report that fails carries the ones before is kept with them: a Runner that dies then
+/// still says every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_said_while_a_report_is_under_way_keeps_the_ones_it_carries() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    rig.service.said("first", true, "one");
+    rig.console.down(true);
+    {
+        let report = rig.service.report();
+        tokio::pin!(report);
+        // Polled once: the report is on its way with the first result.
+        std::future::poll_fn(|cx| {
+            let _ = report.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        rig.service.said("second", true, "two");
+        report.await;
+    }
+    rig.restart().await;
+    rig.console.down(false);
+    rig.stop_pump().await;
+    rig.service.report().await;
+    let ids: BTreeSet<String> = results(&rig.console)
+        .iter()
+        .map(|result| result["id"].as_str().expect("an id").to_string())
+        .collect();
+    assert_eq!(ids, BTreeSet::from(["first".into(), "second".into()]));
+}
+
+/// The last report of a Runner that ends says so, and not that the Mac serves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    rig.stop_pump().await;
+    rig.service.report().await;
+    assert!(last_status(&rig.console).get("notServing").is_none());
+    rig.service.shutdown().await;
+    let last = last_status(&rig.console);
+    assert_eq!(
+        last["notServing"],
+        json!("the Runner ends; the one that starts next serves them again")
     );
 }

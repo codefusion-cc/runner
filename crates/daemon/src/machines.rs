@@ -312,6 +312,8 @@ struct Inner<H> {
     intents: BTreeMap<String, (Record, bool)>,
     paused: bool,
     draining: bool,
+    /// An update waits for the machines to end: no new job, though the Runner goes on.
+    updating: bool,
     /// Nobody listens to GitHub any more (an uninstall closed every session): how a job ended is not waited for.
     deaf: bool,
     host_error: Option<String>,
@@ -433,6 +435,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 intents: BTreeMap::new(),
                 paused: false,
                 draining: false,
+                updating: false,
                 deaf: false,
                 host_error: None,
                 stuck: BTreeSet::new(),
@@ -593,7 +596,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let failures = inner.breaker.holds(now.elapsed) || !inner.stuck.is_empty();
         inner.budget.hold(Hold::StartFailures, failures);
         inner.budget.hold(Hold::Paused, inner.paused);
-        inner.budget.hold(Hold::Draining, inner.draining);
+        inner
+            .budget
+            .hold(Hold::Draining, inner.draining || inner.updating);
         inner.making.check(&mut inner.budget, now);
     }
 
@@ -601,6 +606,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// offers GitHub the slot the Mac had when it began.
     pub fn pause(&self, paused: bool) {
         let changed = std::mem::replace(&mut self.lock().paused, paused) != paused;
+        if changed {
+            self.ring();
+        }
+    }
+
+    /// Takes no new job while an update waits for the machines that stand to end, or takes them again when it
+    /// gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would otherwise. The polls in
+    /// flight are told.
+    pub fn hold_for_update(&self, on: bool) {
+        let changed = std::mem::replace(&mut self.lock().updating, on) != on;
         if changed {
             self.ring();
         }
@@ -1294,6 +1309,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     pub fn unsettled(&self) -> usize {
         let inner = self.lock();
         inner.jobs.len() + inner.intents.len()
+    }
+
+    /// How many jobs may still get a machine although no new slot is granted: one for each slot promised to GitHub,
+    /// or granted, with no machine yet. A registration under way still holds its slot, so it counts here and in
+    /// [`Machines::unsettled`] for those few seconds. A job that waits in line gets no machine while no slot is
+    /// granted: if the Runner ends, GitHub takes it back and hands it out again, as it would anyway.
+    pub fn coming(&self) -> usize {
+        let inner = self.lock();
+        let held: BTreeSet<SlotId> = inner.jobs.values().filter_map(|job| job.slot).collect();
+        inner.grants.keys().filter(|slot| !held.contains(slot)).count()
     }
 
     /// What there is to report.

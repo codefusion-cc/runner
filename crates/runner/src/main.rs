@@ -11,6 +11,8 @@ mod hidden;
 mod launchd;
 #[cfg(target_os = "macos")]
 mod service;
+#[cfg(target_os = "macos")]
+mod update;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod vm;
 

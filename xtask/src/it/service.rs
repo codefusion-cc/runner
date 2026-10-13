@@ -111,6 +111,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
             stand_in: Some(Workload::Command {
                 argv: vec!["/bin/bash".into(), "-c".into(), STAND_IN.into()],
             }),
+            updates: None,
         })?
     };
     let service = Arc::new(service);

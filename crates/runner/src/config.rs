@@ -53,6 +53,10 @@ pub struct Config {
     /// The longest a job may run, in minutes.
     #[serde(default = "deadline_minutes")]
     pub deadline_minutes: u64,
+    /// The git checkout that belongs to the Runner alone, which the console's `update` fetches, checks out at a
+    /// commit and builds in. Without it the Runner is updated by hand: a person's checkout is never touched.
+    #[serde(default)]
+    pub build_folder: Option<PathBuf>,
 }
 
 fn github_api() -> String {
@@ -97,16 +101,21 @@ impl Config {
                 self.machine
             ));
         }
-        for (what, folder) in [("state_dir", &self.state_dir), ("app_dir", &self.app_dir)] {
+        let build_folder = self.build_folder.iter().map(|folder| ("build_folder", folder));
+        let folders = [("state_dir", &self.state_dir), ("app_dir", &self.app_dir)];
+        for (what, folder) in folders.into_iter().chain(build_folder.clone()) {
             if !folder.is_absolute() {
                 return Err(format!("{what}: `{}` is not an absolute path", folder.display()));
             }
         }
-        if self.state_dir.starts_with("/Volumes") {
-            return Err(format!(
-                "state_dir: `{}` is on an external volume, which a launchd agent may not open",
-                self.state_dir.display()
-            ));
+        // The service reads and writes the state folder, and `update` builds in the build folder.
+        for (what, folder) in std::iter::once(("state_dir", &self.state_dir)).chain(build_folder) {
+            if folder.starts_with("/Volumes") {
+                return Err(format!(
+                    "{what}: `{}` is on an external volume, which a launchd agent may not open",
+                    folder.display()
+                ));
+            }
         }
         if self.image.is_empty() {
             return Err("image: no version".into());
@@ -287,9 +296,30 @@ mod tests {
     #[test]
     fn the_state_folder_is_absolute_and_on_no_external_volume() {
         assert!(with(|v| v["state_dir"] = "state".into()).is_err());
-        let error = with(|v| v["state_dir"] = "/Volumes/Dev/runner".into()).expect_err("refused");
+        let error = with(|v| v["state_dir"] = "/Volumes/External/runner".into()).expect_err("refused");
         assert!(error.contains("external volume"), "{error}");
         assert!(with(|v| v["app_dir"] = "~/.config/x".into()).is_err());
+    }
+
+    #[test]
+    fn a_build_folder_is_optional_absolute_and_on_no_external_volume() {
+        assert_eq!(with(|_| ()).expect("no build folder").build_folder, None);
+        let config =
+            with(|v| v["build_folder"] = "/Users/someone/runner-build".into()).expect("a build folder");
+        assert_eq!(
+            config.build_folder.as_deref(),
+            Some(Path::new("/Users/someone/runner-build"))
+        );
+        let error = with(|v| v["build_folder"] = "runner-build".into()).expect_err("refused");
+        assert!(
+            error.starts_with("build_folder:") && error.contains("absolute"),
+            "{error}"
+        );
+        let error = with(|v| v["build_folder"] = "/Volumes/External/runner".into()).expect_err("refused");
+        assert!(
+            error.starts_with("build_folder:") && error.contains("external volume"),
+            "{error}"
+        );
     }
 
     #[test]

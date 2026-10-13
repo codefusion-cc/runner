@@ -61,6 +61,22 @@ fn main() {
         .filter(|commit| !commit.is_empty())
         .or_else(|| commit(&root))
         .unwrap_or_else(|| "unknown".into());
+    // Where the program was built from and with what, for the update that builds the next one the same way.
+    for name in ["CARGO_HOME", "RUSTUP_HOME", "CARGO_BUILD_JOBS"] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let source = root.canonicalize().unwrap_or_else(|_| root.clone());
+    println!("cargo:rustc-env=CF_SOURCE={}", source.display());
+    for (name, built) in [
+        ("CARGO_HOME", "CF_CARGO_HOME"),
+        ("RUSTUP_HOME", "CF_RUSTUP_HOME"),
+        ("CARGO_BUILD_JOBS", "CF_BUILD_JOBS"),
+    ] {
+        println!(
+            "cargo:rustc-env={built}={}",
+            std::env::var(name).unwrap_or_default()
+        );
+    }
     // Under a name of its own: cargo hands what is set here to the tests it runs too, and `CF_COMMIT` there would
     // read as a build that was given its name.
     println!("cargo:rustc-env=CF_BUILT_AT={commit}");

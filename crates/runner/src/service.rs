@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use cf_budget::{Budget, Host as _, HostReading, Settings, Size, admit};
 use cf_daemon::names::ServePolicy;
+use cf_daemon::update::{STAYS_UP, SelfUpdate, UpdateFile};
 use cf_daemon::{Lines, MacMachines, MacService, MacSetup, ROLL_AT, mac_service};
 use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_host_macos::{MacHost, host_name, model};
@@ -16,6 +17,7 @@ use cf_secret::Secret;
 use crate::config::{Config, check_beside_old_manager};
 use crate::hidden::{self, NoLine};
 use crate::launchd::{AGENT_PAUSE, Agent, LABEL, launchctl, plist};
+use crate::update::{self, MacUpdate, Started};
 
 use crate::commands::VERSION;
 /// The entitlement without which macOS starts no virtual machine for a program.
@@ -105,7 +107,11 @@ fn installed_image(config: &Config) -> Result<PathBuf, String> {
         })
 }
 
-fn service(config: &Config, program: &Path) -> Result<(Arc<MacMachines>, MacService), String> {
+fn service(
+    config: &Config,
+    program: &Path,
+    updates: Option<Arc<dyn SelfUpdate>>,
+) -> Result<(Arc<MacMachines>, MacService), String> {
     mac_service(MacSetup {
         machine: config.machine.clone(),
         version: VERSION.into(),
@@ -121,6 +127,7 @@ fn service(config: &Config, program: &Path) -> Result<(Arc<MacMachines>, MacServ
         },
         console: console(config)?,
         stand_in: None,
+        updates,
     })
 }
 
@@ -170,9 +177,23 @@ fn own_program() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|error| format!("the Runner's own program: {error}"))
 }
 
+/// The state folder of the installed program `program` runs as: `<state>/bin/codefusion-runner`. `None` for a
+/// program run from elsewhere, such as a build.
+fn installed_state(program: &Path) -> Option<&Path> {
+    let bin = program.parent()?;
+    (bin.file_name()? == "bin").then_some(bin.parent()?)
+}
+
 /// What launchd runs: the service until it is asked to end. Machines that stand then go on, and the Runner that
 /// starts next finds them.
 pub fn daemon(config: &Path) -> Result<(), String> {
+    let program = own_program()?;
+    // First, before anything a new program could fail at: an update under way counts its starts, and puts the
+    // program before back when it does not stay up.
+    let started = match installed_state(&program) {
+        Some(state) => update::guard(state, &program, VERSION)?,
+        None => Started::Nothing,
+    };
     let config = Config::load(config)?;
     check_beside_old_manager(&config, &home()?, &hostname())?;
     // A job is not taken from GitHub to fail for a missing image.
@@ -183,9 +204,23 @@ pub fn daemon(config: &Path) -> Result<(), String> {
     if let Some(said) = keep_out_of_backups(&config.state_dir) {
         tracing::warn!("{said}");
     }
-    let program = own_program()?;
-    runtime(2)?.block_on(async {
-        let (_machines, service) = service(&config, &program)?;
+    // Only the installed program replaces itself: one run from elsewhere would replace another.
+    let updates = (program == config.program())
+        .then(|| {
+            MacUpdate::of_this_program(
+                &config.state_dir,
+                &config.program(),
+                &config.records(),
+                config.build_folder.as_deref(),
+                entitled,
+            )
+        })
+        .flatten()
+        .map(Arc::new);
+    let runtime = runtime(2)?;
+    let ran = runtime.block_on(async {
+        let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
+        let (_machines, service) = service(&config, &program, updates)?;
         let (trigger, stop) = cf_scaleset::shutdown();
         watch_signals();
         tokio::spawn(async move {
@@ -195,10 +230,48 @@ pub fn daemon(config: &Path) -> Result<(), String> {
             trigger.trigger();
         });
         tracing::info!(version = VERSION, machine = %config.machine, "the Runner starts");
-        service.run(stop).await;
+        let stays_up = async {
+            match started {
+                Started::Nothing => {}
+                Started::Failed { id, message } => {
+                    tracing::warn!(%message, "the update did not take");
+                    service.said(&id, false, &message);
+                }
+                Started::Trying(pending) => {
+                    service.take_up(&pending);
+                    tokio::time::sleep(STAYS_UP).await;
+                    service.said(
+                        &pending.id,
+                        true,
+                        &format!("now runs {} (was {})", pending.to, pending.from),
+                    );
+                    if let Err(error) = UpdateFile::in_state(&config.state_dir).remove() {
+                        tracing::warn!(%error, "the update is done, and its file stays");
+                    }
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            () = service.run(stop) => {}
+            () = stays_up => {}
+        }
         tracing::info!("the Runner ends; machines that stand go on and are found again");
         Ok(())
-    })
+    });
+    // An update's build is ended with the Runner (the console sends its command again to the one that starts
+    // next), and a git call of one is not waited for.
+    if let Some(updates) = &updates {
+        updates.end_build();
+    }
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    if ran.is_ok()
+        && let Some(state) = installed_state(&program)
+        && let Err(error) = update::ended_in_order(state, VERSION)
+    {
+        tracing::warn!(%error, "the update under way still counts this start");
+    }
+    ran
 }
 
 /// The console's one-time code from standard input. A person at a terminal is told what is waited for, and what
@@ -278,7 +351,7 @@ pub fn enroll(config: &Path) -> Result<(), String> {
 }
 
 /// Whether the program carries the entitlement macOS asks of a program that starts virtual machines.
-fn entitled(program: &Path) -> Result<(), String> {
+pub(crate) fn entitled(program: &Path) -> Result<(), String> {
     let output = std::process::Command::new("/usr/bin/codesign")
         .args(["-d", "--entitlements", "-", "--xml"])
         .arg(program)
@@ -439,7 +512,7 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
             ..config.clone()
         };
         let (served, problems) = runtime(1)?.block_on(async {
-            let (_machines, service) = service(&probe, &program)?;
+            let (_machines, service) = service(&probe, &program, None)?;
             Ok::<_, String>(service.survey().await)
         })?;
         for line in &served {
@@ -470,31 +543,6 @@ fn agent(home: &Path) -> Agent<'_> {
     }
 }
 
-/// How many machines have a record. Counted from the files, so that a look from beside a Runner that runs
-/// changes nothing; a record nobody can read counts, since its machine may stand.
-fn standing(config: &Config) -> usize {
-    std::fs::read_dir(config.records())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
-        .count()
-}
-
-/// Puts a copy of the program where the agent runs it from, in one step: a program that runs is never written
-/// into.
-fn place(program: &Path, at: &Path) -> Result<(), String> {
-    let folder = at.parent().ok_or("the program's folder has no parent")?;
-    std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-    let fresh = at.with_extension("new");
-    std::fs::copy(program, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
-    if let Err(error) = entitled(&fresh) {
-        let _ = std::fs::remove_file(&fresh);
-        return Err(error);
-    }
-    std::fs::rename(&fresh, at).map_err(|error| format!("{}: {error}", at.display()))
-}
-
 /// Installs this program as the person's launchd agent, or replaces the one installed before (the update). It is
 /// refused while a machine stands: the Runner that starts would have to take over machines of another version.
 pub fn install(config_path: &Path) -> Result<(), String> {
@@ -506,7 +554,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
         return Err("not installed: the lines marked MISSING first".into());
     }
     let waits = "wait for its job to end, or `uninstall` to stop it";
-    match standing(&config) {
+    match crate::update::standing(&config.records()) {
         0 => {}
         n => return Err(format!("not installed: {n} machines stand; {waits}")),
     }
@@ -514,13 +562,13 @@ pub fn install(config_path: &Path) -> Result<(), String> {
     let before = std::fs::read_to_string(agent.path()).ok();
     agent.stop()?;
     // A job may have come between the look and the stop.
-    if let (n @ 1.., Some(before)) = (standing(&config), &before) {
+    if let (n @ 1.., Some(before)) = (crate::update::standing(&config.records()), &before) {
         agent.start(before)?;
         return Err(format!(
             "not installed: {n} machines stand, the Runner of before runs again; {waits}"
         ));
     }
-    place(&program, &config.program())?;
+    crate::update::place(&program, &config.program(), entitled)?;
     if let Some(said) = keep_out_of_backups(&config.state_dir) {
         eprintln!("note: {said}");
     }
@@ -555,7 +603,7 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
         own_program()?
     };
     let left = runtime(2)?.block_on(async {
-        let (machines, service) = service(&config, &program).map_err(|error| {
+        let (machines, service) = service(&config, &program, None).map_err(|error| {
             format!(
                 "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its \
                  deadline"
@@ -781,7 +829,7 @@ mod tests {
         let at = folder.path().join("bin/codefusion-runner");
         std::fs::create_dir_all(at.parent().expect("a folder")).expect("folder");
         std::fs::write(&at, "the one before").expect("a program");
-        assert!(place(&unsigned, &at).is_err());
+        assert!(crate::update::place(&unsigned, &at, entitled).is_err());
         assert_eq!(
             std::fs::read_to_string(&at).expect("the program"),
             "the one before",
@@ -799,13 +847,27 @@ mod tests {
     fn what_stands_is_counted_from_the_records_and_the_look_changes_nothing() {
         let folder = tempfile::tempdir().expect("folder");
         let config = config(folder.path(), folder.path(), false);
-        assert_eq!(standing(&config), 0, "no folder yet");
+        assert_eq!(crate::update::standing(&config.records()), 0, "no folder yet");
         std::fs::create_dir_all(config.records()).expect("folder");
-        assert_eq!(standing(&config), 0);
+        assert_eq!(crate::update::standing(&config.records()), 0);
         std::fs::write(config.records().join("j1.json"), "{}").expect("a record");
         std::fs::write(config.records().join("j2.json"), "not a record").expect("a record");
         std::fs::write(config.records().join("j3.json.tmp"), "half written").expect("a file");
-        assert_eq!(standing(&config), 2);
+        assert_eq!(crate::update::standing(&config.records()), 2);
         assert!(config.records().join("j2.json").exists());
+    }
+
+    #[test]
+    fn only_a_program_in_a_bin_folder_has_a_state_folder() {
+        assert_eq!(
+            installed_state(Path::new("/s/state/bin/codefusion-runner")),
+            Some(Path::new("/s/state"))
+        );
+        assert_eq!(
+            installed_state(Path::new("/s/target/release/codefusion-runner")),
+            None
+        );
+        assert_eq!(installed_state(Path::new("/bin")), None);
+        assert_eq!(installed_state(Path::new("codefusion-runner")), None);
     }
 }

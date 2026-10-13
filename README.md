@@ -80,7 +80,7 @@ A configuration file says what the Mac is:
   `app.json` and `app.pem` (0600).
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
-  `github_api`. Without `console` the Mac reports to none.
+  `github_api`, `build_folder` (see the update below). Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
@@ -136,10 +136,19 @@ Mac that cannot set the mark logs a line and goes on. A cache folder the Runner 
 
 One Runner works over a state folder at a time: a second `daemon` over the same one ends at once and says so.
 
-To update, build the new version and run its `install` again. It refuses while a machine stands, so a job is never
-cut off by an update. `uninstall` stops the agent and every machine, removes every scale set and registration at
-GitHub and says what it could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the
-state folder with its images.
+To update by hand, build the new version and run its `install` again. It refuses while a machine stands, so a job is
+never cut off by an update. A Runner installed so updates itself when the console asks (`update`), from a checkout of its
+own. The config's `build_folder` names that checkout, an absolute path not on an external volume, and the Runner must
+have been built there. The checkout stays at a commit (`git checkout --detach`), not on a branch, and has no changes of
+its own. Otherwise `update` touches nothing and says why: a person's checkout is never fetched into or moved. The
+update fetches `main`, checks it out at its commit and builds it while jobs run. It takes no new job until no machine
+stands and no slot promised to GitHub is left, then installs and starts again. A new program that does not stay up for
+a minute three times is replaced by the one before, and the console hears why; a start that ends as asked (a signal,
+`restart`) does not count. `restart` ends the Runner at once and launchd starts it again; machines that run go on and
+are adopted.
+
+`uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
+could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
 
 Beside the cf-runners manager of `codefusion-cc/codefusion` the Runner touches nothing of it: another launchd label,
 another folder, another name at GitHub (it refuses to run under the manager's own). Both serve a `runs-on` that includes
