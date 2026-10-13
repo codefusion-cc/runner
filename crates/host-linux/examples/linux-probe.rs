@@ -1,7 +1,7 @@
 //! Prints what the Runner reads from this Linux host, to compare with `free -b`, `/proc/vmstat`, `/proc/pressure`,
 //! the thermal zones and `df`. It only reads and prints, and prints no name of the host.
 //!
-//! `cargo run -p cf-host-linux --example host-probe [the state folder]`
+//! `cargo run -p cf-host-linux --example linux-probe [the state folder]`
 
 use std::path::Path;
 use std::process::ExitCode;
