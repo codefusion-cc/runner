@@ -3465,3 +3465,24 @@ async fn new_settings_and_an_update_never_wait_at_once() {
         "{kept}"
     );
 }
+
+/// An update's limit runs from the console's command, the build included: a build that takes most of it leaves the
+/// wait for the machines what is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_updates_limit_counts_its_build() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.job_running().await;
+    rig.updates.build_takes(Duration::from_millis(3000));
+    rig.updates.build_gives(Ok(NEWER));
+    let began = std::time::Instant::now();
+    let update = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    // The test's limit is 4 seconds: with the build's 3 left out, the wait alone would take 4 more.
+    assert!(
+        began.elapsed() < Duration::from_millis(6000),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(results_of(&rig.console, &update)[0]["ok"], json!(false));
+}
