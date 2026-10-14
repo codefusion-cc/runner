@@ -84,7 +84,8 @@ pub struct HostReading {
     pub pressure: Pressure,
     /// Swap in use.
     pub swap_used_bytes: u64,
-    /// Pages swapped out since boot. Only that it changed matters.
+    /// What the host has swapped out: pages since boot on a Mac; on Linux what `cf_host_linux::reading`
+    /// makes of its swap, which may also go down. Only that it changed matters.
     pub swapouts: u64,
     /// Time since the person last used the keyboard or the mouse.
     pub idle: Millis,

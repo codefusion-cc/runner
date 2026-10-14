@@ -1,7 +1,7 @@
 //! What the Runner reads from Linux, behind the budget's [`Host`](cf_budget::Host) trait. The Linux counterpart of
 //! `cf-host-macos`, with the same names where the two do the same.
 //!
-//! - [`LinuxHost`] reads `/proc/meminfo` (`MemAvailable`, swap), `/proc/vmstat` (`pswpout`), PSI's
+//! - [`LinuxHost`] reads `/proc/meminfo` (`MemAvailable`, swap), `/proc/vmstat` (`pswpout`), `/proc/swaps`, PSI's
 //!   `/proc/pressure/memory` when the kernel has it, the thermal zones and their trip points, the power supplies,
 //!   and `statvfs` of the state folder. It only reads; nothing here changes the host. PSI's `cpu` and `io` files
 //!   are not read: the budget decides by memory, heat, power and disk, and has no use for them.
@@ -21,9 +21,11 @@ mod host;
 pub mod parse;
 mod read;
 
-pub use convert::{Raw, Supply, Trip, TripKind, Zone, cpu_percent, pressure_of, reading, thermal_of};
+pub use convert::{
+    Raw, Supply, Trip, TripKind, Zone, cpu_percent, pressure_of, reading, swapouts_of, thermal_of,
+};
 pub use host::LinuxHost;
-pub use parse::{CpuTicks, Psi};
+pub use parse::{CpuTicks, Psi, Swap};
 pub use read::{
     Process, battery, boot_session, boot_time, fast_cpus, host_name, load, model, process, program_of, under,
 };

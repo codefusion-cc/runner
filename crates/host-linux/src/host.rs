@@ -41,6 +41,7 @@ impl LinuxHost {
         Ok(Raw {
             memory: read::meminfo(&self.root)?,
             swapouts: read::swapouts(&self.root)?,
+            swaps: read::swaps(&self.root),
             memory_pressure: read::memory_pressure(&self.root)?,
             zones: read::zones(&self.root),
             supplies: read::supplies(&self.root),

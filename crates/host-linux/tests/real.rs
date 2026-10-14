@@ -63,6 +63,10 @@ fn memory_and_swap_agree_with_free() {
         swap[1]
     );
     assert!(reading.available_bytes <= raw.memory.total_bytes);
+    // `/proc/swaps` is read, or zram would count as swapping, and its areas hold the swap `free` counts.
+    let swaps = raw.swaps.as_ref().expect("/proc/swaps as the kernel writes it");
+    let used: u64 = swaps.iter().map(|swap| swap.used_bytes).sum();
+    assert!(near(used, swap[1]), "{used} against {}", swap[1]);
     // PSI is there exactly when the kernel offers the file.
     assert_eq!(
         raw.memory_pressure.is_some(),

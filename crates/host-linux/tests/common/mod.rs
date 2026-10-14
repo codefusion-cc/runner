@@ -19,6 +19,9 @@ Hugepagesize:       2048 kB
 ";
 
 pub const VMSTAT: &str = "nr_free_pages 1566262\npswpin 0\npswpout 0\npgpgin 482811\n";
+/// The board's `/proc/swaps`: zram alone.
+pub const SWAPS_ZRAM: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n\
+                              /dev/zram0                              partition\t4064908\t\t37120\t\t100\n";
 
 pub const PSI: &str = "\
 some avg10=0.00 avg60=0.00 avg300=0.00 total=0
@@ -63,6 +66,7 @@ impl Tree {
         let tree = Tree::empty();
         tree.file("/proc/meminfo", MEMINFO);
         tree.file("/proc/vmstat", VMSTAT);
+        tree.file("/proc/swaps", SWAPS_ZRAM);
         tree.file("/proc/pressure/memory", PSI);
         tree.file("/proc/stat", STAT);
         tree.file("/proc/loadavg", "0.13 0.09 0.03 1/265 4955\n");

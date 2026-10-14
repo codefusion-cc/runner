@@ -5,7 +5,7 @@ mod common;
 
 use cf_budget::{Pressure, Thermal};
 use cf_host_linux::parse::{
-    self, CpuTicks, Meminfo, Psi, boot_id, btime, counter, cpu_list, cpu_ticks, loadavg, meminfo,
+    self, CpuTicks, Meminfo, Psi, Swap, boot_id, btime, counter, cpu_list, cpu_ticks, loadavg, meminfo,
     millidegrees, psi, start_ticks, text,
 };
 use cf_host_linux::{Trip, TripKind, Zone, cpu_percent, pressure_of, thermal_of};
@@ -295,6 +295,38 @@ proptest! {
     }
 
     #[test]
+    fn swaps_give_back_each_area_the_kernel_wrote(
+        areas in prop::collection::vec(
+            (
+                // A name, and whether it names a zram device.
+                prop_oneof![
+                    "/dev/zram[0-9]{1,3}".prop_map(|name| (name, true)),
+                    "/dev/zram([0-9]{0,2}[a-z_]{1,3})?".prop_map(|name| (name, false)),
+                    "/[a-y0-9_]{1,12}(/[a-z0-9_]{1,12}){0,3}".prop_map(|name| (name, false)),
+                ],
+                any::<bool>(),
+                0..u64::MAX / 1024,
+                any::<u64>(),
+                any::<i32>(),
+            ),
+            0..8,
+        ),
+    ) {
+        let mut text = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_string();
+        let mut want = Vec::new();
+        for ((name, zram_name), partition, size, used, priority) in &areas {
+            let used = used % (size + 1);
+            let kind = if *partition { "partition" } else { "file" };
+            // As `swap_show` writes it: the name padded to 40 columns, at least one space, then tabs.
+            let pad = 40usize.saturating_sub(name.len()).max(1);
+            text += &format!("{name}{:pad$}{kind}\t{size}\t\t{used}\t\t{priority}\n", "");
+            // A file named like zram is a file on a disk.
+            want.push(Swap { zram: *zram_name && *partition, used_bytes: used * 1024 });
+        }
+        prop_assert_eq!(parse::swaps(&text), Some(want));
+    }
+
+    #[test]
     fn no_text_makes_a_parser_panic(text_in in "\\PC{0,200}", bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = meminfo(&text_in);
         let _ = counter(&text_in, "pswpout");
@@ -307,6 +339,8 @@ proptest! {
         let _ = boot_id(&text_in);
         let _ = millidegrees(&text_in);
         let _ = parse::count(&text_in);
+        let _ = parse::swaps(&text_in);
+        let _ = parse::swaps(&format!("Filename Type Size Used Priority\n{text_in}"));
         let _ = text(&bytes);
     }
 }
