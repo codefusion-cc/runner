@@ -421,6 +421,7 @@ dependencies = [
  "cf-budget",
  "cf-console-client",
  "cf-daemon",
+ "cf-fake-github",
  "cf-ghapp",
  "cf-guest-proto",
  "cf-host-linux",
