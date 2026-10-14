@@ -1170,6 +1170,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     &record.repo,
                     copy.default_branch.as_deref(),
                     record.github.as_ref(),
+                    copy.run.as_ref(),
                     copy.end,
                 );
                 caches.settle(&record.repo, &copy, why_not, self.wall());
@@ -1181,6 +1182,39 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             inner.jobs.remove(name);
         }
         opened
+    }
+
+    /// The workflow runs to read for Docker jobs' copies, as `(job, repository, run)`: a copy is kept only when GitHub
+    /// says its run checked out the default branch ([`caches::refusal`]). The sweep reads them while the jobs run and
+    /// gives each answer to [`Machines::run_read`].
+    pub fn runs_to_read(&self) -> Vec<(String, String, i64)> {
+        let inner = self.lock();
+        inner
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.record
+                    .docker_copy
+                    .as_ref()
+                    .is_some_and(|copy| copy.run.is_none())
+            })
+            .filter_map(|(name, job)| {
+                let github = job.record.github.as_ref().filter(|github| github.run_id > 0)?;
+                Some((name.clone(), job.record.repo.clone(), github.run_id))
+            })
+            .collect()
+    }
+
+    /// What GitHub said of a Docker job's run, kept with its copy.
+    pub fn run_read(&self, name: &str, run: caches::WorkflowRun) {
+        let mut inner = self.lock();
+        let Some(job) = inner.jobs.get_mut(name) else {
+            return;
+        };
+        if let Some(copy) = job.record.docker_copy.as_mut().filter(|copy| copy.run.is_none()) {
+            copy.run = Some(run);
+            self.store.save(&job.record);
+        }
     }
 
     /// The registrations at GitHub that have to go: of Actions runners asking for their removal, of machines that

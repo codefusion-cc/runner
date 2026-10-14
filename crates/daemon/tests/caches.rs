@@ -8,7 +8,9 @@ use std::fs;
 use std::path::Path;
 
 use cf_daemon::GithubJob;
-use cf_daemon::caches::{Cache, CacheCopy, CacheStore, DISK_BYTES, evictions, key, refusal, spoiled};
+use cf_daemon::caches::{
+    Cache, CacheCopy, CacheStore, DISK_BYTES, WorkflowRun, evictions, key, refusal, spoiled,
+};
 use cf_guest_proto::{CacheEnd, CacheFound};
 use proptest::prelude::*;
 use support::{cache_folder, head};
@@ -39,6 +41,15 @@ fn on_main() -> GithubJob {
     )
 }
 
+/// What GitHub's REST API says of a push's run on main.
+fn main_run() -> WorkflowRun {
+    WorkflowRun {
+        head_branch: Some("main".into()),
+        head_repository: Some(REPO.into()),
+        event: "push".into(),
+    }
+}
+
 fn clean(found: CacheFound) -> Option<CacheEnd> {
     Some(CacheEnd {
         found,
@@ -50,7 +61,13 @@ fn clean(found: CacheFound) -> Option<CacheEnd> {
 #[test]
 fn a_successful_push_to_the_default_branch_with_a_clean_disk_is_kept() {
     assert_eq!(
-        refusal(REPO, Some("main"), Some(&on_main()), clean(CacheFound::Fresh)),
+        refusal(
+            REPO,
+            Some("main"),
+            Some(&on_main()),
+            Some(&main_run()),
+            clean(CacheFound::Fresh)
+        ),
         None
     );
     for event in ["schedule", "workflow_dispatch"] {
@@ -59,7 +76,16 @@ fn a_successful_push_to_the_default_branch_with_a_clean_disk_is_kept() {
             ..on_main()
         };
         assert_eq!(
-            refusal(REPO, Some("main"), Some(&job), clean(CacheFound::Reused)),
+            refusal(
+                REPO,
+                Some("main"),
+                Some(&job),
+                Some(&WorkflowRun {
+                    event: event.into(),
+                    ..main_run()
+                }),
+                clean(CacheFound::Reused)
+            ),
             None,
             "{event}"
         );
@@ -70,7 +96,16 @@ fn a_successful_push_to_the_default_branch_with_a_clean_disk_is_kept() {
         Some("success"),
     );
     assert_eq!(
-        refusal(REPO, Some("main"), Some(&spelled), clean(CacheFound::Reused)),
+        refusal(
+            REPO,
+            Some("main"),
+            Some(&spelled),
+            Some(&WorkflowRun {
+                head_repository: Some("CodeFusion-CC/Shop".into()),
+                ..main_run()
+            }),
+            clean(CacheFound::Reused)
+        ),
         None,
         "GitHub's names ignore case"
     );
@@ -79,7 +114,8 @@ fn a_successful_push_to_the_default_branch_with_a_clean_disk_is_kept() {
 #[test]
 fn each_condition_alone_refuses() {
     let end = clean(CacheFound::Reused);
-    let with = |job: GithubJob| refusal(REPO, Some("main"), Some(&job), end);
+    let run = main_run();
+    let with = |job: GithubJob| refusal(REPO, Some("main"), Some(&job), Some(&run), end);
     for event in [
         "pull_request",
         "pull_request_target",
@@ -136,24 +172,72 @@ fn each_condition_alone_refuses() {
         );
     }
     assert!(
-        refusal(REPO, Some("main"), None, end).is_some(),
+        refusal(REPO, Some("main"), None, Some(&run), end).is_some(),
         "no word from GitHub"
     );
     assert!(
-        refusal(REPO, None, Some(&on_main()), end).is_some(),
+        refusal(REPO, None, Some(&on_main()), Some(&run), end).is_some(),
         "no default branch known"
     );
     assert!(
-        refusal(REPO, Some(""), Some(&on_main()), end).is_some(),
+        refusal(REPO, Some(""), Some(&on_main()), Some(&run), end).is_some(),
         "an empty default branch"
     );
     assert!(
-        refusal(REPO, Some("develop"), Some(&on_main()), end).is_some(),
+        refusal(REPO, Some("develop"), Some(&on_main()), Some(&run), end).is_some(),
         "main is not the default"
     );
     assert!(
-        refusal(REPO, Some("main"), Some(&on_main()), None).is_some(),
+        refusal(REPO, Some("main"), Some(&on_main()), Some(&run), None).is_some(),
         "no word from the guest"
+    );
+    let on = |run: Option<&WorkflowRun>| refusal(REPO, Some("main"), Some(&on_main()), run, end);
+    assert!(on(None).is_some(), "the run was not read");
+    for head_branch in [None, Some("feature"), Some("Main"), Some("main2"), Some("")] {
+        let run = WorkflowRun {
+            head_branch: head_branch.map(str::to_string),
+            ..main_run()
+        };
+        assert!(
+            on(Some(&run)).is_some(),
+            "a reusable workflow at main run from {head_branch:?}"
+        );
+    }
+    for head_repository in [
+        None,
+        Some("someone/shop"),
+        Some("codefusion-cc/shop-fork"),
+        Some(""),
+    ] {
+        let run = WorkflowRun {
+            head_repository: head_repository.map(str::to_string),
+            ..main_run()
+        };
+        assert!(on(Some(&run)).is_some(), "code of {head_repository:?}");
+    }
+    for event in ["pull_request", "workflow_call", ""] {
+        let run = WorkflowRun {
+            event: event.into(),
+            ..main_run()
+        };
+        assert!(on(Some(&run)).is_some(), "the run's event {event}");
+    }
+    // A branch whose name holds `@` and a ref: its workflow's ref would end in the default branch.
+    let tricked = GithubJob {
+        workflow: "codefusion-cc/shop/.github/workflows/ci.yml@refs/heads/x@refs/heads/main".into(),
+        ..on_main()
+    };
+    assert!(
+        refusal(REPO, Some("main"), Some(&tricked), Some(&run), end).is_some(),
+        "two refs"
+    );
+    let tricked_run = WorkflowRun {
+        head_branch: Some("x@refs/heads/main".into()),
+        ..main_run()
+    };
+    assert!(
+        refusal(REPO, Some("main"), Some(&tricked), Some(&tricked_run), end).is_some(),
+        "two refs, and the run's own branch"
     );
     for (clean, daemon) in [(false, true), (true, false), (false, false)] {
         let end = Some(CacheEnd {
@@ -162,7 +246,7 @@ fn each_condition_alone_refuses() {
             daemon,
         });
         assert!(
-            refusal(REPO, Some("main"), Some(&on_main()), end).is_some(),
+            refusal(REPO, Some("main"), Some(&on_main()), Some(&run), end).is_some(),
             "{clean} {daemon}"
         );
     }
@@ -177,10 +261,15 @@ proptest! {
         result in prop_oneof![Just("succeeded".to_string()), "[a-z]{0,10}"],
         clean in any::<bool>(),
         daemon in any::<bool>(),
+        head in prop_oneof![Just("main".to_string()), "[a-z@/-]{0,12}"],
+        read in any::<bool>(),
     ) {
         let job = github(&event, &format!("{repo}/.github/workflows/x.yml@refs/heads/{branch}"), Some(&result));
         let end = Some(CacheEnd { found: CacheFound::Reused, clean, daemon });
-        if refusal(REPO, Some("main"), Some(&job), end).is_none() {
+        let run = WorkflowRun { head_branch: Some(head.clone()), head_repository: Some(repo.clone()), event: event.clone() };
+        if refusal(REPO, Some("main"), Some(&job), read.then_some(&run), end).is_none() {
+            prop_assert!(read);
+            prop_assert_eq!(head, "main");
             prop_assert!(["push", "schedule", "workflow_dispatch"].contains(&event.as_str()));
             prop_assert_eq!(branch, "main");
             prop_assert!(repo.eq_ignore_ascii_case(REPO));

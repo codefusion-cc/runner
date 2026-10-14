@@ -480,6 +480,15 @@ impl ScaleSetClient {
             .await?)
     }
 
+    /// What GitHub says of a workflow run of the repository; `None` when it has no such run.
+    pub async fn workflow_run(&self, run_id: i64) -> Result<Option<cf_ghapp::WorkflowRun>, Error> {
+        Ok(self
+            .inner
+            .app
+            .workflow_run(self.inner.installation, &self.inner.repo, run_id)
+            .await?)
+    }
+
     /// Removes a registered Actions runner. An Actions runner with a job refuses (the service answers 422); one that is
     /// gone is [`Error::is_not_found`].
     pub async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {

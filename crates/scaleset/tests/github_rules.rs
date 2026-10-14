@@ -197,3 +197,34 @@ async fn a_stale_rest_view_answers_what_the_read_before_saw() {
         "never registered"
     );
 }
+
+#[tokio::test]
+async fn a_run_says_the_branch_its_code_came_from_not_its_workflows() {
+    let h = harness_with(honest(), fast(), Duration::from_secs(5)).await;
+    let main = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    let pull = h
+        .fake
+        .queue_job_at(REPO, &["self-hosted", "cf-2g"], "build", "refs/pull/4/merge");
+    let called = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    // A reusable workflow at main, called from a workflow of another branch: its code is that branch's.
+    h.fake.set_run_head(called, "feature");
+    let run = |request| h.fake.run_id_of(request).unwrap();
+
+    let read = h.client.workflow_run(run(main)).await.unwrap().expect("a run");
+    assert_eq!(
+        (
+            read.head_branch.as_deref(),
+            read.head_repository.as_deref(),
+            read.event.as_str()
+        ),
+        (Some("main"), Some(REPO), "push")
+    );
+    let read = h.client.workflow_run(run(pull)).await.unwrap().expect("a run");
+    assert_eq!(
+        (read.head_branch.as_deref(), read.event.as_str()),
+        (Some("feature"), "pull_request")
+    );
+    let read = h.client.workflow_run(run(called)).await.unwrap().expect("a run");
+    assert_eq!(read.head_branch.as_deref(), Some("feature"));
+    assert_eq!(h.client.workflow_run(424_242).await.unwrap(), None, "no such run");
+}

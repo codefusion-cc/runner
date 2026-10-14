@@ -6,8 +6,8 @@ use base64::engine::general_purpose::STANDARD;
 use cf_secret::Secret;
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, LINK};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::credentials::{AppCredentials, AppKey};
@@ -31,6 +31,18 @@ const MAX_PAGES: usize = 100;
 pub struct Installation {
     /// The installation's ID.
     pub id: i64,
+}
+
+/// A workflow run as GitHub keeps it: where its code came from, which is not always where its workflow file did (a
+/// reusable workflow at another ref runs the caller's code).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    /// The branch of the code the run checked out; none for some events.
+    pub head_branch: Option<String>,
+    /// The repository of that code, `owner/name`: a fork's for a pull request from one.
+    pub head_repository: Option<String>,
+    /// `push`, `pull_request` and so on.
+    pub event: String,
 }
 
 /// A repository the App may serve.
@@ -328,6 +340,40 @@ impl GitHubApp {
             Ok(response) => Ok(Some(
                 self.decode::<RunnerState>("Actions runner", &response)?.busy,
             )),
+            Err(Error::Status(s)) if s.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// What GitHub says of a workflow run of a repository: the branch and repository its code came from and its
+    /// event. `None` when GitHub has no such run.
+    pub async fn workflow_run(
+        &self,
+        installation: i64,
+        repo: &str,
+        run_id: i64,
+    ) -> Result<Option<WorkflowRun>, Error> {
+        #[derive(Deserialize)]
+        struct Named {
+            full_name: String,
+        }
+        #[derive(Deserialize)]
+        struct Run {
+            head_branch: Option<String>,
+            head_repository: Option<Named>,
+            #[serde(default)]
+            event: String,
+        }
+        let path = format!("/repos/{repo}/actions/runs/{run_id}");
+        match self.as_installation(installation, Method::GET, &path).await {
+            Ok(response) => {
+                let run = self.decode::<Run>("workflow run", &response)?;
+                Ok(Some(WorkflowRun {
+                    head_branch: run.head_branch,
+                    head_repository: run.head_repository.map(|named| named.full_name),
+                    event: run.event,
+                }))
+            }
             Err(Error::Status(s)) if s.status == 404 => Ok(None),
             Err(e) => Err(e),
         }

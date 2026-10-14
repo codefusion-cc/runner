@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::records::GithubJob;
+pub use cf_ghapp::WorkflowRun;
 
 /// The size of a cache disk as the guest sees it. The file is sparse: the host holds only what was written.
 pub const DISK_BYTES: u64 = 20 << 30;
@@ -38,12 +39,17 @@ pub fn key(repo: &str) -> String {
 const WRITERS: [&str; 3] = ["push", "schedule", "workflow_dispatch"];
 
 /// Why a job's copy does not become its repository's cache; `None` when it does. Every condition must be known and
-/// hold, so what is unknown refuses: GitHub's result, the event, the workflow's ref, the default branch, the guest's
-/// word on the disk.
+/// hold, so what is unknown refuses: GitHub's result, the event, the workflow's ref, the default branch, the run's
+/// branch, the guest's word on the disk.
+///
+/// The workflow's ref is where its file is, not where the code it runs came from: a reusable workflow at the default
+/// branch that another branch's workflow calls runs that branch's code. So the run itself (`run`, which GitHub's REST
+/// API says) must have checked out the default branch of this repository.
 pub fn refusal(
     repo: &str,
     default_branch: Option<&str>,
     github: Option<&GithubJob>,
+    run: Option<&WorkflowRun>,
     end: Option<CacheEnd>,
 ) -> Option<&'static str> {
     let Some(github) = github else {
@@ -56,9 +62,12 @@ pub fn refusal(
         return Some("only a push, a schedule or a dispatch writes the cache");
     }
     // `owner/name/.github/workflows/file.yml@refs/heads/main`: the repository and the ref the workflow ran at.
-    let Some((path, git_ref)) = github.workflow.rsplit_once('@') else {
+    let Some((path, git_ref)) = github.workflow.split_once('@') else {
         return Some("the job's workflow names no ref");
     };
+    if git_ref.contains('@') {
+        return Some("the job's workflow names more than one ref");
+    }
     let own = path
         .get(..repo.len() + 1)
         .is_some_and(|start| start.eq_ignore_ascii_case(&format!("{repo}/")));
@@ -70,6 +79,22 @@ pub fn refusal(
     };
     if git_ref != format!("refs/heads/{branch}") {
         return Some("the run is not on the default branch");
+    }
+    let Some(run) = run else {
+        return Some("GitHub's run was not read");
+    };
+    if run.head_branch.as_deref() != Some(branch) {
+        return Some("the run's code is not the default branch's");
+    }
+    if !run
+        .head_repository
+        .as_deref()
+        .is_some_and(|head| head.eq_ignore_ascii_case(repo))
+    {
+        return Some("the run's code is another repository's");
+    }
+    if run.event != github.event {
+        return Some("the run's event is not the job's");
     }
     let Some(end) = end else {
         return Some("the machine said nothing of the cache");
@@ -190,6 +215,9 @@ pub struct CacheCopy {
     /// What the guest said of the disk at the job's end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<CacheEnd>,
+    /// What GitHub said of the job's run, read while the job ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<WorkflowRun>,
 }
 
 impl CacheStore {
@@ -320,6 +348,7 @@ impl CacheStore {
                     path,
                     default_branch: default_branch.map(str::to_string),
                     end: None,
+                    run: None,
                 })
             }
             Err(error) => {

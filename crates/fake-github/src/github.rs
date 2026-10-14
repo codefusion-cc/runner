@@ -223,6 +223,8 @@ struct State {
     rest_stale: bool,
     /// What the REST view of each Actions runner said at its last read: busy or not, `None` once removed.
     rest_seen: HashMap<i64, Option<bool>>,
+    /// The branch a run's code came from where it is not its workflow's ([`FakeGithub::set_run_head`]).
+    run_heads: HashMap<i64, String>,
     /// Whether every request is dropped unanswered and changes nothing ([`FakeGithub::set_down`]).
     down: bool,
     /// How often a job was handed to a scale set, the same job again after a take-back included.
@@ -425,6 +427,7 @@ impl FakeGithub {
                 registered: HashMap::new(),
                 rest_stale: false,
                 rest_seen: HashMap::new(),
+                run_heads: HashMap::new(),
                 down: false,
                 assignments: 0,
             }),
@@ -510,6 +513,29 @@ impl FakeGithub {
     /// first read the view as the registration left it (registered, idle). Off, it answers what is true now.
     pub fn set_rest_stale(&self, stale: bool) {
         self.lock().rest_stale = stale;
+    }
+
+    /// Says that the run of a queued job checked out `branch`, whatever ref its workflow file is at: as a reusable
+    /// workflow pinned to the default branch that another branch's workflow calls.
+    pub fn set_run_head(&self, request_id: i64, branch: &str) {
+        let mut st = self.lock();
+        if let Some(run) = st
+            .jobs
+            .iter()
+            .find(|j| j.request_id == request_id)
+            .map(|j| j.run_id)
+        {
+            st.run_heads.insert(run, branch.to_string());
+        }
+    }
+
+    /// The run of a queued job.
+    pub fn run_id_of(&self, request_id: i64) -> Option<i64> {
+        self.lock()
+            .jobs
+            .iter()
+            .find(|j| j.request_id == request_id)
+            .map(|j| j.run_id)
     }
 
     /// Takes the fake down: every request is dropped unanswered and changes nothing, as for a client whose process
@@ -933,6 +959,36 @@ impl FakeGithub {
                     let exp = st.now() + 3600;
                     st.registration_tokens.insert(token.clone(), (exp, name.clone()));
                     Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
+                })
+            }
+            // A workflow run: the branch its code came from (a pull request's head, a push's branch) and its event.
+            ("GET", ["repos", owner, repo, "actions", "runs", id]) => {
+                let name = format!("{owner}/{repo}");
+                let id: i64 = id.parse().unwrap_or(0);
+                self.with_installation(&req, |st| {
+                    let Some(job) = st.jobs.iter().find(|j| j.run_id == id && j.repo == name) else {
+                        return Reply::status_json(404, &json!({"message": "Not Found"}));
+                    };
+                    let (event, head) = match job.git_ref.strip_prefix("refs/pull/") {
+                        Some(_) => ("pull_request", "feature".to_string()),
+                        None => (
+                            "push",
+                            job.git_ref
+                                .strip_prefix("refs/heads/")
+                                .or_else(|| job.git_ref.strip_prefix("refs/tags/"))
+                                .unwrap_or(&job.git_ref)
+                                .to_string(),
+                        ),
+                    };
+                    let head = st.run_heads.get(&id).cloned().unwrap_or(head);
+                    Reply::json(&json!({
+                        "id": id,
+                        "head_branch": head,
+                        "event": event,
+                        "path": ".github/workflows/ci.yml",
+                        "head_repository": {"full_name": name},
+                        "repository": {"full_name": name},
+                    }))
                 })
             }
             // Probe H, 2026-10-12: `busy` and `status` for an Actions runner registered for a scale set, by the ID its

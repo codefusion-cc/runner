@@ -935,6 +935,23 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
+        self.read_runs().await;
+    }
+
+    /// Reads the workflow runs of Docker jobs with a cache copy ([`Machines::runs_to_read`]). A run that cannot be read
+    /// is asked again at the next sweep; one never read keeps its job's copy from becoming the cache.
+    async fn read_runs(&self) {
+        let shared = &self.shared;
+        for (job, repo, run_id) in shared.machines.runs_to_read() {
+            let Some(client) = self.client_for(&repo).await else {
+                continue;
+            };
+            match client.workflow_run(run_id).await {
+                Ok(Some(run)) => shared.machines.run_read(&job, run),
+                Ok(None) => tracing::debug!(%job, %repo, run_id, "GitHub has no such run yet"),
+                Err(error) => tracing::debug!(%job, %repo, run_id, %error, "a run was not read; asked again"),
+            }
+        }
     }
 
     /// Leaves a registration to a later sweep.

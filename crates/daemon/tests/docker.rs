@@ -4,6 +4,7 @@
 
 mod support;
 
+use cf_daemon::caches::WorkflowRun;
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
 use cf_daemon::{Claim, DOCKER_FULL, EventKind, Slots};
@@ -174,9 +175,51 @@ fn copy_of_last_start(w: &World) -> std::path::PathBuf {
         .expect("a copy of the cache")
 }
 
+/// What GitHub's REST API says of the run of a job whose workflow is at `workflow`: the branch of that ref, or a
+/// pull request's head.
+fn run_of(event: &str, workflow: &str) -> WorkflowRun {
+    WorkflowRun {
+        head_branch: Some(
+            workflow
+                .rsplit_once("@refs/heads/")
+                .map_or("feature", |(_, branch)| branch)
+                .into(),
+        ),
+        head_repository: Some(REPO.into()),
+        event: event.into(),
+    }
+}
+
+/// What the sweep does while a job runs: reads its run, as GitHub says it.
+fn read_run(w: &World, runner: &str, run: WorkflowRun) {
+    let wanted = w.m.runs_to_read();
+    assert_eq!(
+        wanted,
+        [(job_name(runner).to_string(), REPO.to_string(), 42)],
+        "the run to read"
+    );
+    w.m.run_read(job_name(runner), run);
+    assert!(w.m.runs_to_read().is_empty(), "read once");
+}
+
 /// The job ends: its machine first, then GitHub's word on it.
 fn ends(w: &mut World, runner: &str, result: &str, event: &str, workflow: &str) {
+    ends_with_run(w, runner, result, event, workflow, Some(run_of(event, workflow)));
+}
+
+/// [`ends`] with what the sweep read of the run, if anything.
+fn ends_with_run(
+    w: &mut World,
+    runner: &str,
+    result: &str,
+    event: &str,
+    workflow: &str,
+    run: Option<WorkflowRun>,
+) {
     w.github_run(EventKind::Started, runner, "", event, workflow);
+    if let Some(run) = run {
+        read_run(w, runner, run);
+    }
     w.parts.vms.end(job_name(runner), End::Ok);
     pass(&w.m, 2);
     w.github_run(EventKind::Completed, runner, result, event, workflow);
@@ -312,6 +355,7 @@ async fn a_cache_copy_outlives_a_restart_of_the_runner_and_is_settled_after() {
     w.parts.vms.ready(job_name(&runner));
     pass(&w.m, 2);
     w.github_run(EventKind::Started, &runner, "", "push", ON_MAIN);
+    read_run(&w, &runner, run_of("push", ON_MAIN));
     w.restart();
     w.parts.vms.end(job_name(&runner), End::Ok);
     pass(&w.m, 2);
@@ -336,5 +380,45 @@ async fn a_machine_that_does_not_start_leaves_no_copy_and_a_plain_job_gets_none(
         w.parts.vms.started().last().unwrap().docker_cache,
         None,
         "{plain} has no Docker"
+    );
+}
+
+#[tokio::test]
+async fn a_job_whose_run_checked_out_another_branch_or_was_never_read_does_not_write_the_cache() {
+    let Some((dir, mut w)) = caching() else { return };
+    let first = docker_job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"main").unwrap();
+    ends(&mut w, &first, "succeeded", "push", ON_MAIN);
+
+    // A reusable workflow at main, called by a push to another branch: its workflow's ref is main's, its code is not.
+    let called = docker_job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"a feature branch").unwrap();
+    let feature = WorkflowRun {
+        head_branch: Some("feature".into()),
+        ..run_of("push", ON_MAIN)
+    };
+    ends_with_run(&mut w, &called, "succeeded", "push", ON_MAIN, Some(feature));
+    // A run the sweep never read: GitHub was away the whole job.
+    let unread = docker_job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"unread").unwrap();
+    ends_with_run(&mut w, &unread, "succeeded", "push", ON_MAIN, None);
+
+    let next = docker_job(&mut w).await;
+    assert_eq!(head(&copy_of_last_start(&w)), b"main");
+    ends(&mut w, &next, "failed", "push", ON_MAIN);
+    assert_eq!(kept_repos(dir.path()), [REPO]);
+    let whys: Vec<String> =
+        w.m.snapshot()
+            .cache_events
+            .iter()
+            .filter_map(|event| event.why.clone())
+            .collect();
+    assert!(
+        whys.contains(&"the run's code is not the default branch's".to_string()),
+        "{whys:?}"
+    );
+    assert!(
+        whys.contains(&"GitHub's run was not read".to_string()),
+        "{whys:?}"
     );
 }
