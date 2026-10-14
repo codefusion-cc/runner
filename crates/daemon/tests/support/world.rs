@@ -66,6 +66,14 @@ impl World {
         World::on(settings_for(machines))
     }
 
+    /// A Mac with room for `machines` machines that keeps Docker jobs' caches in `dir`, `budget` bytes of them.
+    pub fn with_docker_cache(machines: u32, dir: &std::path::Path, budget: u64) -> World {
+        let mut world = World::new(machines);
+        world.parts.docker_cache = Some((dir.to_path_buf(), budget));
+        world.m = world.parts.machines(None);
+        world
+    }
+
     /// A Mac with these numbers.
     pub fn on(settings: cf_budget::Settings) -> World {
         World::keeping(settings, Arc::new(MemoryStore::default()))
@@ -82,6 +90,7 @@ impl World {
             settings,
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
+            docker_cache: None,
             bell: Arc::default(),
         };
         let m = parts.machines(None);
@@ -174,14 +183,19 @@ impl World {
 
     /// GitHub says a job started on the Actions runner, or completed with this result.
     pub fn github(&self, kind: EventKind, runner: &str, result: &str) {
+        self.github_run(kind, runner, result, "push", "ci.yml");
+    }
+
+    /// [`World::github`] for a run of this event, of a workflow at this ref (`owner/name/…/ci.yml@refs/heads/main`).
+    pub fn github_run(&self, kind: EventKind, runner: &str, result: &str, event: &str, workflow: &str) {
         self.m.job(&JobEvent {
             kind,
             runner: runner.into(),
             repo: REPO.into(),
             job: "build".into(),
-            workflow: "ci.yml".into(),
+            workflow: workflow.into(),
             run_id: 42,
-            event: "push".into(),
+            event: event.into(),
             queued_at: Some(OffsetDateTime::UNIX_EPOCH),
             started_at: Some(OffsetDateTime::UNIX_EPOCH),
             at: OffsetDateTime::UNIX_EPOCH,

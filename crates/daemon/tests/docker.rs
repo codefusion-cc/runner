@@ -148,3 +148,149 @@ async fn a_docker_scale_set_acquires_one_job_and_offers_no_more_while_it_runs() 
         "the running job, and still nothing to offer"
     );
 }
+
+// Docker jobs' caches: a job runs with a copy of its repository's cache, which becomes the cache only after a
+// successful run of the repository's own workflow on its default branch whose disk the guest let go cleanly.
+
+const ON_MAIN: &str = "org/app/.github/workflows/ci.yml@refs/heads/main";
+
+/// A Docker job on a machine of its own, started with a promise: its Actions runner's name.
+async fn docker_job(w: &mut World) -> String {
+    let ticket = w.m.reserve_docker(SIZE).expect("room for a Docker job");
+    let Claim::Start(ticket) = w.m.claim(SIZE, Some(ticket)) else {
+        panic!("the promise is claimed");
+    };
+    w.start_on(ticket).await.expect("the machine starts")
+}
+
+fn copy_of_last_start(w: &World) -> std::path::PathBuf {
+    w.parts.vms.started().last().unwrap().docker_cache.clone().expect("a copy of the cache")
+}
+
+/// The job ends: its machine first, then GitHub's word on it.
+fn ends(w: &mut World, runner: &str, result: &str, event: &str, workflow: &str) {
+    w.github_run(EventKind::Started, runner, "", event, workflow);
+    w.parts.vms.end(job_name(runner), End::Ok);
+    pass(&w.m, 2);
+    w.github_run(EventKind::Completed, runner, result, event, workflow);
+    w.assert_nothing_left();
+}
+
+fn head(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).unwrap().take(64).read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
+fn kept_repos(dir: &std::path::Path) -> Vec<String> {
+    cf_daemon::caches::CacheStore::open(dir, u64::MAX)
+        .map(|caches| caches.list().into_iter().map(|(_, cache)| cache.repo).collect())
+        .unwrap_or_default()
+}
+
+/// A Mac that keeps caches in a folder of the test's own, or none where the folder's file system cannot share
+/// blocks between files.
+fn caching() -> Option<(tempfile::TempDir, World)> {
+    let dir = tempfile::tempdir().unwrap();
+    cf_daemon::caches::CacheStore::open(dir.path(), 1 << 40)?;
+    let w = World::with_docker_cache(3, dir.path(), 100 << 30);
+    Some((dir, w))
+}
+
+#[tokio::test]
+async fn a_successful_push_to_main_keeps_its_copy_and_the_next_docker_job_starts_from_it() {
+    let Some((dir, mut w)) = caching() else { return };
+    let runner = docker_job(&mut w).await;
+    let copy = copy_of_last_start(&w);
+    std::fs::write(&copy, b"what main built").unwrap();
+    ends(&mut w, &runner, "succeeded", "push", ON_MAIN);
+    assert_eq!(kept_repos(dir.path()), [REPO]);
+    assert!(!copy.exists(), "the copy became the cache");
+
+    let next = docker_job(&mut w).await;
+    assert_eq!(head(&copy_of_last_start(&w)), b"what main built");
+    ends(&mut w, &next, "failed", "push", ON_MAIN);
+}
+
+#[tokio::test]
+async fn a_pull_request_a_failure_or_an_unclean_disk_never_writes_the_cache() {
+    let Some((dir, mut w)) = caching() else { return };
+    let first = docker_job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"main").unwrap();
+    ends(&mut w, &first, "succeeded", "push", ON_MAIN);
+
+    for (result, event, workflow) in [
+        ("succeeded", "pull_request", "org/app/.github/workflows/ci.yml@refs/pull/3/merge"),
+        ("succeeded", "push", "org/app/.github/workflows/ci.yml@refs/heads/feature"),
+        ("failed", "push", ON_MAIN),
+        ("canceled", "push", ON_MAIN),
+        ("succeeded", "push", "other/tools/.github/workflows/build.yml@refs/heads/main"),
+    ] {
+        let runner = docker_job(&mut w).await;
+        std::fs::write(copy_of_last_start(&w), event.as_bytes()).unwrap();
+        ends(&mut w, &runner, result, event, workflow);
+        let next = docker_job(&mut w).await;
+        assert_eq!(head(&copy_of_last_start(&w)), b"main", "{result} {event} {workflow}");
+        ends(&mut w, &next, "failed", "push", ON_MAIN);
+    }
+
+    // The guest could not let the disk go: not kept either.
+    w.parts.vms.cache_end(cf_guest_proto::CacheEnd {
+        found: cf_guest_proto::CacheFound::Reused,
+        clean: false,
+        daemon: true,
+    });
+    let runner = docker_job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"unclean").unwrap();
+    ends(&mut w, &runner, "succeeded", "push", ON_MAIN);
+    assert_eq!(kept_repos(dir.path()), [REPO]);
+    let next = docker_job(&mut w).await;
+    assert_eq!(head(&copy_of_last_start(&w)), b"main");
+    ends(&mut w, &next, "failed", "push", ON_MAIN);
+}
+
+#[tokio::test]
+async fn a_job_github_never_says_the_end_of_does_not_write_the_cache() {
+    let Some((dir, mut w)) = caching() else { return };
+    let runner = docker_job(&mut w).await;
+    let copy = copy_of_last_start(&w);
+    std::fs::write(&copy, b"unsaid").unwrap();
+    w.github_run(EventKind::Started, &runner, "", "push", ON_MAIN);
+    w.parts.vms.end(job_name(&runner), End::Ok);
+    pass(&w.m, 2);
+    w.assert_nothing_left();
+    assert!(kept_repos(dir.path()).is_empty());
+    assert!(!copy.exists(), "the copy is thrown away");
+}
+
+#[tokio::test]
+async fn a_cache_copy_outlives_a_restart_of_the_runner_and_is_settled_after() {
+    let Some((dir, mut w)) = caching() else { return };
+    let runner = docker_job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"across a restart").unwrap();
+    w.parts.vms.ready(job_name(&runner));
+    pass(&w.m, 2);
+    w.github_run(EventKind::Started, &runner, "", "push", ON_MAIN);
+    w.restart();
+    w.parts.vms.end(job_name(&runner), End::Ok);
+    pass(&w.m, 2);
+    w.github_run(EventKind::Completed, &runner, "succeeded", "push", ON_MAIN);
+    w.assert_nothing_left();
+    assert_eq!(kept_repos(dir.path()), [REPO]);
+}
+
+#[tokio::test]
+async fn a_machine_that_does_not_start_leaves_no_copy_and_a_plain_job_gets_none() {
+    let Some((dir, mut w)) = caching() else { return };
+    w.parts.vms.fail_start(1);
+    let ticket = w.m.reserve_docker(SIZE).unwrap();
+    let Claim::Start(ticket) = w.m.claim(SIZE, Some(ticket)) else {
+        panic!("the promise is claimed");
+    };
+    assert!(w.start_on(ticket).await.is_err());
+    let jobs: Vec<_> = std::fs::read_dir(dir.path().join("jobs")).unwrap().collect();
+    assert!(jobs.is_empty(), "no copy is left");
+    let plain = w.start().await;
+    assert_eq!(w.parts.vms.started().last().unwrap().docker_cache, None, "{plain} has no Docker");
+}

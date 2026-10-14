@@ -374,6 +374,7 @@ pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harn
         settings,
         nudges: Arc::new(AtomicUsize::new(0)),
         boot: "start-1".into(),
+        docker_cache: None,
         bell: Arc::default(),
     };
     let machines = parts.machines(None);
