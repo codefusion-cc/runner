@@ -237,6 +237,13 @@ fn launcher() -> Result<i32, String> {
 /// The sandbox's first process, PID 1 of its process namespace: builds its view as the machine's root, says so on
 /// `built`, becomes the sandbox's root and runs [`sandbox`]. Returns only when that failed.
 fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Result<Infallible, String> {
+    // A launcher ended for being too slow takes this process with it, so nothing builds the view as the machine's
+    // root once the job's container starts. Being PID 1 of its namespace, its end takes the whole sandbox too.
+    // SAFETY: prctl with this option takes numbers only.
+    context(
+        "end with the launcher",
+        check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) }),
+    )?;
     unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC)?;
     // SAFETY: sethostname reads `len` bytes of the string we own.
     unsafe { libc::sethostname(spec.host_name.as_ptr().cast(), spec.host_name.len()) };
