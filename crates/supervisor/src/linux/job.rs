@@ -1,7 +1,8 @@
 //! One job: its disks, its limits, its container, and the watch over it until it ends.
 
 use super::container::{STATUS_FD, Spec};
-use super::init::{Event, Failure, Host, SELF_COPY};
+use super::docker;
+use super::init::{Event, Failure, Host, spawn_self};
 use super::net::Network;
 use super::sys::{self, context, say};
 use cf_guest_proto::{
@@ -130,6 +131,8 @@ fn usage() -> Usage {
 
 fn limits(job: &Job) -> Result<(), String> {
     sys::set("/sys/fs/cgroup/cgroup.subtree_control", "+memory +pids")?;
+    // Processor time too where the kernel has the controller, for a Docker job's containers (`--cpus`).
+    let _ = fs::write("/sys/fs/cgroup/cgroup.subtree_control", "+cpu");
     for (group, delegate) in [(CGROUP.to_string(), true), (format!("{CGROUP}/run"), false)] {
         context("the job's control group", fs::create_dir_all(&group))?;
         sys::set(
@@ -141,6 +144,7 @@ fn limits(job: &Job) -> Result<(), String> {
         let _ = fs::write(format!("{group}/memory.swap.max"), "0");
         if delegate {
             sys::set(format!("{group}/cgroup.subtree_control"), "+memory +pids")?;
+            let _ = fs::write(format!("{group}/cgroup.subtree_control"), "+cpu");
         }
     }
     Ok(())
@@ -206,6 +210,10 @@ pub fn run(
 ) -> Result<Summary, Failure> {
     let disks = |error| ("disks", error);
     let began = sys::uptime_ms();
+    if !job.docker {
+        // What only a Docker job loads goes at once: the machine's memory is the job's.
+        let _ = fs::remove_dir_all(docker::MODULE_DIR);
+    }
     mount_image().map_err(disks)?;
     let scratch = disk(cf_guest_proto::SCRATCH_DISK).map_err(disks)?;
     // The disk's size as the job asked for it; the file system on it holds a little less.
@@ -264,6 +272,7 @@ pub fn run(
         host: job.host.clone(),
         limits: job.limits,
         disk_bytes,
+        docker: job.docker,
     };
     share(
         "job.json",
@@ -283,11 +292,26 @@ pub fn run(
     let passwd = fs::read_to_string(format!("{ROOT}/etc/passwd")).unwrap_or_default();
     let (uid, gid, home) =
         find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
-    let groups = groups_of(
-        &fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default(),
-        USER,
-        gid,
-    );
+    let group = fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default();
+    let groups = groups_of(&group, USER, gid);
+    if job.docker {
+        // Started before the Actions runner, so the daemon is up by the first step. A job whose daemon cannot be
+        // made runs on and is told why when it starts.
+        let started = docker::prepare(
+            ROOT,
+            SCRATCH,
+            CGROUP,
+            (uid, gid),
+            &group,
+            &name,
+            job.limits.shm_bytes,
+        )
+        .and_then(|spec| docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM)));
+        if let Err(error) = started {
+            say(&format!("no Docker for this job: {error}"));
+            share(cf_supervisor::docker::PROBLEM, &error, 0o644).map_err(container)?;
+        }
+    }
     let argv = match &job.workload {
         Workload::ActionsRunner { jit_config } => vec![
             format!("{home}/run.sh"),
@@ -339,6 +363,7 @@ pub fn run(
         previous: Table::new([]),
         oom: None,
         count: oom::Count::default(),
+        own_limit: oom::OwnLimit::default(),
         step: None,
         stop: None,
         killed: false,
@@ -372,34 +397,18 @@ pub fn run(
 fn launch(spec: &Spec, sender: Sender<Event>) -> Result<(u32, std::os::fd::OwnedFd), String> {
     let (status_read, status_write) = context("pipe", sys::pipe())?;
     let (output_read, output_write) = context("pipe", sys::pipe())?;
-    let mut command = Command::new(SELF_COPY);
-    command
-        .arg("container")
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(context("pipe", output_write.try_clone())?)
-        .stderr(output_write);
-    let status_fd = status_write.as_raw_fd();
-    // SAFETY: dup2 is async-signal-safe; the descriptor is open in the child, which is a copy of this process.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(status_fd, STATUS_FD) < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut child = context("start the launcher", command.spawn())?;
-    // The command holds the ends the launcher got; while they are open here, neither pipe ever ends.
-    drop((command, status_write));
+    let mut child = spawn_self(
+        "container",
+        (&status_write, STATUS_FD),
+        (
+            Stdio::from(context("pipe", output_write.try_clone())?),
+            Stdio::from(output_write),
+        ),
+        spec,
+    )?;
+    // While the end the launcher got is open here too, the pipe never ends.
+    drop(status_write);
     let launcher = child.id();
-    if let Some(mut input) = child.stdin.take() {
-        context(
-            "describe the container",
-            input.write_all(serde_json::to_string(spec).unwrap_or_default().as_bytes()),
-        )?;
-    }
     std::thread::spawn(move || {
         let mut output = File::from(output_read);
         let (mut buffer, mut written) = (vec![0u8; 65536], 0usize);
@@ -451,6 +460,8 @@ struct Watch<'a> {
     oom: Option<OomEvent>,
     /// The stops the kernel counted for the job against those its log named.
     count: oom::Count,
+    /// A Docker job's stops that are its containers' own, apart from the job's.
+    own_limit: oom::OwnLimit,
     /// The step whose processes go when its time to fail by itself is over.
     step: Option<(Instant, Process)>,
     stop: Option<(StopReason, Instant)>,
@@ -549,8 +560,25 @@ impl Watch<'_> {
             let reader = &mut self.log;
             oom::read_records(log, |message| kills.extend(reader.line(message)));
         }
-        let counted =
+        let mut counted =
             oom::kills_in_events(&fs::read_to_string(format!("{CGROUP}/memory.events")).unwrap_or_default());
+        if self.job.docker {
+            // The job's limits are set on the job's group and on its container's; a container of the daemon's
+            // that reached a limit of its own reached neither.
+            let reached: u64 = [CGROUP.to_string(), format!("{CGROUP}/run")]
+                .iter()
+                .map(|group| {
+                    oom::limit_reached(
+                        &fs::read_to_string(format!("{group}/memory.events.local")).unwrap_or_default(),
+                    )
+                })
+                .sum();
+            let (ours, own) = self.own_limit.look(reached, counted);
+            if !ours {
+                kills.clear();
+            }
+            counted = own;
+        }
         if self.count.look(kills.len() as u64, counted, last) {
             kills.push(Kill {
                 process: Used {

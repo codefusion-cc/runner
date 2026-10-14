@@ -58,6 +58,9 @@ pub struct Job {
     /// in (its local network, a VPN), whatever their range, as `(network, prefix length)`.
     #[serde(default)]
     pub blocked: Vec<([u8; 4], u8)>,
+    /// Whether the job gets a Docker daemon of its own, in a sandbox beside its container.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 /// A job's limits, enforced by the guest kernel on the job's control group.

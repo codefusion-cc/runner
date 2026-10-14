@@ -158,6 +158,8 @@ pub struct SetState {
     pub labels: Vec<String>,
     /// The size of its machines.
     pub size: Size,
+    /// Whether its jobs get a Docker daemon (`cf-docker`).
+    pub docker: bool,
     /// Why its listener is not listening, when it is not.
     pub error: Option<String>,
     /// Since when, in seconds since 1970.
@@ -184,6 +186,7 @@ struct Wanted {
     client: ScaleSetClient,
     labels: Vec<String>,
     size: Size,
+    docker: bool,
 }
 
 struct Serving {
@@ -589,6 +592,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 id: 0,
                 labels: want.labels.clone(),
                 size: want.size,
+                docker: want.docker,
                 error: None,
                 error_at: None,
                 statistics: None,
@@ -692,7 +696,16 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     continue;
                 }
                 for set in self_hosted_with(&files, &variables) {
-                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str)) else {
+                    if set.docker() && !shared.config.policy.serves_docker(&repo) {
+                        // Not offered to GitHub: the job waits for a Mac that gives this repository Docker. A Mac
+                        // left out on purpose is no problem of discovery.
+                        tracing::info!(repo = %name, labels = %set.key(), "not served: Docker is only for the repositories in docker_repos");
+                        continue;
+                    }
+                    // `cf-docker` alone is a machine of the size `self-hosted` means.
+                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str))
+                        .or_else(|| set.docker().then_some(Size::G4))
+                    else {
                         continue;
                     };
                     if let Err(refusal) = settings.can_run(size) {
@@ -707,6 +720,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             client: client.clone(),
                             labels: set.labels().to_vec(),
                             size,
+                            docker: set.docker(),
                         },
                     );
                 }
@@ -1477,12 +1491,13 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
     stop: Shutdown,
 ) {
     let bell = shared.nudge.subscribe();
-    let (name, labels, size, repo) = {
+    let (name, labels, size, docker, repo) = {
         let state = state.lock().expect("set");
         (
             state.name.clone(),
             state.labels.clone(),
             state.size,
+            state.docker,
             state.repo.clone(),
         )
     };
@@ -1519,6 +1534,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         repo,
                         machine: shared.config.machine.clone(),
                         size,
+                        docker,
                     },
                     session.clone(),
                     registry,

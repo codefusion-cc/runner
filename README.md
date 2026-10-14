@@ -44,6 +44,11 @@ ran, each in a machine that was gone when the job ended. What is there:
   Mac's memory stays where it was), and its time (a deadline, 20 s for the job to end by itself, then by force),
 - what a job reaches: the internet, and names through the Mac's gateway. Not the Mac, the networks the Mac is in,
   other jobs' machines, private, tailnet and metadata addresses, or anything over IPv6,
+- Docker for a job that asks for it with `cf-docker`, in a repository the Mac's `docker_repos` lists (private ones
+  only): a daemon of the job's own in a sandbox beside its container, so `docker build`, `docker run` and
+  `docker compose` work as on GitHub's runners. Its containers, privileged ones too, reach what the job reaches and
+  nothing more, and are root of the sandbox, not of the machine. One Docker job at a time per Mac
+  (`docker_max_jobs`); `docs/docker.md` says how and why,
 - the guest: Alpine's `linux-virt` kernel and an initramfs whose PID 1 is the supervisor, built reproducibly by
   `cargo xtask guest` and embedded in the binary,
 - images: an Ed25519 signature over `SHA256SUMS`, every hash and size checked, the root filesystem in parts below
@@ -80,7 +85,8 @@ A configuration file says what the Mac is:
   `app.json` and `app.pem` (0600).
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
-  `github_api`, `build_folder` (see the update below). Without `console` the Mac reports to none.
+  `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`
+  jobs get Docker) and `docker_max_jobs` (1). Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.

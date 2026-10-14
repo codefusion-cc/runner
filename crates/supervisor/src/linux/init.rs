@@ -1,13 +1,15 @@
 //! The machine's first process: brings the guest up, answers the host, runs the one task it is given, powers off.
 
 use super::sys::{self, say};
-use super::{job, net};
+use super::{docker, job, net};
 use cf_guest_proto::{
     GuestMessage, HostMessage, PORT, PROTOCOL, Start, Summary, Task, read_message, write_message,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +25,45 @@ const LAST_WORDS: Duration = Duration::from_secs(3);
 const HOST_CID: u32 = 2;
 /// The supervisor's own copy, which the job's container and its hooks run.
 pub const SELF_COPY: &str = "/run/cf/supervisor";
+
+/// Starts the supervisor's own copy as a launcher, `role` (`container`, `docker`), with `pass` at descriptor
+/// `at` and the given output, and writes `spec` to its input as JSON, for [`super::container::read_spec`]. The
+/// command holds the ends it was given and goes with this call; the caller drops its own end of `pass` after it,
+/// so the launcher's end is the only one left.
+pub fn spawn_self(
+    role: &str,
+    (pass, at): (&OwnedFd, libc::c_int),
+    (stdout, stderr): (Stdio, Stdio),
+    spec: &impl serde::Serialize,
+) -> Result<Child, String> {
+    let mut command = Command::new(SELF_COPY);
+    command
+        .arg(role)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(stderr);
+    let fd = pass.as_raw_fd();
+    // SAFETY: dup2 is async-signal-safe; the descriptor is open in the child, which is a copy of this process.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(fd, at) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = sys::context(&format!("start the {role} launcher"), command.spawn())?;
+    drop(command);
+    if let Some(mut input) = child.stdin.take() {
+        sys::context(
+            &format!("describe the {role}"),
+            input.write_all(serde_json::to_string(spec).unwrap_or_default().as_bytes()),
+        )?;
+    }
+    Ok(child)
+}
 
 /// The connection to the host, shared by the threads that send.
 #[derive(Clone)]
@@ -69,7 +110,7 @@ pub fn run() -> ! {
         .to_string();
     say(&format!("kernel {kernel}"));
 
-    if let Err(error) = load_modules().and_then(|()| own_root()) {
+    if let Err(error) = load_modules(MODULE_LIST, MODULE_DIR).and_then(|()| own_root()) {
         say(&error);
         sys::power_off();
     }
@@ -198,10 +239,11 @@ fn wait_for_console() -> File {
     sys::power_off()
 }
 
-fn load_modules() -> Result<(), String> {
-    let list = fs::read_to_string(MODULE_LIST).unwrap_or_default();
+/// Loads the modules a list names, in its order, from a folder. A module the kernel has already is no error.
+pub fn load_modules(list: &str, dir: &str) -> Result<(), String> {
+    let list = fs::read_to_string(list).unwrap_or_default();
     for name in list.lines().filter(|line| !line.is_empty()) {
-        let path = format!("{MODULE_DIR}/{name}.ko");
+        let path = format!("{dir}/{name}.ko");
         let file = File::open(&path).map_err(|error| format!("module {path}: {error}"))?;
         let parameters = sys::cstr("");
         // SAFETY: finit_module takes a descriptor we own for the call and a NUL terminated parameter string.
@@ -216,7 +258,8 @@ fn load_modules() -> Result<(), String> {
 }
 
 /// Moves the supervisor from the boot archive's root, which a container cannot leave behind, to a memory file
-/// system of its own, and frees what the archive held.
+/// system of its own, and frees what the archive held. The modules only a Docker job loads come along, until the
+/// job says whether it is one.
 fn own_root() -> Result<(), String> {
     const NEW: &str = "/newroot";
     sys::mount_at("root", NEW, "tmpfs", 0, "mode=0755")?;
@@ -228,9 +271,25 @@ fn own_root() -> Result<(), String> {
         "mnt/image",
         "mnt/scratch",
         "mnt/root",
+        "etc",
+        &docker::MODULE_DIR[1..],
     ] {
         sys::context("make the root", fs::create_dir_all(format!("{NEW}/{directory}")))?;
     }
+    let docker_modules = fs::read_to_string(docker::MODULE_LIST).unwrap_or_default();
+    for name in docker_modules.lines().filter(|line| !line.is_empty()) {
+        sys::context(
+            "keep a module",
+            fs::copy(
+                format!("{MODULE_DIR}/{name}.ko"),
+                format!("{NEW}{}/{name}.ko", docker::MODULE_DIR),
+            ),
+        )?;
+    }
+    sys::context(
+        "keep the module list",
+        fs::write(format!("{NEW}{}", docker::MODULE_LIST), docker_modules),
+    )?;
     sys::context(
         "copy the supervisor",
         fs::copy("/init", format!("{NEW}{SELF_COPY}")),

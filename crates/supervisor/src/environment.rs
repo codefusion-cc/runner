@@ -77,3 +77,13 @@ pub fn groups_of(group: &str, user: &str, primary: u32) -> Vec<u32> {
     }
     groups
 }
+
+/// A group's id, from the image's `/etc/group`. `None` when the file does not name it.
+pub fn find_group(group: &str, name: &str) -> Option<u32> {
+    group.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == name).then_some(())?;
+        let _password = fields.next()?;
+        fields.next()?.parse().ok()
+    })
+}

@@ -37,6 +37,8 @@ pub struct ScalerConfig {
     pub machine: String,
     /// The size of the scale set's machines.
     pub size: Size,
+    /// Whether its jobs get a Docker daemon (`cf-docker`).
+    pub docker: bool,
 }
 
 /// A slot promised to a job this scaler acquired.
@@ -326,7 +328,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let first = self.promised.len();
         let mut refusal = None;
         for _ in 0..ids.len() {
-            match self.slots.reserve(self.config.size) {
+            let reserved = if self.config.docker {
+                self.slots.reserve_docker(self.config.size)
+            } else {
+                self.slots.reserve(self.config.size)
+            };
+            match reserved {
                 Ok(ticket) => self.promised.push(Promise {
                     ticket,
                     since: self.clock.now(),
@@ -415,7 +422,13 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         for n in 0..assigned.saturating_sub(active + self.waiting.len()) {
             let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
             let turn = self.turn_for(taken + n);
-            match self.slots.claim_in_turn(self.config.size, promised, turn) {
+            let claim = self.slots.claim_in_turn(self.config.size, promised, turn);
+            if self.config.docker
+                && let Claim::Start(ticket) | Claim::Waits { ticket, .. } = &claim
+            {
+                self.slots.mark_docker(*ticket);
+            }
+            match claim {
                 Claim::Start(ticket) => {
                     if let Err(e) = self.start(ticket).await {
                         self.slots.release(ticket);
@@ -591,7 +604,15 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         self.active()
             + self.waiting.len()
             + self.promised.len()
-            + self.slots.open_slots(self.config.size).min(1)
+            + self
+                .slots
+                .open_slots(self.config.size)
+                .min(1)
+                .min(if self.config.docker {
+                    self.slots.docker_room()
+                } else {
+                    usize::MAX
+                })
     }
 }
 

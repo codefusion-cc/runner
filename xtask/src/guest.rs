@@ -33,6 +33,30 @@ const MODULES: &[&str] = &[
     "nf_tables",
     "nft_ct",
 ];
+/// The modules only a Docker job loads, with what they need beyond [`MODULES`]: the daemon's bridge and its
+/// container links, the tun device pasta joins the daemon's network with, and what the daemon's iptables rules take
+/// (nftables underneath). The guest keeps them apart and loads them only for a job that asks for Docker.
+const DOCKER_MODULES: &[&str] = &[
+    "tun",
+    "veth",
+    "bridge",
+    "br_netfilter",
+    "nf_nat",
+    "nft_chain_nat",
+    "nft_nat",
+    "nft_masq",
+    "nft_compat",
+    "nft_reject_inet",
+    "xt_conntrack",
+    "xt_MASQUERADE",
+    "xt_addrtype",
+    "xt_nat",
+    "xt_tcpudp",
+    "xt_comment",
+    "xt_mark",
+    "xt_multiport",
+    "ipt_REJECT",
+];
 /// A release asset may be at most 2 GiB; the root filesystem is cut a little below that.
 const MAX_PART: u64 = 1_900_000_000;
 /// The names of the kernel and the initramfs in the bundle and in a release.
@@ -54,7 +78,8 @@ pub fn build(root: &Path) -> Result<()> {
     let kernel = unpack_zboot(&fs::read(package.join("boot/vmlinuz-virt"))?)?;
     fs::write(staging.join(KERNEL_FILE), &kernel)?;
 
-    let modules = collect_modules(&package)?;
+    let modules = collect_modules(&package, MODULES, &[])?;
+    let docker_modules = collect_modules(&package, DOCKER_MODULES, &modules)?;
     run_command(Command::new(cargo()).current_dir(root).args([
         "build",
         "--release",
@@ -64,7 +89,7 @@ pub fn build(root: &Path) -> Result<()> {
         "cf-supervisor",
     ]))?;
     let supervisor = fs::read(target.join("aarch64-unknown-linux-musl/release/supervisor"))?;
-    let initramfs = initramfs(&supervisor, &modules)?;
+    let initramfs = initramfs(&supervisor, &modules, &docker_modules)?;
     fs::write(staging.join(INITRAMFS_FILE), &initramfs)?;
 
     let version = format!(
@@ -186,8 +211,13 @@ fn fetch_package(cache: &Path) -> Result<PathBuf> {
     Ok(unpacked)
 }
 
-/// The wanted modules and what they depend on, unpacked, in the order to load them: `(name, bytes)`.
-fn collect_modules(package: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+/// The wanted modules and what they depend on, unpacked, in the order to load them: `(name, bytes)`. Modules in
+/// `loaded` (an earlier list's) are left out.
+fn collect_modules(
+    package: &Path,
+    wanted: &[&str],
+    loaded: &[(String, Vec<u8>)],
+) -> Result<Vec<(String, Vec<u8>)>> {
     let release_dir = fs::read_dir(package.join("lib/modules"))?
         .next()
         .ok_or("no modules in the package")??
@@ -222,18 +252,21 @@ fn collect_modules(package: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         order.push(path.to_string());
         Ok(())
     }
-    for name in MODULES {
+    for name in wanted {
         visit(&find(name)?, &deps, &mut order)?;
     }
+    let file_name = |path: &str| {
+        path.rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".ko.gz")
+            .to_string()
+    };
     order
         .into_iter()
+        .filter(|path| !loaded.iter().any(|(name, _)| *name == file_name(path)))
         .map(|path| {
-            let name = path
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .trim_end_matches(".ko.gz")
-                .to_string();
+            let name = file_name(&path);
             let mut raw = Vec::new();
             GzDecoder::new(fs::File::open(release_dir.join(&path))?).read_to_end(&mut raw)?;
             Ok((name, raw))
@@ -241,16 +274,28 @@ fn collect_modules(package: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         .collect()
 }
 
-/// The initramfs: the supervisor as `/init`, the module list and the modules. Reproducible: same inputs, same bytes.
-fn initramfs(supervisor: &[u8], modules: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+/// The initramfs: the supervisor as `/init`, the module lists (`etc/modules` loaded at boot, `etc/modules-docker`
+/// for a Docker job) and the modules. Reproducible: same inputs, same bytes.
+fn initramfs(
+    supervisor: &[u8],
+    modules: &[(String, Vec<u8>)],
+    docker_modules: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>> {
     let mut archive = Archive::new(Vec::new());
     for dir in ["dev", "proc", "sys", "etc", "lib", "lib/modules"] {
         archive.add(dir, Kind::Dir, 0o755)?;
     }
     archive.add("init", Kind::File(supervisor), 0o755)?;
-    let list: String = modules.iter().map(|(name, _)| format!("{name}\n")).collect();
-    archive.add("etc/modules", Kind::File(list.as_bytes()), 0o644)?;
-    for (name, bytes) in modules {
+    let list = |modules: &[(String, Vec<u8>)]| -> String {
+        modules.iter().map(|(name, _)| format!("{name}\n")).collect()
+    };
+    archive.add("etc/modules", Kind::File(list(modules).as_bytes()), 0o644)?;
+    archive.add(
+        "etc/modules-docker",
+        Kind::File(list(docker_modules).as_bytes()),
+        0o644,
+    )?;
+    for (name, bytes) in modules.iter().chain(docker_modules) {
         archive.add(&format!("lib/modules/{name}.ko"), Kind::File(bytes), 0o644)?;
     }
     let cpio = archive.finish()?;

@@ -29,6 +29,9 @@ pub struct JobRequest {
     pub env: Vec<(String, String)>,
     /// The longest the job may run, in seconds.
     pub deadline_s: u64,
+    /// Whether the job gets a Docker daemon of its own beside its container (`cf-docker`).
+    #[serde(default)]
+    pub docker: bool,
 }
 
 /// Why a request is refused before anything starts.

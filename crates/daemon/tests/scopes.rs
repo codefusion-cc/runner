@@ -125,6 +125,7 @@ mod linux {
             },
             env: Vec::new(),
             deadline_s: 60,
+            docker: false,
         })
         .expect("started");
         let found_at = state.join(FOUND);

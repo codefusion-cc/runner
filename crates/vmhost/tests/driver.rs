@@ -36,6 +36,7 @@ fn request(job: &str) -> JobRequest {
         },
         env: vec![("CI".into(), "true".into())],
         deadline_s: 3600,
+        docker: false,
     }
 }
 

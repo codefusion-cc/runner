@@ -25,6 +25,7 @@ fn job(secret: &str) -> Job {
         env: vec![("CI".into(), "true".into())],
         oom_grace_ms: 15_000,
         blocked: vec![([203, 0, 113, 0], 24)],
+        docker: true,
     }
 }
 
@@ -459,4 +460,19 @@ fn a_host_reads_no_frame_of_a_guest_beyond_its_limit_and_what_is_short_arrives_a
         })
     ));
     assert_eq!(read_guest_message(&mut Cursor::new(Vec::new())).unwrap(), None);
+}
+
+#[test]
+fn a_job_from_a_host_before_docker_has_none() {
+    let mut value = serde_json::to_value(job("x")).unwrap();
+    value.as_object_mut().unwrap().remove("docker");
+    let read: Job = serde_json::from_value(value).unwrap();
+    assert!(!read.docker);
+    assert_eq!(
+        read,
+        Job {
+            docker: false,
+            ..job("x")
+        }
+    );
 }

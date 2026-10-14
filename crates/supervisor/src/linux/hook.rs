@@ -2,15 +2,46 @@
 //! kernel stopped something. Runs in the container, as the job's user.
 
 use cf_guest_proto::{OomEvent, StopReason};
+use cf_supervisor::docker;
 use cf_supervisor::tell::{self, JobFacts};
 use serde::de::DeserializeOwned;
 use std::fs;
 use std::io::Write;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 const SHARED: &str = "/run/codefusion";
 
 fn read<T: DeserializeOwned>(name: &str) -> Option<T> {
     serde_json::from_str(&fs::read_to_string(format!("{SHARED}/{name}")).ok()?).ok()
+}
+
+/// How long the start hook waits for a Docker job's daemon: it starts with the machine, and is up in a second or two.
+const DOCKER_WAIT: Duration = Duration::from_secs(60);
+
+/// Waits until a Docker job's daemon answers on its socket, and says so as an error on the run when it does not.
+fn docker_ready() {
+    let deadline = Instant::now() + DOCKER_WAIT;
+    let why = loop {
+        if let Ok(why) = fs::read_to_string(format!("{SHARED}/{}", docker::PROBLEM)) {
+            break why;
+        }
+        if UnixStream::connect(docker::SOCKET).is_ok() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break format!(
+                "its daemon did not answer within {} seconds.",
+                DOCKER_WAIT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let log = fs::read_to_string(docker::LOG).unwrap_or_default();
+    println!(
+        "{}",
+        tell::annotation("Docker did not start", &tell::docker_missing(why.trim(), &log))
+    );
 }
 
 /// Prints what the hook `name` has to say. A hook that fails would fail the job, so this one never does.
@@ -20,6 +51,9 @@ pub fn run(name: &str) -> ! {
         "job-started" => {
             if let Some(facts) = &facts {
                 println!("{}", tell::started(facts));
+                if facts.docker {
+                    docker_ready();
+                }
             }
         }
         "job-completed" => {

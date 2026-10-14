@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use cf_workflows::{LabelSet, POOL_LABEL, SizeError, self_hosted, self_hosted_with, size_gb};
+use cf_workflows::{DOCKER_LABEL, LabelSet, POOL_LABEL, SizeError, self_hosted, self_hosted_with, size_gb};
 use proptest::prelude::*;
 
 fn files(list: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
@@ -619,4 +619,50 @@ fn keys_that_are_numbers_or_booleans_leave_the_rest_of_the_file_readable() {
         "on:\n  push:\n    branches: [main]\nenv:\n  1: one\n  true: yes\n  ? [a, b]\n  : complex\njobs:\n  7:\n    runs-on: [self-hosted, 16]\n",
     )]));
     assert_eq!(keys(&got), vec!["16,self-hosted"]);
+}
+
+// added: Docker
+#[test]
+fn the_docker_label_is_served_alone_beside_self_hosted_or_with_a_size() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: cf-docker\n  b:\n    runs-on: [self-hosted, CF-Docker]\n  c:\n    runs-on: [cf-docker, cf-6g]\n  d:\n    runs-on: [cf-docker, macos]\n  e:\n    runs-on: [docker]\n  f:\n    runs-on: cf-dockers\n",
+    )]);
+    let sets = self_hosted(&wf);
+    assert_eq!(
+        keys(&sets),
+        ["cf-6g,cf-docker", "cf-docker", "cf-docker,self-hosted"]
+    );
+    assert!(sets.iter().all(LabelSet::docker));
+    assert!(!LabelSet::new(["self-hosted", "cf-dockers"]).docker());
+}
+
+#[test]
+fn a_docker_job_is_four_gb_unless_a_size_says_otherwise() {
+    let size = |labels: &[&str]| size_gb(&LabelSet::new(labels));
+    assert_eq!(size(&["cf-docker"]), Ok(4));
+    assert_eq!(size(&["cf-docker", "self-hosted"]), Ok(4));
+    assert_eq!(size(&["cf-docker", "cf-8g"]), Ok(8));
+}
+
+#[test]
+fn a_variable_naming_the_docker_label_decides_the_scale_set() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  stack:\n    runs-on: ${{ vars.CI_RUNNER_DOCKER || 'ubuntu-latest' }}\n",
+    )]);
+    for value in ["cf-docker", "CF-DOCKER", "\"cf-docker\""] {
+        assert_eq!(
+            keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_DOCKER", value)]))),
+            [DOCKER_LABEL],
+            "{value:?}"
+        );
+    }
+    for value in ["cf-dockers", "docker", "ubuntu-latest"] {
+        assert_eq!(
+            keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_DOCKER", value)]))),
+            [POOL_LABEL],
+            "{value:?}"
+        );
+    }
 }
