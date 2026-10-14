@@ -62,12 +62,10 @@ pub fn refusal(
         return Some("only a push, a schedule or a dispatch writes the cache");
     }
     // `owner/name/.github/workflows/file.yml@refs/heads/main`: the repository and the ref the workflow ran at.
+    // Split at the first `@`: a branch's name may hold one, and the ref is then never just the default branch.
     let Some((path, git_ref)) = github.workflow.split_once('@') else {
         return Some("the job's workflow names no ref");
     };
-    if git_ref.contains('@') {
-        return Some("the job's workflow names more than one ref");
-    }
     let own = path
         .get(..repo.len() + 1)
         .is_some_and(|start| start.eq_ignore_ascii_case(&format!("{repo}/")));
