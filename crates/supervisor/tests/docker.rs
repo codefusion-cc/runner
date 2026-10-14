@@ -93,9 +93,14 @@ fn pasta_keeps_the_gateway_and_forwards_nothing_inwards() {
     assert!(text.contains("--ipv4-only"), "{text}");
 }
 
+/// Nothing next to the machine but its own network and gateway, as on a Mac's NAT.
+fn alone() -> Networks {
+    networks(&[([192, 168, 64, 0], 24), ([192, 168, 64, 1], 32)]).expect("networks")
+}
+
 #[test]
 fn the_daemon_listens_on_the_shared_socket_only() {
-    let command = dockerd_command();
+    let command = dockerd_command(&alone());
     let hosts: Vec<&String> = command
         .iter()
         .zip(command.iter().skip(1))
@@ -118,4 +123,101 @@ fn only_tcp_segments_without_any_flag_are_dropped_before_the_daemons_nat() {
 fn the_socket_and_the_log_are_in_the_shared_folder() {
     assert_eq!(SOCKET, format!("{SOCKET_DIR}/{SOCKET_NAME}"));
     assert_eq!(LOG, format!("{SOCKET_DIR}/{LOG_NAME}"));
+}
+
+#[test]
+fn with_nothing_near_the_daemon_gets_dockers_own_networks() {
+    assert_eq!(
+        alone(),
+        Networks {
+            bridge: ([172, 17, 0, 0], 16),
+            pools: vec![
+                ([172, 18, 0, 0], 16),
+                ([172, 19, 0, 0], 16),
+                ([172, 20, 0, 0], 16),
+                ([172, 21, 0, 0], 16),
+            ],
+        }
+    );
+    let text = dockerd_command(&alone()).join(" ");
+    assert!(text.contains("--bip 172.17.0.1/16"), "{text}");
+    assert!(
+        text.contains("--default-address-pool base=172.18.0.0/16,size=24")
+            && text.contains("--default-address-pool base=172.21.0.0/16,size=24"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_host_on_dockers_own_bridge_moves_the_daemons() {
+    // A Linux host with Docker of its own: docker0 is 172.17.0.1/16, which the host tells as one of its networks.
+    let got = networks(&[([10, 0, 2, 0], 24), ([172, 17, 0, 0], 16)]).unwrap();
+    assert_eq!(got.bridge, ([172, 18, 0, 0], 16));
+    assert_eq!(got.pools.first(), Some(&([172, 19, 0, 0], 16)));
+    // Only the host's address, with no network told: the block that holds it still goes.
+    let got = networks(&[([172, 17, 0, 1], 32)]).unwrap();
+    assert_eq!(got.bridge, ([172, 18, 0, 0], 16));
+    // The last address of a block and the first of the next.
+    let got = networks(&[([172, 17, 255, 255], 32), ([172, 18, 0, 0], 32)]).unwrap();
+    assert_eq!(got.bridge, ([172, 19, 0, 0], 16));
+}
+
+#[test]
+fn a_host_in_all_of_172_16_gets_networks_of_10() {
+    let got = networks(&[([172, 16, 0, 0], 12)]).unwrap();
+    assert_eq!(got.bridge, ([10, 0, 0, 0], 16));
+    assert_eq!(got.pools.len(), POOLS);
+    let got = networks(&[([172, 16, 0, 0], 12), ([10, 0, 0, 0], 8)]).unwrap();
+    assert_eq!(got.bridge, ([198, 18, 0, 0], 16));
+    assert_eq!(got.pools, vec![([198, 19, 0, 0], 16)]);
+}
+
+#[test]
+fn with_no_room_for_a_bridge_and_a_pool_there_is_no_daemon() {
+    let private = [([172, 16, 0, 0], 12), ([10, 0, 0, 0], 8)];
+    assert_eq!(networks(&[private[0], private[1], ([198, 18, 0, 0], 15)]), None);
+    assert_eq!(
+        networks(&[private[0], private[1], ([198, 18, 0, 0], 16)]),
+        None,
+        "one block is a bridge alone"
+    );
+    assert_eq!(networks(&[([0, 0, 0, 0], 0)]), None, "a host told everything");
+}
+
+#[test]
+fn networks_overlap_when_they_share_an_address() {
+    assert!(overlap(([172, 17, 0, 0], 16), ([172, 17, 255, 255], 32)));
+    assert!(!overlap(([172, 17, 0, 0], 16), ([172, 18, 0, 0], 32)));
+    assert!(overlap(([172, 17, 0, 0], 16), ([172, 16, 0, 0], 12)));
+    assert!(overlap(([1, 2, 3, 4], 32), ([0, 0, 0, 0], 0)));
+    assert!(!overlap(([10, 0, 0, 0], 8), ([11, 0, 0, 0], 8)));
+}
+
+fn near() -> impl Strategy<Value = (Ip, u8)> {
+    // Networks of every size, mostly in the ranges the daemon takes from, so the cases meet.
+    let address = prop_oneof![
+        any::<[u8; 4]>(),
+        (16u8..32, any::<u8>(), any::<u8>()).prop_map(|(b, c, d)| [172, b, c, d]),
+        (any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(b, c, d)| [10, b, c, d]),
+    ];
+    (address, 0u8..=32)
+}
+
+proptest! {
+    #[test]
+    fn the_daemons_networks_never_share_an_address_with_what_is_near(beside in prop::collection::vec(near(), 0..80)) {
+        if let Some(got) = networks(&beside) {
+            let all: Vec<(Ip, u8)> = std::iter::once(got.bridge).chain(got.pools.iter().copied()).collect();
+            prop_assert!(!got.pools.is_empty() && got.pools.len() <= POOLS);
+            for (index, own) in all.iter().enumerate() {
+                prop_assert_eq!(own.1, 16);
+                for other in &beside {
+                    prop_assert!(!overlap(*own, *other), "{:?} overlaps {:?}", own, other);
+                }
+                for later in &all[index + 1..] {
+                    prop_assert!(!overlap(*own, *later), "{:?} twice", own);
+                }
+            }
+        }
+    }
 }

@@ -327,6 +327,7 @@ fn runner(v: &Value, path: &str) -> Check {
         field(u, p, "cpuPercent", Required, |v, p| number(v, p, -1.0, 1e5))?;
         field(u, p, "memoryBytes", Required, bytes)
     })
+    // `size` and `countedBytes` end in `.catch(undefined)`: a value the console cannot read is dropped, never refused.
 }
 
 fn scale_set(v: &Value, path: &str) -> Check {
@@ -359,6 +360,7 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "open", Required, boolean)?;
     field(o, path, "reason", Nullish, text(300))?;
     field(o, path, "maxJobs", Required, count)?;
+    // `memoryForJobsBytes` ends in `.catch(undefined)`: a value the console cannot read is dropped, never refused.
     field(o, path, "paused", Default, boolean)?;
     field(o, path, "host", Nullish, host)?;
     field(o, path, "hostError", Nullish, text(300))?;

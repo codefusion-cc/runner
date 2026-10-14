@@ -234,6 +234,33 @@ async fn what_each_size_meets_arrives_under_the_names_the_console_reads() {
 }
 
 #[tokio::test]
+async fn memory_for_jobs_a_runners_size_and_its_counted_bytes_are_left_out_when_unknown() {
+    let w = world().await;
+    let mut report = report("mac-a");
+    report.status.memory_for_jobs_bytes = None;
+    report.status.runners.push(cf_console_client::RunnerStatus {
+        name: "mac-a-j1".into(),
+        scale_set: 4,
+        state: "idle".into(),
+        started: "2026-10-10T08:00:00Z".into(),
+        job: None,
+        usage: None,
+        size: None,
+        counted_bytes: None,
+    });
+    w.client.report(&report).await.expect("answer");
+    let sent = &w.fake.reports()[0];
+    let status = sent["status"].as_object().expect("status");
+    assert!(!status.contains_key("memoryForJobsBytes"), "{status:?}");
+    let runner = sent["status"]["runners"][0].as_object().expect("runner");
+    assert_eq!(runner["name"], "mac-a-j1");
+    assert!(
+        !runner.contains_key("size") && !runner.contains_key("countedBytes"),
+        "{runner:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
     let w = world().await;
     w.fake.pause(true);
@@ -258,6 +285,8 @@ async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
             cpu_percent: 12.5,
             memory_bytes: 1 << 30,
         }),
+        size: Some("cf-4g".into()),
+        counted_bytes: Some(4 << 30),
     });
     report.results.push(cf_console_client::CommandResult {
         id: "old".into(),
@@ -276,6 +305,9 @@ async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
     assert_eq!(sent["protocol"], 1);
     assert_eq!(sent["status"]["machine"], "mac-a");
     assert_eq!(sent["status"]["maxJobs"], 2);
+    assert_eq!(sent["status"]["memoryForJobsBytes"], 12u64 << 30);
+    assert_eq!(sent["status"]["runners"][0]["size"], "cf-4g");
+    assert_eq!(sent["status"]["runners"][0]["countedBytes"], 4u64 << 30);
     assert_eq!(sent["status"]["scaleSets"][0]["name"], "mac-a--app-1a2b");
     assert_eq!(sent["status"]["host"]["freeMemoryPercent"], 60.0);
     assert_eq!(sent["status"]["runners"][0]["scaleSet"], 4);
@@ -306,6 +338,8 @@ async fn a_report_the_console_would_refuse_is_not_sent() {
         started: "2026-10-10T08:00:00Z".into(),
         job: None,
         usage: None,
+        size: None,
+        counted_bytes: None,
     };
     let scale_set = |i: usize| cf_console_client::ScaleSetStatus {
         repo: "org/app".into(),
@@ -407,6 +441,8 @@ async fn every_bound_at_its_maximum_is_sent_and_accepted() {
             started: "2026-10-10T08:00:00Z".into(),
             job: None,
             usage: None,
+            size: None,
+            counted_bytes: None,
         })
         .collect();
     r.status.scale_sets = (0..MAX_SCALE_SETS)
@@ -452,30 +488,36 @@ async fn a_body_of_exactly_512_kib_is_sent_and_one_byte_more_is_not() {
             break;
         }
     }
+    // Two events take up the rest, whatever room the full ones left: one full event less leaves more than two
+    // empty ones take and less than they take padded to their bounds.
+    r.jobs.pop();
     let empty = Some(String::new());
-    let last = cf_console_client::JobEvent {
-        repo: empty.clone(),
-        job: empty.clone(),
-        workflow: empty.clone(),
-        event: empty.clone(),
-        result: empty,
-        machine: None,
-        ..event(r.jobs.len())
-    };
-    r.jobs.push(last);
+    for _ in 0..2 {
+        let pad = cf_console_client::JobEvent {
+            repo: empty.clone(),
+            job: empty.clone(),
+            workflow: empty.clone(),
+            event: empty.clone(),
+            result: empty.clone(),
+            machine: None,
+            ..event(r.jobs.len())
+        };
+        r.jobs.push(pad);
+    }
     let mut left = MAX_BODY_BYTES - body_len(&r);
     let at = r.jobs.len() - 1;
-    for (field, cap) in [(0, 800), (1, 1200), (2, 1600), (3, 200), (4, 120)] {
-        let add = left.min(cap);
-        left -= add;
-        let text = Some("p".repeat(add));
-        let e = &mut r.jobs[at];
-        match field {
-            0 => e.repo = text,
-            1 => e.job = text,
-            2 => e.workflow = text,
-            3 => e.event = text,
-            _ => e.result = text,
+    for e in &mut r.jobs[at - 1..] {
+        for (field, cap) in [(0, 800), (1, 1200), (2, 1600), (3, 200), (4, 120)] {
+            let add = left.min(cap);
+            left -= add;
+            let text = Some("p".repeat(add));
+            match field {
+                0 => e.repo = text,
+                1 => e.job = text,
+                2 => e.workflow = text,
+                3 => e.event = text,
+                _ => e.result = text,
+            }
         }
     }
     assert_eq!(left, 0, "the padding fits");
@@ -484,7 +526,8 @@ async fn a_body_of_exactly_512_kib_is_sent_and_one_byte_more_is_not() {
     w.client.report(&r).await.expect("exactly 512 KiB");
     assert_eq!(w.fake.reports().len(), 1);
     let calls = w.fake.calls();
-    r.jobs[at].job = Some(format!("{}j", r.jobs[at].job.as_deref().unwrap_or("")));
+    // One byte more in a text far from its bound.
+    r.jobs[at].runner.push('j');
     assert_eq!(body_len(&r), MAX_BODY_BYTES + 1);
     assert!(matches!(w.client.report(&r).await, Err(Error::Protocol(_))));
     assert_eq!(w.fake.calls(), calls);

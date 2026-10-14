@@ -928,8 +928,8 @@ mod tests {
     #[test]
     fn the_room_line_gives_memory_in_gib_as_the_memory_line_does() {
         use cf_budget::{GIB, Mode};
-        // The 8 GB board with 4 fast cores read "7 GB and 8 cores, nobody sits at it: 5.635913014411926 GB for
-        // machines": the budget's cap unrounded, and the whole memory cut down to whole GiB.
+        // Both amounts in GiB with two decimals: neither the budget's cap unrounded nor the whole memory cut down
+        // to whole GiB, which on the 8 GB board would be 7.
         let board = HostFacts {
             // Its MemTotal.
             total_bytes: 8_129_820 * 1024,

@@ -36,38 +36,38 @@ impl Os {
     }
 }
 
-/// What a Mac says about itself when it trades a one-time code for its own token.
+/// What a host says about itself when it trades a one-time code for its own token.
 #[derive(Debug, Clone)]
 pub struct Enroll {
     /// The one-time code an owner made on the console's Runners page. Never printed.
     pub code: Secret<String>,
-    /// The Mac's name on the console: lower case letters and digits in groups joined by single hyphens, at most 24
+    /// The host's name on the console: lower case letters and digits in groups joined by single hyphens, at most 24
     /// characters (see [`crate::is_machine_name`]).
     pub machine: String,
-    /// The Mac's host name.
+    /// The name the system gives the host.
     pub hostname: String,
-    /// The Mac's chip and model, such as `Apple M5 (Mac17,3)`.
+    /// The host's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,
     /// The Runner's version with the commit it was built at, such as `0.1.0+446125c0a1b2`.
     pub version: String,
-    /// The Mac's CPU count, 1 to 4096.
+    /// The host's CPU count, 1 to 4096.
     pub cpus: u32,
-    /// The Mac's memory in bytes.
+    /// The host's memory in bytes.
     pub memory_bytes: u64,
     /// The system the Runner runs on; left out when it is `None`.
     pub os: Option<Os>,
 }
 
-/// What the console answers to a valid code: the Mac's own token and the name the console knows it by.
+/// What the console answers to a valid code: the host's own token and the name the console knows it by.
 #[derive(Debug, Clone)]
 pub struct Enrolled {
     /// The token every later call carries. Never printed.
     pub token: Secret<String>,
-    /// The Mac's name, as enrolled.
+    /// The host's name, as enrolled.
     pub name: String,
 }
 
-/// The Mac's load, memory and disk, as the budget reads them.
+/// The host's load, memory and disk, as the budget reads them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStatus {
@@ -79,8 +79,8 @@ pub struct HostStatus {
     pub load5: f64,
     /// Load average over fifteen minutes.
     pub load15: f64,
-    /// The share of the Mac's memory that is available, 0 to 100: free memory, the file cache and purgeable memory,
-    /// which is what Activity Monitor leaves when "Memory Used" is taken from the memory installed. The console
+    /// The share of the host's memory that is available, 0 to 100: free memory, the file cache and purgeable memory,
+    /// on a Mac what Activity Monitor leaves when "Memory Used" is taken from the memory installed. The console
     /// shows 100 less this as memory used.
     pub free_memory_percent: f64,
     /// That available memory in bytes: what the Runner admits machines by.
@@ -100,7 +100,7 @@ pub struct HostStatus {
     pub disk_free_bytes: u64,
     /// Disk in total, in bytes.
     pub disk_total_bytes: u64,
-    /// When the Mac booted.
+    /// When the host booted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_time: Option<String>,
     /// Seconds since the last input, -1 when unknown.
@@ -157,7 +157,7 @@ pub struct RunnerUsage {
     pub memory_bytes: u64,
 }
 
-/// An Actions runner of this Mac and its machine.
+/// An Actions runner of this host and its machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerStatus {
@@ -175,6 +175,14 @@ pub struct RunnerStatus {
     /// What its machine uses, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RunnerUsage>,
+    /// Its machine's size, by its label (`cf-2g`, `cf-4g`, `cf-6g` or `cf-8g`), also while it waits for its job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// What the budget counts its machine with against `memory_for_jobs_bytes` now: the size it committed for it.
+    /// The vm-host's overhead is taken out of that cap already, so on a full host these add up to it. Left out while
+    /// the machine holds no slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_bytes: Option<u64>,
 }
 
 /// When and how the Runner looks for a new version of itself.
@@ -199,26 +207,32 @@ pub struct Update {
     pub failures: u32,
 }
 
-/// What the Mac does now. The console keeps the newest and not the history.
+/// What the host does now. The console keeps the newest and not the history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
-    /// The Mac's name, as enrolled. A different one renames the Mac on the console, unless another has the name.
+    /// The host's name, as enrolled. A different one renames the host on the console, unless another has the name.
     pub machine: String,
     /// The Runner's version with the commit it was built at, such as `0.1.0+446125c0a1b2`.
     pub version: String,
     /// When this status was made.
     pub updated_at: String,
-    /// Whether the Mac takes jobs.
+    /// Whether the host takes jobs.
     pub open: bool,
     /// Why it does not, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// How many jobs at most.
+    /// How many jobs of the commonest size (`cf-4g`) fit side by side under the limits in force. Kept for consoles
+    /// that do not read `memory_for_jobs_bytes`.
     pub max_jobs: u32,
-    /// Whether the console's pause is in effect on the Mac.
+    /// The memory the host gives machines now: the cap of the limits in force (on a workstation, those for its
+    /// person away or at it). The budget counts each machine's size against it, with the vm-hosts' overhead taken
+    /// out of the cap already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_for_jobs_bytes: Option<u64>,
+    /// Whether the console's pause is in effect on the host.
     pub paused: bool,
-    /// The Mac's readings.
+    /// The host's readings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStatus>,
     /// Why there are none.
@@ -230,7 +244,7 @@ pub struct Status {
     /// The Runner's updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<Update>,
-    /// Why the Mac serves no repository, when it does not.
+    /// Why the host serves no repository, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_serving: Option<String>,
     /// Why the Runner does not run on its settings file as it is now: the file changed and no Runner could start on
@@ -240,9 +254,9 @@ pub struct Status {
     /// When that was found (ISO 8601).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_error_at: Option<String>,
-    /// For how many seconds jobs the Mac serves have waited while a machine of their size fits on it, or while it
+    /// For how many seconds jobs the host serves have waited while a machine of their size fits on it, or while it
     /// runs nothing at all; 0 (and left out) while none wait so. A few seconds are normal: GitHub hands a job over
-    /// within a poll. Over a minute the Mac is idle while work waits for it.
+    /// within a poll. Over a minute the host is idle while work waits for it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub idle_with_jobs_waiting_seconds: u64,
     /// What the Runner believes keeps those jobs from starting, while they wait.
@@ -257,19 +271,19 @@ pub struct Status {
     pub runners: Vec<RunnerStatus>,
 }
 
-/// What one more machine of a size meets on the Mac now.
+/// What one more machine of a size meets on the host now.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SizeStatus {
     /// Its label, such as `cf-4g`.
     pub size: String,
-    /// How many more fit now; -1 for a size the Mac never runs.
+    /// How many more fit now; -1 for a size the host never runs.
     pub free: i64,
     /// Why none fits, while none does: `never`, `memory`, `full`, `cpus`, `assigned-first`, `making-room` (room is
-    /// made for a larger size), or why the Mac is closed (`paused`, `calming` and the like).
+    /// made for a larger size), or why the host is closed (`paused`, `calming` and the like).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
-    /// For `memory`, and `full` for memory its own machines hold (not the cap): the memory the Mac must have available
+    /// For `memory`, and `full` for memory its own machines hold (not the cap): the memory the host must have available
     /// for one more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need_bytes: Option<u64>,
@@ -282,7 +296,7 @@ pub struct SizeStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Power {
-    /// Whether the Mac runs on its battery.
+    /// Whether the host runs on its battery.
     pub on_battery: bool,
     /// The battery's charge, 0 to 100.
     pub percent: u32,
@@ -290,7 +304,7 @@ pub struct Power {
     pub charging: bool,
 }
 
-/// What the Mac as a whole is doing, for the console's chart.
+/// What the host as a whole is doing, for the console's chart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
@@ -301,7 +315,7 @@ pub struct Activity {
     pub power: Option<Power>,
 }
 
-/// The sizes of a Mac's virtual machines.
+/// The sizes of a host's virtual machines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmSettings {
@@ -313,7 +327,7 @@ pub struct VmSettings {
     pub disk_gb: u32,
 }
 
-/// The settings the Mac runs with, which the console can change with a `settings` command.
+/// The settings the host runs with, which the console can change with a `settings` command.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -459,17 +473,17 @@ pub struct CommandResult {
     pub at: String,
 }
 
-/// What the Mac tells the console every few seconds. `jobs` is filled by [`crate::Client::deliver`] from the outbox.
+/// What the host tells the console every few seconds. `jobs` is filled by [`crate::Client::deliver`] from the outbox.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {
-    /// What the Mac does now.
+    /// What the host does now.
     pub status: Status,
-    /// What the Mac as a whole is doing.
+    /// What the host as a whole is doing.
     pub activity: Activity,
-    /// The Mac's host name.
+    /// The name the system gives the host.
     pub hostname: String,
-    /// The Mac's chip and model, such as `Apple M5 (Mac17,3)`.
+    /// The host's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,
     /// The system the Runner runs on; left out when it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -486,7 +500,7 @@ pub struct Report {
     pub results: Vec<CommandResult>,
 }
 
-/// A command the console wants the Mac to run.
+/// A command the console wants the host to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command {
     /// Its id, which the result names.
@@ -503,7 +517,7 @@ pub struct Command {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Answer {
-    /// Whether the console has paused the Mac.
+    /// Whether the console has paused the host.
     pub paused: bool,
     /// Seconds until the next report: 5 while someone watches the console or a command waits, 60 otherwise.
     pub report_every: u64,

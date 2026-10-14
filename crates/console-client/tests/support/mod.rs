@@ -85,6 +85,7 @@ pub fn status(machine: &str) -> Status {
         open: true,
         reason: None,
         max_jobs: 2,
+        memory_for_jobs_bytes: Some(12 << 30),
         paused: false,
         host: Some(HostStatus {
             cpus: 10,
