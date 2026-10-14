@@ -200,15 +200,15 @@ pub fn this_user_bus_env() -> Result<Vec<(&'static str, OsString)>, String> {
 /// it: talking to that would be talking to another user's systemd. Empty when both are there and the user's.
 ///
 /// An error, which names the root command that fixes it, when the runtime folder is not there: no systemd user
-/// manager runs for the user, because lingering is off and nobody is logged in.
+/// manager runs for the user, because lingering is off and nobody is logged in. An error too when it is there and not
+/// the user's alone: a bus in a folder others can write to may be anyone's.
 fn user_bus_env(
     uid: u32,
     user: &str,
     get: impl Fn(&str) -> Option<OsString>,
     runtime: &Path,
 ) -> Result<Vec<(&'static str, OsString)>, String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let own = |dir: &Path| std::fs::metadata(dir).is_ok_and(|found| found.is_dir() && found.uid() == uid);
+    let own = |dir: &Path| is_runtime_folder_of(dir, uid);
     let mut env = Vec::new();
     let inherited = get("XDG_RUNTIME_DIR")
         .filter(|dir| !dir.is_empty())
@@ -222,6 +222,13 @@ fn user_bus_env(
             dir
         }
     };
+    if std::fs::symlink_metadata(&folder).is_ok() && !own(folder.as_path()) {
+        return Err(format!(
+            "{} is not {user}'s own runtime folder: systemd makes it a folder of that user's that nobody else can \
+             enter (mode 0700)",
+            folder.display()
+        ));
+    }
     if !own(folder.as_path()) {
         return Err(format!(
             "{} is not there: no systemd user manager runs for {user}. Turn lingering on, as root: `sudo loginctl \
@@ -235,6 +242,14 @@ fn user_bus_env(
         env.push(("DBUS_SESSION_BUS_ADDRESS", bus));
     }
     Ok(env)
+}
+
+/// Whether `dir` is the runtime folder of the user `uid` as systemd makes it: a folder, not a link to one, that the
+/// user owns and nobody else can enter or write to (the XDG base directory specification's 0700).
+fn is_runtime_folder_of(dir: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|found| found.is_dir() && found.uid() == uid && found.mode() & 0o077 == 0)
 }
 
 #[cfg(test)]
@@ -256,11 +271,18 @@ mod tests {
         this_user().0
     }
 
+    /// A folder as systemd makes a runtime folder: this user's, mode 0700.
+    fn runtime_folder(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir(path).expect("folder");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("a mode");
+    }
+
     #[test]
     fn without_a_session_the_users_runtime_folder_and_its_bus_are_named() {
         let runtime = tempfile::tempdir().expect("folder");
         let folder = runtime.path().join(me().to_string());
-        std::fs::create_dir(&folder).expect("folder");
+        runtime_folder(&folder);
         let mut bus = OsString::from("unix:path=");
         bus.push(folder.join("bus"));
         assert_eq!(
@@ -302,7 +324,7 @@ mod tests {
     fn what_the_environment_has_is_kept() {
         let runtime = tempfile::tempdir().expect("folder");
         let own = runtime.path().join("elsewhere");
-        std::fs::create_dir(&own).expect("folder");
+        runtime_folder(&own);
         let own_text = own.to_str().expect("a path");
         assert_eq!(
             user_bus_env(
@@ -338,7 +360,7 @@ mod tests {
         }
         let runtime = tempfile::tempdir().expect("folder");
         let folder = runtime.path().join(me().to_string());
-        std::fs::create_dir(&folder).expect("folder");
+        runtime_folder(&folder);
         let mut bus = OsString::from("unix:path=");
         bus.push(folder.join("bus"));
         // As `su <user>` leaves them: the caller's folder (root's `/` stands for it) and the caller's bus.
@@ -355,6 +377,55 @@ mod tests {
                     ("DBUS_SESSION_BUS_ADDRESS", bus.clone()),
                 ]),
                 "{kept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runtime_folder_others_can_enter_or_that_is_a_link_is_not_the_users() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = tempfile::tempdir().expect("folder");
+        let folder = runtime.path().join(me().to_string());
+        runtime_folder(&folder);
+        let mut bus = OsString::from("unix:path=");
+        bus.push(folder.join("bus"));
+        let replaced = Ok(vec![
+            ("XDG_RUNTIME_DIR", folder.clone().into_os_string()),
+            ("DBUS_SESSION_BUS_ADDRESS", bus),
+        ]);
+        // This user's folders, but one others can write a `bus` into, and a link that may point anywhere later.
+        let open = runtime.path().join("open");
+        runtime_folder(&open);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("a mode");
+        let link = runtime.path().join("link");
+        std::os::unix::fs::symlink(&folder, &link).expect("a link");
+        for inherited in [&open, &link] {
+            let text = inherited.to_str().expect("a path");
+            assert_eq!(
+                user_bus_env(
+                    me(),
+                    "runner",
+                    env(&[
+                        ("XDG_RUNTIME_DIR", text),
+                        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/x/bus")
+                    ]),
+                    runtime.path()
+                ),
+                replaced,
+                "{text}"
+            );
+        }
+        // The folder systemd should have made is no better: its bus is not looked for there.
+        for mode in [0o755, 0o750, 0o701] {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).expect("a mode");
+            assert_eq!(
+                user_bus_env(me(), "runner", env(&[]), runtime.path()),
+                Err(format!(
+                    "{} is not runner's own runtime folder: systemd makes it a folder of that user's that nobody else \
+                     can enter (mode 0700)",
+                    folder.display()
+                )),
+                "{mode:o}"
             );
         }
     }

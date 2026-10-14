@@ -639,6 +639,45 @@ mod tests {
         holds()
     }
 
+    /// systemd refuses the scope (a scope of that name stands, the user's systemd will not take another unit): the
+    /// vm-host never runs. The start fails, or the job ends as one whose vm-host exited before it began, and
+    /// systemd's words are in the vm-host's log, not lost.
+    #[test]
+    fn a_scope_systemd_refuses_ends_the_job_with_systemds_words_in_its_log() {
+        let folder = tempfile::tempdir().expect("folder");
+        let refuses = folder.path().join("systemd-run");
+        std::fs::write(
+            &refuses,
+            "#!/bin/sh\necho 'Failed to start transient scope unit: Unit codefusion-runner-j1.scope already exists.' \
+             >&2\nexit 1\n",
+        )
+        .expect("a program");
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o755)).expect("a mode");
+        let vms = VmHosts::new(hanging(folder.path()), folder.path().join("state")).in_scopes(&refuses);
+        match vms.start(&request("j1")) {
+            // systemd-run ended after the job was handed over: the next look sees a vm-host gone without a word.
+            Ok(()) => assert!(
+                within(Duration::from_secs(5), || matches!(vms.look("j1"), Seen::Exited)),
+                "a refused scope looks like a vm-host that still starts: {:?}",
+                vms.look("j1")
+            ),
+            // It ended before: the start itself fails.
+            Err(error) if error.0.starts_with("hand the vm-host its job: ") => {}
+            // Where no systemd user manager runs for this user, the start is refused before systemd is asked.
+            Err(error) if cfg!(target_os = "linux") => {
+                assert!(error.0.starts_with("no scope for the vm-host: "), "{}", error.0);
+                return;
+            }
+            Err(error) => panic!("{}", error.0),
+        }
+        let log =
+            std::fs::read_to_string(vms.layout.logs().join("j1.vm-host.log")).expect("the vm-host's log");
+        assert!(
+            log.contains("Unit codefusion-runner-j1.scope already exists."),
+            "{log}"
+        );
+    }
+
     #[test]
     fn a_vm_host_that_hangs_before_it_wrote_anything_is_still_killed() {
         let folder = tempfile::tempdir().expect("folder");
