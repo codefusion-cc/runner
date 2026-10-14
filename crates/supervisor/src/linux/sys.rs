@@ -52,6 +52,28 @@ pub fn mount(source: &str, target: &str, kind: &str, flags: libc::c_ulong, data:
     .map(drop)
 }
 
+/// `umount2(2)`.
+pub fn umount(target: &str, flags: libc::c_int) -> io::Result<()> {
+    let target = cstr(target);
+    // SAFETY: umount2 takes a NUL terminated path that lives through the call.
+    check(unsafe { libc::umount2(target.as_ptr(), flags) }).map(drop)
+}
+
+/// Asks `ready` every `every` until it answers or `limit` is over, and says what it answered. It is asked once
+/// more at the limit, so a wait of 0 still asks once.
+pub fn until<T>(limit: Duration, every: Duration, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(answer) = ready() {
+            return Some(answer);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(every);
+    }
+}
+
 /// A mount that must work, with its target directory made first.
 pub fn mount_at(
     source: &str,
@@ -257,15 +279,11 @@ pub fn devices(root: &str, extra: &[(&str, u32, u32)]) -> Result<(), String> {
 pub fn pivot_into(root: &str) -> Result<(), String> {
     context("enter the root", std::env::set_current_dir(root))?;
     let here = cstr(".");
-    // SAFETY: pivot_root and umount2 take NUL terminated paths.
+    // SAFETY: pivot_root takes NUL terminated paths.
     context(
         "new root",
         check(unsafe { libc::syscall(libc::SYS_pivot_root, here.as_ptr(), here.as_ptr()) } as libc::c_int),
     )?;
-    // SAFETY: as above.
-    context(
-        "leave the old root",
-        check(unsafe { libc::umount2(here.as_ptr(), libc::MNT_DETACH) }),
-    )?;
+    context("leave the old root", umount(".", libc::MNT_DETACH))?;
     context("enter the root", std::env::set_current_dir("/"))
 }

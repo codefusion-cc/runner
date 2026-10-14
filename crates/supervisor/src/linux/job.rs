@@ -6,8 +6,8 @@ use super::init::{Event, Failure, Host, spawn_self};
 use super::net::Network;
 use super::sys::{self, context, say};
 use cf_guest_proto::{
-    CacheFound, GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason, Summary,
-    Usage, Workload,
+    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason,
+    Summary, Usage, Workload,
 };
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::oom::{self, Kill};
@@ -53,16 +53,17 @@ pub fn empty_summary(exit_code: Option<i32>) -> Summary {
 
 /// The device of the disk the host attached under this name.
 pub(super) fn disk(id: &str) -> Result<String, String> {
-    for _ in 0..500 {
-        for entry in fs::read_dir("/sys/block").into_iter().flatten().flatten() {
-            let serial = fs::read_to_string(entry.path().join("serial")).unwrap_or_default();
-            if serial.trim() == id {
-                return Ok(format!("/dev/{}", entry.file_name().to_string_lossy()));
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Err(format!("the machine has no disk {id}"))
+    sys::until(Duration::from_secs(5), Duration::from_millis(10), || {
+        fs::read_dir("/sys/block")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|entry| {
+                fs::read_to_string(entry.path().join("serial")).is_ok_and(|serial| serial.trim() == id)
+            })
+            .map(|entry| format!("/dev/{}", entry.file_name().to_string_lossy()))
+    })
+    .ok_or_else(|| format!("the machine has no disk {id}"))
 }
 
 fn mount_image() -> Result<(), String> {
@@ -80,7 +81,7 @@ fn mount_image() -> Result<(), String> {
 pub fn format_scratch() -> Result<Summary, String> {
     mount_image()?;
     let device = disk(cf_guest_proto::SCRATCH_DISK)?;
-    let status = image_tool(&mke2fs_args(&device, false))?;
+    let status = image_tool(&mke2fs_args(&device, false, false))?;
     if !status.success() {
         return Err(format!("the image's mke2fs ended with {status}"));
     }
@@ -89,19 +90,20 @@ pub fn format_scratch() -> Result<Summary, String> {
 
 /// `mke2fs`'s arguments for an ext4 file system on `device`, owned by root, with no blocks kept for root. A disk
 /// that outlives its machine (a Docker cache) keeps a journal, so a machine stopped mid-write leaves it whole; a
-/// scratch disk, gone with its machine, needs none.
-pub(super) fn mke2fs_args(device: &str, journal: bool) -> Vec<String> {
+/// scratch disk, gone with its machine, needs none. On a disk that reads as zeros (`prezeroed`, a sparse file the
+/// host just made) nothing is zeroed, by mke2fs or later by the kernel, so the host's file stays as small as what
+/// the job writes.
+pub(super) fn mke2fs_args(device: &str, journal: bool, prezeroed: bool) -> Vec<String> {
     let mut args = vec!["mke2fs", "-q", "-F", "-t", "ext4"];
     if !journal {
         args.extend(["-O", "^has_journal"]);
     }
-    args.extend([
-        "-m",
-        "0",
-        "-E",
-        "lazy_itable_init=1,nodiscard,root_owner=0:0",
-        device,
-    ]);
+    let extended = if prezeroed {
+        "assume_storage_prezeroed=1,nodiscard,root_owner=0:0"
+    } else {
+        "lazy_itable_init=1,nodiscard,root_owner=0:0"
+    };
+    args.extend(["-m", "0", "-E", extended, device]);
     args.iter().map(|arg| arg.to_string()).collect()
 }
 
@@ -128,9 +130,7 @@ pub(super) fn image_tool(argv: &[String]) -> Result<std::process::ExitStatus, St
     }
     let status = context(&format!("the image's {}", argv[0]), command.status());
     if mounted {
-        let path = sys::cstr(&devices);
-        // SAFETY: umount2 takes a NUL terminated path.
-        unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
+        let _ = sys::umount(&devices, libc::MNT_DETACH);
     }
     status
 }
@@ -336,7 +336,10 @@ pub fn run(
             (uid, gid, &group),
             &name,
             job.limits.shm_bytes,
-            cache,
+            &match cache {
+                Some(_) => format!("{}/docker", docker::CACHE),
+                None => format!("{SCRATCH}/docker"),
+            },
         )
         .and_then(|spec| {
             docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM))?;
@@ -415,15 +418,16 @@ pub fn run(
     let summary_usage = usage();
     // A cache is kept only when its daemon wrote down its state and stopped by itself, before the rest goes. One the
     // host stopped is never kept and its end must reach the host within the stop's slack, so nothing waits for it.
-    let daemon = cache.map(|_| {
+    let daemon = cache.map(|found| {
         let answers = sockets.as_deref().is_some_and(docker::daemon_answers);
         let stopped = answers && watch.stop.is_none() && docker::stop_daemon(&format!("{CGROUP}/docker"));
-        (answers, stopped)
+        (found, answers, stopped)
     });
     kill_job();
-    let docker_cache = cache.zip(daemon).map(|(found, daemon)| {
-        let let_go = daemon.1 && docker::let_go_of_cache();
-        docker::cache_end(found, daemon, let_go)
+    let docker_cache = daemon.map(|(found, answers, stopped)| CacheEnd {
+        found,
+        daemon: answers,
+        clean: stopped && docker::let_go_of_cache(),
     });
 
     let mut report = String::new();

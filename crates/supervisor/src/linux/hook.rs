@@ -1,6 +1,7 @@
 //! What the Actions runner's job hooks print: the job's size at its start, and at its end why the Runner or the
 //! kernel stopped something. Runs in the container, as the job's user.
 
+use super::sys;
 use cf_guest_proto::{OomEvent, StopReason};
 use cf_supervisor::docker;
 use cf_supervisor::tell::{self, JobFacts};
@@ -22,21 +23,21 @@ const DOCKER_WAIT: Duration = Duration::from_secs(60);
 
 /// Waits until a Docker job's daemon answers on its socket, and says so as an error on the run when it does not.
 fn docker_ready() {
-    let deadline = Instant::now() + DOCKER_WAIT;
-    let why = loop {
-        if let Ok(why) = fs::read_to_string(format!("{SHARED}/{}", docker::PROBLEM)) {
-            break why;
-        }
-        if UnixStream::connect(docker::SOCKET).is_ok() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            break format!(
-                "its daemon did not answer within {} seconds.",
-                DOCKER_WAIT.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    let answer = sys::until(
+        DOCKER_WAIT,
+        Duration::from_millis(50),
+        || match fs::read_to_string(format!("{SHARED}/{}", docker::PROBLEM)) {
+            Ok(why) => Some(Some(why)),
+            Err(_) => UnixStream::connect(docker::SOCKET).is_ok().then_some(None),
+        },
+    );
+    let why = match answer {
+        Some(None) => return,
+        Some(Some(why)) => why,
+        None => format!(
+            "its daemon did not answer within {} seconds.",
+            DOCKER_WAIT.as_secs()
+        ),
     };
     let log = fs::read_to_string(docker::LOG).unwrap_or_default();
     println!(
@@ -52,27 +53,30 @@ const TIDY_WAIT: Duration = Duration::from_secs(60);
 /// images and build cache stay; that is what the cache is for.
 fn tidy_docker() {
     let deadline = Instant::now() + TIDY_WAIT;
+    // The job's own daemon by its socket, whatever context or `DOCKER_HOST` the job chose.
+    let host = format!("unix://{}", docker::SOCKET);
     let docker = |args: &[&str]| -> Option<String> {
         let mut child = Command::new("docker")
+            .args(["--host", &host])
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        loop {
-            if let Ok(Some(_)) = child.try_wait() {
-                let mut out = String::new();
-                child.stdout.take()?.read_to_string(&mut out).ok()?;
-                return Some(out);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if sys::until(left, Duration::from_millis(50), || {
+            child.try_wait().ok().flatten()
+        })
+        .is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
+        let mut out = String::new();
+        child.stdout.take()?.read_to_string(&mut out).ok()?;
+        Some(out)
     };
     let containers: Vec<String> = docker(&["ps", "--all", "--quiet"])
         .unwrap_or_default()
