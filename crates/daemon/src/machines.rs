@@ -1756,6 +1756,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             env: Vec::new(),
             deadline_s: self.config.deadline.as_secs(),
             docker: inner.docker.contains(&spec.ticket),
+            docker_cache: None,
         };
         self.woke(&mut inner, now);
         let mut life = Slot::reserved(self.config.limits);

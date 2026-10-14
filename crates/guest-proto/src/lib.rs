@@ -22,7 +22,7 @@ pub use frame::{
     write_message,
 };
 pub use message::{
-    GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS, NAME_CHARS, OomEvent,
+    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS, NAME_CHARS, OomEvent,
     Process, STAGE_CHARS, Start, Stop, StopReason, Summary, Task, Usage, Workload,
 };
 
@@ -37,3 +37,6 @@ pub const IMAGE_DISK: &str = "cf-image";
 
 /// The serial of the job's own disk.
 pub const SCRATCH_DISK: &str = "cf-scratch";
+
+/// The serial of a Docker job's cache disk: its repository's Docker data, a copy the job may write.
+pub const CACHE_DISK: &str = "cf-docker-cache";

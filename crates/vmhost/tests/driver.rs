@@ -37,6 +37,7 @@ fn request(job: &str) -> JobRequest {
         env: vec![("CI".into(), "true".into())],
         deadline_s: 3600,
         docker: false,
+        docker_cache: None,
     }
 }
 
@@ -75,6 +76,7 @@ fn summary(end: GuestEnd, exit_code: Option<i32>) -> Summary {
         disk_peak_bytes: 3,
         oom: None,
         wall_ms: 4,
+        docker_cache: None,
     }
 }
 

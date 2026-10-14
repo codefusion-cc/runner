@@ -4,7 +4,7 @@
 
 use crate::layout::{Layout, make_dir, open_private, private};
 use crate::task::run_task;
-use cf_guest_proto::{IMAGE_DISK, SCRATCH_DISK, Task};
+use cf_guest_proto::{CACHE_DISK, IMAGE_DISK, SCRATCH_DISK, Task};
 use cf_vmm::{Disk, Network, VmSpec, Vmm};
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -30,11 +30,17 @@ impl GuestFiles {
     pub(crate) fn machine(
         &self,
         scratch: &Path,
+        cache: Option<&Path>,
         memory_bytes: u64,
         cpus: usize,
         network: Network,
         console: &Path,
     ) -> VmSpec {
+        let cache = cache.map(|path| Disk {
+            path: path.to_path_buf(),
+            id: CACHE_DISK.into(),
+            read_only: false,
+        });
         VmSpec {
             kernel: self.kernel.clone(),
             initramfs: self.initramfs.clone(),
@@ -51,7 +57,10 @@ impl GuestFiles {
                     id: SCRATCH_DISK.into(),
                     read_only: false,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(cache)
+            .collect(),
             network,
             console: console.to_path_buf(),
         }
@@ -104,7 +113,7 @@ pub fn template(
     open_private(&partial)
         .and_then(|file| file.set_len(bytes))
         .map_err(|error| say("the template", error))?;
-    let spec = files.machine(&partial, 1 << 30, 2, Network::None, console);
+    let spec = files.machine(&partial, None, 1 << 30, 2, Network::None, console);
     let made = run_task(vmm, &spec, Task::FormatScratch, FORMAT, give_up).and_then(|report| {
         match report.summary.exit_code {
             Some(0) => Ok(()),

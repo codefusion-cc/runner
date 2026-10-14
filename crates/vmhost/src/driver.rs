@@ -285,6 +285,7 @@ fn run_in(
     }
     let spec = files.machine(
         &scratch_disk,
+        request.docker_cache.as_deref(),
         request.memory_bytes,
         request.cpus as usize,
         Network::Nat,

@@ -292,6 +292,7 @@ fn finish(vm: &mut FakeVm, end: End) {
             disk_peak_bytes: 5 << 20,
             oom: vm.state.oom.clone(),
             wall_ms: 4200,
+            docker_cache: None,
         }),
         at: 0,
     });

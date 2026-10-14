@@ -274,6 +274,30 @@ pub struct Summary {
     pub oom: Option<OomEvent>,
     /// From the workload's start to its end, in milliseconds.
     pub wall_ms: u64,
+    /// A Docker job's cache disk: what the guest found on it and how it was let go.
+    #[serde(default)]
+    pub docker_cache: Option<CacheEnd>,
+}
+
+/// What became of a Docker job's cache disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheEnd {
+    /// What the disk held when the job started.
+    pub found: CacheFound,
+    /// Whether the daemon stopped by itself and the disk was let go cleanly: only such a disk is worth keeping.
+    pub clean: bool,
+}
+
+/// What a Docker job's cache disk held when the job started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheFound {
+    /// Nothing: the repository's first cache, made here.
+    Fresh,
+    /// A cache of earlier jobs, mounted as it was.
+    Reused,
+    /// Something that would not mount, replaced by an empty cache.
+    Replaced,
 }
 
 /// How a task ended, as the guest saw it.
