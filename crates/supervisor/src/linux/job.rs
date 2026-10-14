@@ -289,6 +289,14 @@ pub fn run(
     limits(&job).map_err(|error| ("limits", error))?;
     settings();
 
+    // A Docker job's cache, as found; a disk that cannot be had leaves the daemon on the job's own disk.
+    let cache: Option<CacheFound> = (job.docker && job.docker_cache)
+        .then(|| {
+            docker::mount_cache()
+                .inspect_err(|error| say(&format!("no cache for this job's Docker: {error}")))
+                .ok()
+        })
+        .flatten();
     let facts = JobFacts {
         host: job.host.clone(),
         limits: job.limits,
@@ -316,15 +324,9 @@ pub fn run(
         find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
     let group = fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default();
     let groups = groups_of(&group, USER, gid);
-    // A Docker job's cache, as found, and the folder of its daemon's socket, once the daemon is started.
-    let mut cache: Option<CacheFound> = None;
+    // The folder of a Docker job's daemon's socket, once the daemon is started.
     let mut sockets: Option<String> = None;
     if job.docker {
-        if job.docker_cache {
-            cache = docker::mount_cache()
-                .inspect_err(|error| say(&format!("no cache for this job's Docker: {error}")))
-                .ok();
-        }
         // Started before the Actions runner, so the daemon is up by the first step. A job whose daemon cannot be
         // made runs on and is told why when it starts.
         let started = docker::prepare(
