@@ -168,9 +168,38 @@ fn installed_state(program: &Path) -> Option<&Path> {
     (bin.file_name()? == "bin").then_some(bin.parent()?)
 }
 
+/// How long a Runner that cannot start runs before it ends, so that the service manager, which starts it again at
+/// once, has it try twice a minute and not twice a second: a missing image or key is said twice a minute in the log.
+pub const FAILED_START_WAIT: Duration = Duration::from_secs(30);
+
 /// What the service manager runs: the service until it is asked to end. Machines that stand then go on, and the
-/// Runner that starts next finds them.
+/// Runner that starts next finds them. One that cannot start ends no sooner than [`FAILED_START_WAIT`] after it
+/// began, or at once when it is asked to.
 pub fn daemon(config: &Path) -> Result<(), String> {
+    let began = std::time::Instant::now();
+    let ran = run_daemon(config);
+    // SAFETY: no pointer; it only asks whether standard input is a terminal.
+    let by_hand = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    if let Err(message) = &ran
+        && !by_hand
+    {
+        // Said now, not after the wait: the log shows why at once.
+        eprintln!("codefusion-runner: {message}");
+        watch_signals();
+        hold_until(began + FAILED_START_WAIT, &STOP);
+        std::process::exit(1);
+    }
+    ran
+}
+
+/// Waits until `until`, or until `stop` is set.
+fn hold_until(until: std::time::Instant, stop: &AtomicBool) {
+    while std::time::Instant::now() < until && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_daemon(config: &Path) -> Result<(), String> {
     let program = own_program()?;
     // First, before anything a new program could fail at: an update under way counts its starts, and puts the
     // program before back when it does not stay up.
@@ -537,15 +566,11 @@ fn manager(home: &Path) -> impl ServiceManager + '_ {
     }
 }
 
-/// The Runner's unit in this user's systemd, in `XDG_CONFIG_HOME` when that names a folder.
+/// The Runner's unit in this user's systemd, in the configuration folder that systemd reads.
 #[cfg(target_os = "linux")]
 fn manager(home: &Path) -> impl ServiceManager + '_ {
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|folder| folder.is_absolute())
-        .unwrap_or_else(|| home.join(".config"));
     crate::systemd::UserUnit {
-        config_home,
+        config_home: crate::systemd::config_home(home, &crate::systemd::systemctl),
         run: &crate::systemd::systemctl,
         pause: crate::systemd::UNIT_PAUSE,
     }
@@ -888,6 +913,25 @@ mod tests {
         std::fs::write(config.records().join("j3.json.tmp"), "half written").expect("a file");
         assert_eq!(crate::update::standing(&config.records()), 2);
         assert!(config.records().join("j2.json").exists());
+    }
+
+    #[test]
+    fn a_runner_that_cannot_start_holds_until_its_time_or_until_it_is_asked_to_end() {
+        use std::time::Instant;
+        let stop = AtomicBool::new(false);
+        let began = Instant::now();
+        hold_until(began + Duration::from_millis(300), &stop);
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        // Asked to end meanwhile: at once.
+        stop.store(true, Ordering::Relaxed);
+        let began = Instant::now();
+        hold_until(began + Duration::from_secs(30), &stop);
+        assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+        // A time that is past already is no wait.
+        let stop = AtomicBool::new(false);
+        let began = Instant::now();
+        hold_until(began - Duration::from_secs(1), &stop);
+        assert!(began.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

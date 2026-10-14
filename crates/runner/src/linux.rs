@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// What `check` finds on a Linux host. Read by [`Facts::of_this_host`]; a test writes its own.
 #[derive(Debug, Clone)]
 pub struct Facts {
-    /// The user the Runner runs as.
+    /// The user the Runner runs as, as the user database names it.
     pub user: String,
     /// That user's number.
     pub uid: u32,
@@ -56,9 +56,7 @@ pub struct Switches {
 impl Facts {
     /// Reads this host, `root` standing for `/` (a folder of files in a test), for the state folder `state_dir`.
     pub fn of_this_host(root: &Path, state_dir: &Path) -> Facts {
-        // SAFETY: no arguments; it cannot fail.
-        let uid = unsafe { libc::getuid() };
-        let user = std::env::var("USER").unwrap_or_else(|_| uid.to_string());
+        let (uid, user) = cf_daemon::platform::this_user();
         let read = |path: &str| std::fs::read_to_string(under(root, path)).ok();
         let number = |path: &str| read(path).and_then(|text| text.trim().parse().ok());
         Facts {
@@ -450,9 +448,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("a folder")).expect("folder");
             std::fs::write(path, text).expect("a file");
         };
-        // SAFETY: no arguments; it cannot fail.
-        let uid = unsafe { libc::getuid() };
-        let user = std::env::var("USER").unwrap_or_else(|_| uid.to_string());
+        let (uid, user) = cf_daemon::platform::this_user();
         let empty = Facts::of_this_host(root.path(), root.path());
         assert!(!empty.cgroup2 && !empty.linger && empty.delegated.is_none());
         assert_eq!(empty.kvm, Err(Kvm::Missing));

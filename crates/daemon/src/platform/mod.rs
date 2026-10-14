@@ -22,7 +22,7 @@ use cf_guest_proto::Workload;
 use cf_secret::Secret;
 
 #[cfg(target_os = "linux")]
-pub use linux::{Linux, RUNTIME, user_bus_env};
+pub use linux::{Linux, RUNTIME, this_user, this_user_bus_env, user_bus_env};
 #[cfg(target_os = "macos")]
 pub use mac::Mac;
 
@@ -47,6 +47,9 @@ pub struct Process {
     pub program: PathBuf,
     /// When it started, in seconds since 1970. A number that went to a later process has a later time.
     pub started_at: u64,
+    /// When it started by a clock that no step of the wall clock moves, where the system keeps one: on Linux clock
+    /// ticks since the host started. With the host's start, it names the process for good.
+    pub mark: Option<u64>,
 }
 
 /// What the service needs of the system it runs on, beside what is the same everywhere.

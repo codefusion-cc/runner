@@ -36,7 +36,8 @@ struct Machine {
     id: u64,
     name: String,
     token: String,
-    /// The system as the console keeps it: what the last connect request or report said, read by [`schema::os`].
+    /// The system as the console keeps it: what the last connect request said, then what the last report that named
+    /// one said ([`schema::os`]).
     os: Option<&'static str>,
 }
 
@@ -238,8 +239,11 @@ impl State {
                 }
             }
         }
-        if let Some(row) = self.machines.iter_mut().find(|m| m.id == machine) {
-            row.os = schema::os(&body);
+        // A report that names no system the console knows keeps the one it has (`os = COALESCE(?, os)`).
+        if let Some(os) = schema::os(&body)
+            && let Some(row) = self.machines.iter_mut().find(|m| m.id == machine)
+        {
+            row.os = Some(os);
         }
         // A Mac renamed on the Mac is renamed here too, unless another Mac has the name.
         let wanted = body["status"]["machine"].as_str().unwrap_or("").to_string();

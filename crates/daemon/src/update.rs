@@ -18,9 +18,9 @@ pub const UPDATE_FILE: &str = "update.json";
 /// How often a new program may start without staying up before the one before is put back.
 pub const MAX_STARTS: u32 = 3;
 
-/// How long a new program must run before its update counts as done. The service manager starts a program that
-/// ended again after 30 s (launchd's `ThrottleInterval`, systemd's `RestartSec`), so a program that fails at once
-/// uses its starts within two minutes.
+/// How long a new program must run before its update counts as done. A program that cannot start ends 30 s after it
+/// began and is started again (launchd's `ThrottleInterval`, the Runner's own wait under systemd), so one that fails
+/// at once uses its starts within two minutes.
 pub const STAYS_UP: Duration = Duration::from_secs(60);
 
 /// How the Runner updates itself on this host. Both calls take long and block: they run on a thread of their own.

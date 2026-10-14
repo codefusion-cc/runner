@@ -103,7 +103,12 @@ impl Platform for Mac {
         let started_at = started_at(pid)?;
         let program = program_of(pid)?;
         // The number may have gone to another process while the program was read.
-        (self::started_at(pid)? == started_at).then_some(Process { program, started_at })
+        // macOS keeps the start in seconds as the clock said then, which no later step moves.
+        (self::started_at(pid)? == started_at).then_some(Process {
+            program,
+            started_at,
+            mark: None,
+        })
     }
 
     fn vm_hosts(program: &Path, state_dir: &Path) -> VmHosts {

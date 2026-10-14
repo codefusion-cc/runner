@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::platform::{Platform as _, This};
+use crate::platform::{Platform as _, Process, This};
 
 /// What is there of a job's machine at one moment.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +79,10 @@ struct Spawned {
     pid: u32,
     /// Seconds since 1970 when it was started.
     at: u64,
+    /// When its process started by the system's clock that no step of the wall clock moves ([`Process::mark`]),
+    /// where the system keeps one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mark: Option<u64>,
 }
 
 fn now_s() -> u64 {
@@ -133,6 +137,19 @@ impl VmHosts {
             command.arg("vm").arg("--state-dir").arg(&self.state_dir);
             return Ok(command);
         };
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] // only Linux adds to it
+        let mut command = self.scoped_command(systemd_run, job)?;
+        // The bus of the user's systemd, which a Runner started by hand under `sudo -iu` may not be told of.
+        #[cfg(target_os = "linux")]
+        command.envs(
+            crate::platform::this_user_bus_env()
+                .map_err(|why| VmError(format!("no scope for the vm-host: {why}")))?,
+        );
+        Ok(command)
+    }
+
+    /// The job's vm-host under `systemd_run`, in a scope named after the job whose cgroup is delegated to it.
+    fn scoped_command(&self, systemd_run: &Path, job: &str) -> Result<Command, VmError> {
         let unit =
             scope_unit(job).ok_or_else(|| VmError(format!("{job:?} is no name for a systemd scope")))?;
         let mut command = Command::new(systemd_run);
@@ -150,21 +167,6 @@ impl VmHosts {
             .arg("vm")
             .arg("--state-dir")
             .arg(&self.state_dir);
-        // The bus of the user's systemd, which a Runner started by hand under `sudo -iu` may not be told of.
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: no arguments; it cannot fail.
-            let uid = unsafe { libc::getuid() };
-            let user = std::env::var("USER").unwrap_or_else(|_| uid.to_string());
-            let env = crate::platform::user_bus_env(
-                uid,
-                &user,
-                |name| std::env::var_os(name),
-                Path::new(crate::platform::RUNTIME),
-            )
-            .map_err(|why| VmError(format!("no scope for the vm-host: {why}")))?;
-            command.envs(env);
-        }
         Ok(command)
     }
 
@@ -172,11 +174,13 @@ impl VmHosts {
     /// runs the Runner's binary and is no younger than that. All that makes a silent process a vm-host to end. A
     /// number that went to another program is never sent a signal, nor one that went to a later process of the
     /// Runner's own binary (another job's vm-host, a command, this Runner itself).
-    fn is_ours(&self, pid: u32, born_by: u64) -> bool {
+    ///
+    /// `mark` is the start of the vm-host's process as written down when it was started ([`Process::mark`]): where
+    /// it is known, the process must have started at that very moment, whatever the wall clock did since.
+    fn is_ours(&self, pid: u32, born_by: u64, mark: Option<u64>) -> bool {
         pid != std::process::id()
             && This::process(pid).is_some_and(|process| {
-                same_file(&process.program, &self.program)
-                    && process.started_at <= born_by.saturating_add(START_SLACK)
+                same_file(&process.program, &self.program) && started_by(&process, born_by, mark)
             })
     }
 
@@ -187,14 +191,46 @@ impl VmHosts {
     /// Writes down the process a job's vm-host was started as.
     fn note(&self, job: &str, pid: u32) -> std::io::Result<()> {
         cf_secret::private_dir(&self.layout.run())?;
-        let spawned = serde_json::to_vec(&Spawned { pid, at: now_s() }).map_err(std::io::Error::other)?;
+        let spawned = Spawned {
+            pid,
+            at: now_s(),
+            mark: This::process(pid).and_then(|process| process.mark),
+        };
+        let spawned = serde_json::to_vec(&spawned).map_err(std::io::Error::other)?;
         cf_secret::replace_private(&self.spawned(job), &spawned)
     }
 
     /// The vm-host a Runner before started for the job and wrote down, when its process is still that one.
     fn noted(&self, job: &str) -> Option<u32> {
-        let spawned: Spawned = serde_json::from_slice(&std::fs::read(self.spawned(job)).ok()?).ok()?;
-        self.is_ours(spawned.pid, spawned.at).then_some(spawned.pid)
+        let spawned = self.note_of(job)?;
+        self.is_ours(spawned.pid, spawned.at, spawned.mark)
+            .then_some(spawned.pid)
+    }
+
+    /// What was written down of the job's vm-host when it was started.
+    fn note_of(&self, job: &str) -> Option<Spawned> {
+        serde_json::from_slice(&std::fs::read(self.spawned(job)).ok()?).ok()
+    }
+
+    /// Whether the process `pid` that the job's state names is its vm-host: by the start written down for that
+    /// process when it was started, else by the time the state gives.
+    fn state_is_ours(&self, job: &str, state: &JobState) -> bool {
+        let mark = self
+            .note_of(job)
+            .filter(|spawned| spawned.pid == state.pid)
+            .and_then(|spawned| spawned.mark);
+        self.is_ours(state.pid, state.started_at, mark)
+    }
+}
+
+/// Whether `process` started by the moment `born_by` (seconds since 1970), or, where `mark` is known, at that very
+/// start. A wall clock that was stepped since moves what Linux says of an old process's start in seconds (it works it
+/// out from the clock at every read) and nothing of its mark: a board without a clock of its own that meets NTP after
+/// its vm-hosts started still knows them.
+fn started_by(process: &Process, born_by: u64, mark: Option<u64>) -> bool {
+    match (mark, process.mark) {
+        (Some(noted), Some(now)) => noted == now,
+        _ => process.started_at <= born_by.saturating_add(START_SLACK),
     }
 }
 
@@ -337,7 +373,7 @@ impl Vms for VmHosts {
         match control::ask(&self.layout, job, &Request::State, ANSWER) {
             Ok(now) if now.job == state.job && now.pid == state.pid => Seen::Alive(now),
             // A number that is another program's by now is no vm-host of ours, silent or not.
-            _ if state.end.is_none() && exists(state.pid) && self.is_ours(state.pid, state.started_at) => {
+            _ if state.end.is_none() && exists(state.pid) && self.state_is_ours(job, &state) => {
                 Seen::Silent(state)
             }
             // It ended between the two looks: the file has the last word.
@@ -378,7 +414,7 @@ impl Vms for VmHosts {
             return;
         };
         let answers = control::answers(&self.layout, &state, ANSWER);
-        if !(answers || self.is_ours(state.pid, state.started_at)) {
+        if !(answers || self.state_is_ours(job, &state)) {
             return;
         }
         if let Ok(pid) = libc::pid_t::try_from(state.pid)
@@ -459,10 +495,71 @@ mod tests {
             .expect("a process");
         // Nothing here looks at the process until well past the slack a start may have.
         std::thread::sleep(Duration::from_secs(START_SLACK + 2));
-        let ours = vms.is_ours(child.id(), born_by);
+        let ours = vms.is_ours(child.id(), born_by, None);
         let _ = child.kill();
         let _ = child.wait();
         assert!(ours, "a vm-host that has run for a while is no stranger");
+    }
+
+    #[test]
+    fn a_process_known_by_its_start_mark_is_that_process_whatever_the_wall_clock_did() {
+        let born_by = 1_000_000;
+        let process = |started_at: u64, mark: Option<u64>| Process {
+            program: PathBuf::from("/bin/codefusion-runner"),
+            started_at,
+            mark,
+        };
+        // No mark: started no later than the time written down, with the slack of two reads of one clock.
+        assert!(started_by(&process(born_by + START_SLACK, None), born_by, None));
+        assert!(!started_by(
+            &process(born_by + START_SLACK + 1, None),
+            born_by,
+            None
+        ));
+        assert!(started_by(&process(born_by - 3600, Some(7)), born_by, None));
+        // The clock was stepped an hour forward since: the seconds moved, the mark did not.
+        assert!(started_by(
+            &process(born_by + 3600, Some(4200)),
+            born_by,
+            Some(4200)
+        ));
+        // The number went to another process, which by the seconds would pass.
+        assert!(!started_by(
+            &process(born_by - 10, Some(4300)),
+            born_by,
+            Some(4200)
+        ));
+        // A system that keeps no mark is judged by the seconds.
+        assert!(started_by(&process(born_by, None), born_by, Some(4200)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vm_host_is_written_down_with_its_start_mark_and_known_by_it() {
+        let folder = tempfile::tempdir().expect("folder");
+        let program = Path::new(SLEEP);
+        let vms = VmHosts::new(program, folder.path().join("state"));
+        let mut vm_host = Asleep::start(program);
+        vms.note("j1", vm_host.id()).expect("a note");
+        let noted = vms.note_of("j1").expect("the note");
+        let mark = This::process(vm_host.id()).and_then(|process| process.mark);
+        assert!(mark.is_some(), "Linux keeps a mark");
+        assert_eq!((noted.pid, noted.mark), (vm_host.id(), mark));
+        assert_eq!(vms.noted("j1"), Some(vm_host.id()));
+        // A note that names another start of that number names no process to end.
+        std::fs::write(
+            vms.spawned("j2"),
+            serde_json::to_vec(&Spawned {
+                pid: vm_host.id(),
+                at: now_s(),
+                mark: mark.map(|mark| mark + 1),
+            })
+            .expect("json"),
+        )
+        .expect("a note");
+        assert_eq!(vms.noted("j2"), None);
+        vms.kill("j2");
+        assert!(vm_host.runs(), "a process that only has the number was killed");
     }
 
     #[test]
@@ -483,11 +580,9 @@ mod tests {
 
     #[test]
     fn a_vm_host_in_a_scope_is_the_runners_program_under_systemd_run_with_its_cgroup_delegated() {
-        let vms = VmHosts::new("/state/bin/codefusion-runner", "/state").in_scopes("/usr/bin/systemd-run");
-        let Ok(command) = vms.command("j1a2b3c4") else {
-            // A host without the user's runtime folder (no systemd user manager) has no scope to start one in.
-            return;
-        };
+        let systemd_run = Path::new("/usr/bin/systemd-run");
+        let vms = VmHosts::new("/state/bin/codefusion-runner", "/state").in_scopes(systemd_run);
+        let command = vms.scoped_command(systemd_run, "j1a2b3c4").expect("a command");
         assert_eq!(command.get_program(), "/usr/bin/systemd-run");
         let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
         assert_eq!(
@@ -716,6 +811,7 @@ mod tests {
             serde_json::to_vec(&Spawned {
                 pid: later.id(),
                 at: long_ago,
+                mark: None,
             })
             .expect("json"),
         )
@@ -750,7 +846,12 @@ mod tests {
         std::fs::remove_file(vms.layout.state("j1")).expect("the state");
         std::fs::write(
             vms.spawned("j1"),
-            serde_json::to_vec(&Spawned { pid: me, at: now_s() }).expect("json"),
+            serde_json::to_vec(&Spawned {
+                pid: me,
+                at: now_s(),
+                mark: None,
+            })
+            .expect("json"),
         )
         .expect("a note");
         assert_eq!(vms.noted("j1"), None);

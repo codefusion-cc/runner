@@ -16,9 +16,10 @@ pub const UNIT: &str = "codefusion-runner.service";
 /// The unit's text.
 ///
 /// `Restart=always` starts the Runner again whenever it ends, as launchd's `KeepAlive` does: `restart` and an update
-/// work by ending, and machines that stand are found again by the Runner that starts. `RestartSec` keeps one that
-/// cannot start (no image, no key) to two tries and two lines in the log a minute, and `StartLimitIntervalSec=0` lets
-/// it try for as long as it takes. `Type=exec` makes `systemctl start` fail when the program cannot be run at all.
+/// work by ending, and machines that stand are found again by the Runner that starts. systemd waits `RestartSec`
+/// after every end, a restart's too, so it is short; a Runner that cannot start (no image, no key) waits out the rest
+/// of [`crate::service::FAILED_START_WAIT`] itself before it ends, which keeps it to two tries and two lines in the log
+/// a minute as launchd's `ThrottleInterval` does, and `StartLimitIntervalSec=0` lets it try for as long as it takes. `Type=exec` makes `systemctl start` fail when the program cannot be run at all.
 /// `TimeoutStopSec` gives it the time to close its sessions at GitHub. Each vm-host runs in a scope of its own, so
 /// `KillMode=mixed` ends only what the Runner itself left in the unit once it is gone, never a machine. The output
 /// goes to a file of the state folder, beside the Runner's own log, as on a Mac. Nothing in it confines the Runner:
@@ -36,7 +37,7 @@ Type=exec
 ExecStart={program} daemon --config {config}
 WorkingDirectory={state}
 Restart=always
-RestartSec=30
+RestartSec=5
 TimeoutStopSec=90
 KillMode=mixed
 StandardOutput=append:{log}
@@ -102,15 +103,7 @@ pub type Systemctl<'a> = &'a dyn Fn(&[&str]) -> Result<String, String>;
 /// The real `systemctl --user`. The user's systemd is found through its runtime folder, which a shell of
 /// `sudo -iu <user>` may not name ([`cf_daemon::platform::user_bus_env`]).
 pub fn systemctl(args: &[&str]) -> Result<String, String> {
-    // SAFETY: no arguments; it cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let user = std::env::var("USER").unwrap_or_else(|_| uid.to_string());
-    let env = cf_daemon::platform::user_bus_env(
-        uid,
-        &user,
-        |name| std::env::var_os(name),
-        Path::new(cf_daemon::platform::RUNTIME),
-    )?;
+    let env = cf_daemon::platform::this_user_bus_env()?;
     let output = std::process::Command::new("/usr/bin/systemctl")
         .arg("--user")
         .args(args)
@@ -128,6 +121,20 @@ pub fn systemctl(args: &[&str]) -> Result<String, String> {
     } else {
         Err(format!("systemctl --user {}: {}", args.join(" "), text.trim()))
     }
+}
+
+/// The configuration folder the user's systemd reads units from: `XDG_CONFIG_HOME` as that systemd has it, which is
+/// not always what the shell that installs has, else `~/.config`.
+pub fn config_home(home: &Path, run: Systemctl<'_>) -> PathBuf {
+    run(&["show-environment"])
+        .ok()
+        .and_then(|env| {
+            env.lines()
+                .find_map(|line| line.strip_prefix("XDG_CONFIG_HOME="))
+                .map(PathBuf::from)
+        })
+        .filter(|folder| folder.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
 }
 
 /// The Runner's unit in one user's systemd.
@@ -191,7 +198,7 @@ impl ServiceManager for UserUnit<'_> {
         let path = self.path();
         let folder = path.parent().ok_or("the unit's folder has no parent")?;
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-        cf_secret::replace_private_as(&path, unit.as_bytes(), 0o644)
+        cf_secret::replace_private(&path, unit.as_bytes())
             .map_err(|error| format!("{}: {error}", path.display()))?;
         (self.run)(&["daemon-reload"])?;
         (self.run)(&["enable", UNIT])?;
@@ -261,7 +268,8 @@ mod tests {
         );
         assert_eq!(value(&text, "Type"), ["exec"]);
         assert_eq!(value(&text, "Restart"), ["always"]);
-        assert_eq!(value(&text, "RestartSec"), ["30"]);
+        // Short, so that a restart or an update is back in seconds: one that cannot start waits on its own.
+        assert_eq!(value(&text, "RestartSec"), ["5"]);
         assert_eq!(value(&text, "StartLimitIntervalSec"), ["0"]);
         assert_eq!(value(&text, "TimeoutStopSec"), ["90"]);
         // The machines' vm-hosts are in scopes of their own: a stop ends the Runner with SIGTERM, then only what
@@ -394,6 +402,28 @@ mod tests {
     }
 
     const SHOW: &str = "show --property=ActiveState --value codefusion-runner.service";
+
+    #[test]
+    fn the_unit_goes_where_the_users_systemd_reads_units_whatever_the_shell_says() {
+        let home = Path::new("/home/codefusion-runner");
+        let manager_with = |env: &'static str| {
+            move |args: &[&str]| -> Result<String, String> {
+                assert_eq!(args, ["show-environment"]);
+                Ok(env.to_string())
+            }
+        };
+        let own = manager_with(
+            "HOME=/home/codefusion-runner\nXDG_CONFIG_HOME=/srv/cf/config\nXDG_RUNTIME_DIR=/run/user/1002\n",
+        );
+        assert_eq!(config_home(home, &own), Path::new("/srv/cf/config"));
+        let none = manager_with("HOME=/home/codefusion-runner\nXDG_RUNTIME_DIR=/run/user/1002\n");
+        assert_eq!(config_home(home, &none), home.join(".config"));
+        // A value systemd had to quote, or a relative one, is not a folder it reads.
+        let quoted = manager_with("XDG_CONFIG_HOME=$'/srv/a\\nb'\n");
+        assert_eq!(config_home(home, &quoted), home.join(".config"));
+        let unreachable = |_: &[&str]| -> Result<String, String> { Err("Failed to connect to bus".into()) };
+        assert_eq!(config_home(home, &unreachable), home.join(".config"));
+    }
 
     #[test]
     fn a_first_start_writes_the_unit_reloads_enables_and_starts_it() {
@@ -555,7 +585,8 @@ mod tests {
     }
 
     /// The unit as `install` writes it, with this user's real systemd and the real daemon, which ends at once (no
-    /// image is installed): systemd starts it again after `RestartSec`, and `remove` leaves nothing behind. It
+    /// image is installed, and it waits out `FAILED_START_WAIT` first): systemd starts it again, and `remove` leaves
+    /// nothing behind. It
     /// installs `codefusion-runner.service` for this user, so it runs only when asked:
     /// `cargo test -p codefusion-runner -- --ignored the_real_systemd`.
     #[test]
@@ -569,12 +600,8 @@ mod tests {
                 .to_string()
         };
         let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
-        let config_home = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|folder| folder.is_absolute())
-            .unwrap_or_else(|| home.join(".config"));
         let manager = UserUnit {
-            config_home,
+            config_home: config_home(&home, &systemctl),
             run: &systemctl,
             pause: UNIT_PAUSE,
         };

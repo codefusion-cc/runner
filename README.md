@@ -198,8 +198,8 @@ target/release/codefusion-runner install --config <file>
 `check` lists what Linux needs and the command that brings what is missing: `/dev/kvm` open to the user, lingering,
 memory and pids handed on to the user's systemd, user namespaces, pasta, a state folder that may run programs, and a
 build that carries cloud-hypervisor. `install` copies the program to `<state_dir>/bin`, writes
-`~/.config/systemd/user/codefusion-runner.service` (`$XDG_CONFIG_HOME` when it is set), enables and starts it. Under
-`sudo -iu` the Runner finds the user's systemd in `/run/user/<uid>` by itself.
+`~/.config/systemd/user/codefusion-runner.service` (below `$XDG_CONFIG_HOME` when the user's systemd has it set),
+enables and starts it. Under `sudo -iu` the Runner finds the user's systemd in `/run/user/<uid>` by itself.
 
 The log is `<state_dir>/logs/runner.log`, and what the Runner printed before it opened it is in `systemd.log` beside it.
 

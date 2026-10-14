@@ -698,7 +698,7 @@ async fn numbers_and_times_are_bounded() {
 #[tokio::test]
 async fn the_system_is_macos_or_linux_and_anything_else_is_read_as_none_and_refused_never() {
     let w = world().await;
-    let read_as = |os: Value| -> Option<&'static str> {
+    let read_as = |os: &Value| -> Option<&'static str> {
         match os.as_str() {
             Some("macos") => Some("macos"),
             Some("linux") => Some("linux"),
@@ -715,6 +715,8 @@ async fn the_system_is_macos_or_linux_and_anything_else_is_read_as_none_and_refu
         json!(["linux"]),
         Value::Null,
     ];
+    // A report that names no system the console knows keeps the one it has.
+    let mut kept = w.fake.os_of("mac-a");
     for (n, os) in values.iter().enumerate() {
         let code = format!("code-{n}");
         w.fake.add_code(&code);
@@ -724,19 +726,19 @@ async fn the_system_is_macos_or_linux_and_anything_else_is_read_as_none_and_refu
         assert_eq!(got.status, 200, "connect with os {os}: {}", got.error());
         assert_eq!(
             w.fake.os_of(&format!("host-{n}")).as_deref(),
-            read_as(os.clone()),
+            read_as(os),
             "connect with os {os}"
         );
         report_gets(&w, &format!("os {os}"), &with(|r| r["os"] = os.clone()), 200).await;
-        assert_eq!(
-            w.fake.os_of("mac-a").as_deref(),
-            read_as(os.clone()),
-            "report with os {os}"
-        );
+        if let Some(said) = read_as(os) {
+            kept = Some(said.to_string());
+        }
+        assert_eq!(w.fake.os_of("mac-a"), kept, "report with os {os}");
     }
-    // Left out, as an older Runner does.
+    assert_eq!(kept.as_deref(), Some("macos"), "the last system named");
+    // Left out, as an older Runner does: the system said before stays.
     report_gets(&w, "no os", &report_json("mac-a"), 200).await;
-    assert_eq!(w.fake.os_of("mac-a"), None);
+    assert_eq!(w.fake.os_of("mac-a").as_deref(), Some("macos"));
 }
 
 #[tokio::test]

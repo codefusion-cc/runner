@@ -125,6 +125,7 @@ impl Platform for Linux {
         Some(Process {
             program: process.program,
             started_at: process.started_at,
+            mark: Some(process.started_ticks),
         })
     }
 
@@ -136,9 +137,53 @@ impl Platform for Linux {
     }
 }
 
+/// This process's user: its number, and its name as the user database has it (`$USER` only when the database will
+/// not say, the number when neither does). The name is what `loginctl enable-linger` and `/var/lib/systemd/linger`
+/// know the user by.
+pub fn this_user() -> (u32, String) {
+    // SAFETY: no arguments; it cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let name = user_name(uid)
+        .or_else(|| std::env::var("USER").ok().filter(|user| !user.is_empty()))
+        .unwrap_or_else(|| uid.to_string());
+    (uid, name)
+}
+
+/// The name of the user with this number in the user database.
+fn user_name(uid: u32) -> Option<String> {
+    let mut buffer: Vec<libc::c_char> = vec![0; 4096];
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `entry` and `buffer` are writable and `buffer.len()` long as passed; the call writes the entry, its
+    // strings into the buffer, and `found` as a pointer to the entry or null.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &raw mut found,
+        )
+    };
+    if status != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: the call succeeded and found the entry, so `pw_name` is a NUL-ended string in `buffer`, alive here.
+    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
+    name.to_str().ok().map(String::from)
+}
+
+/// [`user_bus_env`] of this process: its user, its environment, the real runtime folders.
+pub fn this_user_bus_env() -> Result<Vec<(&'static str, OsString)>, String> {
+    let (uid, user) = this_user();
+    user_bus_env(uid, &user, |name| std::env::var_os(name), Path::new(RUNTIME))
+}
+
 /// What a program that talks to this user's systemd needs in its environment and may not have, as under
 /// `sudo -iu <user>`: the user's runtime folder (`XDG_RUNTIME_DIR`) and the bus in it
-/// (`DBUS_SESSION_BUS_ADDRESS`). `get` reads the environment; what it has is kept. Empty when both are there.
+/// (`DBUS_SESSION_BUS_ADDRESS`). `get` reads the environment; what it has is kept while the runtime folder it names
+/// is the user's own. One that is not, as `su <user>` or `sudo -E` leave the caller's, is replaced, and its bus with
+/// it: talking to that would be talking to another user's systemd. Empty when both are there and the user's.
 ///
 /// An error, which names the root command that fixes it, when the runtime folder is not there: no systemd user
 /// manager runs for the user, because lingering is off and nobody is logged in.
@@ -148,23 +193,29 @@ pub fn user_bus_env(
     get: impl Fn(&str) -> Option<OsString>,
     runtime: &Path,
 ) -> Result<Vec<(&'static str, OsString)>, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let own = |dir: &Path| std::fs::metadata(dir).is_ok_and(|found| found.is_dir() && found.uid() == uid);
     let mut env = Vec::new();
-    let folder = match get("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
+    let inherited = get("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .filter(|dir| own(dir.as_path()));
+    let folder = match &inherited {
+        Some(dir) => dir.clone(),
         None => {
             let dir = runtime.join(uid.to_string());
             env.push(("XDG_RUNTIME_DIR", dir.clone().into_os_string()));
             dir
         }
     };
-    if !folder.is_dir() {
+    if !own(folder.as_path()) {
         return Err(format!(
             "{} is not there: no systemd user manager runs for {user}. Turn lingering on, as root: `sudo loginctl \
              enable-linger {user}`",
             folder.display()
         ));
     }
-    if get("DBUS_SESSION_BUS_ADDRESS").is_none_or(|bus| bus.is_empty()) {
+    if inherited.is_none() || get("DBUS_SESSION_BUS_ADDRESS").is_none_or(|bus| bus.is_empty()) {
         let mut bus = OsString::from("unix:path=");
         bus.push(folder.join("bus"));
         env.push(("DBUS_SESSION_BUS_ADDRESS", bus));
@@ -186,15 +237,20 @@ mod tests {
         move |name| map.get(name).cloned()
     }
 
+    /// This test's user: a runtime folder is taken only when it is the user's own.
+    fn me() -> u32 {
+        this_user().0
+    }
+
     #[test]
     fn without_a_session_the_users_runtime_folder_and_its_bus_are_named() {
         let runtime = tempfile::tempdir().expect("folder");
-        std::fs::create_dir(runtime.path().join("1001")).expect("folder");
-        let folder = runtime.path().join("1001");
+        let folder = runtime.path().join(me().to_string());
+        std::fs::create_dir(&folder).expect("folder");
         let mut bus = OsString::from("unix:path=");
         bus.push(folder.join("bus"));
         assert_eq!(
-            user_bus_env(1001, "runner", env(&[]), runtime.path()),
+            user_bus_env(me(), "runner", env(&[]), runtime.path()),
             Ok(vec![
                 ("XDG_RUNTIME_DIR", folder.clone().into_os_string()),
                 ("DBUS_SESSION_BUS_ADDRESS", bus.clone()),
@@ -203,13 +259,26 @@ mod tests {
         // An empty value is none.
         assert_eq!(
             user_bus_env(
-                1001,
+                me(),
                 "runner",
                 env(&[("XDG_RUNTIME_DIR", ""), ("DBUS_SESSION_BUS_ADDRESS", "")]),
                 runtime.path()
             ),
             Ok(vec![
                 ("XDG_RUNTIME_DIR", folder.clone().into_os_string()),
+                ("DBUS_SESSION_BUS_ADDRESS", bus.clone()),
+            ])
+        );
+        // A bus without the runtime folder it belongs to is no bus of the user's.
+        assert_eq!(
+            user_bus_env(
+                me(),
+                "runner",
+                env(&[("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus")]),
+                runtime.path()
+            ),
+            Ok(vec![
+                ("XDG_RUNTIME_DIR", folder.into_os_string()),
                 ("DBUS_SESSION_BUS_ADDRESS", bus),
             ])
         );
@@ -223,7 +292,7 @@ mod tests {
         let own_text = own.to_str().expect("a path");
         assert_eq!(
             user_bus_env(
-                1001,
+                me(),
                 "runner",
                 env(&[
                     ("XDG_RUNTIME_DIR", own_text),
@@ -237,7 +306,7 @@ mod tests {
         bus.push(own.join("bus"));
         assert_eq!(
             user_bus_env(
-                1001,
+                me(),
                 "runner",
                 env(&[("XDG_RUNTIME_DIR", own_text)]),
                 runtime.path()
@@ -248,18 +317,61 @@ mod tests {
     }
 
     #[test]
+    fn another_users_runtime_folder_and_bus_left_in_the_environment_are_replaced() {
+        if me() == 0 {
+            // Root owns `/`, the other user's folder here.
+            return;
+        }
+        let runtime = tempfile::tempdir().expect("folder");
+        let folder = runtime.path().join(me().to_string());
+        std::fs::create_dir(&folder).expect("folder");
+        let mut bus = OsString::from("unix:path=");
+        bus.push(folder.join("bus"));
+        // As `su <user>` leaves them: the caller's folder (root's `/` stands for it) and the caller's bus.
+        for kept in [("XDG_RUNTIME_DIR", "/"), ("XDG_RUNTIME_DIR", "/not/there")] {
+            assert_eq!(
+                user_bus_env(
+                    me(),
+                    "runner",
+                    env(&[kept, ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")]),
+                    runtime.path()
+                ),
+                Ok(vec![
+                    ("XDG_RUNTIME_DIR", folder.clone().into_os_string()),
+                    ("DBUS_SESSION_BUS_ADDRESS", bus.clone()),
+                ]),
+                "{kept:?}"
+            );
+        }
+    }
+
+    #[test]
     fn no_runtime_folder_is_lingering_off_and_says_the_command_that_turns_it_on() {
         let runtime = tempfile::tempdir().expect("folder");
         let error =
-            user_bus_env(1001, "codefusion-runner", env(&[]), runtime.path()).expect_err("no manager");
+            user_bus_env(me(), "codefusion-runner", env(&[]), runtime.path()).expect_err("no manager");
         assert_eq!(
             error,
             format!(
-                "{}/1001 is not there: no systemd user manager runs for codefusion-runner. Turn lingering on, as \
+                "{}/{} is not there: no systemd user manager runs for codefusion-runner. Turn lingering on, as \
                  root: `sudo loginctl enable-linger codefusion-runner`",
-                runtime.path().display()
+                runtime.path().display(),
+                me()
             )
         );
+    }
+
+    #[test]
+    fn this_user_is_named_as_the_user_database_names_it() {
+        let (uid, name) = this_user();
+        // SAFETY: no arguments; it cannot fail.
+        assert_eq!(uid, unsafe { libc::getuid() });
+        let id = std::process::Command::new("id").arg("-un").output().expect("id");
+        // A user the database does not know (a container's number) has no name to compare with.
+        if id.status.success() {
+            assert_eq!(name, String::from_utf8_lossy(&id.stdout).trim());
+        }
+        assert_eq!(user_name(u32::MAX - 7), None, "a number nobody has");
     }
 
     #[test]
