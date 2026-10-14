@@ -15,6 +15,10 @@ pub const MAX_JOB_EVENTS: usize = 500;
 pub const MAX_RESULTS: usize = 50;
 /// The most Actions runners one status lists.
 pub const MAX_RUNNERS: usize = 64;
+/// The most Docker caches one status lists.
+pub const MAX_DOCKER_CACHES: usize = 64;
+/// The most Docker cache events one status carries.
+pub const MAX_DOCKER_CACHE_EVENTS: usize = 32;
 /// The most scale sets one status lists.
 pub const MAX_SCALE_SETS: usize = 500;
 /// The longest Mac name.
@@ -144,6 +148,12 @@ fn check(report: &Report, body: &[u8]) -> Result<(), Error> {
     }
     if report.status.runners.len() > MAX_RUNNERS {
         return refuse("more than 64 Actions runners in one status");
+    }
+    if report.status.docker_caches.len() > MAX_DOCKER_CACHES {
+        return refuse("more than 64 Docker caches in one status");
+    }
+    if report.status.docker_cache_events.len() > MAX_DOCKER_CACHE_EVENTS {
+        return refuse("more than 32 Docker cache events in one status");
     }
     if report.status.scale_sets.len() > MAX_SCALE_SETS {
         return refuse("more than 500 scale sets in one status");

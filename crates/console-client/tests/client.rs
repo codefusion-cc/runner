@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cf_console_client::{
-    Client, Enroll, Error, MAX_BODY_BYTES, MAX_JOB_EVENTS, MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS, Os,
-    Outbox, Report, enroll, is_machine_name,
+    Client, Enroll, Error, MAX_BODY_BYTES, MAX_DOCKER_CACHE_EVENTS, MAX_DOCKER_CACHES, MAX_JOB_EVENTS,
+    MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS, Os, Outbox, Report, enroll, is_machine_name,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::httpd::{Handler, Reply, Server};
@@ -346,6 +346,12 @@ async fn a_report_the_console_would_refuse_is_not_sent() {
     r.status.scale_sets = (0..=MAX_SCALE_SETS).map(scale_set).collect();
     cases.push(("501 scale sets", r));
     let mut r = report("mac-a");
+    r.status.docker_caches = (0..=MAX_DOCKER_CACHES).map(docker_cache).collect();
+    cases.push(("65 Docker caches", r));
+    let mut r = report("mac-a");
+    r.status.docker_cache_events = (0..=MAX_DOCKER_CACHE_EVENTS).map(docker_cache_event).collect();
+    cases.push(("33 Docker cache events", r));
+    let mut r = report("mac-a");
     r.jobs = vec![cf_console_client::JobEvent {
         runner: String::new(),
         ..event(1)
@@ -421,6 +427,8 @@ async fn every_bound_at_its_maximum_is_sent_and_accepted() {
             error_at: None,
         })
         .collect();
+    r.status.docker_caches = (0..MAX_DOCKER_CACHES).map(docker_cache).collect();
+    r.status.docker_cache_events = (0..MAX_DOCKER_CACHE_EVENTS).map(docker_cache_event).collect();
     w.client.report(&r).await.expect("everything at its maximum");
     assert_eq!(w.fake.job_events().len(), 500);
 }
@@ -818,6 +826,24 @@ async fn events_with_empty_very_long_and_unicode_names_reach_the_console_as_the_
     }
     assert_eq!(seen[5]["job"].as_str().map(|s| s.chars().count()), Some(300));
     assert_eq!(seen[5]["workflow"].as_str().map(|s| s.chars().count()), Some(400));
+}
+
+fn docker_cache(i: usize) -> cf_console_client::DockerCache {
+    cf_console_client::DockerCache {
+        repo: format!("org/app{i}"),
+        bytes: 1 << 30,
+        written_at: "2026-10-14T10:00:00Z".into(),
+        used_at: "2026-10-14T11:00:00Z".into(),
+    }
+}
+
+fn docker_cache_event(i: usize) -> cf_console_client::DockerCacheEvent {
+    cf_console_client::DockerCacheEvent {
+        at: "2026-10-14T10:00:00Z".into(),
+        repo: format!("org/app{i}"),
+        kind: "evicted".into(),
+        why: None,
+    }
 }
 
 #[test]

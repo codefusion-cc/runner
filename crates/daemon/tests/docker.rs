@@ -183,28 +183,23 @@ fn ends(w: &mut World, runner: &str, result: &str, event: &str, workflow: &str) 
     w.assert_nothing_left();
 }
 
-fn head(path: &std::path::Path) -> Vec<u8> {
-    use std::io::Read as _;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .unwrap()
-        .take(64)
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
-}
-
+/// The repositories whose caches are on disk, as a store that opens the folder finds them.
 fn kept_repos(dir: &std::path::Path) -> Vec<String> {
     cf_daemon::caches::CacheStore::open(dir, u64::MAX)
-        .map(|caches| caches.list().into_iter().map(|(_, cache)| cache.repo).collect())
+        .map(|caches| {
+            caches
+                .list()
+                .iter()
+                .map(|(_, cache)| cache.repo.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// A Mac that keeps caches in a folder of the test's own, or none where the folder's file system cannot share
 /// blocks between files.
 fn caching() -> Option<(tempfile::TempDir, World)> {
-    let dir = tempfile::tempdir().unwrap();
-    cf_daemon::caches::CacheStore::open(dir.path(), 1 << 40)?;
+    let dir = cache_folder()?;
     let w = World::with_docker_cache(3, dir.path(), 100 << 30);
     Some((dir, w))
 }
@@ -221,12 +216,13 @@ async fn a_successful_push_to_main_keeps_its_copy_and_the_next_docker_job_starts
     // What the console is told: the cache with its size and last write, and what happened.
     let snapshot = w.m.snapshot();
     assert_eq!(snapshot.caches.len(), 1);
-    assert_eq!(snapshot.caches[0].1.repo, REPO);
-    assert!(snapshot.caches[0].1.written_at > 0);
+    assert_eq!(snapshot.caches[0].repo, REPO);
+    assert!(snapshot.caches[0].written_at > 0);
+    assert!(snapshot.caches[0].bytes > 0);
     let kinds: Vec<&str> = snapshot
         .cache_events
         .iter()
-        .map(|event| event.kind.as_str())
+        .map(|event| event.kind.name())
         .collect();
     assert_eq!(kinds, ["kept"]);
 
@@ -304,7 +300,7 @@ async fn a_job_github_never_says_the_end_of_does_not_write_the_cache() {
 
 #[tokio::test]
 async fn a_cache_copy_outlives_a_restart_of_the_runner_and_is_settled_after() {
-    let Some((dir, _)) = caching() else { return };
+    let Some(dir) = cache_folder() else { return };
     // Records on disk, as the service keeps them: what a restart reads back is what was written.
     let records = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(cf_daemon::DiskStore::new(records.path()).unwrap());

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, DockerCache, DockerCacheEvent, HostStatus, JobKind,
-    MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
-    RunnerUsage, ScaleSetStatus, SizeStatus, Status, Update,
+    MAX_DOCKER_CACHE_EVENTS, MAX_DOCKER_CACHES, MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power,
+    Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -1131,8 +1131,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 docker_caches: snapshot
                     .caches
                     .iter()
-                    .take(MAX_RUNNERS)
-                    .map(|(_, cache)| DockerCache {
+                    .take(MAX_DOCKER_CACHES)
+                    .map(|cache| DockerCache {
                         repo: cut(cache.repo.clone(), STATUS_TEXT_MAX),
                         bytes: cache.bytes,
                         written_at: iso(cache.written_at),
@@ -1142,10 +1142,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 docker_cache_events: snapshot
                     .cache_events
                     .iter()
+                    .take(MAX_DOCKER_CACHE_EVENTS)
                     .map(|event| DockerCacheEvent {
                         at: iso(event.at),
                         repo: cut(event.repo.clone(), STATUS_TEXT_MAX),
-                        kind: event.kind.clone(),
+                        kind: event.kind.name().to_string(),
                         why: event.why.clone().map(|why| cut(why, STATUS_TEXT_MAX)),
                     })
                     .collect(),

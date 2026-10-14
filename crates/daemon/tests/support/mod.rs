@@ -4,6 +4,32 @@
 
 pub mod world;
 
+/// A folder for Docker jobs' caches, or none where its file system cannot share blocks between files (as on most
+/// Linux CI disks): a test that needs one then passes without running.
+pub fn cache_folder() -> Option<tempfile::TempDir> {
+    let dir = tempfile::tempdir().unwrap();
+    if cf_daemon::caches::CacheStore::open(dir.path(), u64::MAX).is_none() {
+        eprintln!(
+            "skipped: {} cannot share blocks between files",
+            dir.path().display()
+        );
+        return None;
+    }
+    Some(dir)
+}
+
+/// The first 64 KB of a file: all a test needs of a cache disk, which may be 20 GB of holes.
+pub fn head(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .unwrap()
+        .take(1 << 16)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    bytes
+}
+
 /// The `i`th of these, round and round: how a generated number picks among what is there; `None` when nothing is.
 pub fn pick<T: Clone>(from: &[T], i: u8) -> Option<T> {
     (!from.is_empty()).then(|| from[usize::from(i) % from.len()].clone())

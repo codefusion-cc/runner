@@ -11,9 +11,8 @@
 //!
 //! The caches together stay under a budget: the one used longest ago goes first ([`evictions`]).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -26,14 +25,13 @@ use crate::records::GithubJob;
 /// The size of a cache disk as the guest sees it. The file is sparse: the host holds only what was written.
 pub const DISK_BYTES: u64 = 20 << 30;
 /// The events kept for the console: the newest ones.
-pub const EVENTS_KEPT: usize = 32;
+pub const EVENTS_KEPT: usize = cf_console_client::MAX_DOCKER_CACHE_EVENTS;
 
 /// A repository's cache key. GitHub's names ignore case, so one repository has one key however a workflow or a
 /// listing spells it; two repositories never share one, and the cache's own record names its repository, which is
 /// held against the job's before the cache is used ([`CacheStore::prepare`]).
 pub fn key(repo: &str) -> String {
-    let digest = Sha256::digest(repo.to_lowercase().as_bytes());
-    digest.iter().take(16).map(|byte| format!("{byte:02x}")).collect()
+    format!("{:x}", Sha256::digest(repo.to_lowercase().as_bytes()))[..32].to_string()
 }
 
 /// The events of a run whose job may write its repository's cache.
@@ -96,7 +94,8 @@ pub fn spoiled(end: Option<CacheEnd>) -> bool {
 pub struct Cache {
     /// `owner/name`, as the first job that wrote it spelled it.
     pub repo: String,
-    /// What it holds of the host's disk.
+    /// What it holds of the host's disk, as the store last found it; not written down.
+    #[serde(skip)]
     pub bytes: u64,
     /// When a job's copy last became it, in seconds since 1970.
     pub written_at: i64,
@@ -124,6 +123,35 @@ pub fn evictions(caches: &[(String, Cache)], budget: u64, in_use: &BTreeSet<Stri
     out
 }
 
+/// What happened to a cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheEventKind {
+    /// A job's copy became its repository's cache.
+    Kept,
+    /// A job's copy was thrown away, and the cache stays as it was.
+    Discarded,
+    /// The guest found a disk that would not mount and started an empty one.
+    Replaced,
+    /// The cache went: its daemon could not run on it.
+    Dropped,
+    /// The cache went: the caches were over the budget.
+    Evicted,
+}
+
+impl CacheEventKind {
+    /// Its name, as the console shows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            CacheEventKind::Kept => "kept",
+            CacheEventKind::Discarded => "discarded",
+            CacheEventKind::Replaced => "replaced",
+            CacheEventKind::Dropped => "dropped",
+            CacheEventKind::Evicted => "evicted",
+        }
+    }
+}
+
 /// What happened to a cache, for the console and the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheEvent {
@@ -131,46 +159,54 @@ pub struct CacheEvent {
     pub at: i64,
     /// `owner/name`.
     pub repo: String,
-    /// `kept`, `discarded`, `replaced` (the guest found a disk that would not mount and started an empty one),
-    /// `dropped` (its daemon could not run on it) or `evicted` (over the budget).
-    pub kind: String,
+    pub kind: CacheEventKind,
     /// Why, for `discarded` and `dropped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
 
 /// The caches of one host, in a folder of their own: `<key>.img` and `<key>.json` per repository, and `jobs/<job>.img`
-/// for the copies jobs run with.
+/// for the copies jobs run with. Only the store changes the folder, so it reads it once and keeps what it found.
 pub struct CacheStore {
     dir: PathBuf,
     budget: u64,
     events: VecDeque<CacheEvent>,
-    /// The caches as the store last read its folder, which only the store changes: a snapshot reads this, not the disk.
+    /// The caches with their keys, by key.
     listing: Vec<(String, Cache)>,
+    /// The copies machines hold now, with their repositories' keys: those caches are never evicted.
+    copies: BTreeMap<PathBuf, String>,
 }
 
-/// The record of a job's copy, kept with the job's own record.
+/// A job's copy, kept with the job's record: what [`refusal`] needs of it besides GitHub's word.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCopy {
     /// The repository's key.
     pub key: String,
     /// The copy the machine got.
     pub path: PathBuf,
-}
-
-fn private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    /// The repository's default branch when the job was given its machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    /// What the guest said of the disk at the job's end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<CacheEnd>,
 }
 
 impl CacheStore {
-    /// A store in `dir` that keeps at most `budget` bytes, or none at all when the host cannot share blocks between
-    /// files there (a copy of a cache would then cost its whole size, every job).
+    /// A store in `dir` that keeps at most `budget` bytes. None at all when the budget is 0, which deletes what the
+    /// folder held, or when the host cannot share blocks between files there (a copy of a cache would then cost its
+    /// whole size, every job).
     pub fn open(dir: &Path, budget: u64) -> Option<CacheStore> {
         if budget == 0 {
+            match fs::remove_dir_all(dir) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    tracing::warn!(dir = %dir.display(), %error, "the Docker caches were not deleted");
+                }
+                _ => {}
+            }
             return None;
         }
-        private_dir(&dir.join("jobs")).ok()?;
+        cf_secret::private_dir(&dir.join("jobs")).ok()?;
         let probe = dir.join(".clone-probe");
         let copy = dir.join(".clone-probe.copy");
         let _ = fs::remove_file(&copy);
@@ -186,8 +222,9 @@ impl CacheStore {
             budget,
             events: VecDeque::new(),
             listing: Vec::new(),
+            copies: BTreeMap::new(),
         };
-        store.refresh();
+        store.listing = store.read_all();
         Some(store)
     }
 
@@ -199,34 +236,42 @@ impl CacheStore {
         self.dir.join(format!("{key}.json"))
     }
 
-    fn read(&self, key: &str) -> Option<Cache> {
-        let mut cache: Cache = serde_json::from_slice(&fs::read(self.record(key)).ok()?).ok()?;
-        cache.bytes = fs::metadata(self.image(key)).ok()?.blocks() * 512;
-        Some(cache)
+    fn bytes(&self, key: &str) -> Option<u64> {
+        Some(fs::metadata(self.image(key)).ok()?.blocks() * 512)
+    }
+
+    fn read_all(&self) -> Vec<(String, Cache)> {
+        let mut out: Vec<(String, Cache)> = fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let key = name.strip_suffix(".json")?.to_string();
+                let mut cache: Cache = serde_json::from_slice(&fs::read(self.record(&key)).ok()?).ok()?;
+                cache.bytes = self.bytes(&key)?;
+                Some((key, cache))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     fn write(&self, key: &str, cache: &Cache) {
-        let path = self.record(key);
-        let next = path.with_extension("json.next");
-        let written = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&next)
-            .and_then(|mut file| file.write_all(&serde_json::to_vec(cache).unwrap_or_default()))
-            .and_then(|()| fs::rename(&next, &path));
+        let written = serde_json::to_vec(cache)
+            .map_err(std::io::Error::other)
+            .and_then(|json| cf_secret::replace_private(&self.record(key), &json));
         if let Err(error) = written {
             tracing::warn!(%key, %error, "a cache's record was not written");
         }
     }
 
-    fn event(&mut self, at: i64, repo: &str, kind: &str, why: Option<&str>) {
-        tracing::info!(%repo, kind, why = why.unwrap_or(""), "Docker cache");
+    fn event(&mut self, at: i64, repo: &str, kind: CacheEventKind, why: Option<&str>) {
+        tracing::info!(%repo, kind = kind.name(), why = why.unwrap_or(""), "Docker cache");
         self.events.push_back(CacheEvent {
             at,
             repo: repo.to_string(),
-            kind: kind.to_string(),
+            kind,
             why: why.map(str::to_string),
         });
         while self.events.len() > EVENTS_KEPT {
@@ -237,14 +282,21 @@ impl CacheStore {
     /// The copy a Docker job of `repo` runs with, named after the job: its repository's cache shared block by block,
     /// or an empty sparse file the guest makes a file system on. `None` when no copy could be made; the job then
     /// keeps its daemon's data on its own disk.
-    pub fn prepare(&mut self, job: &str, repo: &str, now: i64) -> Option<CacheCopy> {
+    pub fn prepare(
+        &mut self,
+        job: &str,
+        repo: &str,
+        default_branch: Option<&str>,
+        now: i64,
+    ) -> Option<CacheCopy> {
         let key = key(repo);
         let path = self.dir.join("jobs").join(format!("{job}.img"));
         let _ = fs::remove_file(&path);
-        let made = match self.read(&key) {
-            Some(mut cache) if cache.repo.eq_ignore_ascii_case(repo) => {
-                cache.used_at = now;
-                self.write(&key, &cache);
+        let found = self.listing.iter().position(|(found, _)| *found == key);
+        let made = match found {
+            Some(at) if self.listing[at].1.repo.eq_ignore_ascii_case(repo) => {
+                self.listing[at].1.used_at = now;
+                self.write(&key, &self.listing[at].1);
                 cf_vmhost::scratch::clone(&self.image(&key), &path)
             }
             found => {
@@ -260,9 +312,16 @@ impl CacheStore {
                     .and_then(|file| file.set_len(DISK_BYTES))
             }
         };
-        self.refresh();
         match made {
-            Ok(()) => Some(CacheCopy { key, path }),
+            Ok(()) => {
+                self.copies.insert(path.clone(), key.clone());
+                Some(CacheCopy {
+                    key,
+                    path,
+                    default_branch: default_branch.map(str::to_string),
+                    end: None,
+                })
+            }
             Err(error) => {
                 tracing::warn!(%repo, %job, %error, "no Docker cache for this job");
                 let _ = fs::remove_file(&path);
@@ -271,37 +330,40 @@ impl CacheStore {
         }
     }
 
-    fn forget(&self, key: &str) {
+    fn forget(&mut self, key: &str) {
         let _ = fs::remove_file(self.image(key));
         let _ = fs::remove_file(self.record(key));
+        self.listing.retain(|(found, _)| found != key);
     }
 
-    /// Once a job is over: its copy becomes its repository's cache when [`refusal`] finds no reason against it, and is
+    /// Deletes a copy that no job ran with: its machine never started.
+    pub fn discard(&mut self, copy: &CacheCopy) {
+        let _ = fs::remove_file(&copy.path);
+        self.copies.remove(&copy.path);
+    }
+
+    /// Once a job is over: its copy becomes its repository's cache when `why_not` (see [`refusal`]) is `None`, and is
     /// deleted otherwise. A cache its daemon could not run on is dropped. Then the caches are brought under the
-    /// budget, `in_use` being the keys of copies machines hold now.
-    pub fn settle(
-        &mut self,
-        repo: &str,
-        copy: &CacheCopy,
-        why_not: Option<&str>,
-        end: Option<CacheEnd>,
-        in_use: &BTreeSet<String>,
-        now: i64,
-    ) {
-        if end.is_some_and(|end| end.found == CacheFound::Replaced) {
-            self.event(now, repo, "replaced", None);
+    /// budget.
+    pub fn settle(&mut self, repo: &str, copy: &CacheCopy, why_not: Option<&str>, now: i64) {
+        self.copies.remove(&copy.path);
+        if copy.end.is_some_and(|end| end.found == CacheFound::Replaced) {
+            self.event(now, repo, CacheEventKind::Replaced, None);
         }
         match why_not {
             None => match fs::rename(&copy.path, self.image(&copy.key)) {
                 Ok(()) => {
                     let cache = Cache {
                         repo: repo.to_string(),
-                        bytes: 0,
+                        bytes: self.bytes(&copy.key).unwrap_or(0),
                         written_at: now,
                         used_at: now,
                     };
                     self.write(&copy.key, &cache);
-                    self.event(now, repo, "kept", None);
+                    self.listing.retain(|(found, _)| *found != copy.key);
+                    let at = self.listing.partition_point(|(found, _)| *found < copy.key);
+                    self.listing.insert(at, (copy.key.clone(), cache));
+                    self.event(now, repo, CacheEventKind::Kept, None);
                 }
                 Err(error) => {
                     let _ = fs::remove_file(&copy.path);
@@ -310,71 +372,56 @@ impl CacheStore {
             },
             Some(why) => {
                 let _ = fs::remove_file(&copy.path);
-                if spoiled(end) {
+                if spoiled(copy.end) {
                     self.forget(&copy.key);
-                    self.event(now, repo, "dropped", Some(why));
+                    self.event(now, repo, CacheEventKind::Dropped, Some(why));
                 } else {
-                    self.event(now, repo, "discarded", Some(why));
+                    self.event(now, repo, CacheEventKind::Discarded, Some(why));
                 }
             }
         }
-        self.enforce(in_use, now);
+        self.enforce(now);
     }
 
-    fn enforce(&mut self, in_use: &BTreeSet<String>, now: i64) {
-        self.refresh();
-        let caches = self.listing.clone();
-        let evicted = evictions(&caches, self.budget, in_use);
-        if evicted.is_empty() {
-            return;
-        }
-        for key in evicted {
-            let repo = caches
-                .iter()
-                .find(|(found, _)| *found == key)
-                .map(|(_, cache)| cache.repo.clone())
-                .unwrap_or_default();
+    fn enforce(&mut self, now: i64) {
+        let in_use: BTreeSet<String> = self.copies.values().cloned().collect();
+        let gone = evictions(&self.listing, self.budget, &in_use);
+        let gone: Vec<(String, String)> = self
+            .listing
+            .iter()
+            .filter(|(key, _)| gone.contains(key))
+            .map(|(key, cache)| (key.clone(), cache.repo.clone()))
+            .collect();
+        for (key, repo) in gone {
             self.forget(&key);
-            self.event(now, &repo, "evicted", None);
+            self.event(now, &repo, CacheEventKind::Evicted, None);
         }
-        self.refresh();
     }
 
     /// Every cache with its key, by key.
-    pub fn list(&self) -> Vec<(String, Cache)> {
-        self.listing.clone()
-    }
-
-    fn refresh(&mut self) {
-        let mut out: Vec<(String, Cache)> = fs::read_dir(&self.dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let key = name.strip_suffix(".json")?.to_string();
-                let cache = self.read(&key)?;
-                Some((key, cache))
-            })
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        self.listing = out;
+    pub fn list(&self) -> &[(String, Cache)] {
+        &self.listing
     }
 
     /// The newest events, oldest first.
-    pub fn events(&self) -> Vec<CacheEvent> {
-        self.events.iter().cloned().collect()
+    pub fn events(&self) -> impl Iterator<Item = &CacheEvent> {
+        self.events.iter()
     }
 
-    /// Deletes the copies of jobs nothing knows any more: those a Runner before left when it stopped.
-    pub fn sweep(&self, known: &BTreeSet<PathBuf>) {
+    /// The copies machines still hold, `known`, when the Runner starts: they are in use. Every other copy is one a
+    /// Runner before left when it stopped, and is deleted.
+    pub fn sweep<'a>(&mut self, known: impl IntoIterator<Item = &'a CacheCopy>) {
+        self.copies = known
+            .into_iter()
+            .map(|copy| (copy.path.clone(), copy.key.clone()))
+            .collect();
         for entry in fs::read_dir(self.dir.join("jobs"))
             .into_iter()
             .flatten()
             .flatten()
         {
             let path = entry.path();
-            if !known.contains(&path) {
+            if !self.copies.contains_key(&path) {
                 let _ = fs::remove_file(path);
             }
         }

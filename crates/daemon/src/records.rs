@@ -91,12 +91,6 @@ pub struct Record {
     /// A Docker job's copy of its repository's cache, until the job is over and it was kept or thrown away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker_copy: Option<crate::caches::CacheCopy>,
-    /// The repository's default branch when the job started: only a run there may write the cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_branch: Option<String>,
-    /// What the guest said of the cache disk at the job's end.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_end: Option<cf_guest_proto::CacheEnd>,
     /// The machine's memory and CPUs, and how the budget came to grant them.
     pub memory_bytes: u64,
     /// The job's own share of that memory.

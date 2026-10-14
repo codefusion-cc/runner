@@ -1,14 +1,18 @@
 //! Docker jobs' caches: one per repository, written back only by a successful run of the repository's own workflow
 //! on its default branch whose disk was let go cleanly, under a budget the least recently used cache leaves first.
 
+mod support;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
 use cf_daemon::GithubJob;
-use cf_daemon::caches::{Cache, CacheStore, DISK_BYTES, evictions, key, refusal, spoiled};
+use cf_daemon::caches::{Cache, CacheCopy, CacheStore, DISK_BYTES, evictions, key, refusal, spoiled};
 use cf_guest_proto::{CacheEnd, CacheFound};
 use proptest::prelude::*;
+use support::{cache_folder, head};
+use tempfile::TempDir;
 
 const REPO: &str = "codefusion-cc/shop";
 
@@ -270,181 +274,236 @@ proptest! {
     }
 }
 
-/// A store in a folder of its own, or none where the file system cannot share blocks (as on most Linux CI disks).
-fn store(dir: &Path, budget: u64) -> Option<CacheStore> {
-    let store = CacheStore::open(dir, budget);
-    if store.is_none() {
-        eprintln!("skipped: {} cannot share blocks between files", dir.display());
-    }
-    store
-}
-
-/// The first 64 KB of a copy: all a test needs, of a file that may be 20 GB of holes.
-fn head(path: &Path) -> Vec<u8> {
-    use std::io::Read as _;
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .unwrap()
-        .take(1 << 16)
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+/// A store keeping `budget` bytes in a folder of the test's own, or none where its file system cannot share blocks.
+fn store(budget: u64) -> Option<(TempDir, CacheStore)> {
+    let dir = cache_folder()?;
+    let caches = CacheStore::open(dir.path(), budget).expect("a store");
+    Some((dir, caches))
 }
 
 fn empty(path: &Path) -> bool {
     head(path).iter().all(|byte| *byte == 0)
 }
 
-fn ended(found: CacheFound) -> Option<CacheEnd> {
-    clean(found)
+/// A job of `repo` that writes `bytes` to its copy, ends cleanly and is kept.
+fn keep(caches: &mut CacheStore, repo: &str, job: &str, at: i64, bytes: &[u8]) -> CacheCopy {
+    let mut copy = caches.prepare(job, repo, Some("main"), at).expect("a copy");
+    fs::write(&copy.path, bytes).unwrap();
+    copy.end = clean(CacheFound::Fresh);
+    caches.settle(repo, &copy, None, at);
+    copy
+}
+
+fn kinds(caches: &CacheStore) -> Vec<&'static str> {
+    caches.events().map(|event| event.kind.name()).collect()
 }
 
 #[test]
 fn a_kept_copy_is_what_the_next_job_of_the_repository_starts_from() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(mut caches) = store(dir.path(), 100 << 30) else {
+    let Some((_dir, mut caches)) = store(100 << 30) else {
         return;
     };
-    let none = BTreeSet::new();
-    let first = caches.prepare("job1", REPO, 10).expect("a copy");
+    let first = caches.prepare("job1", REPO, Some("main"), 10).expect("a copy");
     assert_eq!(
         fs::metadata(&first.path).unwrap().len(),
         DISK_BYTES,
         "a first one is empty, of the full size"
     );
     assert!(empty(&first.path));
+    assert_eq!(first.default_branch.as_deref(), Some("main"));
     fs::write(&first.path, b"layers of the first job").unwrap();
-    caches.settle(REPO, &first, None, ended(CacheFound::Fresh), &none, 20);
+    caches.settle(
+        REPO,
+        &CacheCopy {
+            end: clean(CacheFound::Fresh),
+            ..first.clone()
+        },
+        None,
+        20,
+    );
     assert!(!first.path.exists(), "the copy became the cache");
     let kept = caches.list();
     assert_eq!(kept.len(), 1);
     assert_eq!((kept[0].1.repo.as_str(), kept[0].1.written_at), (REPO, 20));
+    assert!(kept[0].1.bytes > 0, "its size on the host's disk");
 
-    let second = caches.prepare("job2", "CodeFusion-CC/Shop", 30).expect("a copy");
+    let second = caches
+        .prepare("job2", "CodeFusion-CC/Shop", None, 30)
+        .expect("a copy");
     assert_eq!(
         head(&second.path),
         b"layers of the first job",
         "the same repository, any case"
     );
-    let other = caches.prepare("job3", "codefusion-cc/blog", 30).expect("a copy");
+    assert_eq!(caches.list()[0].1.used_at, 30);
+    let other = caches
+        .prepare("job3", "codefusion-cc/blog", None, 30)
+        .expect("a copy");
     assert!(empty(&other.path), "another repository never gets it");
 }
 
 #[test]
 fn a_refused_copy_is_thrown_away_and_the_cache_stays_as_it_was() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(mut caches) = store(dir.path(), 100 << 30) else {
+    let Some((_dir, mut caches)) = store(100 << 30) else {
         return;
     };
-    let none = BTreeSet::new();
-    let first = caches.prepare("job1", REPO, 10).unwrap();
-    fs::write(&first.path, b"main's layers").unwrap();
-    caches.settle(REPO, &first, None, ended(CacheFound::Fresh), &none, 20);
-
-    let pull_request = caches.prepare("job2", REPO, 30).unwrap();
+    keep(&mut caches, REPO, "job1", 20, b"main's layers");
+    let mut pull_request = caches.prepare("job2", REPO, Some("main"), 30).unwrap();
     fs::write(&pull_request.path, b"a pull request's layers").unwrap();
-    caches.settle(
-        REPO,
-        &pull_request,
-        Some("only a push"),
-        ended(CacheFound::Reused),
-        &none,
-        40,
-    );
+    pull_request.end = clean(CacheFound::Reused);
+    caches.settle(REPO, &pull_request, Some("only a push"), 40);
     assert!(!pull_request.path.exists());
-    let next = caches.prepare("job3", REPO, 50).unwrap();
+    let next = caches.prepare("job3", REPO, Some("main"), 50).unwrap();
     assert_eq!(head(&next.path), b"main's layers");
-    let events = caches.events();
-    let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
-    assert_eq!(kinds, ["kept", "discarded"]);
-    assert_eq!(events[1].why.as_deref(), Some("only a push"));
+    assert_eq!(kinds(&caches), ["kept", "discarded"]);
+    assert_eq!(
+        caches.events().last().unwrap().why.as_deref(),
+        Some("only a push")
+    );
 }
 
 #[test]
 fn a_cache_its_daemon_could_not_run_on_goes_and_the_next_job_starts_empty() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(mut caches) = store(dir.path(), 100 << 30) else {
+    let Some((_dir, mut caches)) = store(100 << 30) else {
         return;
     };
-    let none = BTreeSet::new();
-    let first = caches.prepare("job1", REPO, 10).unwrap();
-    fs::write(&first.path, b"broken").unwrap();
-    caches.settle(REPO, &first, None, ended(CacheFound::Fresh), &none, 20);
-    let second = caches.prepare("job2", REPO, 30).unwrap();
-    let dead = Some(CacheEnd {
+    keep(&mut caches, REPO, "job1", 20, b"broken");
+    let mut second = caches.prepare("job2", REPO, Some("main"), 30).unwrap();
+    second.end = Some(CacheEnd {
         found: CacheFound::Reused,
         clean: true,
         daemon: false,
     });
-    caches.settle(REPO, &second, Some("the daemon did not answer"), dead, &none, 40);
+    caches.settle(REPO, &second, Some("the daemon did not answer"), 40);
     assert!(caches.list().is_empty());
-    assert_eq!(caches.events().last().unwrap().kind, "dropped");
-    let third = caches.prepare("job3", REPO, 50).unwrap();
+    assert_eq!(kinds(&caches), ["kept", "dropped"]);
+    let third = caches.prepare("job3", REPO, Some("main"), 50).unwrap();
     assert!(empty(&third.path));
 }
 
 #[test]
-fn a_cache_whose_record_names_another_repository_is_never_used() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(mut caches) = store(dir.path(), 100 << 30) else {
+fn a_disk_the_guest_replaced_is_told() {
+    let Some((_dir, mut caches)) = store(100 << 30) else {
         return;
     };
-    let none = BTreeSet::new();
-    let first = caches.prepare("job1", REPO, 10).unwrap();
-    fs::write(&first.path, b"the shop's layers").unwrap();
-    caches.settle(REPO, &first, None, ended(CacheFound::Fresh), &none, 20);
+    let mut copy = caches.prepare("job1", REPO, Some("main"), 10).unwrap();
+    copy.end = clean(CacheFound::Replaced);
+    caches.settle(REPO, &copy, Some("only a push"), 20);
+    assert_eq!(kinds(&caches), ["replaced", "discarded"]);
+}
+
+#[test]
+fn a_cache_whose_record_names_another_repository_is_never_used() {
+    let Some((dir, mut caches)) = store(100 << 30) else {
+        return;
+    };
+    keep(&mut caches, REPO, "job1", 20, b"the shop's layers");
     // The record says another repository, under this repository's key: as if two names shared a key.
     let record = dir.path().join(format!("{}.json", key(REPO)));
     let text = fs::read_to_string(&record).unwrap().replace(REPO, "someone/else");
     fs::write(&record, text).unwrap();
-    let copy = caches.prepare("job2", REPO, 30).unwrap();
+    let mut caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
+    let copy = caches.prepare("job2", REPO, Some("main"), 30).unwrap();
     assert!(empty(&copy.path));
     assert!(caches.list().is_empty(), "the stray cache is deleted, not kept");
+    assert!(!record.exists());
 }
 
 #[test]
 fn over_the_budget_the_one_used_longest_ago_goes_and_one_in_use_stays() {
-    let dir = tempfile::tempdir().unwrap();
     // Each cache holds about 1 MB on disk; the budget fits two.
-    let Some(mut caches) = store(dir.path(), (5 << 20) / 2) else {
+    let Some((_dir, mut caches)) = store((5 << 20) / 2) else {
         return;
     };
-    let none = BTreeSet::new();
-    let keep = |caches: &mut CacheStore, repo: &str, job: &str, at: i64, busy: &BTreeSet<String>| {
-        let copy = caches.prepare(job, repo, at).unwrap();
-        fs::write(&copy.path, vec![7u8; 1 << 20]).unwrap();
-        caches.settle(repo, &copy, None, ended(CacheFound::Fresh), busy, at);
-    };
-    keep(&mut caches, "o/a", "j1", 10, &none);
-    keep(&mut caches, "o/b", "j2", 20, &none);
-    let busy: BTreeSet<String> = [key("o/a")].into();
-    keep(&mut caches, "o/c", "j3", 30, &busy);
-    let left: Vec<String> = caches.list().into_iter().map(|(_, cache)| cache.repo).collect();
-    assert_eq!(left.len(), 2);
+    let layers = vec![7u8; 1 << 20];
+    keep(&mut caches, "o/a", "j1", 10, &layers);
+    keep(&mut caches, "o/b", "j2", 20, &layers);
+    // A job runs with a copy of o/a, which stays the one used longest ago.
+    let busy = caches.prepare("busy", "o/a", Some("main"), 15).unwrap();
+    keep(&mut caches, "o/c", "j3", 30, &layers);
+    let left: Vec<&str> = caches
+        .list()
+        .iter()
+        .map(|(_, cache)| cache.repo.as_str())
+        .collect();
     assert!(
-        left.contains(&"o/a".to_string()),
-        "in use, so it stays though oldest: {left:?}"
+        left.contains(&"o/a") && left.contains(&"o/c") && left.len() == 2,
+        "in use, so o/a stays though oldest: {left:?}"
     );
-    assert!(left.contains(&"o/c".to_string()));
-    assert_eq!(caches.events().last().unwrap().kind, "evicted");
-    assert_eq!(caches.events().last().unwrap().repo, "o/b");
+    let last = caches.events().last().unwrap();
+    assert_eq!((last.kind.name(), last.repo.as_str()), ("evicted", "o/b"));
+
+    // Once the job is over its cache may go like any other.
+    caches.settle("o/a", &busy, Some("only a push"), 40);
+    keep(&mut caches, "o/d", "j4", 50, &layers);
+    let left: Vec<&str> = caches
+        .list()
+        .iter()
+        .map(|(_, cache)| cache.repo.as_str())
+        .collect();
+    assert!(
+        left.contains(&"o/c") && left.contains(&"o/d") && left.len() == 2,
+        "{left:?}"
+    );
 }
 
 #[test]
-fn copies_nothing_knows_are_swept_and_known_ones_stay() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(mut caches) = store(dir.path(), 100 << 30) else {
+fn a_copy_whose_machine_never_started_is_deleted_and_holds_its_cache_no_longer() {
+    let Some((_dir, mut caches)) = store((5 << 20) / 2) else {
         return;
     };
-    let known = caches.prepare("job1", REPO, 10).unwrap();
-    let stray = caches.prepare("job2", REPO, 10).unwrap();
-    caches.sweep(&[known.path.clone()].into());
+    let layers = vec![7u8; 1 << 20];
+    keep(&mut caches, "o/a", "j1", 10, &layers);
+    let never = caches.prepare("never", "o/a", Some("main"), 10).unwrap();
+    caches.discard(&never);
+    assert!(!never.path.exists());
+    keep(&mut caches, "o/b", "j2", 20, &layers);
+    keep(&mut caches, "o/c", "j3", 30, &layers);
+    let last = caches.events().last().unwrap();
+    assert_eq!((last.kind.name(), last.repo.as_str()), ("evicted", "o/a"));
+}
+
+#[test]
+fn copies_nothing_knows_are_swept_and_known_ones_stay_in_use() {
+    let Some((dir, mut caches)) = store((5 << 20) / 2) else {
+        return;
+    };
+    let layers = vec![7u8; 1 << 20];
+    keep(&mut caches, "o/a", "j1", 10, &layers);
+    let known = caches.prepare("job1", "o/a", Some("main"), 10).unwrap();
+    let stray = caches.prepare("job2", "o/b", Some("main"), 10).unwrap();
+    // A Runner that starts again knows its copies from its records.
+    let mut caches = CacheStore::open(dir.path(), (5 << 20) / 2).unwrap();
+    caches.sweep([&known]);
     assert!(known.path.exists());
     assert!(!stray.path.exists());
+    keep(&mut caches, "o/b", "j2", 20, &layers);
+    keep(&mut caches, "o/c", "j3", 30, &layers);
+    let last = caches.events().last().unwrap();
+    assert_eq!(
+        (last.kind.name(), last.repo.as_str()),
+        ("evicted", "o/b"),
+        "o/a is in use by the known copy"
+    );
 }
 
 #[test]
-fn no_budget_no_store() {
-    let dir = tempfile::tempdir().unwrap();
+fn a_store_reads_back_what_it_kept() {
+    let Some((dir, mut caches)) = store(100 << 30) else {
+        return;
+    };
+    keep(&mut caches, REPO, "job1", 20, b"kept");
+    let again = CacheStore::open(dir.path(), 100 << 30).unwrap();
+    assert_eq!(again.list(), caches.list());
+}
+
+#[test]
+fn no_budget_no_store_and_no_caches_left() {
+    let Some((dir, mut caches)) = store(100 << 30) else {
+        return;
+    };
+    let kept = keep(&mut caches, REPO, "job1", 20, b"kept");
     assert!(CacheStore::open(dir.path(), 0).is_none());
+    assert!(!dir.path().join(format!("{}.img", kept.key)).exists());
+    assert!(!dir.path().exists(), "the folder is gone with what it held");
 }

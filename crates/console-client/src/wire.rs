@@ -248,10 +248,11 @@ pub struct Status {
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
     pub runners: Vec<RunnerStatus>,
-    /// Docker jobs' caches on this host, one per repository, at most 64. Left out while it keeps none.
+    /// Docker jobs' caches on this host, one per repository, at most 64 (`MAX_DOCKER_CACHES`). Left out while it
+    /// keeps none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docker_caches: Vec<DockerCache>,
-    /// What last happened to them, oldest first, at most 32.
+    /// What last happened to them, oldest first, at most 32 (`MAX_DOCKER_CACHE_EVENTS`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docker_cache_events: Vec<DockerCacheEvent>,
 }
