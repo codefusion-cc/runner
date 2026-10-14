@@ -2099,9 +2099,10 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             break;
         }
         // The Mac's polls show the room for a waiting job, once a session GitHub forgot is open again; then GitHub
-        // looks. A look before that hands nothing out, and GitHub looks again only at its own moments.
+        // looks. A look before that hands nothing out, and GitHub looks again only at its own moments. A machine that
+        // stands up meanwhile for a job assigned before may take the last slot: then the room is looked at anew.
         let free = std::time::Instant::now();
-        while !offered(&rig) {
+        while !offered(&rig) && (waiting(&rig), rig.standing().len()) == (before, standing) {
             prop_assert!(
                 free.elapsed() < OFFERS_WITHIN,
                 "{before} jobs wait at GitHub and {standing} of {slots} machines stand, and the Mac offered no room \
@@ -2109,6 +2110,9 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                 free.elapsed()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !offered(&rig) {
+            continue;
         }
         rig.github.github_looks();
         let looked = std::time::Instant::now();
