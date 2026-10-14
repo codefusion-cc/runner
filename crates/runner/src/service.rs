@@ -246,6 +246,10 @@ fn run_daemon(config: &Path) -> Result<(), String> {
             trigger.trigger();
         });
         tracing::info!(version = VERSION, machine = %config.machine, "the Runner starts");
+        // Before the first report: the console sends the update's command again until it has the result.
+        if let Started::Trying(pending) = &started {
+            service.take_up(pending);
+        }
         let stays_up = async {
             match started {
                 Started::Nothing => {}
@@ -254,7 +258,6 @@ fn run_daemon(config: &Path) -> Result<(), String> {
                     service.said(&id, false, &message);
                 }
                 Started::Trying(pending) => {
-                    service.take_up(&pending);
                     tokio::time::sleep(STAYS_UP).await;
                     service.said(
                         &pending.id,
