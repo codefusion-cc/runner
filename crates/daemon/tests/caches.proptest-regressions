@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 30ecbb7014b0e1200d43492f367df9468d75e7f122edcb78a42d7fbe533dac02 # shrinks to event = "push", branch = "", repo = "codefusion-cc/shop", result = "succeeded", clean = true, daemon = true
+cc 4304ca7a8d29fd6c4bfc0090a9e1c438c8ee4581f8981eec93929b452270b5c9 # shrinks to event = "pull_request", branch = "main", repo = "codefusion-cc/shop", result = "succeeded", clean = true, daemon = true
+cc a66daae352787a6c38e500291cfc7f744921ae554c204da1af09730d815cd139 # shrinks to event = "push", branch = "main", repo = "-/-", result = "succeeded", clean = true, daemon = true
+cc 58de120f43876733de01721e79b5cd77c2d58e10c073be481188503f0a959b77 # shrinks to event = "push", branch = "main", repo = "codefusion-cc/shop", result = "succeeded", clean = false, daemon = true
