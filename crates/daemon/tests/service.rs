@@ -3162,14 +3162,25 @@ async fn said_once_and_done_once_with_the_most_results_waiting(at: usize, others
     rig.stop_pump().await;
     rig.updates.hold_builds();
     rig.updates.build_gives(Err("the source does not build"));
-    let mut ids: Vec<String> = (0..at).map(|_| rig.console.queue_command("dance", None)).collect();
+    let mut ids: Vec<String> = (0..at)
+        .map(|_| rig.console.queue_command("dance", None))
+        .collect();
     let update = rig.console.queue_command("update", None);
     ids.extend((at..others).map(|_| rig.console.queue_command("dance", None)));
     ids.push(update.clone());
     let mut reports = 0;
     while ids.iter().any(|id| results_of(&rig.console, id).is_empty()) {
-        assert!(reports < 20, "the console heard of every command within 20 reports");
+        assert!(
+            reports < 20,
+            "the console heard of every command within 20 reports"
+        );
         rig.service.report().await;
+        // Memory stays bounded: no command is taken while a report's worth of results wait, and only the update's
+        // comes over that.
+        let kept: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(rig.folder.path().join("results.json")).expect("kept"))
+                .expect("results");
+        assert!(kept.len() <= MAX_RESULTS + 1, "{} results wait", kept.len());
         rig.updates.release_builds();
         reports += 1;
         // An update under way says what came of it before the next report reads the results.
