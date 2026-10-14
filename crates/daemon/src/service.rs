@@ -262,6 +262,11 @@ struct Shared<H, V> {
     ending: AtomicBool,
 }
 
+/// What the console's page says of a settings file no Runner could start on.
+fn unusable(why: &str) -> String {
+    format!("the settings file changed and is not used: {why}")
+}
+
 /// What new settings have come to.
 #[derive(Debug, Default)]
 struct Applying {
@@ -271,6 +276,9 @@ struct Applying {
     gave_up: Option<String>,
     /// Why the file is unusable, once said.
     told: Option<String>,
+    /// What the console's page shows until the file changes, and since when: a file no Runner could start on, or a
+    /// wait that ran out.
+    warning: Option<(String, i64)>,
 }
 
 /// What the Runner's updates have come to.
@@ -1075,6 +1083,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             failures: updating.failures,
         });
         drop(updating);
+        let settings_error = shared.applying.lock().expect("applying").warning.clone();
         let not_serving = if shared.ending.load(Ordering::SeqCst) {
             Some("the Runner ends; the one that starts next serves them again".to_string())
         } else {
@@ -1102,6 +1111,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 discovery_error: self.discovery_error().map(|error| cut(error, STATUS_TEXT_MAX)),
                 update,
                 not_serving,
+                settings_error: settings_error
+                    .as_ref()
+                    .map(|(error, _)| cut(error.clone(), STATUS_TEXT_MAX)),
+                settings_error_at: settings_error.as_ref().map(|(_, at)| iso(*at)),
                 idle_with_jobs_waiting_seconds,
                 idle_with_jobs_waiting_reason: idle_with_jobs_waiting_reason
                     .map(|reason| cut(reason, STATUS_TEXT_MAX)),
@@ -1282,6 +1295,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 false,
                 "an update is under way; it starts the Runner again itself".into(),
             ),
+            "restart" if self.shared.applying.lock().expect("applying").under_way => (
+                false,
+                "the Runner waits for its machines to end to start again on new settings; it starts again itself"
+                    .into(),
+            ),
             "restart" => (
                 true,
                 format!(
@@ -1357,11 +1375,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 Err(message) => {
                     tracing::warn!(%message, "the update did not take; the Runner goes on as it was");
                     service.push_result(id, false, message.clone());
+                    // Lifted before the update is no longer under way: new settings that waited for it may hold next.
+                    service.shared.machines.hold_for_restart(false);
                     update.command = None;
                     update.error = Some((message, secs(service.shared.clock.now())));
                     update.failures = update.failures.saturating_add(1);
-                    drop(update);
-                    service.shared.machines.hold_for_restart(false);
                 }
             }
         });
@@ -1451,13 +1469,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return;
         }
         match settings.look() {
-            SettingsLook::Same => {
-                applying.gave_up = None;
-                applying.told = None;
-            }
+            SettingsLook::Same => *applying = Applying::default(),
             SettingsLook::Unusable { why } => {
                 if applying.told.as_ref() != Some(&why) {
                     tracing::warn!(%why, "the settings file changed and no Runner could start on it; this one goes on as it is");
+                    applying.warning = Some((unusable(&why), secs(self.shared.clock.now())));
                     applying.told = Some(why);
                 }
             }
@@ -1467,6 +1483,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 applying.under_way = true;
                 applying.told = None;
+                applying.warning = None;
                 drop(applying);
                 tracing::info!(
                     "new settings; no new job until the machines that stand are gone, then the Runner starts again on them"
@@ -1483,7 +1500,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let shared = &self.shared;
         let waited = self.drained("applying new settings", Instant::now()).await;
         // The file once more: what the next Runner reads is what it is now.
-        let gave_up = match (waited, settings.look()) {
+        let now = secs(shared.clock.now());
+        let left = match (waited, settings.look()) {
             (Ok(()), SettingsLook::Changed { .. }) => {
                 tracing::info!("the machines are gone; the Runner starts again on the new settings");
                 self.restart();
@@ -1491,23 +1509,28 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             }
             (Ok(()), SettingsLook::Same) => {
                 tracing::info!("the settings are as the Runner started with again; it goes on");
-                None
+                Applying::default()
             }
             (Ok(()), SettingsLook::Unusable { why }) => {
                 tracing::warn!(%why, "the settings file changed again and no Runner could start on it; this one goes on as it is");
-                shared.applying.lock().expect("applying").told = Some(why);
-                None
+                Applying {
+                    warning: Some((unusable(&why), now)),
+                    told: Some(why),
+                    ..Applying::default()
+                }
             }
             (Err(waited), _) => {
                 tracing::warn!(%waited, "new settings were not taken up; the Runner goes on with the ones it has until the file changes again");
-                Some(id)
+                Applying {
+                    gave_up: Some(id),
+                    warning: Some((format!("new settings were not taken up: {waited}"), now)),
+                    ..Applying::default()
+                }
             }
         };
         shared.update.lock().expect("update").doing = None;
         shared.machines.hold_for_restart(false);
-        let mut applying = shared.applying.lock().expect("applying");
-        applying.under_way = false;
-        applying.gave_up = gave_up;
+        *shared.applying.lock().expect("applying") = left;
     }
 
     /// Runs the service until `stop` is set: the machines' tick every second, a look at GitHub's repositories now

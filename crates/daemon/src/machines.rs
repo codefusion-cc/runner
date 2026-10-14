@@ -316,8 +316,8 @@ struct Inner<H> {
     intents: BTreeMap<String, (Record, bool)>,
     paused: bool,
     draining: bool,
-    /// An update waits for the machines to end: no new job, though the Runner goes on.
-    updating: bool,
+    /// An update or new settings wait for the machines to end: no new job, though the Runner goes on.
+    holding: bool,
     /// Nobody listens to GitHub any more (an uninstall closed every session): how a job ended is not waited for.
     deaf: bool,
     host_error: Option<String>,
@@ -455,7 +455,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 intents: BTreeMap::new(),
                 paused: false,
                 draining: false,
-                updating: false,
+                holding: false,
                 deaf: false,
                 host_error: None,
                 stuck: BTreeSet::new(),
@@ -619,9 +619,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let failures = inner.breaker.holds(now.elapsed) || !inner.stuck.is_empty();
         inner.budget.hold(Hold::StartFailures, failures);
         inner.budget.hold(Hold::Paused, inner.paused);
-        inner
-            .budget
-            .hold(Hold::Draining, inner.draining || inner.updating);
+        inner.budget.hold(Hold::Draining, inner.draining || inner.holding);
         inner.making.check(&mut inner.budget, now);
     }
 
@@ -638,7 +636,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// again when the wait gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would
     /// otherwise. The polls in flight are told.
     pub fn hold_for_restart(&self, on: bool) {
-        let changed = std::mem::replace(&mut self.lock().updating, on) != on;
+        let changed = std::mem::replace(&mut self.lock().holding, on) != on;
         if changed {
             self.ring();
         }

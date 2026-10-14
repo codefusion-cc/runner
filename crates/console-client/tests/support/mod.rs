@@ -107,6 +107,8 @@ pub fn status(machine: &str) -> Status {
         discovery_error: None,
         update: None,
         not_serving: None,
+        settings_error: None,
+        settings_error_at: None,
         idle_with_jobs_waiting_seconds: 0,
         idle_with_jobs_waiting_reason: None,
         sizes: vec![],

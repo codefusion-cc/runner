@@ -3362,6 +3362,18 @@ async fn settings_no_runner_could_start_on_change_nothing() {
     assert_eq!(rig.standing().len(), 2, "jobs start as before");
     assert_eq!(last_status(&rig.console)["open"], json!(true));
     assert!(!rig.service.restart_requested());
+    // The console's page says so until the file changes.
+    until("the warning at the console", || {
+        last_status(&rig.console)["settingsError"]
+            == json!("the settings file changed and is not used: image 2026.10.20 is not installed")
+    })
+    .await;
+    assert!(last_status(&rig.console)["settingsErrorAt"].is_string());
+    rig.settings.says(SettingsLook::Same);
+    until("the warning gone", || {
+        last_status(&rig.console).get("settingsError").is_none()
+    })
+    .await;
 }
 
 /// A wait that runs out gives up on that version of the file and takes jobs again; it is not waited for again, and
@@ -3388,6 +3400,10 @@ async fn new_settings_whose_wait_runs_out_take_jobs_again_until_the_file_changes
         json!(true),
         "not waited for again"
     );
+    assert_eq!(
+        last_status(&rig.console)["settingsError"],
+        json!("new settings were not taken up: still waiting for 1 machine to end after 4 seconds")
+    );
 
     rig.settings.says(changed("v3"));
     until("a newer version is waited for", || {
@@ -3404,6 +3420,14 @@ async fn settings_put_back_during_the_wait_lift_the_hold() {
     let runner = rig.job_running().await;
     rig.settings.says(changed("v2"));
     until("the hold", || last_status(&rig.console)["open"] == json!(false)).await;
+    // The console's restart would start the next Runner on the new settings beside the machine: refused.
+    let restart = rig.console.queue_command("restart", None);
+    until("the restart's result", || {
+        !results_of(&rig.console, &restart).is_empty()
+    })
+    .await;
+    assert_eq!(results_of(&rig.console, &restart)[0]["ok"], json!(false));
+    assert!(!rig.service.restart_requested());
     rig.settings.says(SettingsLook::Same);
     rig.finish(&runner, "succeeded");
     until("the hold lifted", || {
@@ -3458,12 +3482,23 @@ async fn new_settings_and_an_update_never_wait_at_once() {
     .await;
     assert_eq!(rig.updates.built(), 1);
     assert_eq!(rig.updates.installed(), []);
-    // Said at the console, or kept for the next Runner to say.
-    let kept = std::fs::read_to_string(rig.folder.path().join("results.json")).unwrap_or_default();
-    assert!(
-        !results_of(&rig.console, &update).is_empty() || kept.contains(&update),
-        "{kept}"
-    );
+    // Its result: at the console, or kept for the next Runner to say.
+    let kept: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(rig.folder.path().join("results.json")).unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    let said: Vec<Value> = results_of(&rig.console, &update)
+        .into_iter()
+        .chain(kept.into_iter().filter(|result| result["id"] == json!(update)))
+        .collect();
+    assert!(!said.is_empty());
+    for result in &said {
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["message"],
+            json!(format!("{RUNNING} runs already: there is nothing newer"))
+        );
+    }
 }
 
 /// An update's limit runs from the console's command, the build included: a build that takes most of it leaves the

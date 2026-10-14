@@ -233,6 +233,13 @@ pub struct Status {
     /// Why the Mac serves no repository, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_serving: Option<String>,
+    /// Why the Runner does not run on its settings file as it is now: the file changed and no Runner could start on
+    /// it, or the wait for its machines to end ran out. Said until the file changes again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_error: Option<String>,
+    /// When that was found (ISO 8601).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_error_at: Option<String>,
     /// For how many seconds jobs the Mac serves have waited while a machine of their size fits on it, or while it
     /// runs nothing at all; 0 (and left out) while none wait so. A few seconds are normal: GitHub hands a job over
     /// within a poll. Over a minute the Mac is idle while work waits for it.

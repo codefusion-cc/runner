@@ -88,13 +88,16 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
     Ok(Some((address.clone(), Secret::new(token))))
 }
 
-/// The settings in `path`, when a Runner can start on them: the file is one it takes, and the image it names is
-/// installed, so that no job is taken from GitHub to fail for a missing image.
+/// The settings in `path`, when a Runner can start on them: the file is one it takes, the image it names is
+/// installed (no job is taken from GitHub to fail for a missing image), and the App's key and the console's token
+/// are where it says.
 fn startable(path: &Path) -> Result<Config, String> {
     let config = Config::load(path)?;
     #[cfg(target_os = "macos")]
     crate::config::check_beside_old_manager(&config, &home()?, &hostname())?;
     installed_image(&config)?;
+    app(&config)?;
+    console(&config)?;
     Ok(config)
 }
 
@@ -102,6 +105,9 @@ fn startable(path: &Path) -> Result<Config, String> {
 struct ConfigFile {
     path: PathBuf,
     read: Vec<u8>,
+    /// The state folder and the name the Runner started with, which only `install` changes: the service manager
+    /// runs the program in that folder, and the machines, records and scale sets go by that name.
+    started: (PathBuf, String),
 }
 
 impl SettingsFile for ConfigFile {
@@ -109,6 +115,11 @@ impl SettingsFile for ConfigFile {
         match std::fs::read(&self.path) {
             Ok(now) if now == self.read => SettingsLook::Same,
             Ok(now) => match startable(&self.path) {
+                Ok(config) if (&config.state_dir, &config.machine) != (&self.started.0, &self.started.1) => {
+                    SettingsLook::Unusable {
+                        why: "`state_dir` and `machine` change only with `uninstall` and `install`".into(),
+                    }
+                }
                 Ok(_) => SettingsLook::Changed { id: version_of(&now) },
                 Err(why) => SettingsLook::Unusable { why },
             },
@@ -251,11 +262,14 @@ fn run_daemon(config: &Path) -> Result<(), String> {
         None => Started::Nothing,
     };
     // As read before it is checked: a change that comes meanwhile is one more start, not one missed.
-    let settings = ConfigFile {
-        path: config.to_path_buf(),
-        read: std::fs::read(config).unwrap_or_default(),
-    };
+    let read = std::fs::read(config).map_err(|error| format!("{}: {error}", config.display()))?;
+    let path = config.to_path_buf();
     let config = startable(config)?;
+    let settings = ConfigFile {
+        path,
+        read,
+        started: (config.state_dir.clone(), config.machine.clone()),
+    };
     let _only = only_runner(&config)?;
     tracing::subscriber::set_global_default(Lines::new(&config.log(), ROLL_AT))
         .map_err(|error| format!("the log: {error}"))?;
@@ -778,11 +792,18 @@ mod tests {
         let installed = state.join("images").join("2026.10.1");
         std::fs::create_dir_all(&installed).expect("an image's folder");
         std::fs::write(installed.join(cf_image::store::ROOTFS_NAME), b"").expect("an image");
+        let app = folder.path().join("app");
+        std::fs::create_dir_all(&app).expect("the App's folder");
+        std::fs::write(app.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(app.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(app.join("app.pem"), std::fs::Permissions::from_mode(0o600))
+            .expect("a mode");
         let started = text("2026.10.1", "");
         write(&started);
         let file = ConfigFile {
             path: path.clone(),
             read: std::fs::read(&path).expect("read"),
+            started: (state.clone(), "settings-test-vm".into()),
         };
         assert_eq!(file.look(), SettingsLook::Same);
 
@@ -807,6 +828,27 @@ mod tests {
         };
         write(&text("2026.10.20", ""));
         unusable("is not installed");
+        // A console named before `enroll` gave its token: the next Runner could not start.
+        write(&text("2026.10.1", r#", "console": "https://console.example""#));
+        unusable("run `enroll` first");
+        write(&started.replace("settings-test-vm", "other-vm"));
+        unusable("change only with `uninstall` and `install`");
+        let elsewhere = folder.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("images").join("2026.10.1")).expect("an image's folder");
+        std::fs::write(
+            elsewhere
+                .join("images")
+                .join("2026.10.1")
+                .join(cf_image::store::ROOTFS_NAME),
+            b"",
+        )
+        .expect("an image");
+        write(&started.replace(&state.display().to_string(), &elsewhere.display().to_string()));
+        unusable("change only with `uninstall` and `install`");
+        std::fs::rename(app.join("app.pem"), app.join("app.pem.away")).expect("moved");
+        write(&text("2026.10.1", r#", "docker_repos": ["org/app"]"#));
+        unusable("the GitHub App");
+        std::fs::rename(app.join("app.pem.away"), app.join("app.pem")).expect("moved back");
         write("{");
         unusable(&path.display().to_string());
         write(&text("2026.10.1", r#", "docker_max_jobs": "one""#));
