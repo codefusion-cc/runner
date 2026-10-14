@@ -437,7 +437,6 @@ mod tests {
         assert!(with(|v| v["use"] = "sometimes".into()).is_err());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn docker_is_for_no_repository_and_one_job_at_a_time_unless_set() {
         let config = Config::parse(WHOLE).expect("config");
@@ -462,6 +461,7 @@ mod tests {
         assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_old_managers_name_is_refused_only_while_the_old_manager_is_installed() {
         let home = tempfile::tempdir().expect("home");
