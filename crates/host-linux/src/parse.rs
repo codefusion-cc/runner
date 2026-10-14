@@ -110,6 +110,46 @@ pub fn counter(text: &str, name: &str) -> Option<u64> {
     values.next().is_none().then_some(value)
 }
 
+/// A swap area of `/proc/swaps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swap {
+    /// A zram device (`/dev/zramN`): compressed memory, not a disk.
+    pub zram: bool,
+    /// What is in use there, in bytes.
+    pub used_bytes: u64,
+}
+
+/// `/proc/swaps`: a header, then `Filename Type Size Used Priority` for each swap area, sizes in KiB. `None` when
+/// the header or a line is not that.
+pub fn swaps(text: &str) -> Option<Vec<Swap>> {
+    let mut lines = text.lines();
+    if lines.next()?.split_whitespace().collect::<Vec<_>>()
+        != ["Filename", "Type", "Size", "Used", "Priority"]
+    {
+        return None;
+    }
+    lines
+        .map(|line| {
+            let [name, kind, size, used, priority] = line.split_whitespace().collect::<Vec<_>>()[..] else {
+                return None;
+            };
+            let (size, used) = (number(size)?, number(used)?);
+            priority.parse::<i32>().ok()?;
+            if used > size || !["partition", "file"].contains(&kind) {
+                return None;
+            }
+            let zram = kind == "partition"
+                && name.strip_prefix("/dev/zram").is_some_and(|index| {
+                    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            Some(Swap {
+                zram,
+                used_bytes: used.checked_mul(1024)?,
+            })
+        })
+        .collect()
+}
+
 /// A share of time over the last 10 s from a pressure file (PSI), in hundredths of a percent: 1234 is 12.34%.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Psi {

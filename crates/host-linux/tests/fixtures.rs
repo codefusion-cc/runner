@@ -192,9 +192,135 @@ fn a_file_larger_than_the_kernel_writes_or_not_text_is_not_read_in_part() {
     assert!(matches!(read(&tree), Err(HostError::Call { .. })));
 }
 
+/// Two readings of the tree, `pswpout` 7 and then 9000, with `/proc/swaps` as `first` and then `second` says, or
+/// gone for `None`: whether the budget sees swap-outs between them (only a change of `swapouts` matters).
+fn swapped(tree: &Tree, first: Option<&str>, second: Option<&str>) -> bool {
+    let at = |pswpout: u64, swaps: Option<&str>| {
+        tree.file("/proc/vmstat", &format!("pswpin 3\npswpout {pswpout}\n"));
+        match swaps {
+            Some(swaps) => tree.file("/proc/swaps", swaps),
+            None if tree.path("/proc/swaps").exists() => tree.remove("/proc/swaps"),
+            None => {}
+        }
+        read(tree).unwrap().swapouts
+    };
+    at(7, first) != at(9000, second)
+}
+
+const HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+fn swaps(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .fold(HEADER.to_string(), |all, line| all + line + "\n")
+}
+
+#[test]
+fn swap_outs_to_zram_alone_are_not_swapping_and_psi_still_judges() {
+    let tree = Tree::board();
+    let zram = swaps(&["/dev/zram0 partition 4064908 37120 100"]);
+    let more = swaps(&["/dev/zram0 partition 4064908 937120 100"]);
+    assert!(!swapped(&tree, Some(&zram), Some(&more)));
+    let two = swaps(&[
+        "/dev/zram0 partition 2000000 1000 100",
+        "/dev/zram1 partition 2000000 500000 100",
+    ]);
+    assert!(!swapped(&tree, Some(&two), Some(&two)));
+    assert_eq!(read(&tree).unwrap().pressure, Pressure::Normal);
+    // Memory short with zram is PSI's to say.
+    tree.file(
+        "/proc/pressure/memory",
+        "some avg10=12.00 avg60=1.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+    );
+    assert_eq!(read(&tree).unwrap().pressure, Pressure::Warning);
+}
+
+#[test]
+fn swap_outs_to_a_disk_are_swapping() {
+    let tree = Tree::board();
+    for disk in [
+        swaps(&["/dev/nvme0n1p3 partition 8388604 0 -2"]),
+        swaps(&["/swapfile file 4194300 0 -2"]),
+        swaps(&["/swap\\040file file 4194300 0 -2"]),
+        // Named like zram but a file: a file on a disk.
+        swaps(&["/dev/zram0 file 4194300 0 -2"]),
+        swaps(&["/dev/zramx partition 4194300 0 -2"]),
+    ] {
+        assert!(swapped(&tree, Some(&disk), Some(&disk)), "{disk}");
+    }
+}
+
+#[test]
+fn with_zram_and_a_disk_what_goes_to_the_disk_counts() {
+    let tree = Tree::board();
+    let both = |zram: u64, disk: u64| {
+        swaps(&[
+            &format!("/dev/zram0 partition 4064908 {zram} 100"),
+            &format!("/dev/sda2 partition 8388604 {disk} -2"),
+        ])
+    };
+    // Pages to zram alone: the disk's share stays.
+    assert!(!swapped(&tree, Some(&both(100, 0)), Some(&both(900_000, 0))));
+    assert!(swapped(
+        &tree,
+        Some(&both(4_064_908, 0)),
+        Some(&both(4_064_908, 4))
+    ));
+    // Back from the disk is no calmer.
+    assert!(swapped(
+        &tree,
+        Some(&both(4_064_908, 4)),
+        Some(&both(4_064_908, 0))
+    ));
+    // The order of the lines does not matter.
+    let reversed = swaps(&[
+        "/dev/sda2 partition 8388604 4 -2",
+        "/dev/zram0 partition 4064908 100 100",
+    ]);
+    assert!(swapped(&tree, Some(&both(100, 0)), Some(&reversed)));
+}
+
+#[test]
+fn swaps_that_cannot_be_read_leave_every_swap_out_counting() {
+    let tree = Tree::board();
+    let zram = swaps(&["/dev/zram0 partition 4064908 37120 100"]);
+    for broken in [
+        String::new(),
+        HEADER.to_string(),
+        "/dev/zram0 partition 4064908 37120 100\n".to_string(),
+        "Filename Type Size Used\n/dev/zram0 partition 4064908 37120\n".to_string(),
+        swaps(&["/dev/zram0 partition 4064908 37120"]),
+        swaps(&["/dev/zram0 partition 4064908 37120 100 extra"]),
+        swaps(&["/dev/zram0 partition 4064908 -1 100"]),
+        swaps(&["/dev/zram0 partition 100 200 100"]),
+        swaps(&["/dev/zram0 partition 4064908 37120 high"]),
+        swaps(&["/dev/zram0 tmpfs 4064908 37120 100"]),
+        swaps(&["/dev/zram0 partition 4064908 37120 100", "garbage"]),
+        swaps(&[&format!("/dev/zram0 partition {0} {0} 100", u64::MAX)]),
+    ] {
+        assert!(swapped(&tree, Some(&broken), Some(&broken)), "{broken:?}");
+        // Neither does a reading that could not tell, between two that could.
+        assert!(swapped(&tree, Some(&zram), Some(&broken)), "{broken:?}");
+    }
+    assert!(swapped(&tree, None, None));
+    tree.bytes(
+        "/proc/swaps",
+        b"Filename Type Size Used Priority\n/dev/zram0 partition \xff 1 100\n",
+    );
+    assert!(
+        read(&tree).is_ok(),
+        "a /proc/swaps that is not text does not close the host by itself"
+    );
+    assert_ne!(read(&tree).unwrap().swapouts, 0);
+}
+
 #[test]
 fn swap_outs_are_the_counter_and_a_missing_one_is_an_error() {
     let tree = Tree::board();
+    tree.file(
+        "/proc/swaps",
+        "Filename Type Size Used Priority\n/swapfile file 4194300 0 -2\n",
+    );
     tree.file("/proc/vmstat", "pswpin 3\npswpout 18446744073709551615\n");
     assert_eq!(read(&tree).unwrap().swapouts, u64::MAX);
     for vmstat in [
