@@ -266,7 +266,13 @@ async fn a_job_github_never_says_the_end_of_does_not_write_the_cache() {
 
 #[tokio::test]
 async fn a_cache_copy_outlives_a_restart_of_the_runner_and_is_settled_after() {
-    let Some((dir, mut w)) = caching() else { return };
+    let Some((dir, _)) = caching() else { return };
+    // Records on disk, as the service keeps them: what a restart reads back is what was written.
+    let records = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(cf_daemon::DiskStore::new(records.path()).unwrap());
+    let mut w = World::keeping(cf_daemon::testing::settings_for(3), store);
+    w.parts.docker_cache = Some((dir.path().to_path_buf(), 100 << 30));
+    w.m = w.parts.machines(None);
     let runner = docker_job(&mut w).await;
     std::fs::write(copy_of_last_start(&w), b"across a restart").unwrap();
     w.parts.vms.ready(job_name(&runner));
