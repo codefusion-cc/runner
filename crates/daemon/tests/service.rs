@@ -4,7 +4,7 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1747,9 +1747,13 @@ fn happens_around_removals() -> impl Strategy<Value = Happens> {
     ]
 }
 
-/// How soon, in these tests' timings, GitHub's look at its queue moves a job this Mac serves that waits while a
-/// machine of its size fits: the Mac's polls show the room within two of them (150 ms each here, the long poll in
-/// service), and the assignment and the start follow.
+/// How soon, in these tests' timings, the Mac offers room for a job it serves that waits while a machine of its size
+/// fits: a session GitHub forgot opens again (the backoff here waits 100 ms at most), and two polls (150 ms each here,
+/// the long poll in service) show the room.
+const OFFERS_WITHIN: Duration = Duration::from_secs(3);
+
+/// How soon GitHub's look at its queue, while the Mac offers room, moves a job this Mac serves: the assignment and the
+/// start follow.
 const STARTS_WITHIN: Duration = Duration::from_secs(3);
 
 /// How soon a job whose start and end went with a session is at the console once its machine is gone: the wait for
@@ -1854,6 +1858,8 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     let short = rig.parts.settings.away.floor_bytes + (1 << 30);
     let sets: Vec<i64> = rig.github.scale_sets().iter().map(|s| s.id).collect();
     let mut jobs: Vec<i64> = vec![];
+    // The repository each job was queued for.
+    let mut repos = BTreeMap::new();
     let mut uninstall = false;
     // The Actions runners that ran a job, and for each scale set what may open its session again.
     let mut ran = BTreeSet::new();
@@ -1897,7 +1903,9 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         match step {
             Happens::Queued(first) => {
                 let repo = if first { REPO } else { SECOND };
-                jobs.push(rig.github.queue_job(repo, &["self-hosted", "cf-2g"], "build"));
+                let job = rig.github.queue_job(repo, &["self-hosted", "cf-2g"], "build");
+                jobs.push(job);
+                repos.insert(job, repo);
             }
             Happens::Started(n) => {
                 if let Some(runner) = pick(&idle(&jobs), n) {
@@ -2080,13 +2088,28 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             .filter(|&&job| rig.github.job_state(job) == Some(JobState::Available))
             .count()
     };
+    let offered = |rig: &Rig| {
+        jobs.iter().any(|&job| {
+            rig.github.job_state(job) == Some(JobState::Available) && rig.github.offers_room(repos[&job])
+        })
+    };
     loop {
         let (before, standing) = (waiting(&rig), rig.standing().len());
         if before == 0 || standing >= slots {
             break;
         }
-        // Two polls that show the room, then GitHub looks.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The Mac's polls show the room for a waiting job, once a session GitHub forgot is open again; then GitHub
+        // looks. A look before that hands nothing out, and GitHub looks again only at its own moments.
+        let free = std::time::Instant::now();
+        while !offered(&rig) {
+            prop_assert!(
+                free.elapsed() < OFFERS_WITHIN,
+                "{before} jobs wait at GitHub and {standing} of {slots} machines stand, and the Mac offered no room \
+                 for them in {:?}",
+                free.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         rig.github.github_looks();
         let looked = std::time::Instant::now();
         while waiting(&rig) == before && rig.standing().len() == standing {
