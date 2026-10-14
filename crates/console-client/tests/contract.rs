@@ -696,55 +696,47 @@ async fn numbers_and_times_are_bounded() {
 }
 
 #[tokio::test]
-async fn memory_for_jobs_and_counted_bytes_are_whole_bytes_and_may_be_left_out() {
+async fn memory_for_jobs_and_an_actions_runners_size_and_counted_bytes_are_never_refused() {
+    // The console ends each in `.catch(undefined)`: what it cannot read it drops, and the report is still taken.
     let w = world().await;
     let runner =
         json!({"name": "mac-a-j1", "scaleSet": 4, "state": "idle", "started": "2026-10-10T08:00:00Z"});
-    report_gets(&w, "both left out", &report_json("mac-a"), 200).await;
-    for (label, value, status) in [
-        ("0", json!(0), 200),
-        ("12 GiB", json!(12u64 << 30), 200),
-        ("2^53 - 1", json!(9_007_199_254_740_991u64), 200),
-        ("null", Value::Null, 200),
-        ("2^53 + 2", json!(9_007_199_254_740_994u64), 400),
-        ("-1", json!(-1), 400),
-        ("1.5", json!(1.5), 400),
-        ("a string", json!("12884901888"), 400),
+    report_gets(&w, "all left out", &report_json("mac-a"), 200).await;
+    for (label, value) in [
+        ("0", json!(0)),
+        ("12 GiB", json!(12u64 << 30)),
+        ("2^53", json!(9_007_199_254_740_992u64)),
+        ("2^53 + 2", json!(9_007_199_254_740_994u64)),
+        ("-1", json!(-1)),
+        ("1.5", json!(1.5)),
+        ("a string", json!("12884901888")),
+        ("null", Value::Null),
     ] {
         let memory = with(|r| r["status"]["memoryForJobsBytes"] = value.clone());
-        report_gets(&w, &format!("memoryForJobsBytes {label}"), &memory, status).await;
+        report_gets(&w, &format!("memoryForJobsBytes {label}"), &memory, 200).await;
         let counted = with(|r| {
             let mut runner = runner.clone();
             runner["countedBytes"] = value.clone();
             r["status"]["runners"] = json!([runner]);
         });
-        report_gets(&w, &format!("countedBytes {label}"), &counted, status).await;
+        report_gets(&w, &format!("countedBytes {label}"), &counted, 200).await;
     }
-}
-
-#[tokio::test]
-async fn a_runners_size_is_one_of_the_four_labels_and_anything_else_refuses_the_report() {
-    let w = world().await;
-    let with_size = |size: Value| {
-        with(|r| {
-            r["status"]["runners"] = json!([{"name": "mac-a-j1", "scaleSet": 4, "state": "idle",
-                "started": "2026-10-10T08:00:00Z", "size": size}])
-        })
-    };
-    for size in ["cf-2g", "cf-4g", "cf-6g", "cf-8g"] {
-        report_gets(&w, size, &with_size(json!(size)), 200).await;
+    for size in [
+        json!("cf-2g"),
+        json!("cf-8g"),
+        json!("cf-10g"),
+        json!("CF-4G"),
+        json!(""),
+        json!(4),
+        Value::Null,
+    ] {
+        let sized = with(|r| {
+            let mut runner = runner.clone();
+            runner["size"] = size.clone();
+            r["status"]["runners"] = json!([runner]);
+        });
+        report_gets(&w, &format!("size {size}"), &sized, 200).await;
     }
-    report_gets(&w, "null", &with_size(Value::Null), 200).await;
-    for size in ["cf-10g", "CF-4G", "cf-4", "self-hosted", ""] {
-        report_gets(&w, &format!("size {size:?}"), &with_size(json!(size)), 400).await;
-    }
-    report_gets(&w, "a number", &with_size(json!(4)), 400).await;
-    let refused = post_json(&w, "report", &with_size(json!("cf-3g"))).await;
-    assert_eq!(
-        refused.error(),
-        "Not a report this console reads: status.runners.0.size: Invalid option: expected one of \
-         \"cf-2g\"|\"cf-4g\"|\"cf-6g\"|\"cf-8g\""
-    );
 }
 
 #[tokio::test]

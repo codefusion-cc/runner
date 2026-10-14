@@ -3363,7 +3363,7 @@ async fn a_headless_host_reports_its_one_cap_as_the_memory_for_jobs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_runner_reports_its_size_and_the_memory_the_budget_counts_it_with() {
+async fn each_actions_runner_reports_its_machines_size_and_what_the_budget_counts_it_with() {
     let rig = Rig::new(2).await;
     rig.service.discover().await;
     until("the scale set's session", || {
@@ -3404,10 +3404,9 @@ async fn each_runner_reports_its_size_and_the_memory_the_budget_counts_it_with()
         "also while it waits for its job"
     );
     assert!(of(&waits).get("job").is_none());
-    // Each machine counts with its size and the vm-host's overhead, and together they are all the budget holds.
-    let one = Size::G2.vm_bytes() + Settings::VM_HOST_OVERHEAD;
-    assert_eq!(of(&running)["countedBytes"], json!(one));
-    assert_eq!(of(&waits)["countedBytes"], json!(one));
+    // Each machine counts with its size, and together they are all the budget holds: the full cap.
+    assert_eq!(of(&running)["countedBytes"], json!(Size::G2.vm_bytes()));
+    assert_eq!(of(&waits)["countedBytes"], json!(Size::G2.vm_bytes()));
     let counted: u64 = runners
         .iter()
         .map(|r| r["countedBytes"].as_u64().expect("counted"))
@@ -3418,6 +3417,6 @@ async fn each_runner_reports_its_size_and_the_memory_the_budget_counts_it_with()
         2,
         "the budget holds the two machines and nothing else"
     );
-    assert_eq!(counted, 2 * one);
-    assert_eq!(budget.committed_bytes, 2 * Size::G2.vm_bytes());
+    assert_eq!(counted, budget.committed_bytes);
+    assert_eq!(json!(counted), report["status"]["memoryForJobsBytes"]);
 }

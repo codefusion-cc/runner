@@ -44,7 +44,7 @@ pub struct Enroll {
     /// The host's name on the console: lower case letters and digits in groups joined by single hyphens, at most 24
     /// characters (see [`crate::is_machine_name`]).
     pub machine: String,
-    /// Its host name.
+    /// The name the system gives the host.
     pub hostname: String,
     /// The host's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,
@@ -178,8 +178,9 @@ pub struct RunnerStatus {
     /// Its machine's size, by its label (`cf-2g`, `cf-4g`, `cf-6g` or `cf-8g`), also while it waits for its job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
-    /// The host's memory the budget counts its machine with now: its size and the vm-host's overhead. Left out
-    /// while the machine holds no slot.
+    /// What the budget counts its machine with against `memory_for_jobs_bytes` now: the size it committed for it.
+    /// The vm-host's overhead is taken out of that cap already, so on a full host these add up to it. Left out while
+    /// the machine holds no slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counted_bytes: Option<u64>,
 }
@@ -225,7 +226,8 @@ pub struct Status {
     /// that do not read `memory_for_jobs_bytes`.
     pub max_jobs: u32,
     /// The memory the host gives machines now: the cap of the limits in force (on a workstation, those for its
-    /// person away or at it). The budget counts each machine's size against it.
+    /// person away or at it). The budget counts each machine's size against it, with the vm-hosts' overhead taken
+    /// out of the cap already.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_for_jobs_bytes: Option<u64>,
     /// Whether the console's pause is in effect on the host.
@@ -472,7 +474,7 @@ pub struct Report {
     pub status: Status,
     /// What the host as a whole is doing.
     pub activity: Activity,
-    /// Its host name.
+    /// The name the system gives the host.
     pub hostname: String,
     /// The host's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,

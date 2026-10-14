@@ -286,7 +286,7 @@ async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
             memory_bytes: 1 << 30,
         }),
         size: Some("cf-4g".into()),
-        counted_bytes: Some((4 << 30) + (192 << 20)),
+        counted_bytes: Some(4 << 30),
     });
     report.results.push(cf_console_client::CommandResult {
         id: "old".into(),
@@ -307,10 +307,7 @@ async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
     assert_eq!(sent["status"]["maxJobs"], 2);
     assert_eq!(sent["status"]["memoryForJobsBytes"], 12u64 << 30);
     assert_eq!(sent["status"]["runners"][0]["size"], "cf-4g");
-    assert_eq!(
-        sent["status"]["runners"][0]["countedBytes"],
-        (4u64 << 30) + (192 << 20)
-    );
+    assert_eq!(sent["status"]["runners"][0]["countedBytes"], 4u64 << 30);
     assert_eq!(sent["status"]["scaleSets"][0]["name"], "mac-a--app-1a2b");
     assert_eq!(sent["status"]["host"]["freeMemoryPercent"], 60.0);
     assert_eq!(sent["status"]["runners"][0]["scaleSet"], 4);

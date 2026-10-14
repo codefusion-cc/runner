@@ -185,8 +185,8 @@ pub struct MachineStatus {
     pub size: Option<Size>,
     /// The machine's memory.
     pub memory_bytes: u64,
-    /// What the budget counts it with while it holds a slot: its size and the vm-host's overhead
-    /// ([`cf_budget::Budget::host_bytes`]).
+    /// What the budget's cap counts it with while it holds a slot: the size of that slot. The vm-host's overhead is
+    /// taken out of the cap already, so these add up to the cap on a full host.
     pub counted_bytes: Option<u64>,
     /// The memory the job holds now.
     pub used_bytes: Option<u64>,
@@ -1372,7 +1372,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     started: job.record.created_at,
                     size: job.record.size(),
                     memory_bytes: job.record.memory_bytes,
-                    counted_bytes: job.slot.and_then(|slot| inner.budget.host_bytes(slot).ok()),
+                    counted_bytes: job.slot.and_then(|slot| {
+                        budget
+                            .slots
+                            .iter()
+                            .find(|held| held.slot == slot)
+                            .map(|held| held.size.vm_bytes())
+                    }),
                     used_bytes: job
                         .last
                         .as_ref()
