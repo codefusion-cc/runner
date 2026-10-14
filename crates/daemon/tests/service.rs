@@ -1747,9 +1747,13 @@ fn happens_around_removals() -> impl Strategy<Value = Happens> {
     ]
 }
 
-/// How soon, in these tests' timings, GitHub's look at its queue moves a job this Mac serves that waits while a
-/// machine of its size fits: the Mac's polls show the room within two of them (150 ms each here, the long poll in
-/// service), and the assignment and the start follow.
+/// How soon, in these tests' timings, the Mac offers room for a job it serves that waits while a machine of its size
+/// fits: a session GitHub forgot opens again (the backoff here waits 100 ms at most), and two polls show the room (the
+/// fake GitHub answers each within 150 ms).
+const OFFERS_WITHIN: Duration = Duration::from_secs(3);
+
+/// How soon GitHub's look at its queue, while the Mac offers room, moves a job this Mac serves: the assignment and the
+/// start follow.
 const STARTS_WITHIN: Duration = Duration::from_secs(3);
 
 /// How soon a job whose start and end went with a session is at the console once its machine is gone: the wait for
@@ -2080,13 +2084,28 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
             .filter(|&&job| rig.github.job_state(job) == Some(JobState::Available))
             .count()
     };
+    let offered = |rig: &Rig| jobs.iter().any(|&job| rig.github.offers_room_for(job));
     loop {
         let (before, standing) = (waiting(&rig), rig.standing().len());
         if before == 0 || standing >= slots {
             break;
         }
-        // Two polls that show the room, then GitHub looks.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The Mac's polls show the room for a waiting job, once a session GitHub forgot is open again; then GitHub
+        // looks. A look before that hands nothing out, and GitHub looks again only at its own moments. A machine that
+        // stands up meanwhile for a job assigned before may take the last slot: then the room is looked at anew.
+        let free = std::time::Instant::now();
+        while !offered(&rig) && (waiting(&rig), rig.standing().len()) == (before, standing) {
+            prop_assert!(
+                free.elapsed() < OFFERS_WITHIN,
+                "{before} jobs wait at GitHub and {standing} of {slots} machines stand, and the Mac offered no room \
+                 for them in {:?}",
+                free.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if (waiting(&rig), rig.standing().len()) != (before, standing) {
+            continue;
+        }
         rig.github.github_looks();
         let looked = std::time::Instant::now();
         while waiting(&rig) == before && rig.standing().len() == standing {
