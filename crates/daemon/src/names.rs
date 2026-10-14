@@ -83,6 +83,8 @@ pub struct ServePolicy {
     pub docker_repos: Vec<String>,
     /// The most Docker jobs at once ([`crate::machines::MachineConfig::docker_max_jobs`]).
     pub docker_max_jobs: usize,
+    /// How many bytes Docker jobs' caches may hold together; 0 keeps none.
+    pub docker_cache_bytes: u64,
 }
 
 impl Default for ServePolicy {
@@ -92,6 +94,7 @@ impl Default for ServePolicy {
             public_repos: Vec::new(),
             docker_repos: Vec::new(),
             docker_max_jobs: 1,
+            docker_cache_bytes: 0,
         }
     }
 }
