@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cf_budget::{Battery, FakeHost};
-use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
+use cf_console_client::{Client, Enroll, JobEvent, MAX_RESULTS, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{
     CrashingStore, FakeUpdate, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for,
@@ -3137,6 +3137,62 @@ async fn an_update_with_nothing_newer_installs_nothing_and_holds_no_job() {
     assert!(!rig.service.restart_requested());
     rig.job_running().await;
     assert_eq!(rig.standing().len(), 2, "a second job starts beside {runner}");
+}
+
+/// A report carries at most `MAX_RESULTS` results. An update whose result comes while that many wait for the
+/// console is said all the same, once, and is not done again though the console sends its command meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_whose_result_comes_while_the_most_results_wait_is_said_once_and_done_once() {
+    said_once_and_done_once_with_the_most_results_waiting(0, MAX_RESULTS).await;
+}
+
+/// An update the console sends after more commands than a report carries results is done once too, and every
+/// command is said once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_that_comes_after_more_commands_than_a_report_carries_results_is_said_once_and_done_once() {
+    said_once_and_done_once_with_the_most_results_waiting(MAX_RESULTS + 10, MAX_RESULTS + 10).await;
+}
+
+/// The console sends `others` commands this Runner answers at once, and an update among them at `at`, all with one
+/// answer. The update's build ends only once the answer is done, so that its result comes after theirs; then the
+/// Runner reports until the console has heard of everything.
+async fn said_once_and_done_once_with_the_most_results_waiting(at: usize, others: usize) {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.stop_pump().await;
+    rig.updates.hold_builds();
+    rig.updates.build_gives(Err("the source does not build"));
+    let mut ids: Vec<String> = (0..at).map(|_| rig.console.queue_command("dance", None)).collect();
+    let update = rig.console.queue_command("update", None);
+    ids.extend((at..others).map(|_| rig.console.queue_command("dance", None)));
+    ids.push(update.clone());
+    let mut reports = 0;
+    while ids.iter().any(|id| results_of(&rig.console, id).is_empty()) {
+        assert!(reports < 20, "the console heard of every command within 20 reports");
+        rig.service.report().await;
+        rig.updates.release_builds();
+        reports += 1;
+        // An update under way says what came of it before the next report reads the results.
+        until("no update under way", || {
+            rig.service.status().status.reason.is_none()
+        })
+        .await;
+    }
+    // The console sends a command again until it has its result: two more answers show none is done again.
+    rig.service.report().await;
+    rig.service.report().await;
+    assert_eq!(rig.updates.built(), 1, "the update is done once");
+    for id in &ids {
+        let heard = results_of(&rig.console, id);
+        assert_eq!(heard.len(), 1, "{id} is said once: {heard:?}");
+    }
+    let heard = &results_of(&rig.console, &update)[0];
+    assert_eq!(heard["ok"], json!(false));
+    assert_eq!(heard["message"], json!("the source does not build"));
+    for report in rig.console.reports() {
+        let carried = report["results"].as_array().map_or(0, Vec::len);
+        assert!(carried <= MAX_RESULTS, "a report carries {carried} results");
+    }
 }
 
 /// A build that fails is said with its words, shows in the report's update until one works, and changes nothing
