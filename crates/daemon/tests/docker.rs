@@ -164,7 +164,14 @@ async fn docker_job(w: &mut World) -> String {
 }
 
 fn copy_of_last_start(w: &World) -> std::path::PathBuf {
-    w.parts.vms.started().last().unwrap().docker_cache.clone().expect("a copy of the cache")
+    w.parts
+        .vms
+        .started()
+        .last()
+        .unwrap()
+        .docker_cache
+        .clone()
+        .expect("a copy of the cache")
 }
 
 /// The job ends: its machine first, then GitHub's word on it.
@@ -179,7 +186,11 @@ fn ends(w: &mut World, runner: &str, result: &str, event: &str, workflow: &str) 
 fn head(path: &std::path::Path) -> Vec<u8> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    std::fs::File::open(path).unwrap().take(64).read_to_end(&mut bytes).unwrap();
+    std::fs::File::open(path)
+        .unwrap()
+        .take(64)
+        .read_to_end(&mut bytes)
+        .unwrap();
     bytes
 }
 
@@ -207,6 +218,13 @@ async fn a_successful_push_to_main_keeps_its_copy_and_the_next_docker_job_starts
     ends(&mut w, &runner, "succeeded", "push", ON_MAIN);
     assert_eq!(kept_repos(dir.path()), [REPO]);
     assert!(!copy.exists(), "the copy became the cache");
+    // What the console is told: the cache with its size and last write, and what happened.
+    let snapshot = w.m.snapshot();
+    assert_eq!(snapshot.caches.len(), 1);
+    assert_eq!(snapshot.caches[0].1.repo, REPO);
+    assert!(snapshot.caches[0].1.written_at > 0);
+    let kinds: Vec<&str> = snapshot.cache_events.iter().map(|event| event.kind.as_str()).collect();
+    assert_eq!(kinds, ["kept"]);
 
     let next = docker_job(&mut w).await;
     assert_eq!(head(&copy_of_last_start(&w)), b"what main built");
@@ -221,17 +239,33 @@ async fn a_pull_request_a_failure_or_an_unclean_disk_never_writes_the_cache() {
     ends(&mut w, &first, "succeeded", "push", ON_MAIN);
 
     for (result, event, workflow) in [
-        ("succeeded", "pull_request", "org/app/.github/workflows/ci.yml@refs/pull/3/merge"),
-        ("succeeded", "push", "org/app/.github/workflows/ci.yml@refs/heads/feature"),
+        (
+            "succeeded",
+            "pull_request",
+            "org/app/.github/workflows/ci.yml@refs/pull/3/merge",
+        ),
+        (
+            "succeeded",
+            "push",
+            "org/app/.github/workflows/ci.yml@refs/heads/feature",
+        ),
         ("failed", "push", ON_MAIN),
         ("canceled", "push", ON_MAIN),
-        ("succeeded", "push", "other/tools/.github/workflows/build.yml@refs/heads/main"),
+        (
+            "succeeded",
+            "push",
+            "other/tools/.github/workflows/build.yml@refs/heads/main",
+        ),
     ] {
         let runner = docker_job(&mut w).await;
         std::fs::write(copy_of_last_start(&w), event.as_bytes()).unwrap();
         ends(&mut w, &runner, result, event, workflow);
         let next = docker_job(&mut w).await;
-        assert_eq!(head(&copy_of_last_start(&w)), b"main", "{result} {event} {workflow}");
+        assert_eq!(
+            head(&copy_of_last_start(&w)),
+            b"main",
+            "{result} {event} {workflow}"
+        );
         ends(&mut w, &next, "failed", "push", ON_MAIN);
     }
 
@@ -298,5 +332,9 @@ async fn a_machine_that_does_not_start_leaves_no_copy_and_a_plain_job_gets_none(
     let jobs: Vec<_> = std::fs::read_dir(dir.path().join("jobs")).unwrap().collect();
     assert!(jobs.is_empty(), "no copy is left");
     let plain = w.start().await;
-    assert_eq!(w.parts.vms.started().last().unwrap().docker_cache, None, "{plain} has no Docker");
+    assert_eq!(
+        w.parts.vms.started().last().unwrap().docker_cache,
+        None,
+        "{plain} has no Docker"
+    );
 }

@@ -819,3 +819,32 @@ async fn events_with_empty_very_long_and_unicode_names_reach_the_console_as_the_
     assert_eq!(seen[5]["job"].as_str().map(|s| s.chars().count()), Some(300));
     assert_eq!(seen[5]["workflow"].as_str().map(|s| s.chars().count()), Some(400));
 }
+
+#[test]
+fn docker_caches_go_by_their_wire_names_and_a_report_before_them_has_none() {
+    let mut status = support::status("mac-a");
+    status.docker_caches = vec![cf_console_client::DockerCache {
+        repo: "org/app".into(),
+        bytes: 3 << 30,
+        written_at: "2026-10-14T10:00:00Z".into(),
+        used_at: "2026-10-14T11:00:00Z".into(),
+    }];
+    status.docker_cache_events = vec![cf_console_client::DockerCacheEvent {
+        at: "2026-10-14T10:00:00Z".into(),
+        repo: "org/app".into(),
+        kind: "discarded".into(),
+        why: Some("only a push, a schedule or a dispatch writes the cache".into()),
+    }];
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["dockerCaches"][0]["writtenAt"], "2026-10-14T10:00:00Z");
+    assert_eq!(value["dockerCaches"][0]["bytes"], 3u64 << 30);
+    assert_eq!(value["dockerCacheEvents"][0]["kind"], "discarded");
+    let back: cf_console_client::Status = serde_json::from_value(value).unwrap();
+    assert_eq!(back, status);
+
+    let mut old = serde_json::to_value(support::status("mac-a")).unwrap();
+    assert!(old.get("dockerCaches").is_none(), "left out while there are none");
+    old.as_object_mut().unwrap().remove("dockerCacheEvents");
+    let read: cf_console_client::Status = serde_json::from_value(old).unwrap();
+    assert!(read.docker_caches.is_empty() && read.docker_cache_events.is_empty());
+}

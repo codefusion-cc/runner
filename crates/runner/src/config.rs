@@ -453,7 +453,10 @@ mod tests {
         assert_eq!(config.docker_repos, Vec::<String>::new());
         assert_eq!(config.docker_max_jobs, 1);
         assert_eq!(config.docker_cache_gb, 30);
-        assert_eq!(with(|v| v["docker_cache_gb"] = 0.into()).map(|c| c.docker_cache_gb), Ok(0));
+        assert_eq!(
+            with(|v| v["docker_cache_gb"] = 0.into()).map(|c| c.docker_cache_gb),
+            Ok(0)
+        );
         assert!(with(|v| v["docker_cache_gb"] = 1000.into()).is_ok());
         assert!(with(|v| v["docker_cache_gb"] = 1001.into()).is_err());
         assert!(with(|v| v["docker_cache_gb"] = (-1).into()).is_err());

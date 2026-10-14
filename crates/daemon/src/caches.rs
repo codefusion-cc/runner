@@ -352,7 +352,11 @@ impl CacheStore {
 
     /// Deletes the copies of jobs nothing knows any more: those a Runner before left when it stopped.
     pub fn sweep(&self, known: &BTreeSet<PathBuf>) {
-        for entry in fs::read_dir(self.dir.join("jobs")).into_iter().flatten().flatten() {
+        for entry in fs::read_dir(self.dir.join("jobs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let path = entry.path();
             if !known.contains(&path) {
                 let _ = fs::remove_file(path);

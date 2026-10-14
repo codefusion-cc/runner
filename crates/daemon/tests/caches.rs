@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use cf_daemon::caches::{Cache, CacheStore, DISK_BYTES, evictions, key, refusal, spoiled};
 use cf_daemon::GithubJob;
+use cf_daemon::caches::{Cache, CacheStore, DISK_BYTES, evictions, key, refusal, spoiled};
 use cf_guest_proto::{CacheEnd, CacheFound};
 use proptest::prelude::*;
 
@@ -45,13 +45,20 @@ fn clean(found: CacheFound) -> Option<CacheEnd> {
 
 #[test]
 fn a_successful_push_to_the_default_branch_with_a_clean_disk_is_kept() {
-    assert_eq!(refusal(REPO, Some("main"), Some(&on_main()), clean(CacheFound::Fresh)), None);
+    assert_eq!(
+        refusal(REPO, Some("main"), Some(&on_main()), clean(CacheFound::Fresh)),
+        None
+    );
     for event in ["schedule", "workflow_dispatch"] {
         let job = GithubJob {
             event: event.into(),
             ..on_main()
         };
-        assert_eq!(refusal(REPO, Some("main"), Some(&job), clean(CacheFound::Reused)), None, "{event}");
+        assert_eq!(
+            refusal(REPO, Some("main"), Some(&job), clean(CacheFound::Reused)),
+            None,
+            "{event}"
+        );
     }
     let spelled = github(
         "push",
@@ -69,11 +76,39 @@ fn a_successful_push_to_the_default_branch_with_a_clean_disk_is_kept() {
 fn each_condition_alone_refuses() {
     let end = clean(CacheFound::Reused);
     let with = |job: GithubJob| refusal(REPO, Some("main"), Some(&job), end);
-    for event in ["pull_request", "pull_request_target", "merge_group", "release", "workflow_run", ""] {
-        assert!(with(GithubJob { event: event.into(), ..on_main() }).is_some(), "{event}");
+    for event in [
+        "pull_request",
+        "pull_request_target",
+        "merge_group",
+        "release",
+        "workflow_run",
+        "",
+    ] {
+        assert!(
+            with(GithubJob {
+                event: event.into(),
+                ..on_main()
+            })
+            .is_some(),
+            "{event}"
+        );
     }
-    for result in [None, Some("failed"), Some("canceled"), Some("cancelled"), Some("skipped"), Some("")] {
-        assert!(with(GithubJob { result: result.map(str::to_string), ..on_main() }).is_some(), "{result:?}");
+    for result in [
+        None,
+        Some("failed"),
+        Some("canceled"),
+        Some("cancelled"),
+        Some("skipped"),
+        Some(""),
+    ] {
+        assert!(
+            with(GithubJob {
+                result: result.map(str::to_string),
+                ..on_main()
+            })
+            .is_some(),
+            "{result:?}"
+        );
     }
     for workflow in [
         "codefusion-cc/shop/.github/workflows/ci.yml@refs/heads/feature",
@@ -87,20 +122,45 @@ fn each_condition_alone_refuses() {
         "codefusion-cc/tools/.github/workflows/ci.yml@refs/heads/main",
         "",
     ] {
-        assert!(with(GithubJob { workflow: workflow.into(), ..on_main() }).is_some(), "{workflow}");
+        assert!(
+            with(GithubJob {
+                workflow: workflow.into(),
+                ..on_main()
+            })
+            .is_some(),
+            "{workflow}"
+        );
     }
-    assert!(refusal(REPO, Some("main"), None, end).is_some(), "no word from GitHub");
-    assert!(refusal(REPO, None, Some(&on_main()), end).is_some(), "no default branch known");
-    assert!(refusal(REPO, Some(""), Some(&on_main()), end).is_some(), "an empty default branch");
-    assert!(refusal(REPO, Some("develop"), Some(&on_main()), end).is_some(), "main is not the default");
-    assert!(refusal(REPO, Some("main"), Some(&on_main()), None).is_some(), "no word from the guest");
+    assert!(
+        refusal(REPO, Some("main"), None, end).is_some(),
+        "no word from GitHub"
+    );
+    assert!(
+        refusal(REPO, None, Some(&on_main()), end).is_some(),
+        "no default branch known"
+    );
+    assert!(
+        refusal(REPO, Some(""), Some(&on_main()), end).is_some(),
+        "an empty default branch"
+    );
+    assert!(
+        refusal(REPO, Some("develop"), Some(&on_main()), end).is_some(),
+        "main is not the default"
+    );
+    assert!(
+        refusal(REPO, Some("main"), Some(&on_main()), None).is_some(),
+        "no word from the guest"
+    );
     for (clean, daemon) in [(false, true), (true, false), (false, false)] {
         let end = Some(CacheEnd {
             found: CacheFound::Reused,
             clean,
             daemon,
         });
-        assert!(refusal(REPO, Some("main"), Some(&on_main()), end).is_some(), "{clean} {daemon}");
+        assert!(
+            refusal(REPO, Some("main"), Some(&on_main()), end).is_some(),
+            "{clean} {daemon}"
+        );
     }
 }
 
@@ -139,10 +199,19 @@ proptest! {
 
 #[test]
 fn a_cache_is_dropped_only_when_its_daemon_could_not_run_on_it() {
-    let end = |found, daemon| Some(CacheEnd { found, clean: true, daemon });
+    let end = |found, daemon| {
+        Some(CacheEnd {
+            found,
+            clean: true,
+            daemon,
+        })
+    };
     assert!(spoiled(end(CacheFound::Reused, false)));
     assert!(!spoiled(end(CacheFound::Reused, true)));
-    assert!(!spoiled(end(CacheFound::Fresh, false)), "a fresh one held nothing to blame");
+    assert!(
+        !spoiled(end(CacheFound::Fresh, false)),
+        "a fresh one held nothing to blame"
+    );
     assert!(!spoiled(end(CacheFound::Replaced, false)));
     assert!(!spoiled(None));
 }
@@ -169,7 +238,11 @@ fn the_least_recently_used_go_first_until_the_rest_fit_and_none_in_use() {
     assert_eq!(evictions(&caches, 10, &none), ["b", "c"]);
     assert_eq!(evictions(&caches, 0, &none), ["b", "c", "a"]);
     let busy: BTreeSet<String> = ["b".to_string()].into();
-    assert_eq!(evictions(&caches, 10, &busy), ["c", "a"], "b is in use; the rest go");
+    assert_eq!(
+        evictions(&caches, 10, &busy),
+        ["c", "a"],
+        "b is in use; the rest go"
+    );
     assert_eq!(evictions(&[], 0, &none), Vec::<String>::new());
 }
 
@@ -210,7 +283,11 @@ fn store(dir: &Path, budget: u64) -> Option<CacheStore> {
 fn head(path: &Path) -> Vec<u8> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    fs::File::open(path).unwrap().take(1 << 16).read_to_end(&mut bytes).unwrap();
+    fs::File::open(path)
+        .unwrap()
+        .take(1 << 16)
+        .read_to_end(&mut bytes)
+        .unwrap();
     bytes
 }
 
@@ -230,7 +307,11 @@ fn a_kept_copy_is_what_the_next_job_of_the_repository_starts_from() {
     };
     let none = BTreeSet::new();
     let first = caches.prepare("job1", REPO, 10).expect("a copy");
-    assert_eq!(fs::metadata(&first.path).unwrap().len(), DISK_BYTES, "a first one is empty, of the full size");
+    assert_eq!(
+        fs::metadata(&first.path).unwrap().len(),
+        DISK_BYTES,
+        "a first one is empty, of the full size"
+    );
     assert!(empty(&first.path));
     fs::write(&first.path, b"layers of the first job").unwrap();
     caches.settle(REPO, &first, None, ended(CacheFound::Fresh), &none, 20);
@@ -240,12 +321,13 @@ fn a_kept_copy_is_what_the_next_job_of_the_repository_starts_from() {
     assert_eq!((kept[0].1.repo.as_str(), kept[0].1.written_at), (REPO, 20));
 
     let second = caches.prepare("job2", "CodeFusion-CC/Shop", 30).expect("a copy");
-    assert_eq!(head(&second.path), b"layers of the first job", "the same repository, any case");
-    let other = caches.prepare("job3", "codefusion-cc/blog", 30).expect("a copy");
-    assert!(
-        empty(&other.path),
-        "another repository never gets it"
+    assert_eq!(
+        head(&second.path),
+        b"layers of the first job",
+        "the same repository, any case"
     );
+    let other = caches.prepare("job3", "codefusion-cc/blog", 30).expect("a copy");
+    assert!(empty(&other.path), "another repository never gets it");
 }
 
 #[test]
@@ -261,7 +343,14 @@ fn a_refused_copy_is_thrown_away_and_the_cache_stays_as_it_was() {
 
     let pull_request = caches.prepare("job2", REPO, 30).unwrap();
     fs::write(&pull_request.path, b"a pull request's layers").unwrap();
-    caches.settle(REPO, &pull_request, Some("only a push"), ended(CacheFound::Reused), &none, 40);
+    caches.settle(
+        REPO,
+        &pull_request,
+        Some("only a push"),
+        ended(CacheFound::Reused),
+        &none,
+        40,
+    );
     assert!(!pull_request.path.exists());
     let next = caches.prepare("job3", REPO, 50).unwrap();
     assert_eq!(head(&next.path), b"main's layers");
@@ -332,7 +421,10 @@ fn over_the_budget_the_one_used_longest_ago_goes_and_one_in_use_stays() {
     keep(&mut caches, "o/c", "j3", 30, &busy);
     let left: Vec<String> = caches.list().into_iter().map(|(_, cache)| cache.repo).collect();
     assert_eq!(left.len(), 2);
-    assert!(left.contains(&"o/a".to_string()), "in use, so it stays though oldest: {left:?}");
+    assert!(
+        left.contains(&"o/a".to_string()),
+        "in use, so it stays though oldest: {left:?}"
+    );
     assert!(left.contains(&"o/c".to_string()));
     assert_eq!(caches.events().last().unwrap().kind, "evicted");
     assert_eq!(caches.events().last().unwrap().repo, "o/b");

@@ -121,6 +121,8 @@ pub fn status(machine: &str) -> Status {
             error_at: None,
         }],
         runners: vec![],
+        docker_caches: vec![],
+        docker_cache_events: vec![],
     }
 }
 

@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
-    Status, Update,
+    Activity, Answer, Client, Command, CommandResult, DockerCache, DockerCacheEvent, HostStatus, JobKind,
+    MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
+    RunnerUsage, ScaleSetStatus, SizeStatus, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -1126,6 +1126,27 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             })
                             .map(|error| cut(error, STATUS_TEXT_MAX)),
                         error_at: set.error_at.map(iso),
+                    })
+                    .collect(),
+                docker_caches: snapshot
+                    .caches
+                    .iter()
+                    .take(MAX_RUNNERS)
+                    .map(|(_, cache)| DockerCache {
+                        repo: cut(cache.repo.clone(), STATUS_TEXT_MAX),
+                        bytes: cache.bytes,
+                        written_at: iso(cache.written_at),
+                        used_at: iso(cache.used_at),
+                    })
+                    .collect(),
+                docker_cache_events: snapshot
+                    .cache_events
+                    .iter()
+                    .map(|event| DockerCacheEvent {
+                        at: iso(event.at),
+                        repo: cut(event.repo.clone(), STATUS_TEXT_MAX),
+                        kind: event.kind.clone(),
+                        why: event.why.clone().map(|why| cut(why, STATUS_TEXT_MAX)),
                     })
                     .collect(),
                 runners: snapshot

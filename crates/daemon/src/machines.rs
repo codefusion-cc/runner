@@ -212,6 +212,10 @@ pub struct Snapshot {
     pub waiting: usize,
     /// What one more machine of each size meets, in the order of [`Size::ALL`].
     pub rooms: [SizeRoom; 4],
+    /// Docker jobs' caches with their keys, and what last happened to them.
+    pub caches: Vec<(String, caches::Cache)>,
+    /// See `caches`.
+    pub cache_events: Vec<caches::CacheEvent>,
 }
 
 impl Snapshot {
@@ -1425,6 +1429,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             waiting: inner.waiting.len(),
             rooms,
             budget,
+            caches: inner.caches.as_ref().map(CacheStore::list).unwrap_or_default(),
+            cache_events: inner.caches.as_ref().map(CacheStore::events).unwrap_or_default(),
         }
     }
 
