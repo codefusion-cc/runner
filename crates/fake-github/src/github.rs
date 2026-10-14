@@ -302,6 +302,17 @@ impl State {
         self.scale_sets.iter_mut().find(|s| s.id == id && !s.deleted)
     }
 
+    fn offers_room(&self, repo: &str) -> bool {
+        self.scale_sets.iter().any(|s| {
+            s.repo == repo
+                && !s.deleted
+                && s.session.is_some()
+                && s.capacity
+                    .zip(s.previous_capacity)
+                    .is_some_and(|(newest, before)| newest.min(before) > self.stats(s.id).assigned)
+        })
+    }
+
     fn stats(&self, id: i64) -> Stats {
         let Some(set) = self.scale_sets.iter().find(|s| s.id == id) else {
             return Stats::default();
@@ -756,15 +767,17 @@ impl FakeGithub {
     /// Whether a scale set of `repo` with a session offered room beyond the jobs it holds in both of its last two
     /// polls: a job of that repository queued now goes to it at once. Another repository's room is no room for it.
     pub fn offers_room(&self, repo: &str) -> bool {
+        self.lock().offers_room(repo)
+    }
+
+    /// Whether this job waits in the queue while a scale set of its repository offers room
+    /// ([`FakeGithub::offers_room`]): GitHub's next look hands it out.
+    pub fn offers_room_for(&self, request_id: i64) -> bool {
         let st = self.lock();
-        st.scale_sets.iter().any(|s| {
-            s.repo == repo
-                && !s.deleted
-                && s.session.is_some()
-                && s.capacity
-                    .zip(s.previous_capacity)
-                    .is_some_and(|(newest, before)| newest.min(before) > st.stats(s.id).assigned)
-        })
+        st.jobs
+            .iter()
+            .find(|j| j.request_id == request_id)
+            .is_some_and(|j| j.state == JobState::Available && st.offers_room(&j.repo))
     }
 
     /// How often a job was handed to a scale set: once per job, and once more for each take-back that was handed out
