@@ -802,7 +802,8 @@ mod tests {
                 " while the person is away, none otherwise"
             ),
             "16.00 GiB and 8 cores, someone's own Mac: 9.60 GiB for machines while the person is away, none \
-             otherwise; cf-2g with 2 CPUs, cf-4g with 3 CPUs, cf-6g with 4 CPUs, cf-8g with 4 CPUs; 2 cf-4g side by side"
+             otherwise; cf-2g with 2 CPUs, cf-4g with 3 CPUs, cf-6g with 4 CPUs, cf-8g with 4 CPUs; \
+             2 cf-4g side by side"
         );
     }
 

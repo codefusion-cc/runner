@@ -4,10 +4,12 @@
 //! gateway and tries one target per probe. Each blocked target is a test of its own.
 //!
 //! A probe says `dropped` when nothing answered within [`WAIT`]: the frame never reached pasta, which would have
-//! answered a connection it could not make with a reset (`refused`). A DNS probe asks as a resolver does, again
-//! when no answer came ([`ASKS`]): one question over UDP can be lost on the way to the host's resolver and beyond. Every blocked target must be `dropped`, not
+//! answered a connection it could not make with a reset (`refused`). Every blocked target must be `dropped`, not
 //! `refused`. The host listens on all its addresses and on its loopback for the whole of each test, so a target of
 //! the host that the firewall let through would answer `ok`.
+//!
+//! A DNS probe asks as a resolver does, again when no answer or a server failure came ([`ASKS`]): one question over
+//! UDP can be lost, or time out, on the way to the host's resolver and beyond.
 //!
 //! It needs pasta (`apt install passt`), user namespaces, and `ip` and `unshare` for the stand-in alone.
 #![cfg(target_os = "linux")]
@@ -444,8 +446,8 @@ fn connect(address: &str, port: u16) -> String {
 }
 
 /// `ok` when the name server at `server` answered a question for github.com's address with one, `no-answer` when it
-/// answered without one, else `dropped`. The same question goes out again after each [`WAIT`] without an answer, and
-/// a late answer to an earlier one counts.
+/// answered without one, else `dropped`. The same question goes out again after each [`WAIT`] without an answer and
+/// after a server failure, and a late answer to an earlier one counts.
 fn ask(server: Ipv4Addr) -> String {
     let mut question = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
     for label in ["github", "com"] {
@@ -455,10 +457,15 @@ fn ask(server: Ipv4Addr) -> String {
     question.extend_from_slice(&[0, 0, 1, 0, 1]);
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.set_read_timeout(Some(WAIT)).unwrap();
+    let mut found = "dropped";
     for _ in 0..ASKS {
         socket.send_to(&question, (server, 53)).unwrap();
         let mut answer = [0u8; 512];
         match socket.recv(&mut answer) {
+            // A server failure (SERVFAIL): the host's resolver gave up upstream, and a resolver asks again.
+            Ok(read) if read > 12 && answer[..2] == [0x12, 0x34] && answer[3] & 0x0f == 2 => {
+                found = "no-answer";
+            }
             Ok(read) if read > 12 && answer[..2] == [0x12, 0x34] => {
                 return if u16::from_be_bytes([answer[6], answer[7]]) > 0 {
                     "ok".into()
@@ -470,5 +477,5 @@ fn ask(server: Ipv4Addr) -> String {
             Ok(_) | Err(_) => {}
         }
     }
-    "dropped".into()
+    found.into()
 }
