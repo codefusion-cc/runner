@@ -18,7 +18,7 @@ use std::convert::Infallible;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -121,9 +121,17 @@ pub fn prepare(
     })
 }
 
-/// Starts the launcher, which makes the sandbox; its end goes to the machine's console. What the daemon says goes
-/// to [`plan::LOG`], which the job can read.
-pub fn start(spec: &Spec) -> Result<(), String> {
+/// The descriptor the launcher says on that the sandbox's view is built.
+const VIEW_FD: libc::c_int = 101;
+/// How long the job's container waits for the sandbox's view.
+const VIEW_WAIT_MS: libc::c_int = 10_000;
+
+/// Starts the launcher, which makes the sandbox, and returns once the sandbox has built its view of the job's root:
+/// it does so as the machine's root, so the job must not run yet, or its root could change those paths under it. A
+/// launcher that does not get there in time is ended. Its end goes to the machine's console and, as why the job has
+/// no daemon, to `problem`, which the job's start hook reads. What the daemon says goes to [`plan::LOG`], which the
+/// job can read.
+pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
     let log_path = format!("{}/dockerd.log", spec.sockets);
     let log = context(
         "the daemon's log",
@@ -133,6 +141,7 @@ pub fn start(spec: &Spec) -> Result<(), String> {
             .mode(0o644)
             .open(&log_path),
     )?;
+    let (view_read, view_write) = context("pipe", sys::pipe())?;
     let mut command = Command::new(SELF_COPY);
     command
         .arg("docker")
@@ -140,19 +149,53 @@ pub fn start(spec: &Spec) -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(context("the daemon's log", log.try_clone())?)
         .stderr(log);
+    let view_fd = view_write.as_raw_fd();
+    // SAFETY: dup2 is async-signal-safe; the descriptor is open in the child, which is a copy of this process.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(view_fd, VIEW_FD) < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
     let mut child = context("start the Docker launcher", command.spawn())?;
+    // The command holds the end the launcher got; while it is open here, the pipe never ends.
+    drop((command, view_write));
     if let Some(mut input) = child.stdin.take() {
         context(
             "describe the sandbox",
             input.write_all(serde_json::to_string(spec).unwrap_or_default().as_bytes()),
         )?;
     }
+    let mut poll = libc::pollfd {
+        fd: view_read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd and a length of 1.
+    unsafe { libc::poll(&mut poll, 1, VIEW_WAIT_MS) };
+    let mut byte = [0u8; 1];
+    let built = poll.revents & libc::POLLIN != 0 && File::from(view_read).read(&mut byte).unwrap_or(0) == 1;
+    if !built {
+        let _ = child.kill();
+    }
+    let problem = problem.to_string();
     std::thread::spawn(move || {
         if let Ok(status) = child.wait() {
             say(&format!("the Docker sandbox ended: {status}"));
+            // Read by the start hook, which then stops waiting for the daemon; at the job's end nobody reads it.
+            if !std::path::Path::new(&problem).exists() {
+                let _ = fs::write(&problem, format!("its sandbox ended ({status})."));
+            }
         }
     });
-    Ok(())
+    if built {
+        Ok(())
+    } else {
+        Err("the sandbox did not build its view in time".into())
+    }
 }
 
 fn fork() -> Result<libc::pid_t, String> {
@@ -213,6 +256,10 @@ fn launcher() -> Result<i32, String> {
         "keep to itself",
         check(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }),
     )?;
+    // SAFETY: the supervisor hands the launcher this descriptor, and it is wrapped once, here.
+    let view = unsafe { OwnedFd::from_raw_fd(VIEW_FD) };
+    // SAFETY: fcntl on the descriptor we own; the sandbox's programs must not inherit it.
+    unsafe { libc::fcntl(view.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     sys::set(format!("{}/cgroup.procs", spec.cgroup), "0")?;
     // A process namespace made by the machine's root, so that its `/proc` is mounted before the user namespace.
     unshare(libc::CLONE_NEWPID)?;
@@ -221,11 +268,11 @@ fn launcher() -> Result<i32, String> {
     let first = fork()?;
     if first == 0 {
         drop((ask_read, done_write));
-        let Err(error) = first_process(&spec, ask_write, done_read);
+        let Err(error) = first_process(&spec, view, ask_write, done_read);
         eprintln!("cf-supervisor: the Docker sandbox did not start: {error}");
         std::process::exit(70);
     }
-    drop((ask_write, done_read));
+    drop((view, ask_write, done_read));
     let mut byte = [0u8; 1];
     let mut done = File::from(done_write);
     if File::from(ask_read).read(&mut byte).unwrap_or(0) == 1 {
@@ -241,13 +288,15 @@ fn launcher() -> Result<i32, String> {
     Ok(exit_code(status))
 }
 
-/// The sandbox's first process, PID 1 of its process namespace: builds its view as the machine's root, becomes the
-/// sandbox's root and runs [`sandbox`]. Returns only when that failed.
-fn first_process(spec: &Spec, ask: OwnedFd, done: OwnedFd) -> Result<Infallible, String> {
+/// The sandbox's first process, PID 1 of its process namespace: builds its view as the machine's root, says so on
+/// `built`, becomes the sandbox's root and runs [`sandbox`]. Returns only when that failed.
+fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Result<Infallible, String> {
     unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC)?;
     // SAFETY: sethostname reads `len` bytes of the string we own.
     unsafe { libc::sethostname(spec.host_name.as_ptr().cast(), spec.host_name.len()) };
     view(spec)?;
+    // Nothing more is done in the job's root as the machine's root: its container may start.
+    context("say the view is built", File::from(built).write_all(&[1]))?;
 
     // From here on root is the sandbox's root, a shifted id: what was mounted above is locked.
     unshare(libc::CLONE_NEWUSER)?;

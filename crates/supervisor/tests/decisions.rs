@@ -1243,7 +1243,10 @@ fn a_stop_the_kernel_counted_but_did_not_log_is_believed_at_the_second_look_or_a
 #[test]
 fn a_groups_own_limit_is_read_from_its_local_events() {
     use cf_supervisor::oom::limit_reached;
-    assert_eq!(limit_reached("low 0\nhigh 0\nmax 9\noom 2\noom_kill 5\noom_group_kill 0\n"), 2);
+    assert_eq!(
+        limit_reached("low 0\nhigh 0\nmax 9\noom 2\noom_kill 5\noom_group_kill 0\n"),
+        2
+    );
     assert_eq!(limit_reached("oom_kill 5\n"), 0, "oom_kill is not oom");
     assert_eq!(limit_reached(""), 0);
 }

@@ -1395,6 +1395,7 @@ docker compose up -d --build > /tmp/compose.log 2>&1; echo compose=$?; tail -3 /
 echo published=$(curl -s --max-time 30 --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/)
 echo bind-mount=$(echo shared > /tmp/stack/note && docker run --rm -v /tmp/stack:/s alpine:3.22 cat /s/note)
 docker compose down -t 1 > /dev/null 2>&1
+docker run --rm --memory 32m --memory-swap 32m alpine:3.22 sh -c 'tail /dev/zero' > /dev/null 2>&1; echo own-limit=$?
 T='{try_in_container}'
 docker run --rm alpine:3.22 sh -c "$T; {plain} wget -q -O /dev/null -T 20 https://github.com && echo c-github=open; awk 'NR==1{{print \"c-root=\" \$2}}' /proc/self/uid_map"
 docker run --rm --network host alpine:3.22 sh -c "$T; try $gw {open_port} h-gateway-open; try 10.1.2.3 80 h-private"
@@ -1423,6 +1424,10 @@ echo done"#,
         format!("the job has no daemon: {}", value("daemon")),
     )?;
     expect(
+        !console.contains("out of memory: the kernel stopped"),
+        format!("a container's own limit counted as the job's: {}", tail(console)),
+    )?;
+    expect(
         value("hook").ends_with("and Docker.") && !console.contains("Docker did not start"),
         format!("the start hook did not find the daemon: {}", value("hook")),
     )?;
@@ -1430,6 +1435,8 @@ echo done"#,
         ("socket-link", "/run/cf-docker/docker.sock"),
         ("job-sees-dockerd", "0"),
         ("compose", "0"),
+        // A container stopped at its own limit, which the job sees as 137 and nothing more.
+        ("own-limit", "137"),
         ("published", "built"),
         ("bind-mount", "shared"),
         ("c-github", "open"),

@@ -691,11 +691,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 for set in self_hosted_with(&files, &variables) {
                     if set.docker() && !shared.config.policy.serves_docker(&repo) {
-                        // Not offered to GitHub: the job waits for a Mac that gives this repository Docker.
-                        problems.push(format!(
-                            "{name}: a job asks for {DOCKER_LABEL}, which this Mac gives only the repositories in \
-                             docker_repos"
-                        ));
+                        // Not offered to GitHub: the job waits for a Mac that gives this repository Docker. A Mac
+                        // left out on purpose is no problem of discovery.
+                        tracing::info!(repo = %name, labels = %set.key(), "not served: Docker is only for the repositories in docker_repos");
                         continue;
                     }
                     // `cf-docker` alone is a machine of the size `self-hosted` means.

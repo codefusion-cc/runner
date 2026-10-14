@@ -299,7 +299,7 @@ pub fn run(
             &name,
             job.limits.shm_bytes,
         )
-        .and_then(|spec| docker::start(&spec));
+        .and_then(|spec| docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM)));
         if let Err(error) = started {
             say(&format!("no Docker for this job: {error}"));
             share(cf_supervisor::docker::PROBLEM, &error, 0o644).map_err(container)?;
