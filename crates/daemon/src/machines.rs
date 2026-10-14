@@ -634,10 +634,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
-    /// Takes no new job while an update waits for the machines that stand to end, or takes them again when it
-    /// gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would otherwise. The polls in
-    /// flight are told.
-    pub fn hold_for_update(&self, on: bool) {
+    /// Takes no new job while an update or new settings wait for the machines that stand to end, or takes them
+    /// again when the wait gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would
+    /// otherwise. The polls in flight are told.
+    pub fn hold_for_restart(&self, on: bool) {
         let changed = std::mem::replace(&mut self.lock().updating, on) != on;
         if changed {
             self.ring();

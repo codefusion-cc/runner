@@ -31,7 +31,7 @@ use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
 use crate::traits::{EventKind, Slots};
-use crate::update::{Pending, SelfUpdate};
+use crate::update::{Pending, SelfUpdate, SettingsFile, SettingsLook};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -89,8 +89,11 @@ pub struct ServiceConfig {
     /// small again.
     pub backoff: (Duration, Duration, Duration),
     /// The longest an update may take from the console's command to the install, the wait for the machines that
-    /// stand included. Under the hour the console waits for a command's result.
+    /// stand included. Under the hour the console waits for a command's result. New settings wait as long for the
+    /// machines that stand.
     pub update_limit: Duration,
+    /// How often the settings file is looked at.
+    pub settings_every: Duration,
 }
 
 impl ServiceConfig {
@@ -116,6 +119,7 @@ impl ServiceConfig {
                 Duration::from_secs(300),
             ),
             update_limit: Duration::from_secs(50 * 60),
+            settings_every: Duration::from_secs(30),
         }
     }
 }
@@ -218,6 +222,9 @@ pub struct ServiceParts<H, V> {
     /// Where what came of the console's commands is kept until the console has it, so that a Runner that starts
     /// again still says it, and does not do a command twice; none to keep it in memory only.
     pub results: Option<PathBuf>,
+    /// The settings file the Runner started with, whose changes it takes up by starting again; none to take up
+    /// none.
+    pub settings: Option<Arc<dyn SettingsFile>>,
 }
 
 struct Shared<H, V> {
@@ -246,11 +253,24 @@ struct Shared<H, V> {
     updates: Option<Arc<dyn SelfUpdate>>,
     results_file: Option<PathBuf>,
     update: Mutex<Updating>,
+    settings: Option<Arc<dyn SettingsFile>>,
+    applying: Mutex<Applying>,
     /// Set when the Runner is to end so that the service manager starts it again: a restart, or an update installed.
     restart: AtomicBool,
     restarting: Notify,
     /// Set while the Runner ends: the last report says so instead of serving nothing.
     ending: AtomicBool,
+}
+
+/// What new settings have come to.
+#[derive(Debug, Default)]
+struct Applying {
+    /// Whether the Runner waits for its machines to end, to start again on new settings.
+    under_way: bool,
+    /// The version of the file whose wait ran out: not waited for again.
+    gave_up: Option<String>,
+    /// Why the file is unusable, once said.
+    told: Option<String>,
 }
 
 /// What the Runner's updates have come to.
@@ -415,6 +435,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 stall: Mutex::new(None),
                 updates: parts.updates,
                 update: Mutex::new(Updating::default()),
+                settings: parts.settings,
+                applying: Mutex::new(Applying::default()),
                 restart: AtomicBool::new(false),
                 restarting: Notify::new(),
                 ending: AtomicBool::new(false),
@@ -1299,6 +1321,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let Some(updates) = self.shared.updates.clone() else {
             return Some((false, "this Runner has nowhere to update from".into()));
         };
+        if self.shared.applying.lock().expect("applying").under_way {
+            return Some((
+                false,
+                "the Runner waits to start again on new settings; update once it has".into(),
+            ));
+        }
         {
             let mut update = self.shared.update.lock().expect("update");
             update.asked_at = Some(secs(self.shared.clock.now()));
@@ -1333,7 +1361,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     update.error = Some((message, secs(service.shared.clock.now())));
                     update.failures = update.failures.saturating_add(1);
                     drop(update);
-                    service.shared.machines.hold_for_update(false);
+                    service.shared.machines.hold_for_restart(false);
                 }
             }
         });
@@ -1356,7 +1384,30 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return Ok(Some(format!("{running} runs already: there is nothing newer")));
         }
         tracing::info!(from = %running, to = %built, "an update is built; no new job until the machines that stand are gone");
-        shared.machines.hold_for_update(true);
+        self.drained(&format!("updating to {built}"), began)
+            .await
+            .map_err(|waited| format!("{built} was not installed: {waited}"))?;
+        shared.update.lock().expect("update").doing = Some(format!("updating to {built}: installing"));
+        let pending = Pending {
+            id: id.to_string(),
+            from: running,
+            to: built,
+            starts: 0,
+            failed: None,
+        };
+        tokio::task::spawn_blocking(move || updates.install(&pending))
+            .await
+            .map_err(|error| format!("the install stopped: {error}"))??;
+        self.restart();
+        Ok(None)
+    }
+
+    /// Takes no new job and waits for the machines that stand, and the jobs promised a slot, to be gone; the
+    /// console's page says what it waits for, after `doing`. An error says what was still waited for when
+    /// [`ServiceConfig::update_limit`] after `began` had passed. The hold stays: whoever asked lifts it.
+    async fn drained(&self, doing: &str, began: Instant) -> Result<(), String> {
+        let shared = &self.shared;
+        shared.machines.hold_for_restart(true);
         loop {
             // A job promised a slot before the hold may still get a machine: it is waited for too, until it comes
             // or the promise runs out.
@@ -1374,27 +1425,89 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             };
             if began.elapsed() >= shared.config.update_limit {
                 return Err(format!(
-                    "{built} was not installed: still waiting for {waits_for} after {}",
+                    "still waiting for {waits_for} after {}",
                     crate::update::spoken(shared.config.update_limit),
                 ));
             }
-            shared.update.lock().expect("update").doing =
-                Some(format!("updating to {built}: waiting for {waits_for}"));
+            shared.update.lock().expect("update").doing = Some(format!("{doing}: waiting for {waits_for}"));
             tokio::time::sleep(shared.config.tick_every).await;
         }
-        shared.update.lock().expect("update").doing = Some(format!("updating to {built}: installing"));
-        let pending = Pending {
-            id: id.to_string(),
-            from: running,
-            to: built,
-            starts: 0,
-            failed: None,
+        Ok(())
+    }
+
+    /// Looks at the settings file, and takes new settings up: no new job until the machines that stand are gone,
+    /// then the Runner ends so that its service manager starts it again on them. Settings no Runner could start on
+    /// are said once and change nothing; a wait that runs out gives up on that version of the file. Not while an
+    /// update is under way, which starts the Runner again itself.
+    pub fn look_at_settings(&self) {
+        let Some(settings) = self.shared.settings.clone() else {
+            return;
         };
-        tokio::task::spawn_blocking(move || updates.install(&pending))
-            .await
-            .map_err(|error| format!("the install stopped: {error}"))??;
-        self.restart();
-        Ok(None)
+        if self.restart_requested() || self.shared.update.lock().expect("update").command.is_some() {
+            return;
+        }
+        let mut applying = self.shared.applying.lock().expect("applying");
+        if applying.under_way {
+            return;
+        }
+        match settings.look() {
+            SettingsLook::Same => {
+                applying.gave_up = None;
+                applying.told = None;
+            }
+            SettingsLook::Unusable { why } => {
+                if applying.told.as_ref() != Some(&why) {
+                    tracing::warn!(%why, "the settings file changed and no Runner could start on it; this one goes on as it is");
+                    applying.told = Some(why);
+                }
+            }
+            SettingsLook::Changed { id } => {
+                if applying.gave_up.as_ref() == Some(&id) {
+                    return;
+                }
+                applying.under_way = true;
+                applying.told = None;
+                drop(applying);
+                tracing::info!(
+                    "new settings; no new job until the machines that stand are gone, then the Runner starts again on them"
+                );
+                let service = Service {
+                    shared: self.shared.clone(),
+                };
+                tokio::spawn(async move { service.apply_settings(id, settings).await });
+            }
+        }
+    }
+
+    async fn apply_settings(&self, id: String, settings: Arc<dyn SettingsFile>) {
+        let shared = &self.shared;
+        let waited = self.drained("applying new settings", Instant::now()).await;
+        // The file once more: what the next Runner reads is what it is now.
+        let gave_up = match (waited, settings.look()) {
+            (Ok(()), SettingsLook::Changed { .. }) => {
+                tracing::info!("the machines are gone; the Runner starts again on the new settings");
+                self.restart();
+                return;
+            }
+            (Ok(()), SettingsLook::Same) => {
+                tracing::info!("the settings are as the Runner started with again; it goes on");
+                None
+            }
+            (Ok(()), SettingsLook::Unusable { why }) => {
+                tracing::warn!(%why, "the settings file changed again and no Runner could start on it; this one goes on as it is");
+                shared.applying.lock().expect("applying").told = Some(why);
+                None
+            }
+            (Err(waited), _) => {
+                tracing::warn!(%waited, "new settings were not taken up; the Runner goes on with the ones it has until the file changes again");
+                Some(id)
+            }
+        };
+        shared.update.lock().expect("update").doing = None;
+        shared.machines.hold_for_restart(false);
+        let mut applying = shared.applying.lock().expect("applying");
+        applying.under_way = false;
+        applying.gave_up = gave_up;
     }
 
     /// Runs the service until `stop` is set: the machines' tick every second, a look at GitHub's repositories now
@@ -1422,6 +1535,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         });
         let mut discover = tokio::time::interval(config.discover_every);
         let mut sweep = tokio::time::interval(config.sweep_every);
+        let mut settings = tokio::time::interval(config.settings_every);
+        settings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut report = Box::pin(tokio::time::sleep(Duration::ZERO));
         let mut news = tokio::time::interval(config.tick_every);
         news.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1434,6 +1549,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 _ = discover.tick() => self.discover().await,
                 _ = sweep.tick() => self.sweep().await,
+                _ = settings.tick() => self.look_at_settings(),
                 () = &mut report => {
                     let next = self.report().await;
                     report.as_mut().reset(tokio::time::Instant::now() + next);

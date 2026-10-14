@@ -37,6 +37,29 @@ pub trait SelfUpdate: Send + Sync {
     fn install(&self, pending: &Pending) -> Result<(), String>;
 }
 
+/// The Runner's settings file, which it reads when it starts: new settings take effect when it starts again.
+pub trait SettingsFile: Send + Sync {
+    /// What the file says now, against what the Runner started with. Reads the file; quick, but not async.
+    fn look(&self) -> SettingsLook;
+}
+
+/// What a settings file says now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettingsLook {
+    /// What the Runner started with.
+    Same,
+    /// Other settings, which a Runner could start on. `id` names this version of the file.
+    Changed {
+        /// This version of the file.
+        id: String,
+    },
+    /// Other settings no Runner could start on, and why.
+    Unusable {
+        /// What a Runner starting on them would say.
+        why: String,
+    },
+}
+
 /// An update whose program was put in place and has not yet stayed up.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {

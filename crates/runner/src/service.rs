@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use cf_budget::{Budget, Host as _, HostFacts, HostReading, Settings, Size, admit};
 use cf_daemon::names::ServePolicy;
-use cf_daemon::update::{STAYS_UP, SelfUpdate, UpdateFile};
+use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsFile, SettingsLook, UpdateFile};
 use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
 use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_secret::Secret;
@@ -88,6 +88,45 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
     Ok(Some((address.clone(), Secret::new(token))))
 }
 
+/// The settings in `path`, when a Runner can start on them: the file is one it takes, and the image it names is
+/// installed, so that no job is taken from GitHub to fail for a missing image.
+fn startable(path: &Path) -> Result<Config, String> {
+    let config = Config::load(path)?;
+    #[cfg(target_os = "macos")]
+    crate::config::check_beside_old_manager(&config, &home()?, &hostname())?;
+    installed_image(&config)?;
+    Ok(config)
+}
+
+/// The Runner's settings file as it started with it, which the service looks at for changes.
+struct ConfigFile {
+    path: PathBuf,
+    read: Vec<u8>,
+}
+
+impl SettingsFile for ConfigFile {
+    fn look(&self) -> SettingsLook {
+        match std::fs::read(&self.path) {
+            Ok(now) if now == self.read => SettingsLook::Same,
+            Ok(now) => match startable(&self.path) {
+                Ok(_) => SettingsLook::Changed { id: version_of(&now) },
+                Err(why) => SettingsLook::Unusable { why },
+            },
+            Err(error) => SettingsLook::Unusable {
+                why: format!("{}: {error}", self.path.display()),
+            },
+        }
+    }
+}
+
+/// A name for one version of a file's bytes, within one Runner's life.
+fn version_of(bytes: &[u8]) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn installed_image(config: &Config) -> Result<PathBuf, String> {
     cf_image::store::Store::new(config.state_dir.join("images"))
         .rootfs(&config.image)
@@ -104,6 +143,7 @@ fn service(
     config: &Config,
     program: &Path,
     updates: Option<Arc<dyn SelfUpdate>>,
+    settings: Option<Arc<dyn SettingsFile>>,
 ) -> Result<(Arc<HostMachines>, HostService), String> {
     host_service::<This>(HostSetup {
         machine: config.machine.clone(),
@@ -123,6 +163,7 @@ fn service(
         console: console(config)?,
         stand_in: None,
         updates,
+        settings,
     })
 }
 
@@ -209,11 +250,12 @@ fn run_daemon(config: &Path) -> Result<(), String> {
         Some(state) => update::guard(state, &program, VERSION)?,
         None => Started::Nothing,
     };
-    let config = Config::load(config)?;
-    #[cfg(target_os = "macos")]
-    crate::config::check_beside_old_manager(&config, &home()?, &hostname())?;
-    // A job is not taken from GitHub to fail for a missing image.
-    installed_image(&config)?;
+    // As read before it is checked: a change that comes meanwhile is one more start, not one missed.
+    let settings = ConfigFile {
+        path: config.to_path_buf(),
+        read: std::fs::read(config).unwrap_or_default(),
+    };
+    let config = startable(config)?;
     let _only = only_runner(&config)?;
     tracing::subscriber::set_global_default(Lines::new(&config.log(), ROLL_AT))
         .map_err(|error| format!("the log: {error}"))?;
@@ -236,7 +278,7 @@ fn run_daemon(config: &Path) -> Result<(), String> {
     let runtime = runtime(2)?;
     let ran = runtime.block_on(async {
         let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
-        let (_machines, service) = service(&config, &program, updates)?;
+        let (_machines, service) = service(&config, &program, updates, Some(Arc::new(settings)))?;
         let (trigger, stop) = cf_scaleset::shutdown();
         watch_signals();
         tokio::spawn(async move {
@@ -544,7 +586,7 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
             ..config.clone()
         };
         let (served, problems) = runtime(1)?.block_on(async {
-            let (_machines, service) = service(&probe, &program, None)?;
+            let (_machines, service) = service(&probe, &program, None, None)?;
             Ok::<_, String>(service.survey().await)
         })?;
         for line in &served {
@@ -661,7 +703,7 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
         own_program()?
     };
     let left = runtime(2)?.block_on(async {
-        let (machines, service) = service(&config, &program, None).map_err(|error| {
+        let (machines, service) = service(&config, &program, None, None).map_err(|error| {
             format!(
                 "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its \
                  deadline"
@@ -716,6 +758,67 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_file_is_new_when_its_bytes_are_and_usable_when_a_runner_could_start_on_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, path) = (folder.path().join("state"), folder.path().join("config.json"));
+        let text = |image: &str, more: &str| {
+            format!(
+                r#"{{"machine": "settings-test-vm", "state_dir": "{}", "app_dir": "{}", "image": "{image}", "use": "dedicated"{more}}}"#,
+                state.display(),
+                folder.path().join("app").display(),
+            )
+        };
+        let write = |text: &str| {
+            std::fs::write(&path, text).expect("written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        };
+        let installed = state.join("images").join("2026.10.1");
+        std::fs::create_dir_all(&installed).expect("an image's folder");
+        std::fs::write(installed.join(cf_image::store::ROOTFS_NAME), b"").expect("an image");
+        let started = text("2026.10.1", "");
+        write(&started);
+        let file = ConfigFile {
+            path: path.clone(),
+            read: std::fs::read(&path).expect("read"),
+        };
+        assert_eq!(file.look(), SettingsLook::Same);
+
+        write(&text("2026.10.1", r#", "docker_repos": ["org/app"]"#));
+        let SettingsLook::Changed { id: first } = file.look() else {
+            panic!("a setting changed: {:?}", file.look());
+        };
+        assert_eq!(
+            file.look(),
+            SettingsLook::Changed { id: first.clone() },
+            "one version, one name"
+        );
+        write(&text("2026.10.1", r#", "docker_repos": ["org/other"]"#));
+        let SettingsLook::Changed { id: second } = file.look() else {
+            panic!("another setting changed");
+        };
+        assert_ne!(first, second);
+
+        let unusable = |why: &str| match file.look() {
+            SettingsLook::Unusable { why: said } => assert!(said.contains(why), "{said}"),
+            other => panic!("{why}: {other:?}"),
+        };
+        write(&text("2026.10.20", ""));
+        unusable("is not installed");
+        write("{");
+        unusable(&path.display().to_string());
+        write(&text("2026.10.1", r#", "docker_max_jobs": "one""#));
+        unusable("expected usize");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("a mode");
+        unusable("others can write it");
+        std::fs::remove_file(&path).expect("removed");
+        unusable(&path.display().to_string());
+
+        write(&started);
+        assert_eq!(file.look(), SettingsLook::Same, "put back as it was");
+    }
 
     fn config(state: &Path, app: &Path, console: bool) -> Config {
         Config::parse(&format!(

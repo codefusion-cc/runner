@@ -27,7 +27,7 @@ pub use linux::{Linux, this_user, this_user_bus_env};
 pub use mac::Mac;
 
 use crate::names::ServePolicy;
-use crate::update::SelfUpdate;
+use crate::update::{SelfUpdate, SettingsFile};
 use crate::{
     Console, DiskStore, HostExtras, LoggedReports, MachineConfig, MachineParts, Machines, Nudge,
     OutboxReports, Reports, Roster, Service, ServiceConfig, ServiceParts, VmHosts,
@@ -146,6 +146,9 @@ pub struct HostSetup {
     pub stand_in: Option<Workload>,
     /// How the Runner updates itself; none where it cannot.
     pub updates: Option<Arc<dyn SelfUpdate>>,
+    /// The settings file the Runner started with, whose changes it takes up by starting again; none to take up
+    /// none.
+    pub settings: Option<Arc<dyn SettingsFile>>,
 }
 
 /// Builds the machines and the service of this host, and finds what a Runner before left: records, vm-hosts,
@@ -217,6 +220,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
         extras: P::extras(state).map_err(system)?,
         updates: setup.updates,
         results: Some(state.join("results.json")),
+        settings: setup.settings,
     });
     Ok((machines, service))
 }

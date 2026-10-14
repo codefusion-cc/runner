@@ -669,6 +669,36 @@ impl Events for EventLog {
     }
 }
 
+/// A settings file a test changes: what it says now, and how often it was looked at.
+#[derive(Debug)]
+pub struct FakeSettings(Mutex<(crate::update::SettingsLook, usize)>);
+
+impl Default for FakeSettings {
+    fn default() -> FakeSettings {
+        FakeSettings(Mutex::new((crate::update::SettingsLook::Same, 0)))
+    }
+}
+
+impl FakeSettings {
+    /// From now on the file says `look`.
+    pub fn says(&self, look: crate::update::SettingsLook) {
+        self.0.lock().expect("settings").0 = look;
+    }
+
+    /// How often the file was looked at.
+    pub fn looks(&self) -> usize {
+        self.0.lock().expect("settings").1
+    }
+}
+
+impl crate::update::SettingsFile for FakeSettings {
+    fn look(&self) -> crate::update::SettingsLook {
+        let mut file = self.0.lock().expect("settings");
+        file.1 += 1;
+        file.0.clone()
+    }
+}
+
 /// An update a test scripts: what each build and each install answers, how long a build takes, and what was
 /// installed.
 #[derive(Debug, Default)]
