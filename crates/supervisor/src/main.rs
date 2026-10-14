@@ -2,7 +2,7 @@
 //!
 //! One binary, five ways to start it: with no argument it is the machine's first process; `container` is the
 //! launcher it starts for a job's container; `docker` the launcher of a Docker job's sandbox, and
-//! `docker-sandbox` the sandbox's first program; `hook <name>` is what the Actions runner's job hooks call.
+//! `docker-sandbox <networks>` the sandbox's first program; `hook <name>` is what the Actions runner's job hooks call.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -13,7 +13,7 @@ fn main() {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["container"] => linux::container::launch(),
         ["docker"] => linux::docker::launch(),
-        ["docker-sandbox"] => linux::docker::sandbox(),
+        ["docker-sandbox", networks] => linux::docker::sandbox(networks),
         ["hook", name] => linux::hook::run(name),
         _ => linux::init::run(),
     }

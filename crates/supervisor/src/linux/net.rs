@@ -233,6 +233,8 @@ pub struct Network {
     pub took: Duration,
     /// How often the host's DHCP was asked: 2 when every question got its answer.
     pub questions: u32,
+    /// What is next to the machine, which the firewall keeps the job from ([`firewall::beside`]).
+    pub beside: Vec<(cf_nft::Ip, u8)>,
 }
 
 /// Brings the network up and loads the firewall. An error leaves the job without a start: a job never runs
@@ -316,5 +318,6 @@ pub fn up(told: Vec<(cf_nft::Ip, u8)>) -> Result<Network, String> {
         address: lease.address,
         took: started.elapsed(),
         questions,
+        beside: own,
     })
 }
