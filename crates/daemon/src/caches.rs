@@ -145,6 +145,8 @@ pub struct CacheStore {
     dir: PathBuf,
     budget: u64,
     events: VecDeque<CacheEvent>,
+    /// The caches as the store last read its folder, which only the store changes: a snapshot reads this, not the disk.
+    listing: Vec<(String, Cache)>,
 }
 
 /// The record of a job's copy, kept with the job's own record.
@@ -179,11 +181,14 @@ impl CacheStore {
             tracing::info!(dir = %dir.display(), "no Docker cache: this file system cannot share blocks between files");
             return None;
         }
-        Some(CacheStore {
+        let mut store = CacheStore {
             dir: dir.to_path_buf(),
             budget,
             events: VecDeque::new(),
-        })
+            listing: Vec::new(),
+        };
+        store.refresh();
+        Some(store)
     }
 
     fn image(&self, key: &str) -> PathBuf {
@@ -255,6 +260,7 @@ impl CacheStore {
                     .and_then(|file| file.set_len(DISK_BYTES))
             }
         };
+        self.refresh();
         match made {
             Ok(()) => Some(CacheCopy { key, path }),
             Err(error) => {
@@ -316,8 +322,13 @@ impl CacheStore {
     }
 
     fn enforce(&mut self, in_use: &BTreeSet<String>, now: i64) {
-        let caches = self.list();
-        for key in evictions(&caches, self.budget, in_use) {
+        self.refresh();
+        let caches = self.listing.clone();
+        let evicted = evictions(&caches, self.budget, in_use);
+        if evicted.is_empty() {
+            return;
+        }
+        for key in evicted {
             let repo = caches
                 .iter()
                 .find(|(found, _)| *found == key)
@@ -326,10 +337,15 @@ impl CacheStore {
             self.forget(&key);
             self.event(now, &repo, "evicted", None);
         }
+        self.refresh();
     }
 
     /// Every cache with its key, by key.
     pub fn list(&self) -> Vec<(String, Cache)> {
+        self.listing.clone()
+    }
+
+    fn refresh(&mut self) {
         let mut out: Vec<(String, Cache)> = fs::read_dir(&self.dir)
             .into_iter()
             .flatten()
@@ -342,7 +358,7 @@ impl CacheStore {
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        self.listing = out;
     }
 
     /// The newest events, oldest first.

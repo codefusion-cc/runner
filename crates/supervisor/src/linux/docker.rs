@@ -486,10 +486,14 @@ const DAEMON_STOP: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long the cache disk may stay busy once every process of the sandbox is gone.
 const LET_GO: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// At a Docker job's end, before the job's processes are stopped: whether the daemon still answers, then asks it to
-/// stop and waits for it. Says whether it stopped by itself. `sandbox` is the sandbox's control group.
-pub fn stop_daemon(sandbox: &str, sockets: &str) -> (bool, bool) {
-    let answers = std::os::unix::net::UnixStream::connect(format!("{sockets}/{}", plan::SOCKET_NAME)).is_ok();
+/// Whether a Docker job's daemon still answers on its socket, in the folder `sockets`.
+pub fn daemon_answers(sockets: &str) -> bool {
+    std::os::unix::net::UnixStream::connect(format!("{sockets}/{}", plan::SOCKET_NAME)).is_ok()
+}
+
+/// At a Docker job's end, before the job's processes are stopped: asks the daemon to stop and waits for it. Says
+/// whether it stopped by itself. `sandbox` is the sandbox's control group.
+pub fn stop_daemon(sandbox: &str) -> bool {
     let daemons = || -> Vec<u32> {
         fs::read_to_string(format!("{sandbox}/daemon/cgroup.procs"))
             .unwrap_or_default()
@@ -506,11 +510,11 @@ pub fn stop_daemon(sandbox: &str, sockets: &str) -> (bool, bool) {
     let deadline = std::time::Instant::now() + DAEMON_STOP;
     while !daemons().is_empty() {
         if std::time::Instant::now() >= deadline {
-            return (answers, false);
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    (answers, true)
+    true
 }
 
 /// Once every process of the job is gone: unmounts the cache, which the sandbox's namespaces held until they went.

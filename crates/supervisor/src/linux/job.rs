@@ -413,15 +413,18 @@ pub fn run(
     // not looked for yet.
     watch.last_look();
     let summary_usage = usage();
-    // A cache is kept only when its daemon wrote down its state and stopped by itself, before the rest goes.
-    let daemon = cache.map(|_| match &sockets {
-        Some(sockets) => docker::stop_daemon(&format!("{CGROUP}/docker"), sockets),
-        None => (false, false),
+    // A cache is kept only when its daemon wrote down its state and stopped by itself, before the rest goes. One the
+    // host stopped is never kept and its end must reach the host within the stop's slack, so nothing waits for it.
+    let daemon = cache.map(|_| {
+        let answers = sockets.as_deref().is_some_and(docker::daemon_answers);
+        let stopped = answers && watch.stop.is_none() && docker::stop_daemon(&format!("{CGROUP}/docker"));
+        (answers, stopped)
     });
     kill_job();
-    let docker_cache = cache
-        .zip(daemon)
-        .map(|(found, daemon)| docker::cache_end(found, daemon, docker::let_go_of_cache()));
+    let docker_cache = cache.zip(daemon).map(|(found, daemon)| {
+        let let_go = daemon.1 && docker::let_go_of_cache();
+        docker::cache_end(found, daemon, let_go)
+    });
 
     let mut report = String::new();
     let _ = File::from(status).take(REPORT_BYTES).read_to_string(&mut report);
