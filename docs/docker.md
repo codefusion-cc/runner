@@ -24,7 +24,8 @@ Beside the job's container, in a sandbox the guest's PID 1 makes, not inside the
   of the sandbox is ever mapped. The job's user and group and the `docker` group keep their own ids on both sides,
   so the job's files and the socket mean the same to both.
 - The sandbox is a sibling of the job's container, not its child: the job's root has no rights over its namespaces,
-  cannot see its processes and cannot trace them.
+  cannot see its processes and cannot trace them. Its view of the job's root is built as the machine's root before
+  the job's container starts, so the job cannot change those paths under it.
 
 What the sandbox sees: the job's root (the workspace, `/tmp` and every path a step names in `docker run -v`), its own
 `/proc`, `/sys`, `/dev` (with `net/tun`), `/run`, and the daemon's data at `/var/lib/docker` on the job's disk. The
@@ -54,8 +55,9 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
 ## Limits
 
 - Memory and processes: the daemon and every container count against the job's machine, under the job's control
-  group. A job that runs out ends `oom` like any other; the Mac is not touched. A Docker job's daemon and a small
-  Compose stack hold about 750 MB.
+  group. A job that runs out ends `oom` like any other; the Mac is not touched. A container may have limits of its
+  own (`--memory`, Compose's `mem_limit`, `--cpus`); one stopped at its own limit exits 137 and the job goes on, since
+  only the job's own limit makes the job `oom`. A Docker job's daemon and a small Compose stack hold about 750 MB.
 - Disk: the job's 40 GB disk, `/var/lib/docker` included, gone with the machine.
 - One Docker job at a time per Mac (`docker_max_jobs`, 1 to 8). It counts promised, waiting and running Docker jobs
   until their machine is gone, after a Runner restart too. A job GitHub assigns past the cap without being offered
@@ -65,11 +67,14 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
 ## How it fails
 
 - The daemon does not start (the image lacks a tool, a module is missing): the job runs without Docker, and its
-  start hook writes an error on the run, "Docker did not start", with the end of the daemon's log.
+  start hook writes an error on the run, "Docker did not start", with the end of the daemon's log, as soon as the
+  sandbox ended or after 60 seconds without an answer.
 - The daemon stops during a job: the steps that use it fail; the log is at `/run/cf-docker/dockerd.log`.
 
 ## Tests
 
+- `crates/supervisor/tests/decisions.rs`: a container stopped at its own limit is not the job's out of memory
+  (`oom::OwnLimit`).
 - `crates/supervisor/tests/docker.rs`: the sandbox's ids (every id once, none the machine's root, no overlap, the
   job's ids kept) and the commands of the daemon, pasta and the rule.
 - `crates/daemon/tests/docker.rs`: the daemon flag reaches the machine's request and record, the cap with a promise,
@@ -81,4 +86,5 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
   a port the test opens on the host itself: through pasta a closed port and a dropped packet look alike. The
   scenario goes red with the guest's firewall emptied (the open port is reached through the gateway and the LAN
   address), with `--no-map-gw` taken out (names through the gateway fail), and with the sandbox's root unshifted (a
-  privileged container writes the machine's `core_pattern` and triggers sysrq).
+  privileged container writes the machine's `core_pattern` and triggers sysrq). `cargo xtask it --only docker-oom`:
+  a container that takes all of the job's memory ends the job `oom`.
