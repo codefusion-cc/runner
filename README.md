@@ -90,6 +90,11 @@ A configuration file says what the Mac is:
 - The file names where the App's key and the console's token go, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
+- A running Runner takes up a changed file by itself, as an update does: it looks every 30 seconds, and when a
+  Runner could start on the new file (it is read as above and its `image` is installed), it takes no new job until
+  no machine stands, then starts again on it. The console's page says what it waits for. A file no Runner could start
+  on is said once in the log and changes nothing; a wait that outlasts the update's limit (50 minutes) gives up on
+  that version of the file, and the Runner takes jobs again. So `image install` the image first, then name it here.
 
 The Mac needs Rust to build the Runner (below) and nothing else. Images are public, so a Mac without `gh` fetches a
 release with `curl -fLO https://github.com/codefusion-cc/runner/releases/download/<v>/<file>` for `Image`,
