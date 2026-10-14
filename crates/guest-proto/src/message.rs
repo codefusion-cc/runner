@@ -61,6 +61,9 @@ pub struct Job {
     /// Whether the job gets a Docker daemon of its own, in a sandbox beside its container.
     #[serde(default)]
     pub docker: bool,
+    /// Whether the machine has a cache disk ([`crate::CACHE_DISK`]) for the daemon's data.
+    #[serde(default)]
+    pub docker_cache: bool,
 }
 
 /// A job's limits, enforced by the guest kernel on the job's control group.
@@ -286,6 +289,9 @@ pub struct CacheEnd {
     pub found: CacheFound,
     /// Whether the daemon stopped by itself and the disk was let go cleanly: only such a disk is worth keeping.
     pub clean: bool,
+    /// Whether the daemon still answered at the job's end. A cache it could not run on is not used again.
+    #[serde(default)]
+    pub daemon: bool,
 }
 
 /// What a Docker job's cache disk held when the job started.

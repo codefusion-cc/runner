@@ -188,6 +188,7 @@ fn run_in(
         oom_grace_ms: 15_000,
         blocked: crate::host_net::host_networks(),
         docker: request.docker,
+        docker_cache: request.docker_cache.is_some(),
     });
 
     let snapshot = |machine: Option<&Machine>, stage: Stage| JobState {

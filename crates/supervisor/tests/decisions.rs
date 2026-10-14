@@ -783,6 +783,7 @@ fn facts() -> JobFacts {
         },
         disk_bytes: 30 << 30,
         docker: false,
+        docker_cache: false,
     }
 }
 

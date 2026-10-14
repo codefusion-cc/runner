@@ -271,6 +271,7 @@ fn own_root() -> Result<(), String> {
         "mnt/image",
         "mnt/scratch",
         "mnt/root",
+        "mnt/cache",
         "etc",
         &docker::MODULE_DIR[1..],
     ] {

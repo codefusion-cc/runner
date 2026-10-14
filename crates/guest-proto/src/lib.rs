@@ -22,8 +22,8 @@ pub use frame::{
     write_message,
 };
 pub use message::{
-    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS, NAME_CHARS, OomEvent,
-    Process, STAGE_CHARS, Start, Stop, StopReason, Summary, Task, Usage, Workload,
+    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS,
+    NAME_CHARS, OomEvent, Process, STAGE_CHARS, Start, Stop, StopReason, Summary, Task, Usage, Workload,
 };
 
 /// The protocol's version. A supervisor that hears another one refuses to start a task.

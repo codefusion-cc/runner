@@ -6,8 +6,9 @@ use cf_supervisor::docker;
 use cf_supervisor::tell::{self, JobFacts};
 use serde::de::DeserializeOwned;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SHARED: &str = "/run/codefusion";
@@ -44,6 +45,49 @@ fn docker_ready() {
     );
 }
 
+/// How long the end hook gives the daemon to remove what the job left in it.
+const TIDY_WAIT: Duration = Duration::from_secs(60);
+
+/// Leaves a Docker job's cache as the next job wants it: without this job's containers, volumes and networks. Its
+/// images and build cache stay; that is what the cache is for.
+fn tidy_docker() {
+    let deadline = Instant::now() + TIDY_WAIT;
+    let docker = |args: &[&str]| -> Option<String> {
+        let mut child = Command::new("docker")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                let mut out = String::new();
+                child.stdout.take()?.read_to_string(&mut out).ok()?;
+                return Some(out);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let containers: Vec<String> = docker(&["ps", "--all", "--quiet"])
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if !containers.is_empty() {
+        let mut remove = vec!["rm", "--force", "--volumes"];
+        remove.extend(containers.iter().map(String::as_str));
+        docker(&remove);
+    }
+    docker(&["volume", "prune", "--all", "--force"]);
+    docker(&["network", "prune", "--force"]);
+}
+
 /// Prints what the hook `name` has to say. A hook that fails would fail the job, so this one never does.
 pub fn run(name: &str) -> ! {
     let facts: Option<JobFacts> = read("job.json");
@@ -57,6 +101,9 @@ pub fn run(name: &str) -> ! {
             }
         }
         "job-completed" => {
+            if facts.as_ref().is_some_and(|facts| facts.docker_cache) {
+                tidy_docker();
+            }
             if let Some(oom) = read::<OomEvent>("oom.json") {
                 println!(
                     "{}",
