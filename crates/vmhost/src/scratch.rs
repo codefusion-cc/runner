@@ -26,10 +26,12 @@ pub struct GuestFiles {
 }
 
 impl GuestFiles {
-    /// The machine every guest of ours runs in: the image read-only, `scratch` as the one disk it may write.
+    /// The machine every guest of ours runs in: the image read-only, `scratch` as its own disk, and the `extra`
+    /// disks a job asked for after them.
     pub(crate) fn machine(
         &self,
         scratch: &Path,
+        extra: Vec<Disk>,
         memory_bytes: u64,
         cpus: usize,
         network: Network,
@@ -51,7 +53,10 @@ impl GuestFiles {
                     id: SCRATCH_DISK.into(),
                     read_only: false,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(extra)
+            .collect(),
             network,
             console: console.to_path_buf(),
         }
@@ -104,7 +109,7 @@ pub fn template(
     open_private(&partial)
         .and_then(|file| file.set_len(bytes))
         .map_err(|error| say("the template", error))?;
-    let spec = files.machine(&partial, 1 << 30, 2, Network::None, console);
+    let spec = files.machine(&partial, Vec::new(), 1 << 30, 2, Network::None, console);
     let made = run_task(vmm, &spec, Task::FormatScratch, FORMAT, give_up).and_then(|report| {
         match report.summary.exit_code {
             Some(0) => Ok(()),
@@ -125,24 +130,56 @@ pub fn template(
 /// many gigabytes costs the few megabytes its file system wrote.
 pub fn copy(template: &Path, to: &Path) -> Result<(), String> {
     let _ = fs::remove_file(to);
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        if let (Ok(from), Ok(target)) = (
-            CString::new(template.as_os_str().as_bytes()),
-            CString::new(to.as_os_str().as_bytes()),
-        ) {
-            // SAFETY: clonefile reads two NUL terminated paths.
-            if unsafe { libc::clonefile(from.as_ptr(), target.as_ptr(), 0) } == 0 {
-                return Ok(());
-            }
-        }
+    if clone(template, to).is_ok() {
+        return Ok(());
     }
     copy_data(template, to).map_err(|error| say("the job's disk", error))
 }
 
-/// A copy that shares the template's blocks where the file system can, and otherwise holds its data only.
+/// A copy that shares every block with `from` until one of the two is written, made in one step, readable by this
+/// user alone: APFS's clonefile on a Mac, FICLONE on Linux (btrfs, XFS). A file system that cannot share blocks is
+/// an error and leaves no file: what such a copy would cost is the caller's to decide.
+pub fn clone(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let (Ok(source), Ok(target)) = (
+            CString::new(from.as_os_str().as_bytes()),
+            CString::new(to.as_os_str().as_bytes()),
+        ) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        // SAFETY: clonefile reads two NUL terminated paths.
+        if unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let source = fs::File::open(from)?;
+        let out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(to)?;
+        let shared_now = shared(&source, &out);
+        if shared_now.is_err() {
+            drop(out);
+            let _ = fs::remove_file(to);
+        }
+        shared_now
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// A copy that holds the template's data only, for a file system that cannot share blocks ([`clone`] said so).
 fn copy_data(template: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let from = fs::File::open(template)?;
@@ -151,7 +188,7 @@ fn copy_data(template: &Path, to: &Path) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(to)?;
-    let copied = shared(&from, &out).or_else(|_| sparse_copy(&from, &out));
+    let copied = sparse_copy(&from, &out);
     if copied.is_err() {
         drop(out);
         let _ = fs::remove_file(to);
@@ -168,12 +205,6 @@ fn shared(from: &fs::File, out: &fs::File) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-/// clonefile, the Mac's way, was tried already.
-#[cfg(not(target_os = "linux"))]
-fn shared(_from: &fs::File, _out: &fs::File) -> std::io::Result<()> {
-    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Copies the template's data and leaves its holes: each range `SEEK_DATA` finds up to the hole `SEEK_HOLE` finds

@@ -248,6 +248,42 @@ pub struct Status {
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
     pub runners: Vec<RunnerStatus>,
+    /// Docker jobs' caches on this host, one per repository, at most 64 (`MAX_DOCKER_CACHES`). Left out while it
+    /// keeps none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docker_caches: Vec<DockerCache>,
+    /// What last happened to them, oldest first, at most 32 (`MAX_DOCKER_CACHE_EVENTS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docker_cache_events: Vec<DockerCacheEvent>,
+}
+
+/// A repository's Docker cache on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerCache {
+    /// `owner/name`.
+    pub repo: String,
+    /// What it holds of the host's disk.
+    pub bytes: u64,
+    /// When a job last wrote it (ISO 8601).
+    pub written_at: String,
+    /// When a job last started from it.
+    pub used_at: String,
+}
+
+/// Something that happened to a Docker cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerCacheEvent {
+    /// When (ISO 8601).
+    pub at: String,
+    /// `owner/name`.
+    pub repo: String,
+    /// `kept`, `discarded`, `replaced`, `dropped` or `evicted`.
+    pub kind: String,
+    /// Why, for `discarded` and `dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// What one more machine of a size meets on the Mac now.

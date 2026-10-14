@@ -52,6 +52,9 @@ pub struct Config {
     /// The most Docker jobs at once: a daemon and its builds take more of the Mac's processors than other jobs.
     #[serde(default = "docker_max_jobs")]
     pub docker_max_jobs: usize,
+    /// How many GB Docker jobs' caches may hold together, one per repository; 0 keeps none.
+    #[serde(default = "docker_cache_gb")]
+    pub docker_cache_gb: u64,
     /// The console's address, when the Mac reports to one.
     #[serde(default)]
     pub console: Option<String>,
@@ -79,6 +82,10 @@ const fn deadline_minutes() -> u64 {
 
 const fn docker_max_jobs() -> usize {
     1
+}
+
+const fn docker_cache_gb() -> u64 {
+    30
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -159,6 +166,9 @@ impl Config {
         }
         if !(1..=8).contains(&self.docker_max_jobs) {
             return Err("docker_max_jobs: between 1 and 8".into());
+        }
+        if self.docker_cache_gb > 1000 {
+            return Err("docker_cache_gb: 0 (no cache) to 1000".into());
         }
         for repo in self
             .repos
@@ -442,6 +452,14 @@ mod tests {
         let config = Config::parse(WHOLE).expect("config");
         assert_eq!(config.docker_repos, Vec::<String>::new());
         assert_eq!(config.docker_max_jobs, 1);
+        assert_eq!(config.docker_cache_gb, 30);
+        assert_eq!(
+            with(|v| v["docker_cache_gb"] = 0.into()).map(|c| c.docker_cache_gb),
+            Ok(0)
+        );
+        assert!(with(|v| v["docker_cache_gb"] = 1000.into()).is_ok());
+        assert!(with(|v| v["docker_cache_gb"] = 1001.into()).is_err());
+        assert!(with(|v| v["docker_cache_gb"] = (-1).into()).is_err());
         let set = with(|v| {
             v["docker_repos"] = serde_json::json!(["org/shop"]);
             v["docker_max_jobs"] = 2.into();

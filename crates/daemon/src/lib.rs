@@ -8,6 +8,7 @@
 //! per scale set, removes registrations that have to go and reports to the console.
 
 mod adapters;
+pub mod caches;
 mod ends;
 mod log;
 mod machines;

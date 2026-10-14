@@ -125,6 +125,7 @@ impl Rig {
             settings: settings_for(machines),
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
+            docker_cache: None,
             bell: Arc::new(Nudge::default()),
         };
         parts

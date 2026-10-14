@@ -3,9 +3,9 @@
 use std::io::{Cursor, Read};
 
 use cf_guest_proto::{
-    GuestEnd, GuestMessage, HostMessage, Job, Limits, MAX_FRAME, MAX_GUEST_FRAME, OomEvent, PROTOCOL,
-    Process, ProtoError, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload, encode,
-    read_guest_message, read_message, read_message_within, write_message,
+    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, Limits, MAX_FRAME, MAX_GUEST_FRAME,
+    OomEvent, PROTOCOL, Process, ProtoError, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload,
+    encode, read_guest_message, read_message, read_message_within, write_message,
 };
 use proptest::prelude::*;
 
@@ -26,6 +26,7 @@ fn job(secret: &str) -> Job {
         oom_grace_ms: 15_000,
         blocked: vec![([203, 0, 113, 0], 24)],
         docker: true,
+        docker_cache: true,
     }
 }
 
@@ -44,6 +45,19 @@ impl Read for Trickle<'_> {
         self.left = &self.left[take..];
         Ok(take)
     }
+}
+
+fn cache_end() -> impl Strategy<Value = CacheEnd> {
+    (
+        prop_oneof![
+            Just(CacheFound::Fresh),
+            Just(CacheFound::Reused),
+            Just(CacheFound::Replaced)
+        ],
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(found, clean, daemon)| CacheEnd { found, clean, daemon })
 }
 
 fn usage() -> impl Strategy<Value = Usage> {
@@ -107,19 +121,23 @@ fn guest_message() -> impl Strategy<Value = GuestMessage> {
             usage(),
             any::<u64>(),
             prop::option::of(oom()),
-            any::<u64>()
+            any::<u64>(),
+            prop::option::of(cache_end()),
         )
-            .prop_map(|(end, exit_code, signal, usage, disk_peak_bytes, oom, wall_ms)| {
-                GuestMessage::Exited(Summary {
-                    end,
-                    exit_code,
-                    signal,
-                    usage,
-                    disk_peak_bytes,
-                    oom,
-                    wall_ms,
-                })
-            }),
+            .prop_map(
+                |(end, exit_code, signal, usage, disk_peak_bytes, oom, wall_ms, docker_cache)| {
+                    GuestMessage::Exited(Summary {
+                        end,
+                        exit_code,
+                        signal,
+                        usage,
+                        disk_peak_bytes,
+                        oom,
+                        wall_ms,
+                        docker_cache,
+                    })
+                }
+            ),
     ]
 }
 
@@ -422,6 +440,7 @@ fn what_a_host_reads_from_a_guest_is_short_and_has_no_control_characters() {
         disk_peak_bytes: 0,
         oom: Some(loud),
         wall_ms: 1,
+        docker_cache: None,
     };
     let GuestMessage::Exited(kept) = read(&GuestMessage::Exited(account)) else {
         panic!("another message came back");
@@ -466,13 +485,39 @@ fn a_host_reads_no_frame_of_a_guest_beyond_its_limit_and_what_is_short_arrives_a
 fn a_job_from_a_host_before_docker_has_none() {
     let mut value = serde_json::to_value(job("x")).unwrap();
     value.as_object_mut().unwrap().remove("docker");
+    value.as_object_mut().unwrap().remove("docker_cache");
     let read: Job = serde_json::from_value(value).unwrap();
-    assert!(!read.docker);
+    assert!(!read.docker && !read.docker_cache);
     assert_eq!(
         read,
         Job {
             docker: false,
+            docker_cache: false,
             ..job("x")
         }
     );
+}
+
+#[test]
+fn a_summary_from_a_guest_before_the_cache_has_none() {
+    let mut value = serde_json::to_value(GuestMessage::Exited(Summary {
+        end: GuestEnd::Exited,
+        exit_code: Some(0),
+        signal: None,
+        usage: Usage::default(),
+        disk_peak_bytes: 0,
+        oom: None,
+        wall_ms: 1,
+        docker_cache: Some(CacheEnd {
+            found: CacheFound::Reused,
+            clean: true,
+            daemon: true,
+        }),
+    }))
+    .unwrap();
+    value.as_object_mut().unwrap().remove("docker_cache");
+    let GuestMessage::Exited(read) = serde_json::from_value(value).unwrap() else {
+        panic!("not a summary");
+    };
+    assert_eq!(read.docker_cache, None);
 }

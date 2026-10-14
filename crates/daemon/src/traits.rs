@@ -105,6 +105,8 @@ pub struct RunnerSpec {
     pub runner_id: i64,
     /// The machine's size.
     pub size: Size,
+    /// The repository's default branch, when GitHub named it.
+    pub default_branch: Option<String>,
     /// The slot it runs in.
     pub ticket: Ticket,
     /// What the Actions runner starts with. A credential.

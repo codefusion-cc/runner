@@ -876,7 +876,8 @@ impl FakeGithub {
                     .iter()
                     .map(|(name, r)| {
                         json!({"full_name": name, "private": r.private, "archived": false, "disabled": false,
-                               "pushed_at": "2026-10-10T10:00:00Z", "html_url": format!("https://github.com/{name}")})
+                               "pushed_at": "2026-10-10T10:00:00Z", "html_url": format!("https://github.com/{name}"),
+                               "default_branch": "main"})
                     })
                     .collect();
                 Reply::json(&json!({"total_count": repos.len(), "repositories": repos}))

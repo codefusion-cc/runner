@@ -58,11 +58,38 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
   group. A job that runs out ends `oom` like any other; the Mac is not touched. A container may have limits of its
   own (`--memory`, Compose's `mem_limit`, `--cpus`); one stopped at its own limit exits 137 and the job goes on, since
   only the job's own limit makes the job `oom`. A Docker job's daemon and a small Compose stack hold about 750 MB.
-- Disk: the job's 40 GB disk, `/var/lib/docker` included, gone with the machine.
+- Disk: the job's 40 GB disk, gone with the machine; `/var/lib/docker` is on a cache disk where the host keeps
+  caches (below), and on the job's disk where it does not.
 - One Docker job at a time per Mac (`docker_max_jobs`, 1 to 8). It counts promised, waiting and running Docker jobs
   until their machine is gone, after a Runner restart too. A job GitHub assigns past the cap without being offered
   room still runs, as any assigned job does; the log says so.
-- Nothing is cached between jobs yet: each job pulls its images.
+
+## The cache
+
+A host keeps one cache per repository: a 20 GB disk (sparse: it holds what was written) with the daemon's data,
+images and build cache, so a job does not pull or build again what the one before did. `docker_cache_gb` (30) is
+what all caches of a host may hold together; 0 keeps none and deletes those there were, and a host whose state
+folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, ext4 cannot) keeps none either.
+
+- Each Docker job gets a copy of its repository's cache that shares every block until it is written (APFS's
+  clonefile, Linux's reflink), or an empty one the guest makes a file system on, writing no zeros, so a new cache
+  holds of the host's disk what the job wrote. It writes only its copy.
+- Once the job is over, the copy becomes the repository's cache only when everything says it may
+  (`cf_daemon::caches::refusal`). GitHub said the job succeeded, on a push, a schedule or a manual dispatch. The
+  workflow is the repository's own, at `refs/heads/<its default branch>`. The guest said the daemon still answered,
+  stopped by itself and let the disk go. Anything else is thrown away: a pull request, a fork, another branch, a
+  failed or cancelled job, a job GitHub never said the end of, a disk let go uncleanly. So a cache holds what the
+  default branch built and nothing a pull request, a fork or another repository left. A cache's key is a hash of
+  its repository's name in lowercase, and its record names the repository, which is checked before it is used.
+- The job's end hook removes its containers, volumes and networks from the job's daemon, by its socket, whatever
+  context the job chose; images and build cache stay. A next job starts with none of the containers of the one
+  before. A job the host stopped (its deadline, a cancellation) is never kept, so its daemon is not waited for.
+- Before a cache is mounted the image's `e2fsck` checks it; one that does not mount is made anew and the job runs on
+  an empty one (`replaced`). A cache the daemon could not run on is deleted (`dropped`). Over the budget the cache
+  used longest ago goes (`evicted`), never one a job holds now.
+- The console's Runners page shows each host's caches with their size and last write, and what last happened to
+  them (`kept`, `discarded` with why, `replaced`, `dropped`, `evicted`); the report's `dockerCaches` and
+  `dockerCacheEvents`.
 
 ## How it fails
 
@@ -81,6 +108,18 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
   a running machine, one assigned past the cap and a restart, and a Docker scale set that acquires one job only.
 - `crates/workflows/tests/labels.rs`, `crates/daemon/src/names.rs`, `crates/runner/src/config.rs`: the label, the
   repositories that get Docker, the settings.
+- `crates/daemon/tests/caches.rs`: the rule (each condition refusing alone, and a property: nothing but a successful
+  run of the repository's own workflow on its default branch with a clean disk is kept), the key (one per
+  repository in any case, two repositories never one), eviction (least recently used first, none in use), and the
+  store on a real file system: kept, thrown away, replaced, dropped, a record naming another repository, a copy in
+  use or whose machine never started, sweeping after a restart, a budget of 0, and what a store reads back.
+- `crates/daemon/tests/docker.rs`: the same through the daemon: a push to main keeps its copy and the next job starts
+  from it; a pull request, another branch, a failure, a cancellation, another repository's workflow, an unclean disk
+  and a job GitHub never said the end of do not; a copy outlives a restart (records read back from disk).
+- `cargo xtask it --only docker-cache`, against real machines: a first job fills an empty cache and leaves it clean,
+  the next one on a copy has its image, none of its containers or volumes, and builds from the cache, and a disk of
+  garbage is made anew. It goes red without the end hook's tidying, without the daemon's own stop, and when the
+  guest never reuses a cache.
 - `cargo xtask it --only docker`, against real machines: a Compose stack built and published, a bind mount of `/tmp`,
   and the probes from plain, privileged and host-network containers. The target that shows the firewall at work is
   a port the test opens on the host itself: through pasta a closed port and a dropped packet look alike. The

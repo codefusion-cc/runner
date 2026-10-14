@@ -466,6 +466,7 @@ mod tests {
             env: Vec::new(),
             deadline_s: 60,
             docker: false,
+            docker_cache: None,
         }
     }
 
