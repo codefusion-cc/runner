@@ -61,6 +61,45 @@ pub fn kills_in_events(memory_events: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// How often a control group's own limit was reached, from its `memory.events.local` (`oom`). Unlike `oom_kill`,
+/// which counts each process stopped in the group or below whatever limit it ran into, this counts only the times
+/// this group's limit was the one.
+pub fn limit_reached(memory_events_local: &str) -> u64 {
+    memory_events_local
+        .lines()
+        .find_map(|line| line.strip_prefix("oom ")?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Keeps a Docker job's containers that ran into a limit of their own (`docker run --memory`, Compose's
+/// `mem_limit`) out of the job's stops: the job did not run out of memory, the container did, and its command sees
+/// that as its exit code 137. A stop is the job's when the job's own limit was reached at this look or the one
+/// before: the kernel counts the limit first and stops a process after, so one look may see only the first.
+#[derive(Debug, Default)]
+pub struct OwnLimit {
+    /// How often the job's limit was reached, at the look before last and at the last.
+    reached: [u64; 2],
+    /// The job's `oom_kill` at the last look.
+    counted: u64,
+    /// The stops in it that were the containers'.
+    theirs: u64,
+}
+
+impl OwnLimit {
+    /// One look: the job's limit was reached `reached` times so far, and its group counts `counted` stops. Returns
+    /// whether this look's stops are the job's, and the job's own count of stops to hold against its log.
+    pub fn look(&mut self, reached: u64, counted: u64) -> (bool, u64) {
+        let new = counted.saturating_sub(self.counted);
+        self.counted = self.counted.max(counted);
+        let ours = reached > self.reached[0];
+        self.reached = [self.reached[1], reached];
+        if !ours {
+            self.theirs = self.theirs.saturating_add(new);
+        }
+        (ours, self.counted.saturating_sub(self.theirs))
+    }
+}
+
 /// The stops the kernel counted for a job against those its log named. The log names the process and can fall
 /// behind or drop records; the counter (`oom_kill` in the group's `memory.events`) is exact and names nothing.
 #[derive(Debug, Default)]

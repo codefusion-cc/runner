@@ -358,6 +358,7 @@ pub fn run(
         previous: Table::new([]),
         oom: None,
         count: oom::Count::default(),
+        own_limit: oom::OwnLimit::default(),
         step: None,
         stop: None,
         killed: false,
@@ -470,6 +471,8 @@ struct Watch<'a> {
     oom: Option<OomEvent>,
     /// The stops the kernel counted for the job against those its log named.
     count: oom::Count,
+    /// A Docker job's stops that are its containers' own, apart from the job's.
+    own_limit: oom::OwnLimit,
     /// The step whose processes go when its time to fail by itself is over.
     step: Option<(Instant, Process)>,
     stop: Option<(StopReason, Instant)>,
@@ -568,8 +571,25 @@ impl Watch<'_> {
             let reader = &mut self.log;
             oom::read_records(log, |message| kills.extend(reader.line(message)));
         }
-        let counted =
+        let mut counted =
             oom::kills_in_events(&fs::read_to_string(format!("{CGROUP}/memory.events")).unwrap_or_default());
+        if self.job.docker {
+            // The job's limits are set on the job's group and on its container's; a container of the daemon's
+            // that reached a limit of its own reached neither.
+            let reached: u64 = [CGROUP.to_string(), format!("{CGROUP}/run")]
+                .iter()
+                .map(|group| {
+                    oom::limit_reached(
+                        &fs::read_to_string(format!("{group}/memory.events.local")).unwrap_or_default(),
+                    )
+                })
+                .sum();
+            let (ours, own) = self.own_limit.look(reached, counted);
+            if !ours {
+                kills.clear();
+            }
+            counted = own;
+        }
         if self.count.look(kills.len() as u64, counted, last) {
             kills.push(Kill {
                 process: Used {

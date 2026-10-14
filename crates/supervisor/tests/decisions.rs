@@ -1239,3 +1239,50 @@ fn a_stop_the_kernel_counted_but_did_not_log_is_believed_at_the_second_look_or_a
     assert!(!count.look(3, 3, false));
     assert!(!count.look(0, 1, true));
 }
+
+#[test]
+fn a_groups_own_limit_is_read_from_its_local_events() {
+    use cf_supervisor::oom::limit_reached;
+    assert_eq!(limit_reached("low 0\nhigh 0\nmax 9\noom 2\noom_kill 5\noom_group_kill 0\n"), 2);
+    assert_eq!(limit_reached("oom_kill 5\n"), 0, "oom_kill is not oom");
+    assert_eq!(limit_reached(""), 0);
+}
+
+#[test]
+fn a_docker_jobs_containers_stopped_at_their_own_limit_are_not_the_jobs() {
+    use cf_supervisor::oom::OwnLimit;
+    let mut own = OwnLimit::default();
+    assert_eq!(own.look(0, 0), (false, 0));
+    // A container ran into its own limit: two stops, the job's limit untouched.
+    assert_eq!(own.look(0, 2), (false, 0));
+    assert_eq!(own.look(0, 2), (false, 0));
+    // The job reached its limit, and the kernel stopped one process at the same look.
+    assert_eq!(own.look(1, 3), (true, 1));
+    // The kernel counted the limit at one look and stopped the process at the next: still the job's.
+    assert_eq!(own.look(2, 3), (true, 1));
+    assert_eq!(own.look(2, 4), (true, 2));
+    // Two looks later the container's own stops are theirs again.
+    assert_eq!(own.look(2, 6), (false, 2));
+    assert_eq!(own.look(2, 6), (false, 2));
+}
+
+proptest! {
+    #[test]
+    fn the_jobs_own_count_never_goes_back_or_past_the_kernels(
+        looks in proptest::collection::vec((0u64..4, 0u64..4), 0..40)
+    ) {
+        use cf_supervisor::oom::OwnLimit;
+        let mut own = OwnLimit::default();
+        let (mut reached, mut counted, mut last) = (0, 0, 0);
+        for (more_reached, more_counted) in looks {
+            reached += more_reached;
+            counted += more_counted;
+            let (ours, count) = own.look(reached, counted);
+            prop_assert!(count >= last && count <= counted);
+            if !ours {
+                prop_assert_eq!(count, last, "no new stop is the job's while its limit was not reached");
+            }
+            last = count;
+        }
+    }
+}
