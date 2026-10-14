@@ -181,8 +181,13 @@ pub struct MachineStatus {
     pub state: &'static str,
     /// When it was asked for, in seconds since 1970.
     pub started: i64,
+    /// Its size; none for a record that names none the Runner knows.
+    pub size: Option<Size>,
     /// The machine's memory.
     pub memory_bytes: u64,
+    /// What the budget counts it with while it holds a slot: its size and the vm-host's overhead
+    /// ([`cf_budget::Budget::host_bytes`]).
+    pub counted_bytes: Option<u64>,
     /// The memory the job holds now.
     pub used_bytes: Option<u64>,
     /// GitHub's job, once it took one.
@@ -1365,7 +1370,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     scale_set_id: job.record.scale_set_id,
                     state: phase_name(job.life.phase()),
                     started: job.record.created_at,
+                    size: job.record.size(),
                     memory_bytes: job.record.memory_bytes,
+                    counted_bytes: job.slot.and_then(|slot| inner.budget.host_bytes(slot).ok()),
                     used_bytes: job
                         .last
                         .as_ref()

@@ -125,6 +125,22 @@ fn bytes(v: &Value, path: &str) -> Check {
     number(v, path, 0.0, 9_007_199_254_740_992.0)
 }
 
+/// `z.number().int().min(0).max(2 ** 53)`: a whole number of bytes, which `int` keeps to the safe integers.
+fn whole_bytes(v: &Value, path: &str) -> Check {
+    int(v, path, 0.0, 9_007_199_254_740_992.0)
+}
+
+/// `z.enum(['cf-2g', 'cf-4g', 'cf-6g', 'cf-8g'])`: a machine's size, and nothing else.
+fn size(v: &Value, path: &str) -> Check {
+    match v.as_str() {
+        Some("cf-2g" | "cf-4g" | "cf-6g" | "cf-8g") => Ok(()),
+        _ => Err(bad(
+            path,
+            "Invalid option: expected one of \"cf-2g\"|\"cf-4g\"|\"cf-6g\"|\"cf-8g\"",
+        )),
+    }
+}
+
 fn boolean(v: &Value, path: &str) -> Check {
     if v.is_boolean() {
         Ok(())
@@ -326,7 +342,9 @@ fn runner(v: &Value, path: &str) -> Check {
         let u = object(v, p)?;
         field(u, p, "cpuPercent", Required, |v, p| number(v, p, -1.0, 1e5))?;
         field(u, p, "memoryBytes", Required, bytes)
-    })
+    })?;
+    field(o, path, "size", Nullish, size)?;
+    field(o, path, "countedBytes", Nullish, whole_bytes)
 }
 
 fn scale_set(v: &Value, path: &str) -> Check {
@@ -359,6 +377,7 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "open", Required, boolean)?;
     field(o, path, "reason", Nullish, text(300))?;
     field(o, path, "maxJobs", Required, count)?;
+    field(o, path, "memoryForJobsBytes", Nullish, whole_bytes)?;
     field(o, path, "paused", Default, boolean)?;
     field(o, path, "host", Nullish, host)?;
     field(o, path, "hostError", Nullish, text(300))?;
