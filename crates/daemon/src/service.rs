@@ -10,14 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
-use cf_budget::{Host, Pressure, Size};
+use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
+    MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
     Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp};
-use cf_host_macos::Battery;
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
 use cf_workflows::self_hosted_with;
 use time::OffsetDateTime;
@@ -68,6 +67,8 @@ pub struct ServiceConfig {
     pub model: String,
     /// The Runner's version.
     pub version: String,
+    /// The system the Runner runs on, for the console.
+    pub os: Option<Os>,
     /// Which repositories are served.
     pub policy: ServePolicy,
     /// How long one long poll may take in all.
@@ -100,6 +101,7 @@ impl ServiceConfig {
             hostname: hostname.to_string(),
             model: model.to_string(),
             version: version.to_string(),
+            os: Os::this(),
             policy: ServePolicy::default(),
             poll_timeout: Duration::from_secs(70),
             discover_every: Duration::from_secs(300),
@@ -244,7 +246,7 @@ struct Shared<H, V> {
     updates: Option<Arc<dyn SelfUpdate>>,
     results_file: Option<PathBuf>,
     update: Mutex<Updating>,
-    /// Set when the Runner is to end so that launchd starts it again: a restart, or an update installed.
+    /// Set when the Runner is to end so that the service manager starts it again: a restart, or an update installed.
     restart: AtomicBool,
     restarting: Notify,
     /// Set while the Runner ends: the last report says so instead of serving nothing.
@@ -441,12 +443,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         self.shared.update.lock().expect("update").command = Some(pending.id.clone());
     }
 
-    /// Whether the Runner is to end so that launchd starts it again.
+    /// Whether the Runner is to end so that the service manager starts it again.
     pub fn restart_requested(&self) -> bool {
         self.shared.restart.load(Ordering::SeqCst)
     }
 
-    /// Ends [`Service::run`] so that launchd starts the Runner again.
+    /// Ends [`Service::run`] so that the service manager starts the Runner again.
     fn restart(&self) {
         self.shared.restart.store(true, Ordering::SeqCst);
         self.shared.restarting.notify_one();
@@ -530,7 +532,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // Nothing is known: everything stays as it is.
                 tracing::warn!(%error, "the App's installations could not be read");
                 *shared.discovery_error.lock().expect("discovery") = Some(format!("GitHub: {error}"));
-                return vec!["GitHub could not be asked for this Mac's scale sets".into()];
+                return vec!["GitHub could not be asked for this host's scale sets".into()];
             }
         };
 
@@ -601,7 +603,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             serving.insert(name, Serving { stop, task, state });
         }
         *shared.not_serving.lock().expect("not serving") = (served == 0 && problems.is_empty())
-            .then(|| "the App is installed on no repository this Mac serves".to_string());
+            .then(|| "the App is installed on no repository this host serves".to_string());
         *shared.discovery_error.lock().expect("discovery") =
             (!problems.is_empty()).then(|| problems.join("; "));
         for problem in &problems {
@@ -708,7 +710,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     };
                     if let Err(refusal) = settings.can_run(size) {
                         // Not offered to GitHub at all: a job nobody here can run is left to the other Macs.
-                        tracing::info!(repo = %name, size = size.label(), why = refusal.name(), "a size this Mac never runs is not served");
+                        tracing::info!(repo = %name, size = size.label(), why = refusal.name(), "a size this host never runs is not served");
                         continue;
                     }
                     wanted.insert(
@@ -845,7 +847,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 ));
             }
             if leave && let Err(error) = console.client.leave().await {
-                left.push(format!("the console was not told that the Mac is gone ({error})"));
+                left.push(format!(
+                    "the console was not told that the host is gone ({error})"
+                ));
             }
         }
         left
@@ -972,7 +976,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 let seconds = now.duration_since(over.since).unwrap_or_default().as_secs();
                 tracing::info!(
                     seconds,
-                    "the jobs that waited while the Mac was idle are under way or gone"
+                    "the jobs that waited while the host was idle are under way or gone"
                 );
             }
             return (0, None);
@@ -1110,7 +1114,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             .or_else(|| {
                                 set.never.as_ref().map(|why| {
                                     format!(
-                                        "a job of {} can never start on this Mac: {why}",
+                                        "a job of {} can never start on this host: {why}",
                                         set.size.label()
                                     )
                                 })
@@ -1153,6 +1157,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             },
             hostname: shared.config.hostname.clone(),
             model: shared.config.model.clone(),
+            os: shared.config.os,
             settings: None,
             image: None,
             jobs: Vec::new(),
@@ -1189,7 +1194,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // What was done for the console is said again with the next report.
                 match error {
                     cf_console_client::Error::Unauthorized => {
-                        tracing::error!("the console does not know this Mac's token; enrol it again");
+                        tracing::error!("the console does not know this host's token; enrol it again");
                         shared.config.report_every * 5
                     }
                     error => {
@@ -1257,7 +1262,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             ),
             "restart" => (
                 true,
-                format!("{} ends and launchd starts it again", self.shared.config.version),
+                format!(
+                    "{} ends and its service manager starts it again",
+                    self.shared.config.version
+                ),
             ),
             "update" => return self.update(&command.id),
             "stop-runner" => {
@@ -1277,7 +1285,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .iter()
                     .any(|machine| machine.runner == name);
                 if !stands {
-                    return Some((false, format!("{name} is not on this Mac")));
+                    return Some((false, format!("{name} is not on this host")));
                 }
                 self.shared.machines.stop(crate::names::job_name(name));
                 (true, format!("{name} is being stopped"))

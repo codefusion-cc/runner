@@ -10,11 +10,11 @@
 mod adapters;
 mod ends;
 mod log;
-#[cfg(target_os = "macos")]
-mod mac;
 mod machines;
 mod making;
 pub mod names;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod platform;
 mod records;
 mod roster;
 mod scaler;
@@ -29,12 +29,12 @@ mod vms;
 pub use adapters::SetRegistry;
 pub use ends::{EndKind, machine_end};
 pub use log::{Lines, ROLL_AT};
-#[cfg(target_os = "macos")]
-pub use mac::{MacMachines, MacService, MacSetup, mac_service, records_dir};
 pub use machines::{
     Answer, DOCKER_FULL, JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines,
     RESULT_WAIT, Registration, Reports, SizeRoom, Snapshot,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use platform::{HostMachines, HostService, HostSetup, Platform, This, host_service, records_dir};
 pub use records::{
     Disagrees, DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade,
 };

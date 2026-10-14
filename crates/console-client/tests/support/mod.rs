@@ -47,6 +47,7 @@ pub fn hello(code: &str, machine: &str) -> Enroll {
         version: "abc1234".into(),
         cpus: 10,
         memory_bytes: 16 << 30,
+        os: Some(cf_console_client::Os::Macos),
     }
 }
 
@@ -132,6 +133,7 @@ pub fn report(machine: &str) -> Report {
         },
         hostname: "Build-Mac-2.local".into(),
         model: "Apple M5".into(),
+        os: Some(cf_console_client::Os::Macos),
         settings: None,
         image: None,
         jobs: vec![],

@@ -1,8 +1,8 @@
 //! The Runner's updates of itself, which the console asks for with `update`.
 //!
 //! The service decides when ([`crate::Service`]): it builds while jobs run, holds new jobs until no machine
-//! stands, then installs and ends, and launchd starts the new program. How a build and an install go on this Mac is
-//! a [`SelfUpdate`]'s. What is under way is written down ([`Pending`] in [`UPDATE_FILE`]) before the program is
+//! stands, then installs and ends, and the service manager starts the new program. How a build and an install go
+//! on this host is a [`SelfUpdate`]'s. What is under way is written down ([`Pending`] in [`UPDATE_FILE`]) before the program is
 //! replaced, so the program that starts next knows what it is: the new one counts its starts and goes back to the
 //! one before when it does not stay up ([`at_start`]); the one before, started again, tells the console the update
 //! failed.
@@ -18,11 +18,12 @@ pub const UPDATE_FILE: &str = "update.json";
 /// How often a new program may start without staying up before the one before is put back.
 pub const MAX_STARTS: u32 = 3;
 
-/// How long a new program must run before its update counts as done. launchd starts a program that ended again
-/// within its `ThrottleInterval` (30 s), so a program that fails at once uses its starts within two minutes.
+/// How long a new program must run before its update counts as done. A program that cannot start ends 30 s after it
+/// began and is started again (launchd's `ThrottleInterval`, the Runner's own wait under systemd), so one that fails
+/// at once uses its starts within two minutes.
 pub const STAYS_UP: Duration = Duration::from_secs(60);
 
-/// How the Runner updates itself on this Mac. Both calls take long and block: they run on a thread of their own.
+/// How the Runner updates itself on this host. Both calls take long and block: they run on a thread of their own.
 pub trait SelfUpdate: Send + Sync {
     /// Where updates come from, for the console: the checkout and the branch.
     fn source(&self) -> String;
@@ -104,8 +105,9 @@ pub fn at_start(pending: Option<Pending>, running: &str) -> AtStart {
     }
     let message = if pending.from == running {
         format!(
-            "{} did not stay up and was taken back: {running} runs again (logs/launchd.log says why)",
-            pending.to
+            "{} did not stay up and was taken back: {running} runs again (logs/{} says why)",
+            pending.to,
+            <crate::This as crate::Platform>::SERVICE_LOG
         )
     } else {
         format!(

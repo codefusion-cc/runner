@@ -28,7 +28,7 @@ fn bytes(root: &Path, path: &str) -> io::Result<Vec<u8>> {
 }
 
 /// `path` (absolute, as on a real host) under `root`.
-pub(crate) fn under(root: &Path, path: &str) -> PathBuf {
+pub fn under(root: &Path, path: &str) -> PathBuf {
     root.join(path.trim_start_matches('/'))
 }
 

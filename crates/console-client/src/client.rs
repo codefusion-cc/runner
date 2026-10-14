@@ -79,7 +79,7 @@ fn read<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error
 pub async fn enroll(http: &Http, base: &str, enroll: &Enroll) -> Result<Enrolled, Error> {
     if !is_machine_name(&enroll.machine) {
         return Err(Error::Protocol(
-            "the Mac's name is not one the console accepts".into(),
+            "the host's name is not one the console accepts".into(),
         ));
     }
     if enroll.code.expose().is_empty() || units(enroll.code.expose()) > 200 {
@@ -88,7 +88,7 @@ pub async fn enroll(http: &Http, base: &str, enroll: &Enroll) -> Result<Enrolled
     if !(1..=4096).contains(&enroll.cpus) {
         return Err(Error::Protocol("the CPU count is not 1 to 4096".into()));
     }
-    let message = serde_json::json!({
+    let mut message = serde_json::json!({
         "protocol": PROTOCOL,
         "code": enroll.code.expose(),
         "machine": enroll.machine,
@@ -98,6 +98,9 @@ pub async fn enroll(http: &Http, base: &str, enroll: &Enroll) -> Result<Enrolled
         "cpus": enroll.cpus,
         "memoryBytes": enroll.memory_bytes,
     });
+    if let Some(os) = enroll.os {
+        message["os"] = serde_json::json!(os);
+    }
     let body = serde_json::to_vec(&message)
         .map_err(|_| Error::Protocol("the request cannot be written as JSON".into()))?;
     let url = endpoint(base, "enroll")?;
@@ -131,7 +134,7 @@ pub async fn enroll(http: &Http, base: &str, enroll: &Enroll) -> Result<Enrolled
 fn check(report: &Report, body: &[u8]) -> Result<(), Error> {
     let refuse = |why: &str| Err(Error::Protocol(why.to_string()));
     if !is_machine_name(&report.status.machine) {
-        return refuse("the Mac's name is not one the console accepts");
+        return refuse("the host's name is not one the console accepts");
     }
     if report.jobs.len() > MAX_JOB_EVENTS {
         return refuse("more than 500 job events in one report");

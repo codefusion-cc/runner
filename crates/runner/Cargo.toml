@@ -13,35 +13,36 @@ path = "src/main.rs"
 [dependencies]
 cf-image = { path = "../image" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 cf-budget = { path = "../budget" }
 cf-console-client = { path = "../console-client" }
 cf-daemon = { path = "../daemon" }
 cf-ghapp = { path = "../ghapp" }
-cf-host-macos = { path = "../host-macos" }
+cf-guest-proto = { path = "../guest-proto" }
 cf-scaleset = { path = "../scaleset" }
 cf-secret = { path = "../secret" }
+cf-vmhost = { path = "../vmhost" }
+cf-vmm = { path = "../vmm" }
+libc.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 tracing = "0.1"
-cf-guest-proto = { path = "../guest-proto" }
-cf-vmhost = { path = "../vmhost" }
-cf-vmm = { path = "../vmm" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 cf-vmm-vz = { path = "../vmm-vz" }
-libc.workspace = true
-serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cf-guest-proto = { path = "../guest-proto" }
-cf-vmhost = { path = "../vmhost" }
-cf-vmm = { path = "../vmm" }
+cf-host-linux = { path = "../host-linux" }
 cf-vmm-ch = { path = "../vmm-ch" }
-libc.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
+cf-budget = { path = "../budget" }
 ed25519-dalek.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+cf-host-macos = { path = "../host-macos" }
 
 [lints]
 workspace = true

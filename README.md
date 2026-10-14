@@ -1,7 +1,7 @@
 # CodeFusion Runner
 
-A Rust program for macOS that runs GitHub Actions jobs, each in its own small virtual machine that is gone when the job
-ends. It replaces the runner manager in `codefusion-cc/codefusion` on the CodeFusion Macs.
+A Rust program for macOS and arm64 Linux that runs GitHub Actions jobs, each in its own small virtual machine that is
+gone when the job ends. It replaces the runner manager in `codefusion-cc/codefusion` on the CodeFusion Macs.
 
 The idea: a Mac opens a job slot only when it has the memory for it. The job gets a fixed amount of memory and CPU,
 and when it ends the whole machine goes away, so an idle Mac holds nothing for CI.
@@ -19,7 +19,7 @@ against a fake GitHub and a fake console with real machines (`cargo xtask it --o
 its first jobs from the real GitHub on a MacBook Air: one that passed, one that failed and one cancelled while it
 ran, each in a machine that was gone when the job ended. What is there:
 
-- the service (`codefusion-runner daemon`, kept running by launchd): it reads which repositories and `runs-on`
+- the service (`codefusion-runner daemon`, kept running by launchd on a Mac and by systemd on Linux): it reads which repositories and `runs-on`
   labels to serve, keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
   budget for memory, starts a machine and registers an Actions runner for that one job. When the job ends, however
   it ends, the machine is destroyed, the registration removed, the memory given back, and the console told once,
@@ -114,8 +114,8 @@ What the log says between a start and a job, each once and again when it changes
 the Runner starts version="0.1.0+446125c0a1b2" machine=air-vm
 a scale set at GitHub set=air-vm--cf-4g-177a1a95 id=10 repo=org/app labels=cf-4g size="cf-4g"
 a session is open: the Runner listens for this scale set's jobs set=air-vm--cf-4g-177a1a95
-the Mac is closed: a new job waits why="calming" opens_in_s=60
-the Mac is open: a new job gets a machine
+the host is closed: a new job waits why="calming" opens_in_s=60
+the host is open: a new job gets a machine
 job started runner=air-vm-j1766ef2 job=build at=2026-10-11T09:54:18Z heard_after_s=41
 ```
 
@@ -150,8 +150,8 @@ its own. Otherwise `update` touches nothing and says why: a person's checkout is
 update fetches `main`, checks it out at its commit and builds it while jobs run. It takes no new job until no machine
 stands and no slot promised to GitHub is left, then installs and starts again. A new program that does not stay up for
 a minute three times is replaced by the one before, and the console hears why; a start that ends as asked (a signal,
-`restart`) does not count. `restart` ends the Runner at once and launchd starts it again; machines that run go on and
-are adopted.
+`restart`) does not count. `restart` ends the Runner at once and launchd (systemd on Linux) starts it again; machines
+that run go on and are adopted.
 
 `uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
 could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
@@ -160,6 +160,62 @@ Beside the cf-runners manager of `codefusion-cc/codefusion` the Runner touches n
 another folder, another name at GitHub (it refuses to run under the manager's own). Both serve a `runs-on` that includes
 `self-hosted`, so GitHub gives such a job to whichever has room first. A `runs-on: cf-4g` alone goes only to the
 Runner.
+
+## Run it on Linux
+
+On Linux (arm64, KVM, systemd, cgroup v2; Debian 12 and Ubuntu 24.04 are known to work) the Runner is a unit of the
+user's own systemd, `codefusion-runner.service`, run by a user of its own. Each job's vm-host runs in a systemd scope
+of its own whose cgroup is delegated to it, so machines live through a restart or an update of the Runner and are
+adopted. Nobody sits at such a host: `use` is `dedicated` or left out (`workstation` is refused), and the budget keeps half a
+gigabyte for the host and runs machines on its fast cores.
+
+Once, as root (Ubuntu 24.04 also needs the line about user namespaces):
+
+```sh
+sudo apt install passt git curl build-essential pkg-config libssl-dev
+sudo useradd --create-home --home-dir /data/codefusion-runner --shell /bin/bash codefusion-runner
+sudo usermod -aG kvm codefusion-runner
+sudo loginctl enable-linger codefusion-runner
+echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/60-codefusion-runner.conf && sudo sysctl --system
+```
+
+The home is where the images, the job disks and the build go, so it is on a disk with room (20 GB and more), not on
+one mounted `noexec`. Lingering starts the user's systemd with the host and keeps it running without a login.
+
+Then as that user (`sudo -iu codefusion-runner`): Rust from rustup, the sources in a checkout of the Runner's own, and
+
+```sh
+git clone https://github.com/codefusion-cc/runner ~/runner && cd ~/runner && git checkout --detach
+cargo xtask build
+```
+
+The configuration is the Mac's without `use`, in `~/.config/codefusion-runner/config.json`, with the App's
+`app.json` and `app.pem` beside it (`app_dir` `~/.config/codefusion-runner`), `state_dir`
+`~/.local/state/codefusion-runner` and `build_folder` `~/runner`, each as an absolute path. Then, with the image
+fetched as above:
+
+```sh
+target/release/codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
+target/release/codefusion-runner check --config <file> --github
+target/release/codefusion-runner enroll --config <file>
+target/release/codefusion-runner install --config <file>
+```
+
+`check` lists what Linux needs and the command that brings what is missing: `/dev/kvm` open to the user, lingering,
+memory and pids handed on to the user's systemd, user namespaces, pasta, a state folder that may run programs, and a
+build that carries cloud-hypervisor. `install` copies the program to `<state_dir>/bin`, writes
+`~/.config/systemd/user/codefusion-runner.service` (below `$XDG_CONFIG_HOME` when the user's systemd has it set),
+enables and starts it. Under `sudo -iu` the Runner finds the user's systemd in `/run/user/<uid>` by itself.
+
+The log is `<state_dir>/logs/runner.log`, and what the Runner printed before it opened it is in `systemd.log` beside it.
+
+```sh
+systemctl --user status codefusion-runner
+systemctl --user restart codefusion-runner
+journalctl --user -u codefusion-runner     # when systemd started and stopped it
+```
+
+`uninstall`, `update` and `restart` work as on a Mac.
 
 ## Build and try it
 
@@ -185,14 +241,19 @@ CF_REQUIRE_EMBEDDED=1 cargo test --workspace
 cargo deny check
 ```
 
-and on an arm64 Linux host with pasta (`apt install passt`) and user namespaces (on Ubuntu 24.04,
-`sysctl kernel.apparmor_restrict_unprivileged_userns=0`), for the crates CI lists in `LINUX_CRATES`:
+and on an arm64 Linux host with pasta (`apt install passt`), OpenSSL's headers (`apt install pkg-config libssl-dev`)
+and user namespaces (on Ubuntu 24.04, `sysctl kernel.apparmor_restrict_unprivileged_userns=0`), for the crates CI
+lists in `LINUX_CRATES`, the service's among them:
 
 ```sh
-cargo clippy -p cf-host-linux -p cf-vmm-ch -p cf-vmhost --all-targets -- -D warnings
-cargo test -p cf-host-linux -p cf-vmm-ch -p cf-vmhost
+cargo clippy -p cf-host-linux -p cf-vmm-ch -p cf-vmhost -p cf-daemon -p codefusion-runner --all-targets -- -D warnings
+cargo test -p cf-host-linux -p cf-vmm-ch -p cf-vmhost -p cf-daemon -p codefusion-runner
 cargo run -p cf-host-linux --example linux-probe
 ```
+
+`cargo test -p cf-daemon --test scopes` starts a stand-in vm-host the way the service does, in a scope of the user's
+systemd, and checks that it claims the scope's cgroup; without a systemd of the user's it says so and passes, unless
+`CF_REQUIRE_USER_MANAGER` is set.
 
 CI cannot boot a machine, so the jobs in real machines run on a Mac of your own, or on an arm64 Linux host with
 KVM, in a cgroup delegated to you (`systemd-run --user --scope -p Delegate=yes cargo xtask it`):

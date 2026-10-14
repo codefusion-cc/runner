@@ -12,6 +12,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::platform::{Platform as _, Process, This};
+
 /// What is there of a job's machine at one moment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Seen {
@@ -77,6 +79,10 @@ struct Spawned {
     pid: u32,
     /// Seconds since 1970 when it was started.
     at: u64,
+    /// When its process started by the system's clock that no step of the wall clock moves ([`Process::mark`]),
+    /// where the system keeps one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mark: Option<u64>,
 }
 
 fn now_s() -> u64 {
@@ -94,6 +100,8 @@ pub struct VmHosts {
     /// The process numbers of the vm-hosts started here whose exit nobody collected yet: while one is in here
     /// its number is still its own.
     children: Arc<Mutex<BTreeMap<String, u32>>>,
+    /// `systemd-run`, when each vm-host starts in a systemd scope of its own ([`VmHosts::in_scopes`]).
+    systemd_run: Option<PathBuf>,
 }
 
 impl VmHosts {
@@ -105,17 +113,66 @@ impl VmHosts {
             layout: Layout::new(state_dir),
             exited: Arc::default(),
             children: Arc::default(),
+            systemd_run: None,
         }
+    }
+
+    /// The same vm-hosts, each started by `systemd_run` in a transient scope of the user's systemd,
+    /// `codefusion-runner-<job>.scope`, whose cgroup is delegated to it: there it makes its machines' cgroups. The
+    /// scope is a unit of its own, so a vm-host outlives the Runner's service whatever systemd does to it, and the
+    /// service's own cgroup never has controllers enabled for its children, which would keep systemd from starting
+    /// the service in it again. The process is the vm-host itself (`systemd-run --scope` becomes it), so its number
+    /// is the one written down.
+    pub fn in_scopes(self, systemd_run: impl Into<PathBuf>) -> VmHosts {
+        VmHosts {
+            systemd_run: Some(systemd_run.into()),
+            ..self
+        }
+    }
+
+    /// The command that starts the job's vm-host: the Runner's binary, or `systemd_run` with it in a scope named
+    /// after the job whose cgroup is delegated to it. The job's name is one [`JobRequest::check`] took.
+    fn command(&self, job: &str) -> Result<Command, VmError> {
+        let mut command = match &self.systemd_run {
+            None => Command::new(&self.program),
+            Some(systemd_run) => {
+                let mut command = Command::new(systemd_run);
+                command
+                    .args([
+                        "--user",
+                        "--scope",
+                        "--quiet",
+                        "--collect",
+                        "--property=Delegate=yes",
+                    ])
+                    .arg(format!("--unit={}", scope_unit(job)))
+                    .arg("--")
+                    .arg(&self.program);
+                // The bus of the user's systemd, which a Runner started by hand under `sudo -iu` may not be told of.
+                #[cfg(target_os = "linux")]
+                command.envs(
+                    crate::platform::this_user_bus_env()
+                        .map_err(|why| VmError(format!("no scope for the vm-host: {why}")))?,
+                );
+                command
+            }
+        };
+        command.arg("vm").arg("--state-dir").arg(&self.state_dir);
+        Ok(command)
     }
 
     /// Whether the process with this number is the vm-host that was started by `born_by` (seconds since 1970): it
     /// runs the Runner's binary and is no younger than that. All that makes a silent process a vm-host to end. A
     /// number that went to another program is never sent a signal, nor one that went to a later process of the
     /// Runner's own binary (another job's vm-host, a command, this Runner itself).
-    fn is_ours(&self, pid: u32, born_by: u64) -> bool {
+    ///
+    /// `mark` is the start of the vm-host's process as written down when it was started ([`Process::mark`]): where
+    /// it is known, the process must have started at that very moment, whatever the wall clock did since.
+    fn is_ours(&self, pid: u32, born_by: u64, mark: Option<u64>) -> bool {
         pid != std::process::id()
-            && process_path(pid).is_some_and(|path| same_file(&path, &self.program))
-            && process_start(pid).is_some_and(|started| started <= born_by.saturating_add(START_SLACK))
+            && This::process(pid).is_some_and(|process| {
+                same_file(&process.program, &self.program) && started_by(&process, born_by, mark)
+            })
     }
 
     fn spawned(&self, job: &str) -> PathBuf {
@@ -125,15 +182,53 @@ impl VmHosts {
     /// Writes down the process a job's vm-host was started as.
     fn note(&self, job: &str, pid: u32) -> std::io::Result<()> {
         cf_secret::private_dir(&self.layout.run())?;
-        let spawned = serde_json::to_vec(&Spawned { pid, at: now_s() }).map_err(std::io::Error::other)?;
+        let spawned = Spawned {
+            pid,
+            at: now_s(),
+            mark: This::process(pid).and_then(|process| process.mark),
+        };
+        let spawned = serde_json::to_vec(&spawned).map_err(std::io::Error::other)?;
         cf_secret::replace_private(&self.spawned(job), &spawned)
     }
 
     /// The vm-host a Runner before started for the job and wrote down, when its process is still that one.
     fn noted(&self, job: &str) -> Option<u32> {
-        let spawned: Spawned = serde_json::from_slice(&std::fs::read(self.spawned(job)).ok()?).ok()?;
-        self.is_ours(spawned.pid, spawned.at).then_some(spawned.pid)
+        let spawned = self.note_of(job)?;
+        self.is_ours(spawned.pid, spawned.at, spawned.mark)
+            .then_some(spawned.pid)
     }
+
+    /// What was written down of the job's vm-host when it was started.
+    fn note_of(&self, job: &str) -> Option<Spawned> {
+        serde_json::from_slice(&std::fs::read(self.spawned(job)).ok()?).ok()
+    }
+
+    /// Whether the process `pid` that the job's state names is its vm-host: by the start written down for that
+    /// process when it was started, else by the time the state gives.
+    fn state_is_ours(&self, job: &str, state: &JobState) -> bool {
+        let mark = self
+            .note_of(job)
+            .filter(|spawned| spawned.pid == state.pid)
+            .and_then(|spawned| spawned.mark);
+        self.is_ours(state.pid, state.started_at, mark)
+    }
+}
+
+/// Whether `process` started by the moment `born_by` (seconds since 1970), or, where `mark` is known, at that very
+/// start. A wall clock that was stepped since moves what Linux says of an old process's start in seconds (it works it
+/// out from the clock at every read) and nothing of its mark: a board without a clock of its own that meets NTP after
+/// its vm-hosts started still knows them.
+fn started_by(process: &Process, born_by: u64, mark: Option<u64>) -> bool {
+    match (mark, process.mark) {
+        (Some(noted), Some(now)) => noted == now,
+        _ => process.started_at <= born_by.saturating_add(START_SLACK),
+    }
+}
+
+/// The name of the systemd scope a job's vm-host runs in. A job's name ([`JobRequest::check`]) is one a unit can
+/// carry as it is.
+fn scope_unit(job: &str) -> String {
+    format!("codefusion-runner-{job}.scope")
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -180,48 +275,15 @@ fn ended_uncollected(pid: u32) -> bool {
 }
 
 /// The program a process runs.
-#[cfg(target_os = "macos")]
 fn process_path(pid: u32) -> Option<PathBuf> {
-    cf_host_macos::program_of(libc::c_int::try_from(pid).ok()?)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_path(pid: u32) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-/// When a process started, in seconds since 1970.
-#[cfg(target_os = "macos")]
-fn process_start(pid: u32) -> Option<u64> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` is `size` writable bytes, which is what is passed; the call writes at most that many and says
-    // how many it wrote.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            libc::c_int::try_from(pid).ok()?,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if written != size {
-        return None;
-    }
-    // SAFETY: the call wrote the whole struct, which is integers and bytes and was zeroed before.
-    Some(unsafe { info.assume_init() }.pbi_start_tvsec)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_start(pid: u32) -> Option<u64> {
-    let started = std::fs::metadata(format!("/proc/{pid}")).ok()?.modified().ok()?;
-    Some(started.duration_since(UNIX_EPOCH).ok()?.as_secs())
+    This::program(pid)
 }
 
 impl Vms for VmHosts {
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let fail = |what: &str, error: &dyn std::fmt::Display| VmError(format!("{what}: {error}"));
+        // The job's name ends up in paths and in the name of a unit.
+        request.check().map_err(|e| fail("the request", &e))?;
         // The request holds the job's registration: it goes to the vm-host's input and nowhere else.
         let json = serde_json::to_vec(request).map_err(|e| fail("the request", &e))?;
         let log = std::fs::OpenOptions::new()
@@ -236,10 +298,8 @@ impl Vms for VmHosts {
                     .open(self.layout.logs().join(format!("{}.vm-host.log", request.job)))
             })
             .map_err(|e| fail("the vm-host's log", &e))?;
-        let mut child = Command::new(&self.program)
-            .arg("vm")
-            .arg("--state-dir")
-            .arg(&self.state_dir)
+        let mut child = self
+            .command(&request.job)?
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(log)
@@ -302,7 +362,7 @@ impl Vms for VmHosts {
         match control::ask(&self.layout, job, &Request::State, ANSWER) {
             Ok(now) if now.job == state.job && now.pid == state.pid => Seen::Alive(now),
             // A number that is another program's by now is no vm-host of ours, silent or not.
-            _ if state.end.is_none() && exists(state.pid) && self.is_ours(state.pid, state.started_at) => {
+            _ if state.end.is_none() && exists(state.pid) && self.state_is_ours(job, &state) => {
                 Seen::Silent(state)
             }
             // It ended between the two looks: the file has the last word.
@@ -343,7 +403,7 @@ impl Vms for VmHosts {
             return;
         };
         let answers = control::answers(&self.layout, &state, ANSWER);
-        if !(answers || self.is_ours(state.pid, state.started_at)) {
+        if !(answers || self.state_is_ours(job, &state)) {
             return;
         }
         if let Ok(pid) = libc::pid_t::try_from(state.pid)
@@ -409,6 +469,158 @@ mod tests {
         }
     }
 
+    /// A Runner that starts again looks at a vm-host for the first time long after the vm-host started: its start is
+    /// when it started, not when it was first looked at (Linux makes `/proc/<pid>` only then, with that time).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vm_host_first_looked_at_long_after_it_started_is_still_known_as_ours() {
+        let folder = tempfile::tempdir().expect("folder");
+        let program = Path::new(SLEEP);
+        let vms = VmHosts::new(program, folder.path().join("state"));
+        let born_by = now_s();
+        let mut child = Command::new(program)
+            .arg("60")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("a process");
+        // Nothing here looks at the process until well past the slack a start may have.
+        std::thread::sleep(Duration::from_secs(START_SLACK + 2));
+        let ours = vms.is_ours(child.id(), born_by, None);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(ours, "a vm-host that has run for a while is no stranger");
+    }
+
+    #[test]
+    fn a_process_known_by_its_start_mark_is_that_process_whatever_the_wall_clock_did() {
+        let born_by = 1_000_000;
+        let process = |started_at: u64, mark: Option<u64>| Process {
+            program: PathBuf::from("/bin/codefusion-runner"),
+            started_at,
+            mark,
+        };
+        // No mark: started no later than the time written down, with the slack of two reads of one clock.
+        assert!(started_by(&process(born_by + START_SLACK, None), born_by, None));
+        assert!(!started_by(
+            &process(born_by + START_SLACK + 1, None),
+            born_by,
+            None
+        ));
+        assert!(started_by(&process(born_by - 3600, Some(7)), born_by, None));
+        // The clock was stepped an hour forward since: the seconds moved, the mark did not.
+        assert!(started_by(
+            &process(born_by + 3600, Some(4200)),
+            born_by,
+            Some(4200)
+        ));
+        // The number went to another process, which by the seconds would pass.
+        assert!(!started_by(
+            &process(born_by - 10, Some(4300)),
+            born_by,
+            Some(4200)
+        ));
+        // A system that keeps no mark is judged by the seconds.
+        assert!(started_by(&process(born_by, None), born_by, Some(4200)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vm_host_is_written_down_with_its_start_mark_and_known_by_it() {
+        let folder = tempfile::tempdir().expect("folder");
+        let program = Path::new(SLEEP);
+        let vms = VmHosts::new(program, folder.path().join("state"));
+        let mut vm_host = Asleep::start(program);
+        vms.note("j1", vm_host.id()).expect("a note");
+        let noted = vms.note_of("j1").expect("the note");
+        let mark = This::process(vm_host.id()).and_then(|process| process.mark);
+        assert!(mark.is_some(), "Linux keeps a mark");
+        assert_eq!((noted.pid, noted.mark), (vm_host.id(), mark));
+        assert_eq!(vms.noted("j1"), Some(vm_host.id()));
+        // A note that names another start of that number names no process to end.
+        std::fs::write(
+            vms.spawned("j2"),
+            serde_json::to_vec(&Spawned {
+                pid: vm_host.id(),
+                at: now_s(),
+                mark: mark.map(|mark| mark + 1),
+            })
+            .expect("json"),
+        )
+        .expect("a note");
+        assert_eq!(vms.noted("j2"), None);
+        vms.kill("j2");
+        assert!(vm_host.runs(), "a process that only has the number was killed");
+    }
+
+    #[test]
+    fn a_job_whose_name_no_path_or_scope_can_carry_is_not_started() {
+        let folder = tempfile::tempdir().expect("folder");
+        let vms = VmHosts::new("/bin/true", folder.path()).in_scopes("/bin/true");
+        for job in [
+            "",
+            "a.b",
+            "a/b",
+            "a b",
+            "a\\x2d",
+            "a_b",
+            "J1",
+            "ä",
+            "a\n",
+            &"j".repeat(33),
+        ] {
+            let refused = vms.start(&request(job)).expect_err(job);
+            assert!(
+                refused.0.starts_with("the request: the request is refused"),
+                "{job:?}: {}",
+                refused.0
+            );
+        }
+        assert!(
+            !folder.path().join("logs").exists(),
+            "a refused job leaves no log"
+        );
+    }
+
+    #[test]
+    fn a_vm_host_in_a_scope_is_the_runners_program_under_systemd_run_with_its_cgroup_delegated() {
+        let vms = VmHosts::new("/state/bin/codefusion-runner", "/state").in_scopes("/usr/bin/systemd-run");
+        let command = match vms.command("j1a2b3c4") {
+            Ok(command) => command,
+            // Where no systemd user manager runs for this user, there is no bus to start a scope on.
+            Err(error) if cfg!(target_os = "linux") => {
+                assert!(error.0.starts_with("no scope for the vm-host: "), "{}", error.0);
+                return;
+            }
+            Err(error) => panic!("{}", error.0),
+        };
+        assert_eq!(command.get_program(), "/usr/bin/systemd-run");
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--property=Delegate=yes",
+                "--unit=codefusion-runner-j1a2b3c4.scope",
+                "--",
+                "/state/bin/codefusion-runner",
+                "vm",
+                "--state-dir",
+                "/state",
+            ]
+        );
+        let direct = VmHosts::new("/state/bin/codefusion-runner", "/state")
+            .command("j1a2b3c4")
+            .expect("a command");
+        assert_eq!(direct.get_program(), "/state/bin/codefusion-runner");
+        assert_eq!(
+            direct.get_args().collect::<Vec<_>>(),
+            ["vm", "--state-dir", "/state"]
+        );
+    }
+
     /// A program in place of the Runner's binary, as a vm-host that hangs before it wrote anything.
     fn hanging(folder: &Path) -> PathBuf {
         let program = folder.join("vm-host");
@@ -426,6 +638,45 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         holds()
+    }
+
+    /// systemd refuses the scope (a scope of that name stands, the user's systemd will not take another unit): the
+    /// vm-host never runs. The start fails, or the job ends as one whose vm-host exited before it began, and
+    /// systemd's words are in the vm-host's log, not lost.
+    #[test]
+    fn a_scope_systemd_refuses_ends_the_job_with_systemds_words_in_its_log() {
+        let folder = tempfile::tempdir().expect("folder");
+        let refuses = folder.path().join("systemd-run");
+        std::fs::write(
+            &refuses,
+            "#!/bin/sh\necho 'Failed to start transient scope unit: Unit codefusion-runner-j1.scope already exists.' \
+             >&2\nexit 1\n",
+        )
+        .expect("a program");
+        std::fs::set_permissions(&refuses, std::fs::Permissions::from_mode(0o755)).expect("a mode");
+        let vms = VmHosts::new(hanging(folder.path()), folder.path().join("state")).in_scopes(&refuses);
+        match vms.start(&request("j1")) {
+            // systemd-run ended after the job was handed over: the next look sees a vm-host gone without a word.
+            Ok(()) => assert!(
+                within(Duration::from_secs(5), || matches!(vms.look("j1"), Seen::Exited)),
+                "a refused scope looks like a vm-host that still starts: {:?}",
+                vms.look("j1")
+            ),
+            // It ended before: the start itself fails.
+            Err(error) if error.0.starts_with("hand the vm-host its job: ") => {}
+            // Where no systemd user manager runs for this user, the start is refused before systemd is asked.
+            Err(error) if cfg!(target_os = "linux") => {
+                assert!(error.0.starts_with("no scope for the vm-host: "), "{}", error.0);
+                return;
+            }
+            Err(error) => panic!("{}", error.0),
+        }
+        let log =
+            std::fs::read_to_string(vms.layout.logs().join("j1.vm-host.log")).expect("the vm-host's log");
+        assert!(
+            log.contains("Unit codefusion-runner-j1.scope already exists."),
+            "{log}"
+        );
     }
 
     #[test]
@@ -608,6 +859,7 @@ mod tests {
             serde_json::to_vec(&Spawned {
                 pid: later.id(),
                 at: long_ago,
+                mark: None,
             })
             .expect("json"),
         )
@@ -642,7 +894,12 @@ mod tests {
         std::fs::remove_file(vms.layout.state("j1")).expect("the state");
         std::fs::write(
             vms.spawned("j1"),
-            serde_json::to_vec(&Spawned { pid: me, at: now_s() }).expect("json"),
+            serde_json::to_vec(&Spawned {
+                pid: me,
+                at: now_s(),
+                mark: None,
+            })
+            .expect("json"),
         )
         .expect("a note");
         assert_eq!(vms.noted("j1"), None);

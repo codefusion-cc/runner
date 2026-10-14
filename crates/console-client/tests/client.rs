@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cf_console_client::{
-    Client, Error, MAX_BODY_BYTES, MAX_JOB_EVENTS, MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS, Outbox, enroll,
-    is_machine_name,
+    Client, Enroll, Error, MAX_BODY_BYTES, MAX_JOB_EVENTS, MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS, Os,
+    Outbox, Report, enroll, is_machine_name,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::httpd::{Handler, Reply, Server};
@@ -47,8 +47,57 @@ async fn enrolling_gives_the_token_and_name_and_sends_the_contracts_fields() {
         fake.enrollments(),
         vec![json!({
             "protocol": 1, "code": "code-a", "machine": "mac-a", "hostname": "Build-Mac-2.local", "model": "Apple M5",
-            "version": "abc1234", "cpus": 10, "memoryBytes": 17179869184u64,
+            "version": "abc1234", "cpus": 10, "memoryBytes": 17179869184u64, "os": "macos",
         })]
+    );
+    assert_eq!(fake.os_of("mac-a").as_deref(), Some("macos"));
+}
+
+#[tokio::test]
+async fn the_system_travels_as_the_console_names_it_and_none_is_left_out() {
+    let fake = FakeConsole::start().await;
+    for (code, machine, os, sent) in [
+        ("code-l", "host-l", Some(Os::Linux), Some("linux")),
+        ("code-m", "host-m", Some(Os::Macos), Some("macos")),
+        ("code-n", "host-n", None, None),
+    ] {
+        fake.add_code(code);
+        let enrolled = enroll(
+            &http(),
+            &fake.url(),
+            &Enroll {
+                os,
+                ..hello(code, machine)
+            },
+        )
+        .await
+        .expect("enrolled");
+        let hello = fake.enrollments().pop().expect("the request");
+        assert_eq!(hello.get("os").and_then(Value::as_str), sent, "{machine}");
+        assert_eq!(fake.os_of(machine).as_deref(), sent, "{machine}");
+        let client = Client::new(&fake.url(), enrolled.token, http());
+        client
+            .report(&Report {
+                os,
+                ..report(machine)
+            })
+            .await
+            .expect("an answer");
+        let report = fake.reports().pop().expect("the report");
+        assert_eq!(report.get("os").and_then(Value::as_str), sent, "{machine}");
+        assert!(
+            sent.is_some() || report.get("os").is_none(),
+            "none is left out, not null"
+        );
+    }
+    // The build's own system is the one it says.
+    assert_eq!(
+        Os::this(),
+        Some(if cfg!(target_os = "linux") {
+            Os::Linux
+        } else {
+            Os::Macos
+        })
     );
 }
 

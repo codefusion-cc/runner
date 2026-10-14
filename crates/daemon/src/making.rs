@@ -98,7 +98,7 @@ impl Making {
                 } else if past(room.empty, NO_ROOM_WAIT) {
                     Some((
                         true,
-                        "the Mac is empty and still has no room: what else runs on it holds the memory",
+                        "the host is empty and still has no room: what else runs on it holds the memory",
                     ))
                 } else if past(room.alone, TAKEN_BACK_WAIT) {
                     Some((false, "GitHub took the job back and did not hand it here again"))
