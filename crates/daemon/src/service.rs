@@ -1065,8 +1065,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 updated_at: iso(now),
                 open,
                 reason,
-                // Of the commonest size, under the limits in force.
+                // Of the commonest size, under the limits in force, for consoles that do not read the memory.
                 max_jobs: settings.side_by_side(&snapshot.budget.limits, Size::G4),
+                memory_for_jobs_bytes: Some(snapshot.budget.limits.cap_bytes),
                 paused,
                 host,
                 host_error: snapshot
@@ -1142,6 +1143,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             cpu_percent: -1.0,
                             memory_bytes,
                         }),
+                        size: machine.size.map(|size| size.label().to_string()),
+                        counted_bytes: machine.counted_bytes,
                     })
                     .collect(),
             },

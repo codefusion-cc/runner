@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cf_budget::{Battery, FakeHost};
+use cf_budget::{Battery, FakeHost, GIB, Millis, Mode, Settings, Size};
 use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{
@@ -85,6 +85,11 @@ impl Rig {
 
     /// A Mac with room for `machines` machines, enrolled at the console, serving [`REPO`] with one workflow.
     async fn new(machines: u32) -> Rig {
+        Rig::with_settings(settings_for(machines)).await
+    }
+
+    /// A host with these budget numbers, enrolled at the console, serving [`REPO`] with one workflow.
+    async fn with_settings(settings: Settings) -> Rig {
         let github = FakeGithub::start(Options {
             poll_timeout: Duration::from_millis(150),
             auto_assign: true,
@@ -122,7 +127,7 @@ impl Rig {
             roster: Arc::new(Roster::new()),
             clock: clock.clone(),
             reports: Arc::new(ReportLog::default()),
-            settings: settings_for(machines),
+            settings,
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
             bell: Arc::new(Nudge::default()),
@@ -3304,4 +3309,114 @@ async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
         last["notServing"],
         json!("the Runner ends; the one that starts next serves them again")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workstation_reports_the_memory_for_jobs_of_its_person_away_or_at_it() {
+    let mut settings = settings_for(2);
+    settings.mode = Mode::Workstation;
+    settings.idle_after = Millis::secs(120);
+    settings.away.cap_bytes = 10 * GIB;
+    settings.in_use.cap_bytes = 6 * GIB;
+    let mut rig = Rig::with_settings(settings).await;
+    rig.stop_pump().await;
+    rig.machines.with_host(FakeHost::touch);
+    assert_eq!(
+        rig.report()["status"]["memoryForJobsBytes"],
+        json!(6u64 << 30),
+        "the person is there"
+    );
+    pass(&rig.machines, 120);
+    let away = rig.report();
+    assert_eq!(
+        away["status"]["memoryForJobsBytes"],
+        json!(10u64 << 30),
+        "the person is away"
+    );
+    assert_eq!(
+        away["status"]["maxJobs"],
+        json!(2),
+        "kept for older consoles: 10 GB of cf-4g"
+    );
+    rig.machines.with_host(FakeHost::touch);
+    assert_eq!(
+        rig.report()["status"]["memoryForJobsBytes"],
+        json!(6u64 << 30),
+        "back at it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_headless_host_reports_its_one_cap_as_the_memory_for_jobs() {
+    let settings = Settings::for_headless(cf_daemon::testing::TEST_MAC, 8);
+    let cap = settings.away.cap_bytes;
+    assert!(cap > 0 && cap < 64 * GIB, "{cap}");
+    let mut rig = Rig::with_settings(settings).await;
+    rig.stop_pump().await;
+    assert_eq!(rig.report()["status"]["memoryForJobsBytes"], json!(cap));
+    rig.machines.with_host(FakeHost::touch);
+    assert_eq!(
+        rig.report()["status"]["memoryForJobsBytes"],
+        json!(cap),
+        "nobody sits at a headless host: a touch changes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_actions_runner_reports_its_machines_size_and_what_the_budget_counts_it_with() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let running = rig.job_running().await;
+    rig.queue().await;
+    until("a second machine", || rig.standing().len() == 2).await;
+    let waits = rig
+        .standing()
+        .into_iter()
+        .find(|r| *r != running)
+        .expect("the second");
+    until("both machines in a report", || {
+        rig.console.reports().last().is_some_and(|report| {
+            report["status"]["runners"].as_array().is_some_and(|runners| {
+                runners.len() == 2
+                    && runners
+                        .iter()
+                        .any(|r| r["name"] == json!(running) && r["job"].is_object())
+            })
+        })
+    })
+    .await;
+    let report = rig.console.reports().last().cloned().expect("report");
+    assert_eq!(
+        report["status"]["memoryForJobsBytes"],
+        json!(4u64 << 30),
+        "room for two cf-2g"
+    );
+    let runners = report["status"]["runners"].as_array().expect("runners");
+    let of = |name: &str| runners.iter().find(|r| r["name"] == json!(name)).expect("runner");
+    assert_eq!(of(&running)["size"], json!("cf-2g"));
+    assert_eq!(
+        of(&waits)["size"],
+        json!("cf-2g"),
+        "also while it waits for its job"
+    );
+    assert!(of(&waits).get("job").is_none());
+    // Each machine counts with its size, and together they are all the budget holds: the full cap.
+    assert_eq!(of(&running)["countedBytes"], json!(Size::G2.vm_bytes()));
+    assert_eq!(of(&waits)["countedBytes"], json!(Size::G2.vm_bytes()));
+    let counted: u64 = runners
+        .iter()
+        .map(|r| r["countedBytes"].as_u64().expect("counted"))
+        .sum();
+    let budget = rig.machines.snapshot().budget;
+    assert_eq!(
+        budget.slots.len(),
+        2,
+        "the budget holds the two machines and nothing else"
+    );
+    assert_eq!(counted, budget.committed_bytes);
+    assert_eq!(json!(counted), report["status"]["memoryForJobsBytes"]);
 }
