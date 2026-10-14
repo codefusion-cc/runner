@@ -302,7 +302,8 @@ proptest! {
                 prop_oneof![
                     "/dev/zram[0-9]{1,3}".prop_map(|name| (name, true)),
                     "/dev/zram([0-9]{0,2}[a-z_]{1,3})?".prop_map(|name| (name, false)),
-                    "/[a-y0-9_]{1,12}(/[a-z0-9_]{1,12}){0,3}".prop_map(|name| (name, false)),
+                    // No `z`, so never `/dev/zram0` by chance.
+                    "/[a-y0-9_]{1,12}(/[a-y0-9_]{1,12}){0,3}".prop_map(|name| (name, false)),
                 ],
                 any::<bool>(),
                 0..u64::MAX / 1024,
