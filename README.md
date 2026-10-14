@@ -1,7 +1,7 @@
 # CodeFusion Runner
 
 A Rust program for macOS and arm64 Linux that runs GitHub Actions jobs, each in its own small virtual machine that is
-gone when the job ends. It replaces the runner manager in `codefusion-cc/codefusion` on the CodeFusion Macs.
+gone when the job ends. It runs CodeFusion's CI on CodeFusion's own machines.
 
 The idea: a Mac opens a job slot only when it has the memory for it. The job gets a fixed amount of memory and CPU,
 and when it ends the whole machine goes away, so an idle Mac holds nothing for CI.
@@ -75,17 +75,15 @@ A configuration file says what the Mac is:
 ```
 
 - `machine` names the Mac at GitHub and at the console. Its scale sets and Actions runners carry it, so no other
-  Runner and no cf-runners manager may have the same name.
+  Runner may have the same name.
 - `state_dir` holds everything the Runner keeps and is on the Mac's own disk. `app_dir` holds the GitHub App's
-  `app.json` and `app.pem` (0600).
+  `app.json` and `app.pem` (0600); `scripts/runner-app.ts` in `codefusion-cc/codefusion` makes the App and writes them.
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below). Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
-- Beside the cf-runners manager, `app_dir` is the manager's own `~/.config/codefusion-runners` (with an `s`), which
-  the Runner only reads, and `machine` is the manager's name with `-vm`.
 
 The Mac needs Rust to build the Runner (below) and nothing else. Images are public, so a Mac without `gh` fetches a
 release with `curl -fLO https://github.com/codefusion-cc/runner/releases/download/<v>/<file>` for `Image`,
@@ -124,10 +122,9 @@ the log's first line and the console have too. `check` ends its list with the me
 of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside what runs`. That is the budget's
 own arithmetic, so it says what a Runner on this Mac would decide, short of the calm minute.
 
-`enroll` typed at a terminal asks for the code and does not show it while it is typed or pasted. The code is the
-`--code` value of the command the console's Add a Mac shows for the cf-runners manager, made for exactly this
-`machine`. Do not put it on a command line (`echo <code> | …` stays in the shell's history); a script hands it over
-on standard input from where it keeps it.
+`enroll` typed at a terminal asks for the code and does not show it while it is typed or pasted. The code is the one
+the console's Add a machine shows, made for exactly this `machine`. Do not put it on a command line (`echo <code> |
+…` stays in the shell's history); a script hands it over on standard input from where it keeps it.
 
 The state folder (images, scratch disks, machine files, the Runner's copy) is marked as skipped by Time Machine, the way
 `tmutil addexclusion <folder>` does it, by the daemon at every start and by `enroll`, `install` and `image install`. A
@@ -149,11 +146,6 @@ that run go on and are adopted.
 
 `uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
 could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
-
-Beside the cf-runners manager of `codefusion-cc/codefusion` the Runner touches nothing of it: another launchd label,
-another folder, another name at GitHub (it refuses to run under the manager's own). Both serve a `runs-on` that includes
-`self-hosted`, so GitHub gives such a job to whichever has room first. A `runs-on: cf-4g` alone goes only to the
-Runner.
 
 ## Run it on Linux
 
