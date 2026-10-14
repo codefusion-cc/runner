@@ -44,6 +44,8 @@ mod linux {
 
     /// What the stand-in writes down.
     const FOUND: &str = "found.json";
+    /// What the test writes when the stand-in may end.
+    const END: &str = "end";
 
     /// The stand-in vm-host: reads its job, claims the delegation, says what it found and ends.
     pub fn stand_in(args: &[String]) {
@@ -66,6 +68,8 @@ mod linux {
             "machines": claim.as_ref().map(|d| d.machines().display().to_string()).map_err(Clone::clone),
         });
         std::fs::write(state.join(FOUND), found.to_string()).expect("written");
+        // Runs on while the test looks at its scope.
+        within(Duration::from_secs(30), || state.join(END).exists());
     }
 
     fn user_manager() -> Result<(), String> {
@@ -80,9 +84,15 @@ mod linux {
         }
     }
 
-    fn state_of(unit: &str) -> String {
+    fn show(unit: &str, property: &str) -> String {
         let output = Command::new("/usr/bin/systemctl")
-            .args(["--user", "show", "--property=ActiveState", "--value", unit])
+            .args([
+                "--user",
+                "show",
+                &format!("--property={property}"),
+                "--value",
+                unit,
+            ])
             .output()
             .expect("systemctl");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -159,12 +169,16 @@ mod linux {
             before,
             "the Runner stays where it was"
         );
+        // systemd knows the cgroup is the vm-host's to manage, and leaves what it made there alone.
+        assert_eq!(show(&unit, "Delegate"), "yes");
+        assert_eq!(show(&unit, "ActiveState"), "active");
+        std::fs::write(state.join(END), "").expect("the end");
         // The vm-host is gone, and with it the scope and its cgroup.
         assert!(
             within(Duration::from_secs(20), || !cgroup.exists()
-                && matches!(state_of(&unit).as_str(), "inactive" | "")),
+                && matches!(show(&unit, "ActiveState").as_str(), "inactive" | "")),
             "the scope stays: {}",
-            state_of(&unit)
+            show(&unit, "ActiveState")
         );
         eprintln!("ok: a vm-host in {unit} claimed {}", cgroup.display());
     }
