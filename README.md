@@ -200,6 +200,19 @@ target/release/codefusion-runner enroll --config <file>
 target/release/codefusion-runner install --config <file>
 ```
 
+The Runner takes the first `pasta` on its `PATH`. Prefer one from 2025 or newer; where the distribution's is older
+(Debian 12 ships 2023-03), build it from upstream as the Runner's user, at a tagged release whose name ends in the
+commit it was made from, and put it first on the unit's `PATH` with a drop-in that `install` leaves alone:
+
+```sh
+git clone --depth 1 --branch <tag> https://passt.top/passt ~/src/passt && cd ~/src/passt && make
+install -D -m 0755 -T passt ~/.local/bin/pasta
+mkdir -p ~/.config/systemd/user/codefusion-runner.service.d
+printf '[Service]\nEnvironment=PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin\n' "$HOME" \
+  > ~/.config/systemd/user/codefusion-runner.service.d/pasta.conf
+systemctl --user daemon-reload && systemctl --user restart codefusion-runner
+```
+
 `check` lists what Linux needs and the command that brings what is missing: `/dev/kvm` open to the user, lingering,
 memory and pids handed on to the user's systemd, user namespaces, pasta, a state folder that may run programs, and a
 build that carries cloud-hypervisor. `install` copies the program to `<state_dir>/bin`, writes
