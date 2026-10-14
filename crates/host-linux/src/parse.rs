@@ -123,8 +123,10 @@ pub struct Swap {
 /// the header or a line is not that.
 pub fn swaps(text: &str) -> Option<Vec<Swap>> {
     let mut lines = text.lines();
-    if lines.next()?.split_whitespace().collect::<Vec<_>>()
-        != ["Filename", "Type", "Size", "Used", "Priority"]
+    if !lines
+        .next()?
+        .split_whitespace()
+        .eq(["Filename", "Type", "Size", "Used", "Priority"])
     {
         return None;
     }

@@ -158,7 +158,7 @@ impl Watch {
             self.critical_since = None;
         }
 
-        // The counter only ever rises; any other value than the last one means pages went out (or the count
+        // Any other value than the last one means pages went out (or came back from a disk, or the count
         // started again, which is no better).
         if self.swapouts.is_some_and(|before| before != reading.swapouts) {
             self.last_swapout = Some(now);
