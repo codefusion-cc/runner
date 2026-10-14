@@ -135,6 +135,7 @@ mod tests {
             private,
             archived: false,
             disabled: false,
+            default_branch: Some("main".into()),
         }
     }
 
