@@ -1,5 +1,5 @@
-//! The Runner's configuration file: where its state is, which GitHub App and console it talks to, what the Mac
-//! is for. One JSON file that the service's launchd entry names; nothing in it is a secret.
+//! The Runner's configuration file: where its state is, which GitHub App and console it talks to, what the host
+//! is for. One JSON file that the service manager's entry names; nothing in it is a secret.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,6 +9,7 @@ use cf_daemon::names::slug;
 use serde::Deserialize;
 
 /// The label of the cf-runners manager's launchd agent, which the Runner may run beside and never touches.
+#[cfg(target_os = "macos")]
 pub const OLD_MANAGER_LABEL: &str = "cc.codefusion.runners";
 
 /// What a person works on the Mac means for jobs.
@@ -47,8 +48,10 @@ pub struct Config {
     /// The console's address, when the Mac reports to one.
     #[serde(default)]
     pub console: Option<String>,
-    /// Whether a person works on the Mac.
+    /// Whether a person works on the Mac. Required on a Mac; on Linux, where nobody sits at the host, it is
+    /// `dedicated` or left out.
     #[serde(rename = "use")]
+    #[cfg_attr(not(target_os = "macos"), serde(default = "dedicated"))]
     pub mac_use: Use,
     /// The longest a job may run, in minutes.
     #[serde(default = "deadline_minutes")]
@@ -65,6 +68,11 @@ fn github_api() -> String {
 
 const fn deadline_minutes() -> u64 {
     360
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn dedicated() -> Use {
+    Use::Dedicated
 }
 
 impl Config {
@@ -109,6 +117,7 @@ impl Config {
             }
         }
         // The service reads and writes the state folder, and `update` builds in the build folder.
+        #[cfg(target_os = "macos")]
         for (what, folder) in std::iter::once(("state_dir", &self.state_dir)).chain(build_folder) {
             if folder.starts_with("/Volumes") {
                 return Err(format!(
@@ -116,6 +125,14 @@ impl Config {
                     folder.display()
                 ));
             }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if self.mac_use == Use::Workstation {
+            return Err(
+                "use: `workstation` means something on macOS only, where a person works at the Mac; say \
+                 `dedicated` or leave `use` out"
+                    .into(),
+            );
         }
         if self.image.is_empty() {
             return Err("image: no version".into());
@@ -177,6 +194,7 @@ impl Config {
 /// The name the cf-runners manager has on this Mac, when it is installed for this user: the `machine` of its
 /// configuration, or the name it makes of the host name. The Runner must not carry it: both name their scale sets
 /// `<machine>--…`, each deletes those of its name it does not want, and their sessions would shut each other out.
+#[cfg(target_os = "macos")]
 pub fn old_manager_name(home: &Path, hostname: &str) -> Option<String> {
     let agent = home
         .join("Library/LaunchAgents")
@@ -198,6 +216,7 @@ pub fn old_manager_name(home: &Path, hostname: &str) -> Option<String> {
 }
 
 /// Refuses a machine name the cf-runners manager on this Mac has.
+#[cfg(target_os = "macos")]
 pub fn check_beside_old_manager(config: &Config, home: &Path, hostname: &str) -> Result<(), String> {
     match old_manager_name(home, hostname) {
         Some(old) if old == config.machine => Err(format!(
@@ -217,7 +236,7 @@ mod tests {
         "state_dir": "/Users/someone/Library/Application Support/CodeFusion Runner",
         "app_dir": "/Users/someone/.config/codefusion-runners",
         "image": "2026.10.1",
-        "use": "workstation"
+        "use": "dedicated"
     }"#;
 
     fn with(change: impl FnOnce(&mut serde_json::Value)) -> Result<Config, String> {
@@ -255,7 +274,7 @@ mod tests {
         let config = Config::parse(WHOLE).expect("config");
         assert_eq!(config.github_api, "https://api.github.com");
         assert_eq!(config.deadline(), Duration::from_secs(6 * 3600));
-        assert_eq!(config.mode(), Mode::Workstation);
+        assert_eq!(config.mode(), Mode::Dedicated);
         assert_eq!(config.console, None);
         assert_eq!(config.repos, Vec::<String>::new());
         assert_eq!(
@@ -294,11 +313,40 @@ mod tests {
     }
 
     #[test]
-    fn the_state_folder_is_absolute_and_on_no_external_volume() {
+    fn the_state_folder_is_absolute_and_on_a_mac_on_no_external_volume() {
         assert!(with(|v| v["state_dir"] = "state".into()).is_err());
-        let error = with(|v| v["state_dir"] = "/Volumes/External/runner".into()).expect_err("refused");
-        assert!(error.contains("external volume"), "{error}");
         assert!(with(|v| v["app_dir"] = "~/.config/x".into()).is_err());
+        let external = with(|v| v["state_dir"] = "/Volumes/External/runner".into());
+        if cfg!(target_os = "macos") {
+            let error = external.expect_err("refused");
+            assert!(error.contains("external volume"), "{error}");
+        } else {
+            // A folder of that name is nothing special on Linux.
+            assert!(external.is_ok(), "{external:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_host_is_for_is_said_on_a_mac_and_may_be_left_out_on_linux_where_nobody_works_at_it() {
+        let without = with(|v| {
+            v.as_object_mut().expect("an object").remove("use");
+        });
+        let workstation = with(|v| v["use"] = "workstation".into());
+        if cfg!(target_os = "macos") {
+            let error = without.expect_err("required");
+            assert!(error.contains("use"), "{error}");
+            assert_eq!(workstation.map(|c| c.mode()), Ok(Mode::Workstation));
+        } else {
+            assert_eq!(without.map(|c| c.mode()), Ok(Mode::Dedicated));
+            let error = workstation.expect_err("no person works at a Linux host");
+            assert!(
+                error.starts_with("use: `workstation` means something on macOS only"),
+                "{error}"
+            );
+        }
+        // `dedicated` is read on both, and a word it does not know is refused on both.
+        assert_eq!(with(|_| ()).map(|c| c.mode()), Ok(Mode::Dedicated));
+        assert!(with(|v| v["use"] = "sometimes".into()).is_err());
     }
 
     #[test]
@@ -315,11 +363,13 @@ mod tests {
             error.starts_with("build_folder:") && error.contains("absolute"),
             "{error}"
         );
-        let error = with(|v| v["build_folder"] = "/Volumes/External/runner".into()).expect_err("refused");
-        assert!(
-            error.starts_with("build_folder:") && error.contains("external volume"),
-            "{error}"
-        );
+        if cfg!(target_os = "macos") {
+            let error = with(|v| v["build_folder"] = "/Volumes/External/runner".into()).expect_err("refused");
+            assert!(
+                error.starts_with("build_folder:") && error.contains("external volume"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -368,6 +418,7 @@ mod tests {
         assert!(with(|v| v["use"] = "sometimes".into()).is_err());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_old_managers_name_is_refused_only_while_the_old_manager_is_installed() {
         let home = tempfile::tempdir().expect("home");

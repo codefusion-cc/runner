@@ -1,5 +1,7 @@
 use std::path::Path;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use cf_daemon::{Platform as _, This};
 use cf_image::store::Store;
 use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
@@ -9,18 +11,20 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CF_BUILT
 
 const USAGE: &str = "usage: codefusion-runner
   version
-  check --config <file> [--github]      what an install needs and, with --github, what GitHub shows this Mac
+  check --config <file> [--github]      what an install needs and, with --github, what GitHub shows this host
   enroll --config <file>                enrol at the console with the one-time code on standard input
-  install --config <file>               install or update the launchd agent
+  install --config <file>               install or update the service (a launchd agent on macOS, a systemd
+                                        user unit on Linux)
   uninstall --config <file> [--leave] [--purge]
-                                        stop every machine and remove the agent; --leave the console too,
+                                        stop every machine and remove the service; --leave the console too,
                                         --purge the state folder
-  daemon --config <file>                the service (what the agent runs)
+  daemon --config <file>                the service (what the service manager runs)
   image verify <folder> --version <v>
   image install <folder> --version <v> --state-dir <folder>
   vm --state-dir <folder> [--host-cpus <list>]
                                         the vm-host of one job; on Linux --host-cpus are the CPUs its
                                         machine runs on (such as 4-7), by default the fastest
+  vmm                                   the virtual machine monitor this build carries (Linux)
   boot-proof [--memory-mb N] [--timeout-s N, at most 3600] [--host-cpus <list>]";
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -49,6 +53,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             options @ ..,
         ] => service(command, config, options),
         ["boot-proof", rest @ ..] => boot_proof(rest),
+        #[cfg(target_os = "linux")]
+        ["vmm"] => crate::linux::vmm(),
         _ => Err(USAGE.into()),
     }
 }
@@ -71,14 +77,14 @@ fn install(folder: &str, version: &str, state: &str) -> Result<(), String> {
         .install(Path::new(folder), version, &key)
         .map_err(|error| error.to_string())?;
     println!("ok: image {} installed", manifest.version);
-    #[cfg(target_os = "macos")]
-    if let Some(said) = crate::service::keep_out_of_backups(Path::new(state)) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(said) = This::keep_state(Path::new(state)) {
         eprintln!("note: {said}");
     }
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn service(command: &str, config: &str, options: &[&str]) -> Result<(), String> {
     let config = Path::new(config);
     let has = |option: &str| options.contains(&option);
@@ -95,9 +101,9 @@ fn service(command: &str, config: &str, options: &[&str]) -> Result<(), String> 
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn service(_command: &str, _config: &str, _options: &[&str]) -> Result<(), String> {
-    Err("the service runs on macOS only".into())
+    Err("the service runs on macOS and Linux only".into())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

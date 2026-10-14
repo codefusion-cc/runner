@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use cf_budget::FakeHost;
 use cf_budget::{GIB, HostFacts, Millis, Mode, Settings, Size};
 use cf_ghapp::Clock;
 use cf_guest_proto::{GuestEnd, OomEvent, Process, StopReason, Summary, Usage};
-use cf_host_macos::FakeHost;
 use cf_vmhost::{End, Ended, JobRequest, JobState, Stage};
 
 use crate::machines::{JobReport, MachineConfig, MachineParts, Machines, Reports};

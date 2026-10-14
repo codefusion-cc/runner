@@ -25,14 +25,15 @@ pub const PASTA_TRIAL: Duration = Duration::from_secs(10);
 /// Where pasta is looked for when there is no `PATH`.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// What a build without cloud-hypervisor says, and how to make one with it.
+pub const NOT_EMBEDDED: &str = "this build carries no cloud-hypervisor: build it with `cargo xtask build` on Linux for \
+                                arm64, the one architecture it is pinned for";
+
 /// Unpacks the embedded cloud-hypervisor into `dir` (made private when it is not there), checked byte for byte,
 /// and says where it is; a file that is there and right stays. A folder or file another user could change is
 /// refused.
 pub fn unpack(dir: &Path) -> Result<PathBuf, String> {
-    let embedded = embedded().ok_or(
-        "this build carries no cloud-hypervisor: build it after `cargo xtask cloud-hypervisor` on Linux for arm64, \
-         the one architecture it is pinned for",
-    )?;
+    let embedded = embedded().ok_or(NOT_EMBEDDED)?;
     unpack_these(dir, embedded)
 }
 

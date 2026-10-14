@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cf_budget::{Battery, FakeHost};
 use cf_console_client::{Client, Enroll, JobEvent, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{
@@ -24,7 +25,6 @@ use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Clock as _, Http, RetryPolicy};
 use cf_guest_proto::StopReason;
-use cf_host_macos::{Battery, FakeHost};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 use cf_vmhost::End;
@@ -106,6 +106,7 @@ impl Rig {
                 version: "0.1.0".into(),
                 cpus: 16,
                 memory_bytes: 64 << 30,
+                os: cf_console_client::Os::this(),
             },
         )
         .await
@@ -2979,7 +2980,7 @@ async fn a_restart_is_said_by_the_runner_that_starts_next_and_not_done_again() {
     assert_eq!(heard[0]["ok"], json!(true));
     assert_eq!(
         heard[0]["message"],
-        json!(format!("{RUNNING} ends and launchd starts it again"))
+        json!(format!("{RUNNING} ends and its service manager starts it again"))
     );
     assert!(!rig.service.restart_requested(), "the command is not done again");
 }

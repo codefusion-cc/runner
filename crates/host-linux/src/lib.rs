@@ -25,5 +25,5 @@ pub use convert::{Raw, Supply, Trip, TripKind, Zone, cpu_percent, pressure_of, r
 pub use host::LinuxHost;
 pub use parse::{CpuTicks, Psi};
 pub use read::{
-    Process, battery, boot_session, boot_time, fast_cpus, host_name, load, model, process, program_of,
+    Process, battery, boot_session, boot_time, fast_cpus, host_name, load, model, process, program_of, under,
 };

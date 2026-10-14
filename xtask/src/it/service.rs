@@ -1,7 +1,7 @@
 //! The service's scenarios: the whole loop with a real machine, and the installed program's own commands.
 //!
 //! GitHub and the console are the repository's fakes, on this Mac. `service` builds the service the way the
-//! program does (`cf_daemon::mac_service`), with a shell script in the machine in place of the Actions runner, and
+//! program does (`cf_daemon::host_service`), with a shell script in the machine in place of the Actions runner, and
 //! takes three jobs through it: one to its end, one across a Runner that dies and starts again, one into an
 //! uninstall. `commands` runs the program itself: `enroll`, `check --github`, and `daemon` until a SIGTERM. Nothing
 //! is installed: no launchd agent, no file outside the suite's folders.
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use cf_budget::Mode;
 use cf_daemon::names::ServePolicy;
-use cf_daemon::{MacMachines, MacService, MacSetup, mac_service, records_dir};
+use cf_daemon::{HostMachines, HostService, HostSetup, This, host_service, records_dir};
 use cf_fake_console::FakeConsole;
 use cf_fake_github::harness::REPO;
 use cf_fake_github::{FakeGithub, Options, test_key};
@@ -83,8 +83,8 @@ impl World {
 /// One Runner: what a process of the program holds. Dropping its runtime is the process dying.
 struct Process {
     runtime: Runtime,
-    machines: Arc<MacMachines>,
-    service: Arc<MacService>,
+    machines: Arc<HostMachines>,
+    service: Arc<HostService>,
     stop: ShutdownTrigger,
     run: tokio::task::JoinHandle<()>,
 }
@@ -93,7 +93,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
     let runtime = runtime()?;
     let (machines, service) = {
         let _inside = runtime.enter();
-        mac_service(MacSetup {
+        host_service::<This>(HostSetup {
             machine: MACHINE.into(),
             version: "0.0.0-it".into(),
             state_dir: bench.state.clone(),
@@ -232,7 +232,7 @@ fn records(bench: &Bench) -> usize {
 fn nothing_left(
     bench: &Bench,
     world: &World,
-    machines_of: &MacMachines,
+    machines_of: &HostMachines,
     standing: &BTreeSet<u32>,
 ) -> Fallible<()> {
     let clean = || {
@@ -295,6 +295,7 @@ pub fn service(bench: &Bench) -> Fallible<Vec<String>> {
                 version: "0.0.0-it".into(),
                 cpus: 8,
                 memory_bytes: 16 << 30,
+                os: cf_console_client::Os::this(),
             },
         ))?
         .token;

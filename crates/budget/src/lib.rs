@@ -26,9 +26,11 @@
 //!   [`DEFER_LIMIT`] behind a later one ([`Budget::line`]).
 //!   [`Status`] names every slot with how it came to be ([`Origin`]) and every waiting job with what keeps it.
 //!
-//! The numbers are [`Settings`]; [`Settings::for_host`] has the defaults and where each comes from.
+//! The numbers are [`Settings`]; [`Settings::for_host`] has the defaults and where each comes from. [`FakeHost`] is a
+//! host a test scripts: time passes, the host sleeps, the person comes back, a read fails.
 
 mod budget;
+mod fake;
 mod host;
 mod level;
 mod settings;
@@ -38,6 +40,7 @@ pub use budget::{
     Assigned, Budget, Charge, Eviction, EvictionCause, Free, Grant, Held, Observed, Origin, Refusal,
     Released, SlotId, Status, Turn, UnknownSlot, Usage, Waiting, admit,
 };
+pub use fake::FakeHost;
 pub use host::{Battery, Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};
 pub use settings::{DEFER_LIMIT, Mode, Profile, Settings, SettingsError};

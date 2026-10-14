@@ -1,10 +1,10 @@
 //! The scripted host, driven the way the daemon drives a real one: one reading a second into a real budget.
 
+use cf_budget::FakeHost;
 use cf_budget::{
     Budget, GIB, Host, HostError, HostFacts, Level, Millis, Mode, Now, Pressure, Refusal, Settings, Size,
     Trouble,
 };
-use cf_host_macos::FakeHost;
 
 const FACTS: HostFacts = HostFacts {
     total_bytes: 16 * GIB,
