@@ -1386,6 +1386,7 @@ echo built > index.html
 printf 'FROM nginx:1.29-alpine\nCOPY index.html /usr/share/nginx/html/\n' > Dockerfile
 printf 'services:\n  web:\n    build: .\n    ports: ["18080:80"]\n' > compose.yaml
 docker compose up -d --build > /tmp/compose.log 2>&1; echo compose=$?; tail -3 /tmp/compose.log
+echo nets=$(docker network inspect -f '{{{{range .IPAM.Config}}}}{{{{.Subnet}}}} {{{{end}}}}' $(docker network ls -q) | tr '\n' ' ')
 echo published=$(curl -s --max-time 30 --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/)
 echo bind-mount=$(echo shared > /tmp/stack/note && docker run --rm -v /tmp/stack:/s alpine:3.22 cat /s/note)
 docker compose down -t 1 > /dev/null 2>&1
@@ -1442,6 +1443,33 @@ echo done"#,
         ("p-disk", "refused"),
         ("p-own-network", "0"),
     ];
+    // An address in one of the daemon's own networks is answered inside the machine, where no firewall sees it:
+    // the probes would say nothing of the host. The daemon's networks keep clear of the host's, so none is.
+    let nets: Vec<(u32, u32)> = value("nets").split_whitespace().filter_map(cidr).collect();
+    expect(
+        nets.len() >= 2,
+        format!(
+            "the daemon's networks (its bridge and Compose's) were not read: {}",
+            value("nets")
+        ),
+    )?;
+    let inside: Vec<String> = unreachable
+        .iter()
+        .filter_map(|(name, address, _)| {
+            let at = u32::from(address.parse::<std::net::Ipv4Addr>().ok()?);
+            nets.iter()
+                .any(|(network, mask)| at & mask == *network)
+                .then(|| format!("{name} {address}"))
+        })
+        .collect();
+    expect(
+        inside.is_empty(),
+        format!(
+            "in the daemon's own networks ({}), so a probe there never leaves the machine: {}",
+            value("nets"),
+            inside.join(", ")
+        ),
+    )?;
     let mut wrong: Vec<String> = works
         .iter()
         .filter(|(name, wanted)| value(name) != *wanted)
@@ -1497,6 +1525,17 @@ docker run --rm alpine:3.22 sh -c 'tail /dev/zero'; echo after=$?"#;
             "its step saw {code}"
         ))
     )])
+}
+
+/// `a.b.c.d/n` as a network and its mask.
+fn cidr(text: &str) -> Option<(u32, u32)> {
+    let (address, prefix) = text.split_once('/')?;
+    let prefix: u32 = prefix.parse().ok().filter(|prefix| *prefix <= 32)?;
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    Some((
+        u32::from(address.parse::<std::net::Ipv4Addr>().ok()?) & mask,
+        mask,
+    ))
 }
 
 /// The address a machine's supervisor says its network got (`network up in … address 192.168.64.3`).
@@ -1746,7 +1785,22 @@ step();'"#;
 
 #[cfg(test)]
 mod tests {
-    use super::{ms_after, pid_arg};
+    use super::{cidr, ms_after, pid_arg};
+
+    #[test]
+    fn a_network_is_read_with_its_mask() {
+        assert_eq!(cidr("172.17.0.0/16"), Some((0xac11_0000, 0xffff_0000)));
+        assert_eq!(
+            cidr("172.17.9.9/16"),
+            Some((0xac11_0000, 0xffff_0000)),
+            "the network, not the address"
+        );
+        assert_eq!(cidr("10.0.0.1/32"), Some((0x0a00_0001, u32::MAX)));
+        assert_eq!(cidr("0.0.0.0/0"), Some((0, 0)));
+        for bad in ["172.17.0.0/33", "172.17.0.0", "fd00::/8", "/16", "a.b.c.d/8"] {
+            assert_eq!(cidr(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn a_boot_time_is_read_in_its_own_unit() {

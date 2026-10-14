@@ -112,6 +112,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
                 argv: vec!["/bin/bash".into(), "-c".into(), STAND_IN.into()],
             }),
             updates: None,
+            settings: None,
         })?
     };
     let service = Arc::new(service);

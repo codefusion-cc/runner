@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cf_budget::{Battery, FakeHost};
+use cf_budget::{Battery, FakeHost, GIB, Millis, Mode, Settings, Size};
 use cf_console_client::{Client, Enroll, JobEvent, MAX_RESULTS, OUTBOX_CAPACITY, Outbox, enroll};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::{
-    CrashingStore, FakeUpdate, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for,
+    CrashingStore, FakeSettings, FakeUpdate, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for,
 };
+use cf_daemon::update::SettingsLook;
 use cf_daemon::{
     Claim, Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
     ServiceConfig, ServiceParts, Slots,
@@ -56,6 +57,8 @@ struct Rig {
     battery: Arc<Mutex<Option<Battery>>>,
     /// How the Runner updates itself.
     updates: Arc<FakeUpdate>,
+    /// The Runner's settings file.
+    settings: Arc<FakeSettings>,
     /// How long an update waits for the machines that stand, in wall time.
     update_limit: Duration,
     /// Lets time pass on the Mac and runs the service's rounds, as its loop does, and counts them.
@@ -67,6 +70,11 @@ struct Rig {
 const ROUNDS: usize = 400;
 /// How long one round may take before [`Rig::settles`] calls the Runner stuck.
 const ROUND_STALL: Duration = Duration::from_secs(30);
+
+/// How long a real Mac's update waits for the machines that stand.
+fn default_update_limit() -> Duration {
+    ServiceConfig::new(MACHINE, "", "", RUNNING).update_limit
+}
 
 /// A test that fails while a build waits ([`FakeUpdate::hold_builds`]) ends: the runtime waits for the build.
 impl Drop for Rig {
@@ -101,15 +109,20 @@ impl Rig {
     /// A Mac with room for `machines` machines, enrolled at the console, serving [`REPO`] with one workflow. An
     /// update waits as long for the machines that stand as on a real Mac: a loaded Mac does not cut it short.
     async fn new(machines: u32) -> Rig {
-        Rig::limited(
-            machines,
-            ServiceConfig::new(MACHINE, "", "", RUNNING).update_limit,
-        )
-        .await
+        Rig::with(settings_for(machines), default_update_limit()).await
+    }
+
+    /// A host with these budget numbers, enrolled at the console, serving [`REPO`] with one workflow.
+    async fn with_settings(settings: Settings) -> Rig {
+        Rig::with(settings, default_update_limit()).await
     }
 
     /// [`Rig::new`], whose updates wait `update_limit` for the machines that stand.
     async fn limited(machines: u32, update_limit: Duration) -> Rig {
+        Rig::with(settings_for(machines), update_limit).await
+    }
+
+    async fn with(settings: Settings, update_limit: Duration) -> Rig {
         let github = FakeGithub::start(Options {
             poll_timeout: Duration::from_millis(150),
             auto_assign: true,
@@ -147,7 +160,7 @@ impl Rig {
             roster: Arc::new(Roster::new()),
             clock: clock.clone(),
             reports: Arc::new(ReportLog::default()),
-            settings: settings_for(machines),
+            settings,
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
             bell: Arc::new(Nudge::default()),
@@ -158,6 +171,7 @@ impl Rig {
         let machines = parts.machines(None);
         let battery = Arc::new(Mutex::new(None));
         let updates = Arc::new(FakeUpdate::default());
+        let settings = Arc::new(FakeSettings::default());
         let mut rig = Rig {
             service: Arc::new(service(
                 &github,
@@ -166,7 +180,7 @@ impl Rig {
                 &machines,
                 &enrolled.token,
                 &battery,
-                (&outbox, &updates, folder.path(), update_limit),
+                (&outbox, &updates, &settings, folder.path(), update_limit),
             )),
             github,
             console,
@@ -180,6 +194,7 @@ impl Rig {
             folder,
             battery,
             updates,
+            settings,
             update_limit,
             pump: None,
         };
@@ -200,6 +215,7 @@ impl Rig {
             while !stopped.load(Ordering::Relaxed) {
                 pass(&machines, 1);
                 service.sweep().await;
+                service.look_at_settings();
                 service.report().await;
                 done.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(15)).await;
@@ -299,7 +315,13 @@ impl Rig {
             &self.machines,
             &self.token,
             &self.battery,
-            (&self.outbox, &self.updates, self.folder.path(), self.update_limit),
+            (
+                &self.outbox,
+                &self.updates,
+                &self.settings,
+                self.folder.path(),
+                self.update_limit,
+            ),
         ));
         pass(&self.machines, 61);
     }
@@ -418,9 +440,15 @@ fn service(
     machines: &Arc<TestMachines>,
     token: &Secret<String>,
     battery: &Arc<Mutex<Option<Battery>>>,
-    // What stays across a daemon's starts: the outbox, the update it builds, the folder of its files, how long an
-    // update waits for the machines that stand.
-    (outbox, updates, folder, update_limit): (&Arc<Outbox>, &Arc<FakeUpdate>, &std::path::Path, Duration),
+    // What stays across a daemon's starts: the outbox, the update it builds, its settings file, the folder of its
+    // files, how long an update waits for the machines that stand.
+    (outbox, updates, settings, folder, update_limit): (
+        &Arc<Outbox>,
+        &Arc<FakeUpdate>,
+        &Arc<FakeSettings>,
+        &std::path::Path,
+        Duration,
+    ),
 ) -> TestService {
     let battery = battery.clone();
     let mut config = ServiceConfig::new(
@@ -458,6 +486,7 @@ fn service(
         }),
         updates: Some(updates.clone()),
         results: Some(folder.join("results.json")),
+        settings: Some(settings.clone()),
     })
 }
 
@@ -1240,7 +1269,13 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
         &rig.machines,
         &Secret::new("not-this-macs-token".to_string()),
         &rig.battery,
-        (&rig.outbox, &rig.updates, rig.folder.path(), rig.update_limit),
+        (
+            &rig.outbox,
+            &rig.updates,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
     );
     rig.finish(&runner, "succeeded");
     until("the end waits to be sent", || {
@@ -3439,4 +3474,317 @@ async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
         last["notServing"],
         json!("the Runner ends; the one that starts next serves them again")
     );
+}
+
+fn changed(id: &str) -> SettingsLook {
+    SettingsLook::Changed { id: id.into() }
+}
+
+/// New settings: no new job while a machine stands, the page says why, and once it ended the Runner ends to start
+/// again on them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_settings_wait_for_the_machine_that_stands_then_the_runner_starts_again() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.settings.says(changed("v2"));
+    until("no new job while the machine stands", || {
+        last_status(&rig.console)["reason"] == json!("applying new settings: waiting for 1 machine to end")
+    })
+    .await;
+    assert_eq!(last_status(&rig.console)["open"], json!(false));
+    rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    rig.github.github_looks();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.standing(), [runner.as_str()], "nothing new starts");
+    assert!(!rig.service.restart_requested());
+
+    rig.finish(&runner, "succeeded");
+    until("the Runner is to end", || rig.service.restart_requested()).await;
+    assert!(rig.standing().is_empty());
+}
+
+/// Settings no Runner could start on change nothing: jobs go on, the Runner goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_no_runner_could_start_on_change_nothing() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.settings.says(SettingsLook::Unusable {
+        why: "image 2026.10.20 is not installed".into(),
+    });
+    let looked = rig.settings.looks();
+    until("looked at again", || rig.settings.looks() > looked + 3).await;
+    rig.job_running().await;
+    rig.job_running().await;
+    assert_eq!(rig.standing().len(), 2, "jobs start as before");
+    assert_eq!(last_status(&rig.console)["open"], json!(true));
+    assert!(!rig.service.restart_requested());
+    // The console's page says so until the file changes.
+    until("the warning at the console", || {
+        last_status(&rig.console)["settingsError"]
+            == json!("the settings file changed and is not used: image 2026.10.20 is not installed")
+    })
+    .await;
+    assert!(last_status(&rig.console)["settingsErrorAt"].is_string());
+    rig.settings.says(SettingsLook::Same);
+    until("the warning gone", || {
+        last_status(&rig.console).get("settingsError").is_none()
+    })
+    .await;
+}
+
+/// A wait that runs out gives up on that version of the file and takes jobs again; it is not waited for again, and
+/// a newer version is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_settings_whose_wait_runs_out_take_jobs_again_until_the_file_changes_again() {
+    let rig = Rig::limited(2, Duration::from_secs(4)).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.settings.says(changed("v2"));
+    until("the hold", || last_status(&rig.console)["open"] == json!(false)).await;
+    // The test's limit is 4 seconds.
+    until("the hold lifted", || {
+        last_status(&rig.console)["open"] == json!(true)
+    })
+    .await;
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+    assert_eq!(rig.standing().len(), 2, "jobs start again beside {runner}");
+    let looked = rig.settings.looks();
+    until("looked at again", || rig.settings.looks() > looked + 3).await;
+    assert_eq!(
+        last_status(&rig.console)["open"],
+        json!(true),
+        "not waited for again"
+    );
+    assert_eq!(
+        last_status(&rig.console)["settingsError"],
+        json!("new settings were not taken up: still waiting for 1 machine to end after 4 seconds")
+    );
+
+    rig.settings.says(changed("v3"));
+    until("a newer version is waited for", || {
+        last_status(&rig.console)["reason"] == json!("applying new settings: waiting for 2 machines to end")
+    })
+    .await;
+}
+
+/// A file put back as it was while the Runner waited: the hold is lifted and the Runner goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_put_back_during_the_wait_lift_the_hold() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.settings.says(changed("v2"));
+    until("the hold", || last_status(&rig.console)["open"] == json!(false)).await;
+    // The console's restart would start the next Runner on the new settings beside the machine: refused.
+    let restart = rig.console.queue_command("restart", None);
+    until("the restart's result", || {
+        !results_of(&rig.console, &restart).is_empty()
+    })
+    .await;
+    assert_eq!(results_of(&rig.console, &restart)[0]["ok"], json!(false));
+    assert!(!rig.service.restart_requested());
+    rig.settings.says(SettingsLook::Same);
+    rig.finish(&runner, "succeeded");
+    until("the hold lifted", || {
+        last_status(&rig.console)["open"] == json!(true)
+    })
+    .await;
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+}
+
+/// While new settings wait an update is refused, and while an update is under way new settings wait for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_settings_and_an_update_never_wait_at_once() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.settings.says(changed("v2"));
+    until("the hold", || last_status(&rig.console)["open"] == json!(false)).await;
+    let update = rig.console.queue_command("update", None);
+    until("the update's result", || {
+        !results_of(&rig.console, &update).is_empty()
+    })
+    .await;
+    assert_eq!(results_of(&rig.console, &update)[0]["ok"], json!(false));
+    assert_eq!(rig.updates.built(), 0);
+    rig.settings.says(SettingsLook::Same);
+    rig.finish(&runner, "succeeded");
+    until("the hold lifted", || {
+        last_status(&rig.console)["open"] == json!(true)
+    })
+    .await;
+
+    rig.updates.build_takes(Duration::from_millis(1500));
+    rig.updates.build_gives(Ok(RUNNING));
+    let update = rig.console.queue_command("update", None);
+    until("building", || {
+        last_status(&rig.console)["reason"] == json!("updating: building")
+    })
+    .await;
+    rig.settings.says(changed("v3"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        last_status(&rig.console)["reason"],
+        json!("updating: building"),
+        "the update's, not the settings'"
+    );
+    assert!(!rig.service.restart_requested());
+    // The update finds nothing newer; then the settings are taken up.
+    until("then the settings are taken up", || {
+        rig.service.restart_requested()
+    })
+    .await;
+    assert_eq!(rig.updates.built(), 1);
+    assert_eq!(rig.updates.installed(), []);
+    // Its result: at the console, or kept for the next Runner to say.
+    let kept: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(rig.folder.path().join("results.json")).unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    let said: Vec<Value> = results_of(&rig.console, &update)
+        .into_iter()
+        .chain(kept.into_iter().filter(|result| result["id"] == json!(update)))
+        .collect();
+    assert!(!said.is_empty());
+    for result in &said {
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["message"],
+            json!(format!("{RUNNING} runs already: there is nothing newer"))
+        );
+    }
+}
+
+/// An update's limit runs from the console's command, the build included: a build that takes most of it leaves the
+/// wait for the machines what is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_updates_limit_counts_its_build() {
+    let rig = Rig::limited(2, Duration::from_secs(4)).await;
+    rig.service.discover().await;
+    rig.job_running().await;
+    rig.updates.build_takes(Duration::from_millis(3000));
+    rig.updates.build_gives(Ok(NEWER));
+    let began = std::time::Instant::now();
+    let update = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    // The test's limit is 4 seconds: with the build's 3 left out, the wait alone would take 4 more.
+    assert!(
+        began.elapsed() < Duration::from_millis(6000),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(results_of(&rig.console, &update)[0]["ok"], json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workstation_reports_the_memory_for_jobs_of_its_person_away_or_at_it() {
+    let mut settings = settings_for(2);
+    settings.mode = Mode::Workstation;
+    settings.idle_after = Millis::secs(120);
+    settings.away.cap_bytes = 10 * GIB;
+    settings.in_use.cap_bytes = 6 * GIB;
+    let mut rig = Rig::with_settings(settings).await;
+    rig.stop_pump().await;
+    rig.machines.with_host(FakeHost::touch);
+    assert_eq!(
+        rig.report()["status"]["memoryForJobsBytes"],
+        json!(6u64 << 30),
+        "the person is there"
+    );
+    pass(&rig.machines, 120);
+    let away = rig.report();
+    assert_eq!(
+        away["status"]["memoryForJobsBytes"],
+        json!(10u64 << 30),
+        "the person is away"
+    );
+    assert_eq!(
+        away["status"]["maxJobs"],
+        json!(2),
+        "kept for older consoles: 10 GB of cf-4g"
+    );
+    rig.machines.with_host(FakeHost::touch);
+    assert_eq!(
+        rig.report()["status"]["memoryForJobsBytes"],
+        json!(6u64 << 30),
+        "back at it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_headless_host_reports_its_one_cap_as_the_memory_for_jobs() {
+    let settings = Settings::for_headless(cf_daemon::testing::TEST_MAC, 8);
+    let cap = settings.away.cap_bytes;
+    assert!(cap > 0 && cap < 64 * GIB, "{cap}");
+    let mut rig = Rig::with_settings(settings).await;
+    rig.stop_pump().await;
+    assert_eq!(rig.report()["status"]["memoryForJobsBytes"], json!(cap));
+    rig.machines.with_host(FakeHost::touch);
+    assert_eq!(
+        rig.report()["status"]["memoryForJobsBytes"],
+        json!(cap),
+        "nobody sits at a headless host: a touch changes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_actions_runner_reports_its_machines_size_and_what_the_budget_counts_it_with() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let running = rig.job_running().await;
+    rig.queue().await;
+    until("a second machine", || rig.standing().len() == 2).await;
+    let waits = rig
+        .standing()
+        .into_iter()
+        .find(|r| *r != running)
+        .expect("the second");
+    until("both machines in a report", || {
+        rig.console.reports().last().is_some_and(|report| {
+            report["status"]["runners"].as_array().is_some_and(|runners| {
+                runners.len() == 2
+                    && runners
+                        .iter()
+                        .any(|r| r["name"] == json!(running) && r["job"].is_object())
+            })
+        })
+    })
+    .await;
+    let report = rig.console.reports().last().cloned().expect("report");
+    assert_eq!(
+        report["status"]["memoryForJobsBytes"],
+        json!(4u64 << 30),
+        "room for two cf-2g"
+    );
+    let runners = report["status"]["runners"].as_array().expect("runners");
+    let of = |name: &str| runners.iter().find(|r| r["name"] == json!(name)).expect("runner");
+    assert_eq!(of(&running)["size"], json!("cf-2g"));
+    assert_eq!(
+        of(&waits)["size"],
+        json!("cf-2g"),
+        "also while it waits for its job"
+    );
+    assert!(of(&waits).get("job").is_none());
+    // Each machine counts with its size, and together they are all the budget holds: the full cap.
+    assert_eq!(of(&running)["countedBytes"], json!(Size::G2.vm_bytes()));
+    assert_eq!(of(&waits)["countedBytes"], json!(Size::G2.vm_bytes()));
+    let counted: u64 = runners
+        .iter()
+        .map(|r| r["countedBytes"].as_u64().expect("counted"))
+        .sum();
+    let budget = rig.machines.snapshot().budget;
+    assert_eq!(
+        budget.slots.len(),
+        2,
+        "the budget holds the two machines and nothing else"
+    );
+    assert_eq!(counted, budget.committed_bytes);
+    assert_eq!(json!(counted), report["status"]["memoryForJobsBytes"]);
 }

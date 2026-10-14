@@ -696,6 +696,50 @@ async fn numbers_and_times_are_bounded() {
 }
 
 #[tokio::test]
+async fn memory_for_jobs_and_an_actions_runners_size_and_counted_bytes_are_never_refused() {
+    // The console ends each in `.catch(undefined)`: what it cannot read it drops, and the report is still taken.
+    let w = world().await;
+    let runner =
+        json!({"name": "mac-a-j1", "scaleSet": 4, "state": "idle", "started": "2026-10-10T08:00:00Z"});
+    report_gets(&w, "all left out", &report_json("mac-a"), 200).await;
+    for (label, value) in [
+        ("0", json!(0)),
+        ("12 GiB", json!(12u64 << 30)),
+        ("2^53", json!(9_007_199_254_740_992u64)),
+        ("2^53 + 2", json!(9_007_199_254_740_994u64)),
+        ("-1", json!(-1)),
+        ("1.5", json!(1.5)),
+        ("a string", json!("12884901888")),
+        ("null", Value::Null),
+    ] {
+        let memory = with(|r| r["status"]["memoryForJobsBytes"] = value.clone());
+        report_gets(&w, &format!("memoryForJobsBytes {label}"), &memory, 200).await;
+        let counted = with(|r| {
+            let mut runner = runner.clone();
+            runner["countedBytes"] = value.clone();
+            r["status"]["runners"] = json!([runner]);
+        });
+        report_gets(&w, &format!("countedBytes {label}"), &counted, 200).await;
+    }
+    for size in [
+        json!("cf-2g"),
+        json!("cf-8g"),
+        json!("cf-10g"),
+        json!("CF-4G"),
+        json!(""),
+        json!(4),
+        Value::Null,
+    ] {
+        let sized = with(|r| {
+            let mut runner = runner.clone();
+            runner["size"] = size.clone();
+            r["status"]["runners"] = json!([runner]);
+        });
+        report_gets(&w, &format!("size {size}"), &sized, 200).await;
+    }
+}
+
+#[tokio::test]
 async fn the_system_is_macos_or_linux_and_anything_else_is_read_as_none_and_refused_never() {
     let w = world().await;
     let read_as = |os: &Value| -> Option<&'static str> {

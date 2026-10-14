@@ -181,8 +181,13 @@ pub struct MachineStatus {
     pub state: &'static str,
     /// When it was asked for, in seconds since 1970.
     pub started: i64,
+    /// Its size; none for a record that names none the Runner knows.
+    pub size: Option<Size>,
     /// The machine's memory.
     pub memory_bytes: u64,
+    /// What the budget's cap counts it with while it holds a slot: the size of that slot. The vm-host's overhead is
+    /// taken out of the cap already, so these add up to the cap on a full host.
+    pub counted_bytes: Option<u64>,
     /// The memory the job holds now.
     pub used_bytes: Option<u64>,
     /// GitHub's job, once it took one.
@@ -316,8 +321,8 @@ struct Inner<H> {
     intents: BTreeMap<String, (Record, bool)>,
     paused: bool,
     draining: bool,
-    /// An update waits for the machines to end: no new job, though the Runner goes on.
-    updating: bool,
+    /// An update or new settings wait for the machines to end: no new job, though the Runner goes on.
+    holding: bool,
     /// Nobody listens to GitHub any more (an uninstall closed every session): how a job ended is not waited for.
     deaf: bool,
     host_error: Option<String>,
@@ -455,7 +460,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 intents: BTreeMap::new(),
                 paused: false,
                 draining: false,
-                updating: false,
+                holding: false,
                 deaf: false,
                 host_error: None,
                 stuck: BTreeSet::new(),
@@ -619,9 +624,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let failures = inner.breaker.holds(now.elapsed) || !inner.stuck.is_empty();
         inner.budget.hold(Hold::StartFailures, failures);
         inner.budget.hold(Hold::Paused, inner.paused);
-        inner
-            .budget
-            .hold(Hold::Draining, inner.draining || inner.updating);
+        inner.budget.hold(Hold::Draining, inner.draining || inner.holding);
         inner.making.check(&mut inner.budget, now);
     }
 
@@ -634,11 +637,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
-    /// Takes no new job while an update waits for the machines that stand to end, or takes them again when it
-    /// gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would otherwise. The polls in
-    /// flight are told.
-    pub fn hold_for_update(&self, on: bool) {
-        let changed = std::mem::replace(&mut self.lock().updating, on) != on;
+    /// Takes no new job while an update or new settings wait for the machines that stand to end, or takes them
+    /// again when the wait gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would
+    /// otherwise. The polls in flight are told.
+    pub fn hold_for_restart(&self, on: bool) {
+        let changed = std::mem::replace(&mut self.lock().holding, on) != on;
         if changed {
             self.ring();
         }
@@ -1365,7 +1368,15 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                     scale_set_id: job.record.scale_set_id,
                     state: phase_name(job.life.phase()),
                     started: job.record.created_at,
+                    size: job.record.size(),
                     memory_bytes: job.record.memory_bytes,
+                    counted_bytes: job.slot.and_then(|slot| {
+                        budget
+                            .slots
+                            .iter()
+                            .find(|held| held.slot == slot)
+                            .map(|held| held.size.vm_bytes())
+                    }),
                     used_bytes: job
                         .last
                         .as_ref()
