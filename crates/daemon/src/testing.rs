@@ -702,13 +702,15 @@ impl crate::update::SettingsFile for FakeSettings {
 /// An update a test scripts: what each build and each install answers, how long a build takes, and what was
 /// installed.
 #[derive(Debug, Default)]
-pub struct FakeUpdate(Mutex<UpdateScript>);
+pub struct FakeUpdate(Mutex<UpdateScript>, Condvar);
 
 #[derive(Debug, Default)]
 struct UpdateScript {
     builds: std::collections::VecDeque<Result<String, String>>,
     installs: std::collections::VecDeque<Result<(), String>>,
     build_takes: Duration,
+    /// Builds wait while this is set.
+    held: bool,
     built: usize,
     installed: Vec<crate::update::Pending>,
 }
@@ -731,7 +733,18 @@ impl FakeUpdate {
         self.0.lock().expect("update").build_takes = time;
     }
 
-    /// How many builds ran.
+    /// Builds started from now on wait until [`FakeUpdate::release_builds`].
+    pub fn hold_builds(&self) {
+        self.0.lock().expect("update").held = true;
+    }
+
+    /// Lets the builds that wait go on.
+    pub fn release_builds(&self) {
+        self.0.lock().expect("update").held = false;
+        self.1.notify_all();
+    }
+
+    /// How many builds started.
     pub fn built(&self) -> usize {
         self.0.lock().expect("update").built
     }
@@ -751,6 +764,7 @@ impl crate::update::SelfUpdate for FakeUpdate {
         let (takes, answer) = {
             let mut script = self.0.lock().expect("update");
             script.built += 1;
+            let mut script = self.1.wait_while(script, |script| script.held).expect("update");
             let answer = script
                 .builds
                 .pop_front()

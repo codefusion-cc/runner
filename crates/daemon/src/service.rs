@@ -490,14 +490,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if results.iter().any(|result| result.id == id) {
             return;
         }
-        if results.len() < cf_console_client::MAX_RESULTS {
-            results.push(CommandResult {
-                id,
-                ok,
-                message: cut(message, STATUS_TEXT_MAX),
-                at: iso(secs(shared.clock.now())),
-            });
-        }
+        // Never dropped: the console would send the command again, and it would be done again. Only an update's
+        // result, which ends on its own, comes while a report's worth wait (see `answered`).
+        results.push(CommandResult {
+            id,
+            ok,
+            message: cut(message, STATUS_TEXT_MAX),
+            at: iso(secs(shared.clock.now())),
+        });
         self.keep(&results);
     }
 
@@ -1209,8 +1209,16 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return shared.config.report_every;
         };
         let mut report = self.status();
-        // Kept until the console has them, so that one said meanwhile is written down beside them.
-        let results: Vec<CommandResult> = shared.results.lock().expect("results").clone();
+        // Kept until the console has them, so that one said meanwhile is written down beside them. The oldest go
+        // first, as many as a report carries; the rest go with the next.
+        let results: Vec<CommandResult> = shared
+            .results
+            .lock()
+            .expect("results")
+            .iter()
+            .take(cf_console_client::MAX_RESULTS)
+            .cloned()
+            .collect();
         report.results.clone_from(&results);
         // Read before the events are taken for the report: one queued meanwhile is news after it.
         let queued = console.outbox.queued();
@@ -1266,13 +1274,20 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             // Under way first: a command's result is in before it is no longer under way, so a command that was
             // taken is one or the other whenever the update ends meanwhile.
             let under_way = shared.update.lock().expect("update").command.as_deref() == Some(&command.id);
-            let done = shared
-                .results
-                .lock()
-                .expect("results")
-                .iter()
-                .any(|result| result.id == command.id);
+            let (done, full) = {
+                let results = shared.results.lock().expect("results");
+                (
+                    results.iter().any(|result| result.id == command.id),
+                    results.len() >= cf_console_client::MAX_RESULTS,
+                )
+            };
             if done || under_way || self.restart_requested() {
+                continue;
+            }
+            // Taken only while its result fits in the next report: the console sends the command again with the
+            // answer to that report, which takes the results that wait.
+            if full {
+                tracing::info!(id = %command.id, "a command of the console waits for room for its result");
                 continue;
             }
             tracing::info!(id = %command.id, kind = %command.kind, "a command of the console");
