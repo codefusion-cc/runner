@@ -160,6 +160,8 @@ pub struct SetState {
     pub size: Size,
     /// Whether its jobs get a Docker daemon (`cf-docker`).
     pub docker: bool,
+    /// The repository's default branch, when GitHub named it.
+    pub default_branch: Option<String>,
     /// Why its listener is not listening, when it is not.
     pub error: Option<String>,
     /// Since when, in seconds since 1970.
@@ -187,6 +189,7 @@ struct Wanted {
     labels: Vec<String>,
     size: Size,
     docker: bool,
+    default_branch: Option<String>,
 }
 
 struct Serving {
@@ -593,6 +596,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 labels: want.labels.clone(),
                 size: want.size,
                 docker: want.docker,
+                default_branch: want.default_branch.clone(),
                 error: None,
                 error_at: None,
                 statistics: None,
@@ -721,6 +725,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             labels: set.labels().to_vec(),
                             size,
                             docker: set.docker(),
+                            default_branch: repo.default_branch.clone(),
                         },
                     );
                 }
@@ -1491,13 +1496,14 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
     stop: Shutdown,
 ) {
     let bell = shared.nudge.subscribe();
-    let (name, labels, size, docker, repo) = {
+    let (name, labels, size, docker, default_branch, repo) = {
         let state = state.lock().expect("set");
         (
             state.name.clone(),
             state.labels.clone(),
             state.size,
             state.docker,
+            state.default_branch.clone(),
             state.repo.clone(),
         )
     };
@@ -1509,6 +1515,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
         || {
             let (shared, client, state, bell) = (shared.clone(), client.clone(), state.clone(), bell.clone());
             let (name, labels, repo, stop) = (name.clone(), labels.clone(), repo.clone(), session_stop.clone());
+            let default_branch = default_branch.clone();
             async move {
                 let set = client.ensure_scale_set(&name, &labels).await?;
                 state.lock().expect("set").id = set.id;
@@ -1535,6 +1542,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         machine: shared.config.machine.clone(),
                         size,
                         docker,
+                        default_branch,
                     },
                     session.clone(),
                     registry,

@@ -438,6 +438,7 @@ pub fn scaler_with(parts: &Parts<'_>, repo: &str, docker: bool) -> TestScaler {
             machine: MACHINE.into(),
             size: SIZE,
             docker,
+            default_branch: Some("main".into()),
         },
         parts.session.clone(),
         SetRegistry {

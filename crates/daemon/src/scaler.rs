@@ -39,6 +39,8 @@ pub struct ScalerConfig {
     pub size: Size,
     /// Whether its jobs get a Docker daemon (`cf-docker`).
     pub docker: bool,
+    /// The repository's default branch, when GitHub named it: only a run there writes a Docker cache.
+    pub default_branch: Option<String>,
 }
 
 /// A slot promised to a job this scaler acquired.
@@ -503,6 +505,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             scale_set_id: self.config.scale_set_id,
             runner_id,
             size: self.config.size,
+            default_branch: self.config.default_branch.clone(),
             ticket,
             jit_config: jit.encoded,
         };

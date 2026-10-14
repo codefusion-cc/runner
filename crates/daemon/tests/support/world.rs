@@ -159,6 +159,7 @@ impl World {
                 scale_set_id: SET,
                 runner_id: i64::from(self.next),
                 size,
+                default_branch: Some("main".into()),
                 ticket,
                 jit_config: Secret::new("jit".to_string()),
             })
