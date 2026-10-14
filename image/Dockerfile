@@ -9,6 +9,9 @@ ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
 # Only for the system libraries browsers need; each repository still installs its own Playwright and browsers.
 ARG PLAYWRIGHT_VERSION=1.63.0
+# Docker Compose for `cf-docker` jobs; the Actions runner image has the engine, the CLI and buildx already.
+ARG COMPOSE_VERSION=5.6.0
+ARG COMPOSE_SHA256=733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2
 
 USER root
 
@@ -41,6 +44,18 @@ RUN node=/opt/hostedtoolcache/node/${NODE_VERSION}/arm64 \
 # only downloads the browsers.
 RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium firefox webkit \
  && rm -rf /var/lib/apt/lists/* /root/.npm
+
+# What a `cf-docker` job's daemon needs beside the engine: pasta, which joins the daemon's network to the machine's,
+# iptables for the daemon's own rules in that network, and the Compose plugin. The daemon itself runs only in such a
+# job, in a sandbox the guest makes (crates/supervisor/src/docker.rs).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iptables passt \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSLo /usr/local/lib/docker/cli-plugins/docker-compose \
+      "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-aarch64" \
+ && echo "${COMPOSE_SHA256}  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum -c - \
+ && chmod 755 /usr/local/lib/docker/cli-plugins/docker-compose \
+ && dockerd --version && pasta --version | head -1 && iptables --version && docker compose version
 
 # Jobs install tools and browsers here, each into its own machine, as the user `runner` the Actions runner works as.
 RUN mkdir -p /home/runner/.npm /home/runner/.cache \

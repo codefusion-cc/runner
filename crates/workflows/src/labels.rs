@@ -11,6 +11,11 @@ use crate::size::is_size_label;
 /// runners (`self-hosted`, or a size label); until it does, the repository is still served under this label.
 pub const POOL_LABEL: &str = "self-hosted";
 
+/// The label of a job that runs Docker: it gets a Docker daemon of its own beside its container, in a machine of
+/// the size its other labels name (4 GB with none). Served only for the repositories a Runner is told to give
+/// Docker; a variable may name it (`CI_RUNNER_DOCKER=cf-docker`), like a size label.
+pub const DOCKER_LABEL: &str = "cf-docker";
+
 /// A workflow file bigger than this is not read, and whoever fetches the files need not fetch it. GitHub's own limit
 /// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
@@ -53,6 +58,11 @@ impl LabelSet {
     pub fn contains(&self, label: &str) -> bool {
         self.0.iter().any(|l| l == label)
     }
+
+    /// Whether the set asks for Docker ([`DOCKER_LABEL`]).
+    pub fn docker(&self) -> bool {
+        self.contains(DOCKER_LABEL)
+    }
 }
 
 /// [`self_hosted_with`] without repository variables: every expression over variables stands for [`POOL_LABEL`].
@@ -61,8 +71,8 @@ pub fn self_hosted(files: &BTreeMap<String, Vec<u8>>) -> Vec<LabelSet> {
 }
 
 /// Every distinct label set that jobs in the given workflow files request from self-hosted Actions runners these
-/// Actions runners can serve: sets that include `self-hosted` or a valid size label (`cf-2g`, `cf-4g`, `cf-6g`,
-/// `cf-8g`), name no other platform, and are plain labels or expressions over repository variables, rather than other
+/// Actions runners can serve: sets that include `self-hosted`, a valid size label (`cf-2g`, `cf-4g`, `cf-6g`,
+/// `cf-8g`) or [`DOCKER_LABEL`], name no other platform, and are plain labels or expressions over repository variables, rather than other
 /// expressions or Actions runner groups.
 ///
 /// An expression over `vars.` alone (string literals and functions aside) is a job the console's pool may point at
@@ -112,7 +122,7 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
 fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> String {
     evaluate(expression, vars)
         .map(|v| v.trim().to_lowercase())
-        .filter(|v| v == POOL_LABEL || is_size_label(v))
+        .filter(|v| v == POOL_LABEL || v == DOCKER_LABEL || is_size_label(v))
         .unwrap_or_else(|| POOL_LABEL.to_string())
 }
 
@@ -258,5 +268,5 @@ fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
         set.push(label);
     }
     let set = LabelSet::new(set);
-    (set.contains(POOL_LABEL) || set.labels().iter().any(|l| is_size_label(l))).then_some(set)
+    (set.contains(POOL_LABEL) || set.docker() || set.labels().iter().any(|l| is_size_label(l))).then_some(set)
 }

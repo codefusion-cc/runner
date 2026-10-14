@@ -264,6 +264,18 @@ impl Slots for Spy {
     fn state(&self) -> (bool, String) {
         self.machines.state()
     }
+
+    fn reserve_docker(&self, size: Size) -> Result<Ticket, Refusal> {
+        self.machines.reserve_docker(size)
+    }
+
+    fn mark_docker(&self, ticket: Ticket) {
+        self.machines.mark_docker(ticket);
+    }
+
+    fn docker_room(&self) -> usize {
+        self.machines.docker_room()
+    }
 }
 
 impl Hosts for Spy {
@@ -414,12 +426,18 @@ pub fn scaler_of(parts: &Parts<'_>) -> TestScaler {
 
 /// A scaler of `repo`'s scale set on the parts' machines.
 pub fn scaler_for(parts: &Parts<'_>, repo: &str) -> TestScaler {
+    scaler_with(parts, repo, false)
+}
+
+/// A scaler of `repo`'s scale set on the parts' machines, whose jobs get Docker when `docker` says so.
+pub fn scaler_with(parts: &Parts<'_>, repo: &str, docker: bool) -> TestScaler {
     Scaler::new(
         ScalerConfig {
             scale_set_id: parts.set.id,
             repo: repo.into(),
             machine: MACHINE.into(),
             size: SIZE,
+            docker,
         },
         parts.session.clone(),
         SetRegistry {

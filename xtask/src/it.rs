@@ -171,6 +171,7 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         ("sigkill", sigkill),
         ("firewall", firewall),
         ("inside", inside),
+        ("docker", docker),
         #[cfg(target_os = "macos")]
         ("launchd", launchd),
         #[cfg(target_os = "macos")]
@@ -334,8 +335,9 @@ fn mb(bytes: u64) -> String {
     format!("{} MB", bytes / MB)
 }
 
-fn request(bench: &Bench, job: &str, memory_mb: u64, deadline_s: u64, script: &str) -> Value {
+fn request(bench: &Bench, job: &str, memory_mb: u64, deadline_s: u64, script: &str, docker: bool) -> Value {
     json!({
+        "docker": docker,
         "job": job,
         "host": "the-test-host",
         "memory_bytes": memory_mb * MB,
@@ -379,6 +381,19 @@ fn start(
     script: &str,
     wrap: &[&str],
 ) -> Fallible<Running> {
+    start_job(bench, job, memory_mb, deadline_s, script, wrap, false)
+}
+
+/// [`start`] for a job that gets a Docker daemon when `docker` says so.
+fn start_job(
+    bench: &Bench,
+    job: &str,
+    memory_mb: u64,
+    deadline_s: u64,
+    script: &str,
+    wrap: &[&str],
+    docker: bool,
+) -> Fallible<Running> {
     forget(bench, job);
     let machines_before = machines();
     let available_before = available();
@@ -399,7 +414,7 @@ fn start(
         .spawn()?;
     let mut stdin = child.stdin.take().ok_or("no standard input")?;
     stdin.write_all(
-        request(bench, job, memory_mb, deadline_s, script)
+        request(bench, job, memory_mb, deadline_s, script, docker)
             .to_string()
             .as_bytes(),
     )?;
@@ -1312,6 +1327,171 @@ sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
     ])
 }
 
+/// What a container of a `cf-docker` job tries, in its own shell: whether an address answers on a port, said as
+/// `open`, `refused` (something answered no) or `dropped` (nothing answered within 3 seconds: the firewall).
+const TRY_IN_CONTAINER: &str = r#"try() { s=$(date +%s); if nc -z -w 3 "$1" "$2" 2>/dev/null; then r=open; elif [ $(( $(date +%s) - s )) -ge 2 ]; then r=dropped; else r=refused; fi; echo "$3=$r"; }"#;
+
+/// A `cf-docker` job: its daemon builds and runs a Compose stack whose published port the job reaches, and its
+/// containers, a privileged one and one on the daemon's own network too, reach the internet and nothing else: not
+/// the gateway (the Mac), nor through it the job's own loopback, nor private, link-local or Tailscale addresses, the
+/// Mac's own addresses or another job's machine. The privileged container cannot change the machine, and the job
+/// does not see the daemon's processes.
+fn docker(bench: &Bench) -> Fallible<Vec<String>> {
+    let other = start(
+        bench,
+        "it-docker-other",
+        512,
+        240,
+        r#"node -e 'require("http").createServer((q, s) => s.end("x")).listen(8000, "0.0.0.0")' & sleep 150"#,
+        &[],
+    )?;
+    let mut address = None;
+    within(Duration::from_secs(40), || {
+        address = console_of(bench, "it-docker-other")
+            .split("address ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_string));
+        address.is_some()
+    });
+    let (targets, reached_for) = host_targets(address.as_deref());
+    // A port that answers on the host itself: through pasta a closed port and a dropped packet look alike (no
+    // answer), so only a port that is open shows the firewall at work. The kernel completes the handshake from the
+    // backlog; nothing needs to accept.
+    let listening = std::net::TcpListener::bind("0.0.0.0:0")?;
+    let open_port = listening.local_addr()?.port();
+    let tries: String = targets
+        .iter()
+        .map(|target| {
+            format!(
+                "try {address} {port} {{}}{name}; try {address} {open_port} {{}}{name}-open; ",
+                address = target.address,
+                port = target.port,
+                name = target.name
+            )
+        })
+        .collect();
+    let probes = |prefix: &str| {
+        format!(
+            "try $gw 22 {prefix}gateway-ssh; try $gw {open_port} {prefix}gateway-open; \
+             try $gw 9999 {prefix}job-loopback; try 10.1.2.3 80 {prefix}private; \
+             try 169.254.169.254 80 {prefix}metadata; try 100.100.100.100 80 {prefix}tailscale; {}",
+            tries.replace("{}", prefix)
+        )
+    };
+    let script = format!(
+        r#"set -u
+for i in $(seq 1 150); do docker info > /dev/null 2>&1 && break; sleep 0.2; done
+gw=$(awk '/nameserver/{{print $2; exit}}' /etc/resolv.conf)
+node -e 'require("http").createServer((q, s) => s.end("job")).listen(9999, "127.0.0.1")' &
+echo daemon=$(docker version --format '{{{{.Server.Version}}}}' 2>&1 | head -1)
+echo hook=$(/run/codefusion/job-started.sh | tr '\n' ' ')
+echo socket-link=$(readlink -f /var/run/docker.sock)
+echo job-sees-dockerd=$(ps -eo comm | grep -c '^dockerd$')
+mkdir -p /tmp/stack && cd /tmp/stack
+echo built > index.html
+printf 'FROM nginx:1.29-alpine\nCOPY index.html /usr/share/nginx/html/\n' > Dockerfile
+printf 'services:\n  web:\n    build: .\n    ports: ["18080:80"]\n' > compose.yaml
+docker compose up -d --build > /tmp/compose.log 2>&1; echo compose=$?; tail -3 /tmp/compose.log
+echo published=$(curl -s --max-time 30 --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/)
+echo bind-mount=$(echo shared > /tmp/stack/note && docker run --rm -v /tmp/stack:/s alpine:3.22 cat /s/note)
+docker compose down -t 1 > /dev/null 2>&1
+T='{try_in_container}'
+docker run --rm alpine:3.22 sh -c "$T; {plain} wget -q -O /dev/null -T 20 https://github.com && echo c-github=open; awk 'NR==1{{print \"c-root=\" \$2}}' /proc/self/uid_map"
+docker run --rm --network host alpine:3.22 sh -c "$T; try $gw {open_port} h-gateway-open; try 10.1.2.3 80 h-private"
+docker run --rm --privileged alpine:3.22 sh -c "$T; {privileged}
+  echo x > /proc/sys/kernel/core_pattern 2>/dev/null && echo p-core-pattern=written || echo p-core-pattern=refused
+  echo h > /proc/sysrq-trigger 2>/dev/null && echo p-sysrq=written || echo p-sysrq=refused
+  head -c 1 /proc/kcore > /dev/null 2>&1 && echo p-kcore=read || echo p-kcore=refused
+  (mknod /tmp/vda b 254 0 && head -c 1 /tmp/vda > /dev/null) 2>/dev/null && echo p-disk=read || echo p-disk=refused
+  ip addr add 10.9.9.9/32 dev lo 2>/dev/null; echo p-own-network=\$?"
+echo done"#,
+        try_in_container = TRY_IN_CONTAINER.replace('\'', r"'\''"),
+        plain = probes("c-"),
+        privileged = probes("p-"),
+    );
+    let running = start_job(bench, "it-docker", 4096, 240, &script, &[], true);
+    let first =
+        running.and_then(|running| finish(bench, running, Duration::from_secs(300), &mut |_, _| Ok(())));
+    let other = finish(bench, other, Duration::from_secs(300), &mut |_, _| Ok(()))?;
+    let first = first?;
+    ended(&first, "ok")?;
+    ended(&other, "ok")?;
+    let console = &first.console;
+    let value = |name: &str| printed(console, name).unwrap_or("not tried").to_string();
+    expect(
+        value("daemon").starts_with(char::is_numeric),
+        format!("the job has no daemon: {}", value("daemon")),
+    )?;
+    expect(
+        value("hook").ends_with("and Docker.") && !console.contains("Docker did not start"),
+        format!("the start hook did not find the daemon: {}", value("hook")),
+    )?;
+    let works = [
+        ("socket-link", "/run/cf-docker/docker.sock"),
+        ("job-sees-dockerd", "0"),
+        ("compose", "0"),
+        ("published", "built"),
+        ("bind-mount", "shared"),
+        ("c-github", "open"),
+        // The sandbox's root is `cf_supervisor::docker::SHIFT` outside, never the machine's root.
+        ("c-root", "1048576"),
+        ("p-core-pattern", "refused"),
+        ("p-sysrq", "refused"),
+        ("p-kcore", "refused"),
+        ("p-disk", "refused"),
+        ("p-own-network", "0"),
+    ];
+    let mut wrong: Vec<String> = works
+        .iter()
+        .filter(|(name, wanted)| value(name) != *wanted)
+        .map(|(name, wanted)| format!("{name}={} (wanted {wanted})", value(name)))
+        .collect();
+    let mut blocked = vec!["h-gateway-open".to_string(), "h-private".to_string()];
+    for prefix in ["c-", "p-"] {
+        for name in [
+            "gateway-ssh",
+            "gateway-open",
+            "job-loopback",
+            "private",
+            "metadata",
+            "tailscale",
+        ] {
+            blocked.push(format!("{prefix}{name}"));
+        }
+        for target in &targets {
+            blocked.push(format!("{prefix}{}", target.name));
+            blocked.push(format!("{prefix}{}-open", target.name));
+        }
+    }
+    wrong.extend(
+        blocked
+            .iter()
+            .filter(|name| value(name) != "dropped")
+            .map(|name| format!("{name}={} (wanted dropped)", value(name))),
+    );
+    expect(
+        wrong.is_empty(),
+        format!("{}; the job's console: {}", wrong.join(", "), tail(console)),
+    )?;
+    drop(listening);
+    tidy(bench, "it-docker")?;
+    Ok(vec![
+        format!(
+            "Docker {}: a Compose stack built and published on 18080, reached from the job; a bind mount of /tmp",
+            value("daemon")
+        ),
+        format!(
+            "containers (plain, privileged, the daemon's network) reached github.com and none of: the gateway's port 22 \
+             and a port open on this host, the job's loopback through the gateway, 10.1.2.3, 169.254.169.254, \
+             100.100.100.100, {reached_for}, and each of those addresses at the open port"
+        ),
+        format!(
+            "a privileged container is root {} outside: the kernel's settings, sysrq, kcore and the disks refused",
+            value("c-root")
+        ),
+    ])
+}
+
 /// The last value a job printed as `name=value`.
 fn printed<'a>(console: &'a str, name: &str) -> Option<&'a str> {
     console
@@ -1403,7 +1583,15 @@ fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
     install(&binary, &bench.release, &bench.image, &bench.state)?;
     fs::write(
         path("launchd.json"),
-        request(bench, job, 512, 120, "echo waiting; sleep 15; echo survived").to_string(),
+        request(
+            bench,
+            job,
+            512,
+            120,
+            "echo waiting; sleep 15; echo survived",
+            false,
+        )
+        .to_string(),
     )?;
     // The daemon's stand-in: it starts a vm-host and is gone two seconds later.
     fs::write(

@@ -124,6 +124,8 @@ fn service(
         policy: ServePolicy {
             repos: config.repos.clone(),
             public_repos: config.public_repos.clone(),
+            docker_repos: config.docker_repos.clone(),
+            docker_max_jobs: config.docker_max_jobs,
         },
         console: console(config)?,
         stand_in: None,

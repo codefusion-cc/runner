@@ -123,6 +123,7 @@ pub fn mac_service(setup: MacSetup) -> Result<(Arc<MacMachines>, MacService), St
     };
     let mut config = MachineConfig::new(&setup.machine, &setup.image, &boot, setup.deadline);
     config.stand_in = setup.stand_in;
+    config.docker_max_jobs = setup.policy.docker_max_jobs;
     let rings = bell.clone();
     let machines = Machines::restore(MachineParts {
         host,

@@ -1,6 +1,7 @@
 //! One job: its disks, its limits, its container, and the watch over it until it ends.
 
 use super::container::{STATUS_FD, Spec};
+use super::docker;
 use super::init::{Event, Failure, Host, SELF_COPY};
 use super::net::Network;
 use super::sys::{self, context, say};
@@ -264,6 +265,7 @@ pub fn run(
         host: job.host.clone(),
         limits: job.limits,
         disk_bytes,
+        docker: job.docker,
     };
     share(
         "job.json",
@@ -283,11 +285,28 @@ pub fn run(
     let passwd = fs::read_to_string(format!("{ROOT}/etc/passwd")).unwrap_or_default();
     let (uid, gid, home) =
         find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
-    let groups = groups_of(
-        &fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default(),
-        USER,
-        gid,
-    );
+    let group = fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default();
+    let groups = groups_of(&group, USER, gid);
+    if job.docker {
+        // Started before the Actions runner, so the daemon is up by the first step. A job whose daemon cannot be
+        // made runs on and is told why when it starts.
+        let started = docker::prepare(
+            ROOT,
+            SCRATCH,
+            CGROUP,
+            (uid, gid),
+            &group,
+            &name,
+            job.limits.shm_bytes,
+        )
+        .and_then(|spec| docker::start(&spec));
+        if let Err(error) = started {
+            say(&format!("no Docker for this job: {error}"));
+            share(cf_supervisor::docker::PROBLEM, &error, 0o644).map_err(container)?;
+        }
+    } else {
+        let _ = fs::remove_dir_all(docker::MODULE_DIR);
+    }
     let argv = match &job.workload {
         Workload::ActionsRunner { jit_config } => vec![
             format!("{home}/run.sh"),

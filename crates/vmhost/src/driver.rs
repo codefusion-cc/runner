@@ -187,6 +187,7 @@ fn run_in(
         env: std::mem::take(&mut request.env),
         oom_grace_ms: 15_000,
         blocked: crate::host_net::host_networks(),
+        docker: request.docker,
     });
 
     let snapshot = |machine: Option<&Machine>, stage: Stage| JobState {

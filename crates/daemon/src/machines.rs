@@ -53,6 +53,9 @@ pub struct MachineConfig {
     pub boot: String,
     /// What runs in place of GitHub's Actions runner: the integration suite's command. None in service.
     pub stand_in: Option<Workload>,
+    /// The most Docker jobs (`cf-docker`) at once: a daemon and its builds take the Mac's processors more than
+    /// other jobs do.
+    pub docker_max_jobs: usize,
 }
 
 impl MachineConfig {
@@ -82,6 +85,7 @@ impl MachineConfig {
             },
             boot: boot.to_string(),
             stand_in: None,
+            docker_max_jobs: 1,
         }
     }
 }
@@ -331,9 +335,24 @@ struct Inner<H> {
     offer: Offer,
     /// For which size room is made.
     making: Making,
+    /// The slots of Docker jobs; one given back leaves at the next count.
+    docker: BTreeSet<SlotId>,
 }
 
 impl<H> Inner<H> {
+    /// How many slots Docker jobs hold: promised, waiting in line, or under a machine (whose grant goes when the
+    /// machine is gone). Those given back are forgotten.
+    fn docker_held(&mut self) -> usize {
+        let Inner {
+            docker,
+            grants,
+            waiting,
+            ..
+        } = self;
+        docker.retain(|slot| grants.contains_key(slot) || waiting.contains(slot));
+        docker.len()
+    }
+
     /// A machine of `size` got its slot: room made for it is made.
     fn started(&mut self, size: Size) {
         self.making.started(&mut self.budget, size);
@@ -425,6 +444,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 door: None,
                 offer: Offer::default(),
                 making: Making::default(),
+                docker: BTreeSet::new(),
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -537,6 +557,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 (true, Some(size)) => {
                     let grant = inner.budget.adopt(size);
                     inner.grants.insert(grant.slot, grant);
+                    if record.docker {
+                        inner.docker.insert(grant.slot);
+                    }
                     Some(grant.slot)
                 }
                 _ => None,
@@ -1413,9 +1436,15 @@ fn facts(record: &Record) -> MachineFacts {
     }
 }
 
-impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
-    fn reserve(&self, size: Size) -> Result<Ticket, Refusal> {
+/// Why a Docker job's slot is refused: as many Docker jobs as the Mac allows hold one.
+pub const DOCKER_FULL: &str = "docker-full";
+
+impl<H: Host + Send, V: Vms> Machines<H, V> {
+    fn reserve_as(&self, size: Size, docker: bool) -> Result<Ticket, Refusal> {
         let mut inner = self.lock();
+        if docker && inner.docker_held() >= self.config.docker_max_jobs {
+            return Err(Refusal(DOCKER_FULL.to_string()));
+        }
         let now = inner.host.now();
         self.holds(&mut inner, now);
         if !inner.breaker.admit(now.elapsed) {
@@ -1425,6 +1454,9 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             Ok(grant) => {
                 inner.started(size);
                 inner.grants.insert(grant.slot, grant);
+                if docker {
+                    inner.docker.insert(grant.slot);
+                }
                 let told = Self::owed(&inner, now, true);
                 drop(inner);
                 if told {
@@ -1437,6 +1469,33 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
                 Err(Refusal(refusal.name().to_string()))
             }
         }
+    }
+}
+
+impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
+    fn reserve(&self, size: Size) -> Result<Ticket, Refusal> {
+        self.reserve_as(size, false)
+    }
+
+    fn reserve_docker(&self, size: Size) -> Result<Ticket, Refusal> {
+        self.reserve_as(size, true)
+    }
+
+    fn mark_docker(&self, ticket: Ticket) {
+        let mut inner = self.lock();
+        inner.docker.insert(ticket);
+        if inner.docker_held() > self.config.docker_max_jobs {
+            tracing::info!(
+                held = inner.docker.len(),
+                "GitHub assigned a Docker job past the cap; it runs as any assigned job"
+            );
+        }
+    }
+
+    fn docker_room(&self) -> usize {
+        self.config
+            .docker_max_jobs
+            .saturating_sub(self.lock().docker_held())
     }
 
     fn release(&self, ticket: Ticket) {
@@ -1587,6 +1646,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             scale_set_id,
             repo: repo.to_string(),
             size: None,
+            docker: false,
             memory_bytes: 0,
             limit_bytes: 0,
             cpus: 0,
@@ -1695,6 +1755,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             }),
             env: Vec::new(),
             deadline_s: self.config.deadline.as_secs(),
+            docker: inner.docker.contains(&spec.ticket),
         };
         self.woke(&mut inner, now);
         let mut life = Slot::reserved(self.config.limits);
@@ -1707,6 +1768,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             scale_set_id: spec.scale_set_id,
             repo: spec.repo.clone(),
             size: Some(spec.size.label().to_string()),
+            docker: request.docker,
             memory_bytes: grant.vm_bytes,
             limit_bytes: grant.job_limit_bytes,
             cpus: grant.cpus,

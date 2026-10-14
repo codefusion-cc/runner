@@ -73,12 +73,27 @@ pub fn scale_set_name(machine: &str, repo: &str, set: &LabelSet) -> String {
 }
 
 /// Which repositories the Runner takes jobs from.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServePolicy {
     /// Serve only these `owner/name` repositories; empty serves every private repository the App can see.
     pub repos: Vec<String>,
     /// Public repositories to serve on purpose: their jobs can be a stranger's code.
     pub public_repos: Vec<String>,
+    /// The repositories whose `cf-docker` jobs get a Docker daemon: private ones only, whatever else is listed.
+    pub docker_repos: Vec<String>,
+    /// The most Docker jobs at once ([`crate::machines::MachineConfig::docker_max_jobs`]).
+    pub docker_max_jobs: usize,
+}
+
+impl Default for ServePolicy {
+    fn default() -> Self {
+        ServePolicy {
+            repos: Vec::new(),
+            public_repos: Vec::new(),
+            docker_repos: Vec::new(),
+            docker_max_jobs: 1,
+        }
+    }
 }
 
 impl ServePolicy {
@@ -93,6 +108,18 @@ impl ServePolicy {
             return false;
         }
         self.repos.is_empty() || listed(&self.repos) || listed(&self.public_repos)
+    }
+
+    /// Whether a repository's `cf-docker` jobs are served: one the Runner serves, private, and in
+    /// [`ServePolicy::docker_repos`]. A public repository never is, even listed: anyone can open a pull request
+    /// there, and a Docker job is the most a job can do on a machine.
+    pub fn serves_docker(&self, repo: &Repo) -> bool {
+        repo.private
+            && self.serves(repo)
+            && self
+                .docker_repos
+                .iter()
+                .any(|listed| listed.eq_ignore_ascii_case(&repo.full_name))
     }
 }
 
@@ -198,15 +225,50 @@ mod tests {
         assert!(!open.serves(&disabled));
         let listed = ServePolicy {
             repos: vec!["Org/App".into()],
-            public_repos: vec![],
+            ..ServePolicy::default()
         };
         assert!(listed.serves(&repo("org/app", true)));
         assert!(!listed.serves(&repo("org/other", true)));
         let on_purpose = ServePolicy {
-            repos: vec![],
             public_repos: vec!["org/public".into()],
+            ..ServePolicy::default()
         };
         assert!(on_purpose.serves(&repo("org/public", false)));
         assert!(on_purpose.serves(&repo("org/app", true)));
+    }
+
+    #[test]
+    fn docker_is_for_listed_private_repositories_only() {
+        let policy = ServePolicy {
+            public_repos: vec!["org/public".into()],
+            docker_repos: vec!["Org/Shop".into(), "org/public".into(), "org/gone".into()],
+            ..ServePolicy::default()
+        };
+        assert!(policy.serves_docker(&repo("org/shop", true)), "listed, any case");
+        assert!(
+            !policy.serves_docker(&repo("org/app", true)),
+            "served, not listed"
+        );
+        assert!(
+            !policy.serves_docker(&repo("org/public", false)),
+            "a public repository never gets Docker, even listed twice"
+        );
+        let mut archived = repo("org/gone", true);
+        archived.archived = true;
+        assert!(!policy.serves_docker(&archived), "listed but not served");
+        let narrow = ServePolicy {
+            repos: vec!["org/app".into()],
+            docker_repos: vec!["org/shop".into()],
+            ..ServePolicy::default()
+        };
+        assert!(
+            !narrow.serves_docker(&repo("org/shop", true)),
+            "listed for Docker, not served at all"
+        );
+        assert!(
+            !ServePolicy::default().serves_docker(&repo("org/shop", true)),
+            "no list, no Docker"
+        );
+        assert_eq!(ServePolicy::default().docker_max_jobs, 1);
     }
 }

@@ -1,7 +1,7 @@
 //! The machine's first process: brings the guest up, answers the host, runs the one task it is given, powers off.
 
 use super::sys::{self, say};
-use super::{job, net};
+use super::{docker, job, net};
 use cf_guest_proto::{
     GuestMessage, HostMessage, PORT, PROTOCOL, Start, Summary, Task, read_message, write_message,
 };
@@ -69,7 +69,7 @@ pub fn run() -> ! {
         .to_string();
     say(&format!("kernel {kernel}"));
 
-    if let Err(error) = load_modules().and_then(|()| own_root()) {
+    if let Err(error) = load_modules(MODULE_LIST, MODULE_DIR).and_then(|()| own_root()) {
         say(&error);
         sys::power_off();
     }
@@ -198,10 +198,11 @@ fn wait_for_console() -> File {
     sys::power_off()
 }
 
-fn load_modules() -> Result<(), String> {
-    let list = fs::read_to_string(MODULE_LIST).unwrap_or_default();
+/// Loads the modules a list names, in its order, from a folder. A module the kernel has already is no error.
+pub fn load_modules(list: &str, dir: &str) -> Result<(), String> {
+    let list = fs::read_to_string(list).unwrap_or_default();
     for name in list.lines().filter(|line| !line.is_empty()) {
-        let path = format!("{MODULE_DIR}/{name}.ko");
+        let path = format!("{dir}/{name}.ko");
         let file = File::open(&path).map_err(|error| format!("module {path}: {error}"))?;
         let parameters = sys::cstr("");
         // SAFETY: finit_module takes a descriptor we own for the call and a NUL terminated parameter string.
@@ -216,7 +217,8 @@ fn load_modules() -> Result<(), String> {
 }
 
 /// Moves the supervisor from the boot archive's root, which a container cannot leave behind, to a memory file
-/// system of its own, and frees what the archive held.
+/// system of its own, and frees what the archive held. The modules only a Docker job loads come along, until the
+/// job says whether it is one.
 fn own_root() -> Result<(), String> {
     const NEW: &str = "/newroot";
     sys::mount_at("root", NEW, "tmpfs", 0, "mode=0755")?;
@@ -228,9 +230,25 @@ fn own_root() -> Result<(), String> {
         "mnt/image",
         "mnt/scratch",
         "mnt/root",
+        "etc",
+        &docker::MODULE_DIR[1..],
     ] {
         sys::context("make the root", fs::create_dir_all(format!("{NEW}/{directory}")))?;
     }
+    let docker_modules = fs::read_to_string(docker::MODULE_LIST).unwrap_or_default();
+    for name in docker_modules.lines().filter(|line| !line.is_empty()) {
+        sys::context(
+            "keep a module",
+            fs::copy(
+                format!("{MODULE_DIR}/{name}.ko"),
+                format!("{NEW}{}/{name}.ko", docker::MODULE_DIR),
+            ),
+        )?;
+    }
+    sys::context(
+        "keep the module list",
+        fs::write(format!("{NEW}{}", docker::MODULE_LIST), docker_modules),
+    )?;
     sys::context(
         "copy the supervisor",
         fs::copy("/init", format!("{NEW}{SELF_COPY}")),

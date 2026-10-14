@@ -44,6 +44,13 @@ pub struct Config {
     /// Public repositories to serve on purpose.
     #[serde(default)]
     pub public_repos: Vec<String>,
+    /// The repositories whose `cf-docker` jobs get a Docker daemon of their own. Private ones only: a public one
+    /// listed here is not given Docker.
+    #[serde(default)]
+    pub docker_repos: Vec<String>,
+    /// The most Docker jobs at once: a daemon and its builds take more of the Mac's processors than other jobs.
+    #[serde(default = "docker_max_jobs")]
+    pub docker_max_jobs: usize,
     /// The console's address, when the Mac reports to one.
     #[serde(default)]
     pub console: Option<String>,
@@ -65,6 +72,10 @@ fn github_api() -> String {
 
 const fn deadline_minutes() -> u64 {
     360
+}
+
+const fn docker_max_jobs() -> usize {
+    1
 }
 
 impl Config {
@@ -129,7 +140,15 @@ impl Config {
                 return Err(format!("`{url}` is no https address"));
             }
         }
-        for repo in self.repos.iter().chain(&self.public_repos) {
+        if !(1..=8).contains(&self.docker_max_jobs) {
+            return Err("docker_max_jobs: between 1 and 8".into());
+        }
+        for repo in self
+            .repos
+            .iter()
+            .chain(&self.public_repos)
+            .chain(&self.docker_repos)
+        {
             let named = repo
                 .split_once('/')
                 .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'));
@@ -366,6 +385,30 @@ mod tests {
         }
         assert!(with(|v| v["public_repos"] = serde_json::json!(["org/app"])).is_ok());
         assert!(with(|v| v["use"] = "sometimes".into()).is_err());
+    }
+
+    #[test]
+    fn docker_is_for_no_repository_and_one_job_at_a_time_unless_set() {
+        let config = Config::parse(WHOLE).expect("config");
+        assert_eq!(config.docker_repos, Vec::<String>::new());
+        assert_eq!(config.docker_max_jobs, 1);
+        let set = with(|v| {
+            v["docker_repos"] = serde_json::json!(["org/shop"]);
+            v["docker_max_jobs"] = 2.into();
+        })
+        .expect("config");
+        assert_eq!(set.docker_repos, ["org/shop"]);
+        assert_eq!(set.docker_max_jobs, 2);
+        for repo in ["shop", "org/", "/shop", "org/shop/x"] {
+            assert!(
+                with(|v| v["docker_repos"] = serde_json::json!([repo])).is_err(),
+                "{repo}"
+            );
+        }
+        for max in [0, 9] {
+            assert!(with(|v| v["docker_max_jobs"] = max.into()).is_err(), "{max}");
+        }
+        assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
     }
 
     #[test]

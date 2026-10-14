@@ -19,7 +19,7 @@ use cf_console_client::{
 use cf_ghapp::{Clock, GitHubApp};
 use cf_host_macos::Battery;
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
-use cf_workflows::self_hosted_with;
+use cf_workflows::{DOCKER_LABEL, self_hosted_with};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Notify;
@@ -690,7 +690,18 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     continue;
                 }
                 for set in self_hosted_with(&files, &variables) {
-                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str)) else {
+                    if set.docker() && !shared.config.policy.serves_docker(&repo) {
+                        // Not offered to GitHub: the job waits for a Mac that gives this repository Docker.
+                        problems.push(format!(
+                            "{name}: a job asks for {DOCKER_LABEL}, which this Mac gives only the repositories in \
+                             docker_repos"
+                        ));
+                        continue;
+                    }
+                    // `cf-docker` alone is a machine of the size `self-hosted` means.
+                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str))
+                        .or_else(|| set.docker().then_some(Size::G4))
+                    else {
                         continue;
                     };
                     if let Err(refusal) = settings.can_run(size) {
@@ -1511,6 +1522,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         repo,
                         machine: shared.config.machine.clone(),
                         size,
+                        docker: labels.iter().any(|label| label == DOCKER_LABEL),
                     },
                     session.clone(),
                     registry,

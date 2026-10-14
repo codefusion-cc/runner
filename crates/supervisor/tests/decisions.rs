@@ -3,11 +3,13 @@
 use cf_guest_proto::{Limits, OomEvent, Process as Used, StopReason};
 use cf_nft::{BLOCKED, IPV4, IPV6, Packet, Verdict, decide};
 use cf_supervisor::dhcp::{self, Lease, Reply};
-use cf_supervisor::environment::{find_user, workload_environment};
+use cf_supervisor::environment::{find_group, find_user, workload_environment};
 use cf_supervisor::firewall::{self, own_network, policy};
 use cf_supervisor::oom::{Count, Kill, Log, kills_in_events, message_of};
 use cf_supervisor::processes::{Process, Table, parse_stat};
-use cf_supervisor::tell::{JobFacts, out_of_memory_line, out_of_memory_summary, size, started, stopped};
+use cf_supervisor::tell::{
+    JobFacts, docker_missing, out_of_memory_line, out_of_memory_summary, size, started, stopped,
+};
 use proptest::prelude::*;
 
 const GATEWAY: [u8; 4] = [192, 168, 64, 1];
@@ -780,6 +782,7 @@ fn facts() -> JobFacts {
             cpus: 4,
         },
         disk_bytes: 30 << 30,
+        docker: false,
     }
 }
 
@@ -829,6 +832,49 @@ fn a_job_is_told_its_size_at_the_start() {
         started(&facts()),
         "This job runs on mac-1 with 3.75 GB memory, 4 CPUs, 30 GB disk."
     );
+    assert_eq!(
+        started(&JobFacts {
+            docker: true,
+            ..facts()
+        }),
+        "This job runs on mac-1 with 3.75 GB memory, 4 CPUs, 30 GB disk and Docker."
+    );
+}
+
+#[test]
+fn facts_from_a_supervisor_before_docker_read_as_no_docker() {
+    let old =
+        r#"{"host":"mac-1","limits":{"memory_bytes":1,"pids":1,"shm_bytes":1,"cpus":1},"disk_bytes":1}"#;
+    assert!(!serde_json::from_str::<JobFacts>(old).unwrap().docker);
+}
+
+#[test]
+fn a_job_without_docker_is_told_why_with_the_end_of_the_daemons_log() {
+    let log = "one\n\ntwo\nthree\nfour\nfive\nsix\n\n";
+    assert_eq!(
+        docker_missing("its daemon did not answer within 60 seconds.", log),
+        "Docker is not available in this job: its daemon did not answer within 60 seconds. The daemon's log ends with:\ntwo\nthree\nfour\nfive\nsix"
+    );
+    assert_eq!(
+        docker_missing("the image has no group docker", ""),
+        "Docker is not available in this job: the image has no group docker"
+    );
+    let long = "x".repeat(1000);
+    assert_eq!(
+        docker_missing("why", &long).len(),
+        "Docker is not available in this job: why The daemon's log ends with:\n".len() + 300
+    );
+}
+
+#[test]
+fn a_group_is_found_by_its_whole_name() {
+    let group = "root:x:0:\nsudo:x:27:runner\ndocker:x:123:runner\ndockerish:x:5:\nbroken:x\n";
+    assert_eq!(find_group(group, "docker"), Some(123));
+    assert_eq!(find_group(group, "sudo"), Some(27));
+    assert_eq!(find_group(group, "dock"), None);
+    assert_eq!(find_group(group, "broken"), None);
+    assert_eq!(find_group("", "docker"), None);
+    assert_eq!(find_group("docker:x:notanumber:", "docker"), None);
 }
 
 #[test]

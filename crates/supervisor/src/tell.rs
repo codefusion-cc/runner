@@ -12,6 +12,9 @@ pub struct JobFacts {
     pub limits: Limits,
     /// The size of the job's disk.
     pub disk_bytes: u64,
+    /// Whether the job has a Docker daemon.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 /// A size as people write it: `3.75 GB`, `4 GB`, `512 MB`.
@@ -30,12 +33,32 @@ pub fn size(bytes: u64) -> String {
 /// The line at a job's start.
 pub fn started(facts: &JobFacts) -> String {
     format!(
-        "This job runs on {} with {} memory, {} CPUs, {} disk.",
+        "This job runs on {} with {} memory, {} CPUs, {} disk{}.",
         facts.host,
         size(facts.limits.memory_bytes),
         facts.limits.cpus,
         size(facts.disk_bytes),
+        if facts.docker { " and Docker" } else { "" },
     )
+}
+
+/// The error a Docker job shows when its daemon is not there: why, and the end of what the daemon said.
+pub fn docker_missing(why: &str, log: &str) -> String {
+    let tail: Vec<&str> = log
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(5)
+        .collect();
+    let mut text = format!("Docker is not available in this job: {why}");
+    if !tail.is_empty() {
+        text.push_str(" The daemon's log ends with:");
+        for line in tail.into_iter().rev() {
+            text.push('\n');
+            text.push_str(&line.chars().take(300).collect::<String>());
+        }
+    }
+    text
 }
 
 /// What to do about a job that ran out of memory. The sizes a job can ask for are 2, 4, 6 and 8 GB; the limit is a

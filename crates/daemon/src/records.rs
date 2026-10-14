@@ -85,6 +85,9 @@ pub struct Record {
     pub repo: String,
     /// The machine's size, by its label; none before a machine was asked for.
     pub size: Option<String>,
+    /// Whether the machine has a Docker daemon (`cf-docker`): it counts against the Mac's Docker cap.
+    #[serde(default)]
+    pub docker: bool,
     /// The machine's memory and CPUs, and how the budget came to grant them.
     pub memory_bytes: u64,
     /// The job's own share of that memory.

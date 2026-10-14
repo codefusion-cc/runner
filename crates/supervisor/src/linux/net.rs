@@ -75,6 +75,12 @@ fn bring_up(control: &OwnedFd, device: &str) -> io::Result<()> {
     ioctl(control, libc::SIOCSIFFLAGS as libc::c_ulong, &mut request)
 }
 
+/// Brings up the loopback device of the network namespace the process is in.
+pub fn loopback_up() -> Result<(), String> {
+    let control = context("socket", socket(libc::AF_INET, libc::SOCK_DGRAM, 0))?;
+    context("bring up lo", bring_up(&control, "lo"))
+}
+
 fn sockaddr(address: [u8; 4]) -> libc::sockaddr {
     let mut data = [0; 14];
     for (to, from) in data[2..6].iter_mut().zip(address) {

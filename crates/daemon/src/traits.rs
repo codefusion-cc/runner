@@ -74,6 +74,22 @@ pub trait Slots: Send + Sync {
 
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
+
+    /// [`Slots::reserve`] for a Docker job (`cf-docker`): refused while as many Docker jobs as the machine allows
+    /// hold a slot, and counted as one from then on ([`Slots::mark_docker`]). A machine without a cap takes it as
+    /// any other.
+    fn reserve_docker(&self, size: Size) -> Result<Ticket, Refusal> {
+        self.reserve(size)
+    }
+
+    /// Counts a slot as a Docker job's until it is given back: its machine gets a Docker daemon, and the cap counts
+    /// it. For a job GitHub assigned without a promise, which runs even past the cap, as any assigned job does.
+    fn mark_docker(&self, _ticket: Ticket) {}
+
+    /// How many more Docker jobs may hold a slot now.
+    fn docker_room(&self) -> usize {
+        usize::MAX
+    }
 }
 
 /// What an Actions runner's machine is started with.
