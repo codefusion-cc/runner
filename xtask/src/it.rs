@@ -172,6 +172,7 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         ("firewall", firewall),
         ("inside", inside),
         ("docker", docker),
+        ("docker-oom", docker_oom),
         #[cfg(target_os = "macos")]
         ("launchd", launchd),
         #[cfg(target_os = "macos")]
@@ -1497,6 +1498,25 @@ echo done"#,
             value("c-root")
         ),
     ])
+}
+
+/// A `cf-docker` job whose container takes all the job's memory: that is the job running out of memory, whatever
+/// process the kernel stops, and the job ends `oom` as any other would. (A container stopped at a limit of its own
+/// is not: the `docker` scenario has one.)
+fn docker_oom(bench: &Bench) -> Fallible<Vec<String>> {
+    let script = r#"for i in $(seq 1 150); do docker info > /dev/null 2>&1 && break; sleep 0.2; done
+docker run --rm alpine:3.22 sh -c 'tail /dev/zero'; echo after=$?"#;
+    let running = start_job(bench, "it-docker-oom", 2048, 240, script, &[], true)?;
+    let finished = finish(bench, running, Duration::from_secs(300), &mut |_, _| Ok(()))?;
+    ended(&finished, "oom")?;
+    shows(&finished.console, &["out of memory: the kernel stopped"])?;
+    tidy(bench, "it-docker-oom")?;
+    Ok(vec![format!(
+        "a container that took all of a 2 GB job's memory ended the job `oom`: {}",
+        printed(&finished.console, "after").map_or("its step was stopped".to_string(), |code| format!(
+            "its step saw {code}"
+        ))
+    )])
 }
 
 /// The last value a job printed as `name=value`.

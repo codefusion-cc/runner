@@ -38,7 +38,7 @@ pub struct Spec {
     pub data: String,
     /// The socket's folder on the job's disk, mounted at [`plan::SOCKET_DIR`] here and in the job's container.
     pub sockets: String,
-    /// The control group the sandbox runs in, beside the container's and under the job's limits.
+    /// The control group the sandbox sees as its root, beside the container's and under the job's limits.
     pub cgroup: String,
     /// The sandbox's host name.
     pub host_name: String,
@@ -76,12 +76,15 @@ pub fn prepare(
         let _ = fs::write(format!("{at}/cgroup.subtree_control"), "+cpu");
     }
     let sandbox_group = format!("{cgroup}/docker");
-    context("the sandbox's control group", fs::create_dir_all(&sandbox_group))?;
     // Delegated to the sandbox's root, which makes a group for each container below it. The job's limits stay one
-    // level up, where the sandbox cannot see them.
-    chown(&sandbox_group, SHIFT, SHIFT)?;
-    for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
-        chown(&format!("{sandbox_group}/{file}"), SHIFT, SHIFT)?;
+    // level up, where the sandbox cannot see them. The sandbox's own processes go to a leaf, `daemon`, since a group
+    // with processes of its own gives its children no controllers (see `launcher`).
+    for group in [sandbox_group.clone(), format!("{sandbox_group}/daemon")] {
+        context("the sandbox's control group", fs::create_dir_all(&group))?;
+        chown(&group, SHIFT, SHIFT)?;
+        for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+            chown(&format!("{group}/{file}"), SHIFT, SHIFT)?;
+        }
     }
 
     let data = format!("{scratch}/docker");
@@ -260,7 +263,13 @@ fn launcher() -> Result<i32, String> {
     let view = unsafe { OwnedFd::from_raw_fd(VIEW_FD) };
     // SAFETY: fcntl on the descriptor we own; the sandbox's programs must not inherit it.
     unsafe { libc::fcntl(view.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // The sandbox sees its group as the root of the control groups; it and its processes sit in the leaf `daemon`,
+    // so the group is empty and gives the containers' groups beside the leaf memory, process and processor limits.
     sys::set(format!("{}/cgroup.procs", spec.cgroup), "0")?;
+    unshare(libc::CLONE_NEWCGROUP)?;
+    sys::set(format!("{}/daemon/cgroup.procs", spec.cgroup), "0")?;
+    sys::set(format!("{}/cgroup.subtree_control", spec.cgroup), "+memory +pids")?;
+    let _ = fs::write(format!("{}/cgroup.subtree_control", spec.cgroup), "+cpu");
     // A process namespace made by the machine's root, so that its `/proc` is mounted before the user namespace.
     unshare(libc::CLONE_NEWPID)?;
     let (ask_read, ask_write) = context("pipe", sys::pipe())?;
@@ -291,7 +300,7 @@ fn launcher() -> Result<i32, String> {
 /// The sandbox's first process, PID 1 of its process namespace: builds its view as the machine's root, says so on
 /// `built`, becomes the sandbox's root and runs [`sandbox`]. Returns only when that failed.
 fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Result<Infallible, String> {
-    unshare(libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC)?;
+    unshare(libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC)?;
     // SAFETY: sethostname reads `len` bytes of the string we own.
     unsafe { libc::sethostname(spec.host_name.as_ptr().cast(), spec.host_name.len()) };
     view(spec)?;
