@@ -457,7 +457,7 @@ fn git(checkout: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Runs `command` for at most `limit`: its standard output when it succeeds, else what it said went wrong.
-fn run_at_most(command: &mut Command, limit: Duration) -> Result<String, String> {
+pub(crate) fn run_at_most(command: &mut Command, limit: Duration) -> Result<String, String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use cf_host_linux::under;
+
 /// What `check` finds on a Linux host. Read by [`Facts::of_this_host`]; a test writes its own.
 #[derive(Debug, Clone)]
 pub struct Facts {
@@ -78,11 +80,6 @@ impl Facts {
             uid,
         }
     }
-}
-
-/// `path` (absolute, as on a real host) under `root`.
-fn under(root: &Path, path: &str) -> PathBuf {
-    root.join(path.trim_start_matches('/'))
 }
 
 fn open_kvm(path: &Path) -> Result<(), Kvm> {
@@ -202,8 +199,7 @@ pub fn lines(facts: &Facts) -> Vec<Result<String, String>> {
             "what the systemd of {user} may hand on is not known while it does not run: turn lingering on first"
         )),
         (true, Some(controllers)) => {
-            let has = |name: &str| controllers.split_whitespace().any(|each| each == name);
-            if has("memory") && has("pids") {
+            if cf_vmm_ch::cgroup::wanted(controllers).is_some() {
                 Ok(format!(
                     "cgroup v2, with memory and pids handed on to {user}'s machines"
                 ))
@@ -266,10 +262,7 @@ pub fn lines(facts: &Facts) -> Vec<Result<String, String>> {
 /// install and an update ask of a program before it is put in place.
 pub fn vmm() -> Result<(), String> {
     if cf_vmm_ch::programs::embedded().is_none() {
-        return Err(
-            "this build carries no cloud-hypervisor: build it with `cargo xtask build` on Linux for arm64"
-                .into(),
-        );
+        return Err(cf_vmm_ch::programs::NOT_EMBEDDED.into());
     }
     println!("cloud-hypervisor {}", cf_vmm_ch::pins::CLOUD_HYPERVISOR_VERSION);
     Ok(())

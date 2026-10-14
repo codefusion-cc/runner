@@ -72,11 +72,18 @@ mod linux {
         within(Duration::from_secs(30), || state.join(END).exists());
     }
 
-    fn user_manager() -> Result<(), String> {
-        let output = Command::new("/usr/bin/systemctl")
-            .args(["--user", "show-environment"])
+    /// `systemctl --user` with these arguments, on the bus of this user's systemd as the Runner finds it.
+    fn systemctl(args: &[&str]) -> Result<std::process::Output, String> {
+        Command::new("/usr/bin/systemctl")
+            .arg("--user")
+            .args(args)
+            .envs(cf_daemon::platform::this_user_bus_env()?)
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+    }
+
+    fn user_manager() -> Result<(), String> {
+        let output = systemctl(&["show-environment"])?;
         if output.status.success() {
             Ok(())
         } else {
@@ -85,16 +92,8 @@ mod linux {
     }
 
     fn show(unit: &str, property: &str) -> String {
-        let output = Command::new("/usr/bin/systemctl")
-            .args([
-                "--user",
-                "show",
-                &format!("--property={property}"),
-                "--value",
-                unit,
-            ])
-            .output()
-            .expect("systemctl");
+        let output =
+            systemctl(&["show", &format!("--property={property}"), "--value", unit]).expect("systemctl");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 

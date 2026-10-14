@@ -33,6 +33,7 @@ tracing = "0.1"
 cf-vmm-vz = { path = "../vmm-vz" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cf-host-linux = { path = "../host-linux" }
 cf-vmm-ch = { path = "../vmm-ch" }
 
 [dev-dependencies]

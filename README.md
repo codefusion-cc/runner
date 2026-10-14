@@ -160,8 +160,8 @@ Runner.
 On Linux (arm64, KVM, systemd, cgroup v2; Debian 12 and Ubuntu 24.04 are known to work) the Runner is a unit of the
 user's own systemd, `codefusion-runner.service`, run by a user of its own. Each job's vm-host runs in a systemd scope
 of its own whose cgroup is delegated to it, so machines live through a restart or an update of the Runner and are
-adopted. Nobody sits at such a host: `use` may be left out and is not read, and the budget keeps half a gigabyte for
-the host and runs machines on its fast cores.
+adopted. Nobody sits at such a host: `use` is `dedicated` or left out (`workstation` is refused), and the budget keeps half a
+gigabyte for the host and runs machines on its fast cores.
 
 Once, as root (Ubuntu 24.04 also needs the line about user namespaces):
 

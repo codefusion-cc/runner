@@ -48,8 +48,8 @@ pub struct Config {
     /// The console's address, when the Mac reports to one.
     #[serde(default)]
     pub console: Option<String>,
-    /// Whether a person works on the Mac. Required on a Mac; on Linux, where nobody sits at the host, it may be left
-    /// out and is not used.
+    /// Whether a person works on the Mac. Required on a Mac; on Linux, where nobody sits at the host, it is
+    /// `dedicated` or left out.
     #[serde(rename = "use")]
     #[cfg_attr(not(target_os = "macos"), serde(default = "dedicated"))]
     pub mac_use: Use,
@@ -125,6 +125,14 @@ impl Config {
                     folder.display()
                 ));
             }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if self.mac_use == Use::Workstation {
+            return Err(
+                "use: `workstation` means something on macOS only, where a person works at the Mac; say \
+                 `dedicated` or leave `use` out"
+                    .into(),
+            );
         }
         if self.image.is_empty() {
             return Err("image: no version".into());
@@ -228,7 +236,7 @@ mod tests {
         "state_dir": "/Users/someone/Library/Application Support/CodeFusion Runner",
         "app_dir": "/Users/someone/.config/codefusion-runners",
         "image": "2026.10.1",
-        "use": "workstation"
+        "use": "dedicated"
     }"#;
 
     fn with(change: impl FnOnce(&mut serde_json::Value)) -> Result<Config, String> {
@@ -266,7 +274,7 @@ mod tests {
         let config = Config::parse(WHOLE).expect("config");
         assert_eq!(config.github_api, "https://api.github.com");
         assert_eq!(config.deadline(), Duration::from_secs(6 * 3600));
-        assert_eq!(config.mode(), Mode::Workstation);
+        assert_eq!(config.mode(), Mode::Dedicated);
         assert_eq!(config.console, None);
         assert_eq!(config.repos, Vec::<String>::new());
         assert_eq!(
@@ -319,18 +327,25 @@ mod tests {
     }
 
     #[test]
-    fn what_the_host_is_for_is_said_on_a_mac_and_may_be_left_out_on_linux() {
+    fn what_the_host_is_for_is_said_on_a_mac_and_may_be_left_out_on_linux_where_nobody_works_at_it() {
         let without = with(|v| {
             v.as_object_mut().expect("an object").remove("use");
         });
+        let workstation = with(|v| v["use"] = "workstation".into());
         if cfg!(target_os = "macos") {
             let error = without.expect_err("required");
             assert!(error.contains("use"), "{error}");
+            assert_eq!(workstation.map(|c| c.mode()), Ok(Mode::Workstation));
         } else {
             assert_eq!(without.map(|c| c.mode()), Ok(Mode::Dedicated));
+            let error = workstation.expect_err("no person works at a Linux host");
+            assert!(
+                error.starts_with("use: `workstation` means something on macOS only"),
+                "{error}"
+            );
         }
-        // Said, it is read on both, and a word it does not know is refused on both.
-        assert_eq!(with(|_| ()).map(|c| c.mode()), Ok(Mode::Workstation));
+        // `dedicated` is read on both, and a word it does not know is refused on both.
+        assert_eq!(with(|_| ()).map(|c| c.mode()), Ok(Mode::Dedicated));
         assert!(with(|v| v["use"] = "sometimes".into()).is_err());
     }
 

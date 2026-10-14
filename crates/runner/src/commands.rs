@@ -1,5 +1,7 @@
 use std::path::Path;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use cf_daemon::{Platform as _, This};
 use cf_image::store::Store;
 use cf_image::{DirFiles, TRUSTED_PUBLIC_KEY, parse_public_key, verify};
 
@@ -76,7 +78,7 @@ fn install(folder: &str, version: &str, state: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     println!("ok: image {} installed", manifest.version);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(said) = <cf_daemon::This as cf_daemon::Platform>::keep_state(Path::new(state)) {
+    if let Some(said) = This::keep_state(Path::new(state)) {
         eprintln!("note: {said}");
     }
     Ok(())

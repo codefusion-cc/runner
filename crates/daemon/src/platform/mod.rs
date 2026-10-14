@@ -16,13 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cf_budget::{Host, HostError, HostFacts, Mode, Settings};
-use cf_console_client::{Client, OUTBOX_CAPACITY, Os, Outbox};
+use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
 use cf_secret::Secret;
 
 #[cfg(target_os = "linux")]
-pub use linux::{Linux, RUNTIME, this_user, this_user_bus_env, user_bus_env};
+pub use linux::{Linux, this_user, this_user_bus_env};
 #[cfg(target_os = "macos")]
 pub use mac::Mac;
 
@@ -56,12 +56,8 @@ pub struct Process {
 pub trait Platform {
     /// The budget's reader of the host.
     type Host: Host + Send + 'static;
-    /// What the console calls the system.
-    const OS: Os;
     /// What the system is called in a message: `macOS`, `Linux`.
     const SYSTEM: &'static str;
-    /// The model the console shows when the system names none.
-    const MODEL: &'static str;
     /// The file in the state folder's `logs` that the system's service manager writes the Runner's own output to:
     /// what it says when it cannot start, before its log is open.
     const SERVICE_LOG: &'static str;
@@ -80,8 +76,8 @@ pub trait Platform {
     /// The host's name.
     fn host_name() -> Option<String>;
 
-    /// The host's model, for the console.
-    fn model() -> Option<String>;
+    /// The host's model, for the console; a name for the system when the host names none.
+    fn model() -> String;
 
     /// Reads what the console's page shows beside the budget's reading.
     fn extras(state_dir: &Path) -> Result<Box<dyn Fn() -> HostExtras + Send + Sync>, HostError>;
@@ -96,6 +92,10 @@ pub trait Platform {
 
     /// The process with this number; `None` once it is gone, or when the system will not say.
     fn process(pid: u32) -> Option<Process>;
+
+    /// The program the process with this number runs; `None` once it is gone. Cheaper than [`Platform::process`],
+    /// and no proof the number is still the same process.
+    fn program(pid: u32) -> Option<PathBuf>;
 
     /// The vm-hosts `program` starts in this state folder.
     fn vm_hosts(program: &Path, state_dir: &Path) -> VmHosts;
@@ -203,14 +203,8 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     .map_err(|error| format!("the budget's settings: {error}"))?;
     let machines = Arc::new(machines);
 
-    let mut service = ServiceConfig::new(
-        &setup.machine,
-        &hostname,
-        &P::model().unwrap_or_else(|| P::MODEL.into()),
-        &setup.version,
-    );
+    let mut service = ServiceConfig::new(&setup.machine, &hostname, &P::model(), &setup.version);
     service.policy = setup.policy;
-    service.os = Some(P::OS);
     let service = Service::new(ServiceParts {
         app: setup.app,
         machines: machines.clone(),

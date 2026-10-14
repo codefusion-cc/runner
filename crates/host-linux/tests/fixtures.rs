@@ -34,6 +34,7 @@ fn the_board_reads_as_its_files_say() {
     let raw = host.raw().unwrap();
     assert_eq!(raw.memory.total_bytes, 8_129_820 * 1024);
     assert_eq!(raw.memory.swap_total_bytes, 4_064_908 * 1024);
+    assert_eq!(host.swap_total_bytes(), Some(4_064_908 * 1024));
     assert_eq!(raw.memory_pressure, Some(Psi { some: 0, full: 0 }));
     assert_eq!(raw.zones.len(), 7);
     assert_eq!(raw.zones[0].name, "soc-thermal");

@@ -130,43 +130,34 @@ impl VmHosts {
         }
     }
 
-    /// The command that starts the job's vm-host.
+    /// The command that starts the job's vm-host: the Runner's binary, or `systemd_run` with it in a scope named
+    /// after the job whose cgroup is delegated to it. The job's name is one [`JobRequest::check`] took.
     fn command(&self, job: &str) -> Result<Command, VmError> {
-        let Some(systemd_run) = &self.systemd_run else {
-            let mut command = Command::new(&self.program);
-            command.arg("vm").arg("--state-dir").arg(&self.state_dir);
-            return Ok(command);
+        let mut command = match &self.systemd_run {
+            None => Command::new(&self.program),
+            Some(systemd_run) => {
+                let mut command = Command::new(systemd_run);
+                command
+                    .args([
+                        "--user",
+                        "--scope",
+                        "--quiet",
+                        "--collect",
+                        "--property=Delegate=yes",
+                    ])
+                    .arg(format!("--unit={}", scope_unit(job)))
+                    .arg("--")
+                    .arg(&self.program);
+                // The bus of the user's systemd, which a Runner started by hand under `sudo -iu` may not be told of.
+                #[cfg(target_os = "linux")]
+                command.envs(
+                    crate::platform::this_user_bus_env()
+                        .map_err(|why| VmError(format!("no scope for the vm-host: {why}")))?,
+                );
+                command
+            }
         };
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] // only Linux adds to it
-        let mut command = self.scoped_command(systemd_run, job)?;
-        // The bus of the user's systemd, which a Runner started by hand under `sudo -iu` may not be told of.
-        #[cfg(target_os = "linux")]
-        command.envs(
-            crate::platform::this_user_bus_env()
-                .map_err(|why| VmError(format!("no scope for the vm-host: {why}")))?,
-        );
-        Ok(command)
-    }
-
-    /// The job's vm-host under `systemd_run`, in a scope named after the job whose cgroup is delegated to it.
-    fn scoped_command(&self, systemd_run: &Path, job: &str) -> Result<Command, VmError> {
-        let unit =
-            scope_unit(job).ok_or_else(|| VmError(format!("{job:?} is no name for a systemd scope")))?;
-        let mut command = Command::new(systemd_run);
-        command
-            .args([
-                "--user",
-                "--scope",
-                "--quiet",
-                "--collect",
-                "--property=Delegate=yes",
-            ])
-            .arg(format!("--unit={unit}"))
-            .arg("--")
-            .arg(&self.program)
-            .arg("vm")
-            .arg("--state-dir")
-            .arg(&self.state_dir);
+        command.arg("vm").arg("--state-dir").arg(&self.state_dir);
         Ok(command)
     }
 
@@ -234,14 +225,10 @@ fn started_by(process: &Process, born_by: u64, mark: Option<u64>) -> bool {
     }
 }
 
-/// The name of the systemd scope a job's vm-host runs in; `None` for a job whose name a unit cannot carry as it is.
-fn scope_unit(job: &str) -> Option<String> {
-    let plain = !job.is_empty()
-        && job.len() <= 64
-        && job
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
-    plain.then(|| format!("codefusion-runner-{job}.scope"))
+/// The name of the systemd scope a job's vm-host runs in. A job's name ([`JobRequest::check`]) is one a unit can
+/// carry as it is.
+fn scope_unit(job: &str) -> String {
+    format!("codefusion-runner-{job}.scope")
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -289,12 +276,14 @@ fn ended_uncollected(pid: u32) -> bool {
 
 /// The program a process runs.
 fn process_path(pid: u32) -> Option<PathBuf> {
-    This::process(pid).map(|process| process.program)
+    This::program(pid)
 }
 
 impl Vms for VmHosts {
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let fail = |what: &str, error: &dyn std::fmt::Display| VmError(format!("{what}: {error}"));
+        // The job's name ends up in paths and in the name of a unit.
+        request.check().map_err(|e| fail("the request", &e))?;
         // The request holds the job's registration: it goes to the vm-host's input and nowhere else.
         let json = serde_json::to_vec(request).map_err(|e| fail("the request", &e))?;
         let log = std::fs::OpenOptions::new()
@@ -563,26 +552,46 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_is_named_after_its_job_and_a_name_no_unit_can_carry_has_none() {
-        assert_eq!(
-            scope_unit("j1a2b3c4").as_deref(),
-            Some("codefusion-runner-j1a2b3c4.scope")
-        );
-        assert_eq!(
-            scope_unit("it_boot-2").as_deref(),
-            Some("codefusion-runner-it_boot-2.scope")
-        );
-        assert_eq!(scope_unit(&"j".repeat(64)).map(|unit| unit.len()), Some(64 + 24));
-        for job in ["", "a.b", "a/b", "a b", "a\\x2d", "ä", "a\n", &"j".repeat(65)] {
-            assert_eq!(scope_unit(job), None, "{job:?}");
+    fn a_job_whose_name_no_path_or_scope_can_carry_is_not_started() {
+        let folder = tempfile::tempdir().expect("folder");
+        let vms = VmHosts::new("/bin/true", folder.path()).in_scopes("/bin/true");
+        for job in [
+            "",
+            "a.b",
+            "a/b",
+            "a b",
+            "a\\x2d",
+            "a_b",
+            "J1",
+            "ä",
+            "a\n",
+            &"j".repeat(33),
+        ] {
+            let refused = vms.start(&request(job)).expect_err(job);
+            assert!(
+                refused.0.starts_with("the request: the request is refused"),
+                "{job:?}: {}",
+                refused.0
+            );
         }
+        assert!(
+            !folder.path().join("logs").exists(),
+            "a refused job leaves no log"
+        );
     }
 
     #[test]
     fn a_vm_host_in_a_scope_is_the_runners_program_under_systemd_run_with_its_cgroup_delegated() {
-        let systemd_run = Path::new("/usr/bin/systemd-run");
-        let vms = VmHosts::new("/state/bin/codefusion-runner", "/state").in_scopes(systemd_run);
-        let command = vms.scoped_command(systemd_run, "j1a2b3c4").expect("a command");
+        let vms = VmHosts::new("/state/bin/codefusion-runner", "/state").in_scopes("/usr/bin/systemd-run");
+        let command = match vms.command("j1a2b3c4") {
+            Ok(command) => command,
+            // Where no systemd user manager runs for this user, there is no bus to start a scope on.
+            Err(error) if cfg!(target_os = "linux") => {
+                assert!(error.0.starts_with("no scope for the vm-host: "), "{}", error.0);
+                return;
+            }
+            Err(error) => panic!("{}", error.0),
+        };
         assert_eq!(command.get_program(), "/usr/bin/systemd-run");
         let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
         assert_eq!(
@@ -601,7 +610,6 @@ mod tests {
                 "/state",
             ]
         );
-        assert!(vms.command("a b").is_err(), "a job no scope can be named after");
         let direct = VmHosts::new("/state/bin/codefusion-runner", "/state")
             .command("j1a2b3c4")
             .expect("a command");

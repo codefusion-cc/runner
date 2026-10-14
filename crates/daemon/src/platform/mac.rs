@@ -1,12 +1,11 @@
 //! macOS: [`MacHost`] for the budget, Virtualization.framework through the vm-hosts, Time Machine for the state
 //! folder, and the entitlement without which macOS starts no virtual machine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cf_budget::{HostError, HostFacts, Mode, Settings};
-use cf_console_client::Os;
 use cf_host_macos::{
     MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, program_of,
 };
@@ -26,9 +25,7 @@ pub struct Mac;
 
 impl Platform for Mac {
     type Host = MacHost;
-    const OS: Os = Os::Macos;
     const SYSTEM: &'static str = "macOS";
-    const MODEL: &'static str = "Mac";
     const SERVICE_LOG: &'static str = "launchd.log";
 
     fn host(state_dir: &Path) -> Result<MacHost, HostError> {
@@ -47,8 +44,8 @@ impl Platform for Mac {
         host_name()
     }
 
-    fn model() -> Option<String> {
-        model()
+    fn model() -> String {
+        model().unwrap_or_else(|| "Mac".into())
     }
 
     fn extras(state_dir: &Path) -> Result<Box<dyn Fn() -> HostExtras + Send + Sync>, HostError> {
@@ -96,6 +93,10 @@ impl Platform for Mac {
                 program.display()
             ))
         }
+    }
+
+    fn program(pid: u32) -> Option<PathBuf> {
+        program_of(libc::c_int::try_from(pid).ok()?)
     }
 
     fn process(pid: u32) -> Option<Process> {

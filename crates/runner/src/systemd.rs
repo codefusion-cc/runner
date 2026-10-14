@@ -19,7 +19,8 @@ pub const UNIT: &str = "codefusion-runner.service";
 /// work by ending, and machines that stand are found again by the Runner that starts. systemd waits `RestartSec`
 /// after every end, a restart's too, so it is short; a Runner that cannot start (no image, no key) waits out the rest
 /// of [`crate::service::FAILED_START_WAIT`] itself before it ends, which keeps it to two tries and two lines in the log
-/// a minute as launchd's `ThrottleInterval` does, and `StartLimitIntervalSec=0` lets it try for as long as it takes. `Type=exec` makes `systemctl start` fail when the program cannot be run at all.
+/// a minute as launchd's `ThrottleInterval` does, and `StartLimitIntervalSec=0` lets it try for as long as it takes.
+/// `Type=exec` makes `systemctl start` fail when the program cannot be run at all.
 /// `TimeoutStopSec` gives it the time to close its sessions at GitHub. Each vm-host runs in a scope of its own, so
 /// `KillMode=mixed` ends only what the Runner itself left in the unit once it is gone, never a machine. The output
 /// goes to a file of the state folder, beside the Runner's own log, as on a Mac. Nothing in it confines the Runner:
@@ -100,27 +101,28 @@ const STOP_TRIES: u32 = 500;
 /// Runs `systemctl --user` with these arguments and says what it printed, as an error when it failed.
 pub type Systemctl<'a> = &'a dyn Fn(&[&str]) -> Result<String, String>;
 
+/// How long one `systemctl` call may take: a stop waits for the unit's `TimeoutStopSec`, and a user bus that hangs
+/// must not hang an install with it.
+const SYSTEMCTL_LIMIT: Duration = Duration::from_secs(100);
+
 /// The real `systemctl --user`. The user's systemd is found through its runtime folder, which a shell of
-/// `sudo -iu <user>` may not name ([`cf_daemon::platform::user_bus_env`]).
+/// `sudo -iu <user>` may not name ([`cf_daemon::platform::this_user_bus_env`]).
 pub fn systemctl(args: &[&str]) -> Result<String, String> {
     let env = cf_daemon::platform::this_user_bus_env()?;
-    let output = std::process::Command::new("/usr/bin/systemctl")
-        .arg("--user")
-        .args(args)
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("systemctl: {error}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if output.status.success() {
-        Ok(text)
-    } else {
-        Err(format!("systemctl --user {}: {}", args.join(" "), text.trim()))
-    }
+    run_systemctl(Path::new("/usr/bin/systemctl"), args, env, SYSTEMCTL_LIMIT)
+}
+
+/// `program --user <args>` with `env`, for at most `limit`.
+fn run_systemctl(
+    program: &Path,
+    args: &[&str],
+    env: Vec<(&str, std::ffi::OsString)>,
+    limit: Duration,
+) -> Result<String, String> {
+    let mut command = std::process::Command::new(program);
+    command.arg("--user").args(args).envs(env);
+    crate::update::run_at_most(&mut command, limit)
+        .map_err(|error| format!("systemctl --user {}: {error}", args.join(" ")))
 }
 
 /// The configuration folder the user's systemd reads units from: `XDG_CONFIG_HOME` as that systemd has it, which is
@@ -423,6 +425,29 @@ mod tests {
         assert_eq!(config_home(home, &quoted), home.join(".config"));
         let unreachable = |_: &[&str]| -> Result<String, String> { Err("Failed to connect to bus".into()) };
         assert_eq!(config_home(home, &unreachable), home.join(".config"));
+    }
+
+    #[test]
+    fn a_systemctl_that_never_answers_is_an_error_within_the_limit() {
+        let folder = tempfile::tempdir().expect("folder");
+        let hangs = folder.path().join("systemctl");
+        std::fs::write(&hangs, "#!/bin/sh\nexec sleep 60\n").expect("a program");
+        std::fs::set_permissions(&hangs, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("mode");
+        let began = std::time::Instant::now();
+        let error = run_systemctl(&hangs, &["stop", UNIT], Vec::new(), Duration::from_secs(1))
+            .expect_err("it never answers");
+        assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
+        assert!(
+            error.starts_with("systemctl --user stop codefusion-runner.service: took longer than"),
+            "{error}"
+        );
+        let says = folder.path().join("says");
+        std::fs::write(&says, "#!/bin/sh\necho \"$@\"\n").expect("a program");
+        std::fs::set_permissions(&says, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("mode");
+        assert_eq!(
+            run_systemctl(&says, &["is-active", UNIT], Vec::new(), Duration::from_secs(10)).as_deref(),
+            Ok("--user is-active codefusion-runner.service")
+        );
     }
 
     #[test]

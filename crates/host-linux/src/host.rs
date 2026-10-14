@@ -54,6 +54,13 @@ impl LinuxHost {
         Some(blocks(stats.f_blocks, stats.f_frsize))
     }
 
+    /// The swap the host has, in bytes (`SwapTotal` of `/proc/meminfo`). `None` when Linux will not say.
+    pub fn swap_total_bytes(&self) -> Option<u64> {
+        read::meminfo(&self.root)
+            .ok()
+            .map(|memory| memory.swap_total_bytes)
+    }
+
     /// The time all CPUs spent since the host started, in ticks (`/proc/stat`). Two counts make a share, see
     /// [`cpu_percent`](crate::cpu_percent). `None` when Linux will not say.
     pub fn cpu_ticks(&self) -> Option<CpuTicks> {

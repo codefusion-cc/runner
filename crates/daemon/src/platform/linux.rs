@@ -2,13 +2,13 @@
 //! vm-hosts, each started in a systemd scope of its own whose cgroup is delegated to it.
 
 use std::ffi::OsString;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use cf_budget::{HostError, HostFacts, Mode, Settings};
-use cf_console_client::Os;
 use cf_host_linux::{
     LinuxHost, battery, boot_session, boot_time, cpu_percent, fast_cpus, host_name, load, model,
 };
@@ -23,7 +23,7 @@ const ROOT: &str = "/";
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 
 /// Where systemd makes each user's runtime folder, `<RUNTIME>/<uid>`, while the user's manager runs.
-pub const RUNTIME: &str = "/run/user";
+const RUNTIME: &str = "/run/user";
 
 /// How long the program check may take.
 const FIT_LIMIT: Duration = Duration::from_secs(10);
@@ -34,9 +34,7 @@ pub struct Linux;
 
 impl Platform for Linux {
     type Host = LinuxHost;
-    const OS: Os = Os::Linux;
     const SYSTEM: &'static str = "Linux";
-    const MODEL: &'static str = "Linux host";
     const SERVICE_LOG: &'static str = "systemd.log";
 
     fn host(state_dir: &Path) -> Result<LinuxHost, HostError> {
@@ -58,8 +56,8 @@ impl Platform for Linux {
         host_name(Path::new(ROOT))
     }
 
-    fn model() -> Option<String> {
-        model(Path::new(ROOT))
+    fn model() -> String {
+        model(Path::new(ROOT)).unwrap_or_else(|| "Linux host".into())
     }
 
     fn extras(state_dir: &Path) -> Result<Box<dyn Fn() -> HostExtras + Send + Sync>, HostError> {
@@ -72,7 +70,7 @@ impl Platform for Linux {
             HostExtras {
                 load: load(root),
                 disk_total_bytes: host.disk_total_bytes().unwrap_or(0),
-                swap_total_bytes: host.raw().map_or(0, |raw| raw.memory.swap_total_bytes),
+                swap_total_bytes: host.swap_total_bytes().unwrap_or(0),
                 cpu_percent: before
                     .zip(now)
                     .and_then(|(before, now)| cpu_percent(before, now))
@@ -89,11 +87,11 @@ impl Platform for Linux {
     }
 
     /// Whether the program carries cloud-hypervisor, by asking it (`codefusion-runner vmm`): a build without it
-    /// starts no machine.
+    /// starts no machine, and says how to build one that does.
     fn fit(program: &Path) -> Result<(), String> {
-        let not = |why: String| {
+        let unknown = |why: &dyn std::fmt::Display| {
             format!(
-                "{} carries no cloud-hypervisor ({why}); build it with `cargo xtask build` on Linux for arm64",
+                "{} did not say which cloud-hypervisor it carries ({why})",
                 program.display()
             )
         };
@@ -101,23 +99,39 @@ impl Platform for Linux {
             .arg("vmm")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| not(error.to_string()))?;
+            .map_err(|error| unknown(&error))?;
         let began = Instant::now();
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(status)) => return Err(not(status.to_string())),
+                Ok(Some(status)) => {
+                    let mut said = String::new();
+                    if let Some(mut stderr) = child.stderr.take() {
+                        let _ = stderr.read_to_string(&mut said);
+                    }
+                    let said = said.trim();
+                    let said = said.strip_prefix("codefusion-runner: ").unwrap_or(said);
+                    return Err(if said.is_empty() {
+                        unknown(&status)
+                    } else {
+                        format!("{}: {said}", program.display())
+                    });
+                }
                 Ok(None) if began.elapsed() > FIT_LIMIT => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(not("it did not answer".into()));
+                    return Err(unknown(&"it did not answer"));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(error) => return Err(not(error.to_string())),
+                Err(error) => return Err(unknown(&error)),
             }
         }
+    }
+
+    fn program(pid: u32) -> Option<PathBuf> {
+        cf_host_linux::program_of(Path::new(ROOT), pid)
     }
 
     fn process(pid: u32) -> Option<Process> {
@@ -187,7 +201,7 @@ pub fn this_user_bus_env() -> Result<Vec<(&'static str, OsString)>, String> {
 ///
 /// An error, which names the root command that fixes it, when the runtime folder is not there: no systemd user
 /// manager runs for the user, because lingering is off and nobody is logged in.
-pub fn user_bus_env(
+fn user_bus_env(
     uid: u32,
     user: &str,
     get: impl Fn(&str) -> Option<OsString>,
@@ -384,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn a_program_that_carries_no_cloud_hypervisor_is_not_fit_and_the_error_says_how_to_build_one() {
+    fn a_program_that_carries_no_cloud_hypervisor_is_not_fit_and_the_error_is_what_it_says() {
         let folder = tempfile::tempdir().expect("folder");
         let program = |name: &str, body: &str| {
             use std::os::unix::fs::PermissionsExt as _;
@@ -393,11 +407,21 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("a mode");
             path
         };
-        let without = program("without", "#!/bin/sh\n[ \"$1\" = vmm ] && exit 1\nexit 0\n");
-        let error = Linux::fit(&without).expect_err("refused");
-        assert!(
-            error.contains("carries no cloud-hypervisor") && error.contains("cargo xtask build"),
-            "{error}"
+        let without = program(
+            "without",
+            "#!/bin/sh\n[ \"$1\" = vmm ] && echo 'codefusion-runner: no cloud-hypervisor: build it' >&2 && exit 1\nexit 0\n",
+        );
+        assert_eq!(
+            Linux::fit(&without),
+            Err(format!("{}: no cloud-hypervisor: build it", without.display()))
+        );
+        let silent = program("silent", "#!/bin/sh\nexit 1\n");
+        assert_eq!(
+            Linux::fit(&silent),
+            Err(format!(
+                "{} did not say which cloud-hypervisor it carries (exit status: 1)",
+                silent.display()
+            ))
         );
         let with = program("with", "#!/bin/sh\n[ \"$1\" = vmm ] && exit 0\nexit 1\n");
         assert_eq!(Linux::fit(&with), Ok(()));

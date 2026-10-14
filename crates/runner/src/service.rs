@@ -347,11 +347,11 @@ pub fn enroll(config: &Path) -> Result<(), String> {
                 code,
                 machine: config.machine.clone(),
                 hostname: hostname(),
-                model: This::model().unwrap_or_else(|| This::MODEL.into()),
+                model: This::model(),
                 version: VERSION.into(),
                 cpus: facts.cores,
                 memory_bytes: facts.total_bytes,
-                os: Some(This::OS),
+                os: cf_console_client::Os::this(),
             },
         ))
         .map_err(|error| format!("the console: {error}"))?;
@@ -454,9 +454,32 @@ fn now_line(config: &Config) -> String {
     }
 }
 
-/// What an install needs, each as a line that says whether it is there. Nothing is changed.
+/// What an install needs, each as a line that says whether it is there. Nothing is changed. On a Mac that includes
+/// a name that is not the cf-runners manager's; on Linux KVM, the cgroups, the user's systemd, user namespaces, pasta
+/// and a state folder that runs programs ([`crate::linux::lines`]).
 fn needs(config: &Config, home: &Path, hostname: &str, program: &Path) -> Vec<Result<String, String>> {
-    let mut lines = system_needs(config, home, hostname);
+    #[cfg(target_os = "macos")]
+    let mut lines = vec![
+        crate::config::check_beside_old_manager(config, home, hostname).map(|()| {
+            match crate::config::old_manager_name(home, hostname) {
+                Some(old) => format!(
+                    "the name `{}` is not the cf-runners manager's (`{old}`), which is left as it is",
+                    config.machine
+                ),
+                None => format!(
+                    "the name `{}`; no cf-runners manager is installed for this user",
+                    config.machine
+                ),
+            }
+        }),
+    ];
+    #[cfg(target_os = "linux")]
+    let _ = (home, hostname);
+    #[cfg(target_os = "linux")]
+    let mut lines = crate::linux::lines(&crate::linux::Facts::of_this_host(
+        Path::new("/"),
+        &config.state_dir,
+    ));
     lines.extend(common_needs(config, program));
     lines
 }
@@ -475,35 +498,6 @@ fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> 
         This::fit(program).map(|()| format!("{} can start machines", program.display())),
         room(config),
     ]
-}
-
-/// What only a Mac needs: a name that is not the cf-runners manager's.
-#[cfg(target_os = "macos")]
-fn system_needs(config: &Config, home: &Path, hostname: &str) -> Vec<Result<String, String>> {
-    vec![
-        crate::config::check_beside_old_manager(config, home, hostname).map(|()| {
-            match crate::config::old_manager_name(home, hostname) {
-                Some(old) => format!(
-                    "the name `{}` is not the cf-runners manager's (`{old}`), which is left as it is",
-                    config.machine
-                ),
-                None => format!(
-                    "the name `{}`; no cf-runners manager is installed for this user",
-                    config.machine
-                ),
-            }
-        }),
-    ]
-}
-
-/// What only Linux needs: KVM, the cgroups, the user's systemd, user namespaces, pasta and a state folder that runs
-/// programs ([`crate::linux::lines`]).
-#[cfg(target_os = "linux")]
-fn system_needs(config: &Config, _home: &Path, _hostname: &str) -> Vec<Result<String, String>> {
-    crate::linux::lines(&crate::linux::Facts::of_this_host(
-        Path::new("/"),
-        &config.state_dir,
-    ))
 }
 
 fn print(lines: &[Result<String, String>]) -> usize {
@@ -791,15 +785,13 @@ mod tests {
         let unfit = if cfg!(target_os = "macos") {
             "is not signed with the com.apple.security.virtualization"
         } else {
-            "carries no cloud-hypervisor"
+            "did not say which cloud-hypervisor it carries"
         };
         assert!(missing[3].contains(unfit), "{}", missing[3]);
         assert!(lines[4].is_ok(), "the room is a look: {lines:?}");
         #[cfg(target_os = "macos")]
         assert!(
-            system_needs(&config, &home, "Build-Mac-2.local")
-                .iter()
-                .all(Result::is_ok),
+            needs(&config, &home, "Build-Mac-2.local", &unsigned)[0].is_ok(),
             "no cf-runners manager in this home"
         );
         assert!(!state.exists() && !app.exists(), "a check makes no folder");
