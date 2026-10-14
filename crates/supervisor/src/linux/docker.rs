@@ -49,6 +49,8 @@ pub struct Spec {
     pub gid_map: String,
     /// The size of the sandbox's `/dev/shm`.
     pub shm_bytes: u64,
+    /// The daemon's networks, clear of every network next to the machine.
+    pub networks: plan::Networks,
 }
 
 fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
@@ -56,17 +58,20 @@ fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
 }
 
 /// The modules, the sandbox's control group and folders, and the socket's folder in the job's root. `root` is the
-/// job's root, `scratch` the job's disk, `cgroup` the job's control group; `passwd` and `group` are the image's.
+/// job's root, `scratch` the job's disk, `cgroup` the job's control group; `passwd` and `group` are the image's;
+/// `beside` is what is next to the machine, which the daemon's networks stay clear of ([`plan::networks`]).
 /// An error says what the job is missing; the job runs without Docker and is told why.
 pub fn prepare(
     root: &str,
     scratch: &str,
     cgroup: &str,
-    (uid, gid): (u32, u32),
-    group: &str,
+    (uid, gid, group): (u32, u32, &str),
     host_name: &str,
     shm_bytes: u64,
+    beside: &[(plan::Ip, u8)],
 ) -> Result<Spec, String> {
+    let networks = plan::networks(beside)
+        .ok_or("every private range the daemon's networks could have is one the machine or the host is in")?;
     load_modules(MODULE_LIST, MODULE_DIR)?;
     let _ = fs::remove_dir_all(MODULE_DIR);
     let docker_gid = cf_supervisor::environment::find_group(group, plan::GROUP)
@@ -118,6 +123,7 @@ pub fn prepare(
         uid_map,
         gid_map,
         shm_bytes,
+        networks,
     })
 }
 
@@ -271,9 +277,14 @@ fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Re
         .iter()
         .map(|(name, value)| sys::cstr(&format!("{name}={value}")))
         .collect();
+    let networks = serde_json::to_string(&spec.networks).unwrap_or_default();
     let error = sys::exec(
         &sys::cstr(SANDBOX_SELF),
-        &[sys::cstr(SANDBOX_SELF), sys::cstr("docker-sandbox")],
+        &[
+            sys::cstr(SANDBOX_SELF),
+            sys::cstr("docker-sandbox"),
+            sys::cstr(&networks),
+        ],
         &environment,
     );
     Err(format!("{SANDBOX_SELF}: {error}"))
@@ -362,9 +373,10 @@ fn view(spec: &Spec) -> Result<(), String> {
 
 /// The sandbox's first program, as its root and PID 1 of its process namespace, in the machine's network: makes the
 /// daemon's network namespace, joins it to the machine's with pasta, starts the daemon in it, and reaps until the
-/// daemon ends. Its output is the daemon's log.
-pub fn sandbox() -> ! {
-    match run_sandbox() {
+/// daemon ends. Its output is the daemon's log. `networks` is the daemon's [`plan::Networks`], as JSON.
+pub fn sandbox(networks: &str) -> ! {
+    let networks = serde_json::from_str(networks).map_err(|error| format!("the daemon's networks: {error}"));
+    match networks.and_then(run_sandbox) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("cf-sandbox: {error}");
@@ -373,13 +385,13 @@ pub fn sandbox() -> ! {
     }
 }
 
-fn run_sandbox() -> Result<i32, String> {
+fn run_sandbox(networks: plan::Networks) -> Result<i32, String> {
     let (ready_read, ready_write) = context("pipe", sys::pipe())?;
     let (go_read, go_write) = context("pipe", sys::pipe())?;
     let daemon = fork()?;
     if daemon == 0 {
         drop((ready_read, go_write));
-        let Err(error) = daemon_process(ready_write, go_read);
+        let Err(error) = daemon_process(ready_write, go_read, &networks);
         eprintln!("cf-sandbox: the daemon did not start: {error}");
         std::process::exit(70);
     }
@@ -412,7 +424,7 @@ fn run_sandbox() -> Result<i32, String> {
 /// The daemon's process: a network namespace of the sandbox's, its loopback up and its one rule
 /// ([`plan::flagless_tcp_rule`]), then the daemon once pasta has joined the namespace to the machine's network.
 /// Returns only when that failed.
-fn daemon_process(ready: OwnedFd, go: OwnedFd) -> Result<Infallible, String> {
+fn daemon_process(ready: OwnedFd, go: OwnedFd, networks: &plan::Networks) -> Result<Infallible, String> {
     unshare(libc::CLONE_NEWNET)?;
     net::loopback_up()?;
     let rule = plan::flagless_tcp_rule();
@@ -428,7 +440,7 @@ fn daemon_process(ready: OwnedFd, go: OwnedFd) -> Result<Infallible, String> {
     if File::from(go).read(&mut byte).unwrap_or(0) != 1 {
         return Err("the daemon's network was not joined".into());
     }
-    let command = plan::dockerd_command();
+    let command = plan::dockerd_command(networks);
     let error = sandbox_command(&command).exec();
     Err(format!("{}: {error}", command[0]))
 }

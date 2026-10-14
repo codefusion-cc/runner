@@ -301,10 +301,10 @@ pub fn run(
             ROOT,
             SCRATCH,
             CGROUP,
-            (uid, gid),
-            &group,
+            (uid, gid, &group),
             &name,
             job.limits.shm_bytes,
+            &network.beside,
         )
         .and_then(|spec| docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM)));
         if let Err(error) = started {
