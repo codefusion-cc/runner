@@ -223,7 +223,11 @@ async fn a_successful_push_to_main_keeps_its_copy_and_the_next_docker_job_starts
     assert_eq!(snapshot.caches.len(), 1);
     assert_eq!(snapshot.caches[0].1.repo, REPO);
     assert!(snapshot.caches[0].1.written_at > 0);
-    let kinds: Vec<&str> = snapshot.cache_events.iter().map(|event| event.kind.as_str()).collect();
+    let kinds: Vec<&str> = snapshot
+        .cache_events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect();
     assert_eq!(kinds, ["kept"]);
 
     let next = docker_job(&mut w).await;
