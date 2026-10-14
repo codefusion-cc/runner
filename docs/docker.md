@@ -76,9 +76,12 @@ folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, 
   holds of the host's disk what the job wrote. It writes only its copy.
 - Once the job is over, the copy becomes the repository's cache only when everything says it may
   (`cf_daemon::caches::refusal`). GitHub said the job succeeded, on a push, a schedule or a manual dispatch. The
-  workflow is the repository's own, at `refs/heads/<its default branch>`. The guest said the daemon still answered,
+  workflow is the repository's own, at `refs/heads/<its default branch>`. GitHub's REST API says the run checked
+  out that branch of this repository (read while the job runs; a workflow's ref is where its file is, and a reusable
+  workflow at the default branch called from another branch runs that branch's code). The guest said the daemon still answered,
   stopped by itself and let the disk go. Anything else is thrown away: a pull request, a fork, another branch, a
-  failed or cancelled job, a job GitHub never said the end of, a disk let go uncleanly. So a cache holds what the
+  failed or cancelled job, a job GitHub never said the end of, a run that could not be read, a disk let go
+  uncleanly. So a cache holds what the
   default branch built and nothing a pull request, a fork or another repository left. A cache's key is a hash of
   its repository's name in lowercase, and its record names the repository, which is checked before it is used.
 - The job's end hook removes its containers, volumes and networks from the job's daemon, by its socket, whatever
@@ -114,8 +117,10 @@ folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, 
   store on a real file system: kept, thrown away, replaced, dropped, a record naming another repository, a copy in
   use or whose machine never started, sweeping after a restart, a budget of 0, and what a store reads back.
 - `crates/daemon/tests/docker.rs`: the same through the daemon: a push to main keeps its copy and the next job starts
-  from it; a pull request, another branch, a failure, a cancellation, another repository's workflow, an unclean disk
-  and a job GitHub never said the end of do not; a copy outlives a restart (records read back from disk).
+  from it; a pull request, another branch, a failure, a cancellation, another repository's workflow, an unclean disk,
+  a job GitHub never said the end of, a reusable workflow at main run from another branch and a run never read do
+  not; a copy outlives a restart (records read back from disk). `crates/scaleset/tests/github_rules.rs`: a run says
+  the branch its code came from, not its workflow's.
 - `cargo xtask it --only docker-cache`, against real machines: a first job fills an empty cache and leaves it clean,
   the next one on a copy has its image, none of its containers or volumes, and builds from the cache, and a disk of
   garbage is made anew. It goes red without the end hook's tidying, without the daemon's own stop, and when the
