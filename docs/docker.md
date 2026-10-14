@@ -68,11 +68,12 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
 
 A host keeps one cache per repository: a 20 GB disk (sparse: it holds what was written) with the daemon's data,
 images and build cache, so a job does not pull or build again what the one before did. `docker_cache_gb` (30) is
-what all caches of a host may hold together; 0 keeps none, and a host whose state folder cannot share blocks
-between files (APFS can; on Linux btrfs and XFS can, ext4 cannot) keeps none either.
+what all caches of a host may hold together; 0 keeps none and deletes those there were, and a host whose state
+folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, ext4 cannot) keeps none either.
 
 - Each Docker job gets a copy of its repository's cache that shares every block until it is written (APFS's
-  clonefile, Linux's reflink), or an empty one the guest makes a file system on. It writes only its copy.
+  clonefile, Linux's reflink), or an empty one the guest makes a file system on, writing no zeros, so a new cache
+  holds of the host's disk what the job wrote. It writes only its copy.
 - Once the job is over, the copy becomes the repository's cache only when everything says it may
   (`cf_daemon::caches::refusal`). GitHub said the job succeeded, on a push, a schedule or a manual dispatch. The
   workflow is the repository's own, at `refs/heads/<its default branch>`. The guest said the daemon still answered,
@@ -80,8 +81,9 @@ between files (APFS can; on Linux btrfs and XFS can, ext4 cannot) keeps none eit
   failed or cancelled job, a job GitHub never said the end of, a disk let go uncleanly. So a cache holds what the
   default branch built and nothing a pull request, a fork or another repository left. A cache's key is a hash of
   its repository's name in lowercase, and its record names the repository, which is checked before it is used.
-- The job's end hook removes its containers, volumes and networks; images and build cache stay. A next job starts
-  with none of the containers of the one before.
+- The job's end hook removes its containers, volumes and networks from the job's daemon, by its socket, whatever
+  context the job chose; images and build cache stay. A next job starts with none of the containers of the one
+  before. A job the host stopped (its deadline, a cancellation) is never kept, so its daemon is not waited for.
 - Before a cache is mounted the image's `e2fsck` checks it; one that does not mount is made anew and the job runs on
   an empty one (`replaced`). A cache the daemon could not run on is deleted (`dropped`). Over the budget the cache
   used longest ago goes (`evicted`), never one a job holds now.
@@ -109,7 +111,8 @@ between files (APFS can; on Linux btrfs and XFS can, ext4 cannot) keeps none eit
 - `crates/daemon/tests/caches.rs`: the rule (each condition refusing alone, and a property: nothing but a successful
   run of the repository's own workflow on its default branch with a clean disk is kept), the key (one per
   repository in any case, two repositories never one), eviction (least recently used first, none in use), and the
-  store on a real file system: kept, thrown away, dropped, a record naming another repository, sweeping.
+  store on a real file system: kept, thrown away, replaced, dropped, a record naming another repository, a copy in
+  use or whose machine never started, sweeping after a restart, a budget of 0, and what a store reads back.
 - `crates/daemon/tests/docker.rs`: the same through the daemon: a push to main keeps its copy and the next job starts
   from it; a pull request, another branch, a failure, a cancellation, another repository's workflow, an unclean disk
   and a job GitHub never said the end of do not; a copy outlives a restart (records read back from disk).
