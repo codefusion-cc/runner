@@ -44,7 +44,7 @@ impl Sink {
         if self.file.is_none() {
             self.open();
         }
-        // A log that cannot be written must not stop the service: the line goes to launchd's own file.
+        // A log that cannot be written must not stop the service: the line goes to the service manager's own file.
         let wrote = self
             .file
             .as_mut()

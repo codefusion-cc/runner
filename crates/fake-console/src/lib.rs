@@ -36,6 +36,8 @@ struct Machine {
     id: u64,
     name: String,
     token: String,
+    /// The system as the console keeps it: what the last connect request or report said, read by [`schema::os`].
+    os: Option<&'static str>,
 }
 
 struct Pending {
@@ -189,13 +191,17 @@ impl State {
         self.tokens.push(token.clone());
         match self.machines.iter_mut().find(|m| m.name == machine) {
             // A Mac connecting again under its name keeps its row; the old token stops working.
-            Some(existing) => existing.token = token.clone(),
+            Some(existing) => {
+                existing.token = token.clone();
+                existing.os = schema::os(&body);
+            }
             None => {
                 self.next_machine += 1;
                 self.machines.push(Machine {
                     id: self.next_machine,
                     name: machine.clone(),
                     token: token.clone(),
+                    os: schema::os(&body),
                 });
             }
         }
@@ -231,6 +237,9 @@ impl State {
                     command.done_by.insert(machine);
                 }
             }
+        }
+        if let Some(row) = self.machines.iter_mut().find(|m| m.id == machine) {
+            row.os = schema::os(&body);
         }
         // A Mac renamed on the Mac is renamed here too, unless another Mac has the name.
         let wanted = body["status"]["machine"].as_str().unwrap_or("").to_string();
@@ -449,6 +458,17 @@ impl FakeConsole {
     /// The names of the Macs that are connected now.
     pub fn machines(&self) -> Vec<String> {
         self.lock().machines.iter().map(|m| m.name.clone()).collect()
+    }
+
+    /// The system the console keeps for this machine: `macos`, `linux`, or none when it was not said or is one the
+    /// console does not know.
+    pub fn os_of(&self, machine: &str) -> Option<String> {
+        self.lock()
+            .machines
+            .iter()
+            .find(|m| m.name == machine)
+            .and_then(|m| m.os)
+            .map(String::from)
     }
 
     /// How many requests arrived, refused ones and faults included.

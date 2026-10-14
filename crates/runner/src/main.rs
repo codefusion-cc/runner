@@ -1,17 +1,23 @@
-//! The CodeFusion Runner: the service of one Mac (`daemon`, `enroll`, `check`, `install`, `uninstall`), `version`,
-//! `image verify` and `image install`, `vm` (the vm-host of one job) and `boot-proof`. On Linux, a machine's monitor
-//! runs through the hidden `vm-sandbox`.
+//! The CodeFusion Runner: the service of one host (`daemon`, `enroll`, `check`, `install`, `uninstall`), `version`,
+//! `image verify` and `image install`, `vm` (the vm-host of one job) and `boot-proof`, on macOS and on Linux. On
+//! Linux, a machine's monitor runs through the hidden `vm-sandbox`, and `vmm` names the monitor the build carries.
 
 mod commands;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod config;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod hidden;
 #[cfg(target_os = "macos")]
 mod launchd;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod manager;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod service;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+mod systemd;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod update;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod vm;

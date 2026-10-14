@@ -12,6 +12,30 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// The operating system a Runner runs on, as the console names it: `macos` or `linux` on the wire. The console reads
+/// a value it does not know as none, so a Runner on a system it learns of later is still enrolled and heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Os {
+    /// macOS.
+    Macos,
+    /// Linux.
+    Linux,
+}
+
+impl Os {
+    /// The system this program was built for; `None` on one the Runner does not run on.
+    pub const fn this() -> Option<Os> {
+        if cfg!(target_os = "macos") {
+            Some(Os::Macos)
+        } else if cfg!(target_os = "linux") {
+            Some(Os::Linux)
+        } else {
+            None
+        }
+    }
+}
+
 /// What a Mac says about itself when it trades a one-time code for its own token.
 #[derive(Debug, Clone)]
 pub struct Enroll {
@@ -30,6 +54,8 @@ pub struct Enroll {
     pub cpus: u32,
     /// The Mac's memory in bytes.
     pub memory_bytes: u64,
+    /// The system the Runner runs on; left out when it is `None`.
+    pub os: Option<Os>,
 }
 
 /// What the console answers to a valid code: the Mac's own token and the name the console knows it by.
@@ -438,6 +464,9 @@ pub struct Report {
     pub hostname: String,
     /// The Mac's chip and model, such as `Apple M5 (Mac17,3)`.
     pub model: String,
+    /// The system the Runner runs on; left out when it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<Os>,
     /// The settings in effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,

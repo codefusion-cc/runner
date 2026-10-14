@@ -1,6 +1,6 @@
-use cf_budget::{GIB, Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
+use crate::{GIB, Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 
-/// A host a test scripts. It starts as a calm Mac on the mains with all its memory available and its person just
+/// A host a test scripts. It starts as a calm host on the mains with all its memory available and its person just
 /// gone; a test moves the clocks and changes what the next readings say.
 #[derive(Clone, Debug)]
 pub struct FakeHost {
@@ -13,7 +13,7 @@ pub struct FakeHost {
 }
 
 impl FakeHost {
-    /// A calm Mac with this much memory and so many cores.
+    /// A calm host with this much memory and so many cores.
     pub fn new(facts: HostFacts) -> FakeHost {
         let now = Now {
             awake: Millis::secs(1000),
@@ -39,7 +39,7 @@ impl FakeHost {
         }
     }
 
-    /// Time passes with the Mac awake and nobody at it: both clocks and the idle time move on.
+    /// Time passes with the host awake and nobody at it: both clocks and the idle time move on.
     pub fn pass(&mut self, span: Millis) {
         self.now.awake = self.now.awake.plus(span);
         self.now.elapsed = self.now.elapsed.plus(span);
@@ -52,7 +52,7 @@ impl FakeHost {
         self.now.elapsed = self.now.elapsed.plus(span);
     }
 
-    /// The Mac sleeps: only the clock that counts sleep moves on.
+    /// The host sleeps: only the clock that counts sleep moves on.
     pub fn sleep(&mut self, span: Millis) {
         self.now.elapsed = self.now.elapsed.plus(span);
     }
@@ -82,7 +82,7 @@ impl FakeHost {
         self.facts = facts;
     }
 
-    /// A reading takes time from now on, as a real Mac's does: both clocks move on by `before` until the reading
+    /// A reading takes time from now on, as a real host's does: both clocks move on by `before` until the reading
     /// gets its time, and by `after` until `read` answers.
     pub fn read_takes(&mut self, before: Millis, after: Millis) {
         self.read_takes = (before, after);

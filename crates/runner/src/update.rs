@@ -1,4 +1,4 @@
-//! How the Runner updates itself on a Mac that built it: from the git checkout it was built from, with the toolchain
+//! How the Runner updates itself on a host that built it: from the git checkout it was built from, with the toolchain
 //! it was built with (`build.rs` writes both into the program). The console's `update` reaches it through
 //! [`cf_daemon::Service`], which decides when to build and when to install; this module does the two, and the guard
 //! at the start of `daemon` that counts the starts of a new program and puts the one before back.
@@ -32,8 +32,8 @@ fn commit_of(version: &str) -> Option<&str> {
     version.split_once('+').map(|(_, commit)| commit)
 }
 
-/// The update of a Runner built from a checkout on this Mac.
-pub struct MacUpdate {
+/// The update of a Runner built from a checkout on this host.
+pub struct CheckoutUpdate {
     /// The checkout the running program was built from.
     pub checkout: PathBuf,
     /// The toolchain's `cargo` (rustup's, which takes the toolchain `rust-toolchain.toml` names).
@@ -42,7 +42,7 @@ pub struct MacUpdate {
     pub env: Vec<(String, OsString)>,
     /// Where the build writes what it says.
     pub log: PathBuf,
-    /// The installed program, which launchd runs.
+    /// The installed program, which the service manager runs.
     pub installed: PathBuf,
     /// The folder of the machines' records: an install is refused while one is there.
     pub records: PathBuf,
@@ -52,27 +52,27 @@ pub struct MacUpdate {
     pub running: String,
     /// How long a build may take.
     pub build_limit: Duration,
-    /// Whether a program may start virtual machines.
-    pub entitled: fn(&Path) -> Result<(), String>,
+    /// Whether a program can start machines on this host.
+    pub fit: fn(&Path) -> Result<(), String>,
     /// `<origin> main`, for the console.
     source: String,
-    /// The process group of the build that runs, which [`MacUpdate::end_build`] ends.
+    /// The process group of the build that runs, which [`CheckoutUpdate::end_build`] ends.
     building: Mutex<Option<libc::pid_t>>,
     /// The checkout the config names as the Runner's own (`build_folder`): only that one is fetched, checked out
     /// and built.
     build_folder: Option<PathBuf>,
 }
 
-impl MacUpdate {
+impl CheckoutUpdate {
     /// The update of the running program, from where `build.rs` says it was built. `None` when that is not a git
-    /// checkout on this Mac, such as for a release built elsewhere.
+    /// checkout on this host, such as for a release built elsewhere.
     pub fn of_this_program(
         state_dir: &Path,
         installed: &Path,
         records: &Path,
         build_folder: Option<&Path>,
-        entitled: fn(&Path) -> Result<(), String>,
-    ) -> Option<MacUpdate> {
+        fit: fn(&Path) -> Result<(), String>,
+    ) -> Option<CheckoutUpdate> {
         let checkout = PathBuf::from(option_env!("CF_SOURCE").filter(|s| !s.is_empty())?);
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
         let or_home = |built: Option<&str>, below: &str| {
@@ -87,7 +87,7 @@ impl MacUpdate {
             ("PATH".to_string(), build_path(&cargo_home)),
             ("CARGO_HOME".to_string(), cargo_home.clone().into_os_string()),
             ("RUSTUP_HOME".to_string(), rustup_home.into_os_string()),
-            // A Mac that runs jobs builds with fewer cores than it has.
+            // A host that runs jobs builds with fewer cores than it has.
             (
                 "CARGO_BUILD_JOBS".to_string(),
                 option_env!("CF_BUILD_JOBS")
@@ -101,7 +101,7 @@ impl MacUpdate {
                 env.push((name.to_string(), value));
             }
         }
-        MacUpdate {
+        CheckoutUpdate {
             checkout,
             cargo: cargo_home.join("bin").join("cargo"),
             env,
@@ -111,7 +111,7 @@ impl MacUpdate {
             state_dir: state_dir.to_path_buf(),
             running: VERSION.into(),
             build_limit: BUILD_LIMIT,
-            entitled,
+            fit,
             source: String::new(),
             building: Mutex::new(None),
             build_folder: build_folder.map(Path::to_path_buf),
@@ -120,14 +120,14 @@ impl MacUpdate {
     }
 
     /// The update from `self.checkout`, once it is known to be a git checkout; `None` when it is none.
-    fn checked(self) -> Option<MacUpdate> {
+    fn checked(self) -> Option<CheckoutUpdate> {
         if !self.checkout.join(".git").exists() {
             return None;
         }
         let origin = git(&self.checkout, &["remote", "get-url", "origin"])
             .ok()
             .map(|url| redact_url(&url));
-        Some(MacUpdate {
+        Some(CheckoutUpdate {
             source: format!(
                 "{} {BRANCH}",
                 origin.unwrap_or_else(|| self.checkout.display().to_string())
@@ -169,6 +169,7 @@ impl MacUpdate {
         };
         let real = |path: &Path| std::fs::canonicalize(path).ok();
         let named_real = real(named);
+        #[cfg(target_os = "macos")]
         if let Some(external) = named_real.as_ref().filter(|real| real.starts_with("/Volumes")) {
             return Err(format!(
                 "the build folder {} is on an external volume ({}), which a launchd agent may not open; {not}",
@@ -252,7 +253,7 @@ impl MacUpdate {
     }
 }
 
-impl SelfUpdate for MacUpdate {
+impl SelfUpdate for CheckoutUpdate {
     fn source(&self) -> String {
         self.source.clone()
     }
@@ -299,7 +300,7 @@ impl SelfUpdate for MacUpdate {
             ));
         }
         copy_whole(&built, &self.next())?;
-        (self.entitled)(&self.next())?;
+        (self.fit)(&self.next())?;
         Ok(version)
     }
 
@@ -319,7 +320,7 @@ impl SelfUpdate for MacUpdate {
         copy_whole(&self.installed, &self.previous())?;
         let file = UpdateFile::in_state(&self.state_dir);
         file.write(pending)?;
-        if let Err(error) = place(&self.next(), &self.installed, self.entitled) {
+        if let Err(error) = place(&self.next(), &self.installed, self.fit) {
             let _ = file.remove();
             return Err(error);
         }
@@ -329,7 +330,8 @@ impl SelfUpdate for MacUpdate {
 }
 
 /// What the program does about an update under way before anything else at its start, in the state folder of the
-/// installed program it runs as. `Err` ends it: the program before is back in place, and launchd starts that.
+/// installed program it runs as. `Err` ends it: the program before is back in place, and the service manager starts
+/// that.
 /// `Ok` is what the service says to the console once it runs.
 pub fn guard(state_dir: &Path, installed: &Path, running: &str) -> Result<Started, String> {
     let file = UpdateFile::in_state(state_dir);
@@ -357,7 +359,7 @@ pub fn guard(state_dir: &Path, installed: &Path, running: &str) -> Result<Starte
                 Err(format!("there is no {} to go back to", previous.display()))
             };
             if let Err(why) = back {
-                // Trying again at every start, which launchd makes every few seconds, would not change that: the
+                // Trying again at every start, which the service manager makes every 30 seconds, would not change that: the
                 // update ends here, and the program, started as it is, tells the console once it runs.
                 let message = format!("{} did not stay up, and {why}", pending.to);
                 file.write(&Pending {
@@ -368,7 +370,7 @@ pub fn guard(state_dir: &Path, installed: &Path, running: &str) -> Result<Starte
             }
             file.write(&pending)?;
             return Err(format!(
-                "{} did not stay up {} times; {} is back in place and launchd starts it",
+                "{} did not stay up {} times; {} is back in place and starts next",
                 pending.to, pending.starts, pending.from
             ));
         }
@@ -535,11 +537,11 @@ fn copy_whole(from: &Path, to: &Path) -> Result<(), String> {
     copy_checked(from, to, |_| Ok(()))
 }
 
-/// Puts a copy of `program` at `at` in one step, once the copy is signed for virtual machines.
-pub fn place(program: &Path, at: &Path, entitled: fn(&Path) -> Result<(), String>) -> Result<(), String> {
+/// Puts a copy of `program` at `at` in one step, once `fit` passes the copy: it can start machines on this host.
+pub fn place(program: &Path, at: &Path, fit: fn(&Path) -> Result<(), String>) -> Result<(), String> {
     let folder = at.parent().ok_or("the program's folder has no parent")?;
     std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
-    copy_checked(program, at, entitled)
+    copy_checked(program, at, fit)
 }
 
 /// Copies `from` beside `to`, and puts the copy in its place once `check` passes it.
@@ -594,7 +596,7 @@ mod tests {
         root: PathBuf,
         first: String,
         second: String,
-        update: MacUpdate,
+        update: CheckoutUpdate,
     }
 
     /// A build that makes a program which says the commit it was built at, as `cargo xtask build` does.
@@ -634,7 +636,7 @@ chmod +x target/release/codefusion-runner"#;
         std::fs::create_dir_all(root.join("marks")).expect("folder");
         let installed = state.join("bin/codefusion-runner");
         std::fs::write(&installed, "the one that runs").expect("program");
-        let update = MacUpdate {
+        let update = CheckoutUpdate {
             checkout: checkout.clone(),
             cargo,
             env: vec![
@@ -647,7 +649,7 @@ chmod +x target/release/codefusion-runner"#;
             state_dir: state,
             running: format!("0.1.0+{}", &first[..12]),
             build_limit: Duration::from_secs(60),
-            entitled: signed,
+            fit: signed,
             source: String::new(),
             building: Mutex::new(None),
             build_folder: Some(checkout.clone()),
@@ -803,19 +805,22 @@ chmod +x target/release/codefusion-runner"#;
         }
 
         // A folder on an external volume, however it is reached, is one a launchd agent may not open.
-        let external = bench.root.join("external");
-        std::os::unix::fs::symlink("/Volumes", &external).expect("link");
-        bench.update.build_folder = Some(external.clone());
-        let said = bench.update.build().expect_err("external");
-        assert_eq!(
-            said,
-            format!(
-                "the build folder {} is on an external volume (/Volumes), which a launchd agent may not open; \
+        #[cfg(target_os = "macos")]
+        {
+            let external = bench.root.join("external");
+            std::os::unix::fs::symlink("/Volumes", &external).expect("link");
+            bench.update.build_folder = Some(external.clone());
+            let said = bench.update.build().expect_err("external");
+            assert_eq!(
+                said,
+                format!(
+                    "the build folder {} is on an external volume (/Volumes), which a launchd agent may not open; \
                  nothing was fetched or built; update by hand",
-                external.display()
-            )
-        );
-        untouched(&bench, &said);
+                    external.display()
+                )
+            );
+            untouched(&bench, &said);
+        }
 
         // The same folder by another way to it is the same.
         bench.update.build_folder = Some(bench.root.join("checkout/../checkout"));
@@ -870,7 +875,7 @@ chmod +x target/release/codefusion-runner"#;
     #[test]
     fn a_build_past_its_limit_is_ended_with_what_it_started() {
         let mut bench = bench("sleep 30 &\necho $! > \"$MARKS/child\"\nwait");
-        // Long enough for the niced build to write its child down on a busy Mac.
+        // Long enough for the niced build to write its child down on a busy host.
         bench.update.build_limit = Duration::from_secs(3);
         let began = Instant::now();
         let said = bench.update.build().expect_err("ended");
@@ -881,7 +886,7 @@ chmod +x target/release/codefusion-runner"#;
             .trim()
             .parse()
             .expect("a pid");
-        // Killed, it may still be there a moment, until launchd, which it went to, collects it.
+        // Killed, it may still be there a moment, until the process that took it over collects it.
         let began = Instant::now();
         // SAFETY: signal 0 only asks whether the process is there.
         while unsafe { libc::kill(child, 0) } == 0 {
@@ -921,7 +926,7 @@ chmod +x target/release/codefusion-runner"#;
         assert!(said.contains("0.1.0+aaaaaaaaaaaa-dirty"), "{said}");
 
         let mut bench = self::bench(BUILDS);
-        bench.update.entitled = unsigned;
+        bench.update.fit = unsigned;
         let said = bench.update.build().expect_err("refused");
         assert!(said.ends_with("is not signed"), "{said}");
     }
@@ -984,7 +989,7 @@ chmod +x target/release/codefusion-runner"#;
     fn an_install_whose_program_cannot_be_placed_leaves_no_update_written_down() {
         let mut bench = bench(BUILDS);
         bench.update.build().expect("built");
-        bench.update.entitled = unsigned;
+        bench.update.fit = unsigned;
         assert!(bench.update.install(&bench.pending()).is_err());
         assert_eq!(
             std::fs::read_to_string(&bench.update.installed).expect("program"),
@@ -993,7 +998,7 @@ chmod +x target/release/codefusion-runner"#;
         assert_eq!(UpdateFile::in_state(&bench.update.state_dir).read(), Ok(None));
     }
 
-    /// The starts of an installed program, as launchd makes them: the new one counts its starts, goes back after
+    /// The starts of an installed program, as the service manager makes them: the new one counts its starts, goes back after
     /// the last, and the one before says it failed.
     #[test]
     fn a_new_program_that_does_not_stay_up_puts_the_one_before_back_which_says_so() {
@@ -1030,10 +1035,11 @@ chmod +x target/release/codefusion-runner"#;
             guard(state, &installed, &pending.from),
             Ok(Started::Failed {
                 id: "cmd-1".into(),
-                message:
+                message: format!(
                     "0.1.0+bbbbbbbbbbbb did not stay up and was taken back: 0.1.0+aaaaaaaaaaaa runs again \
-                          (logs/launchd.log says why)"
-                        .into(),
+                     (logs/{} says why)",
+                    <cf_daemon::This as cf_daemon::Platform>::SERVICE_LOG
+                ),
             })
         );
         assert_eq!(file.read(), Ok(None), "said once");

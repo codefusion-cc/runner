@@ -38,8 +38,8 @@ fn the_log_says_when_the_mac_opens_and_closes_and_why_and_says_it_once() {
     w.restart();
     pass(&w.m, 60);
     assert_eq!(
-        log.lines("the Mac is"),
-        ["the Mac is closed: a new job waits why=\"calming\" opens_in_s=60"]
+        log.lines("the host is"),
+        ["the host is closed: a new job waits why=\"calming\" opens_in_s=60"]
     );
     pass(&w.m, 1);
     w.m.with_host(|host| host.set(|r| r.pressure = Pressure::Warning));
@@ -52,14 +52,14 @@ fn the_log_says_when_the_mac_opens_and_closes_and_why_and_says_it_once() {
     w.m.pause(false);
     pass(&w.m, 2);
     assert_eq!(
-        log.lines("the Mac is")[1..],
+        log.lines("the host is")[1..],
         [
-            "the Mac is open: a new job gets a machine",
-            "the Mac is closed: a new job waits why=\"memory-pressure\"",
-            "the Mac is closed: a new job waits why=\"calming\" opens_in_s=60",
-            "the Mac is open: a new job gets a machine",
-            "the Mac is closed: a new job waits why=\"paused\"",
-            "the Mac is open: a new job gets a machine",
+            "the host is open: a new job gets a machine",
+            "the host is closed: a new job waits why=\"memory-pressure\"",
+            "the host is closed: a new job waits why=\"calming\" opens_in_s=60",
+            "the host is open: a new job gets a machine",
+            "the host is closed: a new job waits why=\"paused\"",
+            "the host is open: a new job gets a machine",
         ]
     );
 }
@@ -1410,9 +1410,9 @@ fn an_open_mac_with_no_room_for_a_size_says_so_once_and_when_one_fits_again() {
         assert_eq!(w.m.open_slots(SIZE), 0);
         pass(&w.m, 30);
     }
-    let said = "the Mac is open, but no machine of this size fits now: its jobs stay at GitHub size=\"cf-2g\" why=\"memory\"";
+    let said = "the host is open, but no machine of this size fits now: its jobs stay at GitHub size=\"cf-2g\" why=\"memory\"";
     assert_eq!(log.lines("of this size"), [said]);
-    assert_eq!(log.lines("the Mac is closed"), Vec::<String>::new());
+    assert_eq!(log.lines("the host is closed"), Vec::<String>::new());
 
     set(64 * GIB);
     pass(&w.m, 1);
@@ -1744,7 +1744,7 @@ async fn a_machine_whose_hold_is_not_known_counts_by_its_jobs_peak_and_says_so()
     assert_eq!(
         log.lines("is not known"),
         [format!(
-            "what the Mac holds for a machine is not known: it counts by its job's peak job=\"{}\"",
+            "what the host holds for a machine is not known: it counts by its job's peak job=\"{}\"",
             job_name(&runner)
         )],
         "said once"

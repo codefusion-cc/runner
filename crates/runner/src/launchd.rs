@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::manager::ServiceManager;
+
 /// The agent's name. The cf-runners manager's is `cc.codefusion.runners`; the two never share one.
 pub const LABEL: &str = "cc.codefusion.vm-runner";
 
@@ -25,8 +27,7 @@ fn escape(text: &str) -> String {
 /// machines that stand are found again by the one that starts. `ThrottleInterval` keeps a Runner that cannot
 /// start (no image, no key) to two tries and two log lines a minute; one that ran longer starts again at once.
 /// `ExitTimeOut` gives it the time to close its sessions at GitHub before launchd ends it for good.
-pub fn plist(program: &Path, config: &Path, state_dir: &Path) -> String {
-    let log = state_dir.join("logs").join("launchd.log");
+pub fn plist(program: &Path, config: &Path, state_dir: &Path, log: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -107,32 +108,37 @@ pub struct Agent<'a> {
     pub pause: Duration,
 }
 
-impl Agent<'_> {
+impl ServiceManager for Agent<'_> {
+    fn name(&self) -> String {
+        format!("the launchd agent {LABEL}")
+    }
+
     /// Where the property list is.
-    pub fn path(&self) -> PathBuf {
+    fn path(&self) -> PathBuf {
         self.home
             .join("Library/LaunchAgents")
             .join(format!("{LABEL}.plist"))
     }
 
-    fn domain(&self) -> String {
-        format!("gui/{}", self.uid)
+    fn definition(
+        &self,
+        program: &Path,
+        config: &Path,
+        state_dir: &Path,
+        log: &Path,
+    ) -> Result<String, String> {
+        Ok(plist(program, config, state_dir, log))
     }
 
-    fn target(&self) -> String {
-        format!("{}/{LABEL}", self.domain())
-    }
-
-    /// Whether launchd has the agent.
-    pub fn loaded(&self) -> bool {
-        (self.run)(&["print", &self.target()]).is_ok()
+    fn look(&self) -> String {
+        format!("launchctl print {}", self.target())
     }
 
     /// Ends the agent if launchd has it and waits until launchd has let go of it. The Runner is sent a SIGTERM
     /// and has the property list's `ExitTimeOut` to end, so the wait is longer than that. What `bootout` says
     /// decides nothing: it can call a Runner that is still ending a failure. Whether launchd still has the agent
     /// does.
-    pub fn stop(&self) -> Result<(), String> {
+    fn stop(&self) -> Result<(), String> {
         if !self.loaded() {
             return Ok(());
         }
@@ -150,7 +156,7 @@ impl Agent<'_> {
     }
 
     /// Writes the property list and has launchd start the agent, in place of one that ran before.
-    pub fn start(&self, plist: &str) -> Result<(), String> {
+    fn start(&self, plist: &str) -> Result<(), String> {
         self.stop()?;
         let path = self.path();
         let folder = path.parent().ok_or("the agent's folder has no parent")?;
@@ -170,13 +176,28 @@ impl Agent<'_> {
     }
 
     /// Ends the agent and removes its property list. Nothing there is nothing to do.
-    pub fn remove(&self) -> Result<(), String> {
+    fn remove(&self) -> Result<(), String> {
         self.stop()?;
         match std::fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("{}: {error}", self.path().display())),
         }
+    }
+}
+
+impl Agent<'_> {
+    fn domain(&self) -> String {
+        format!("gui/{}", self.uid)
+    }
+
+    fn target(&self) -> String {
+        format!("{}/{LABEL}", self.domain())
+    }
+
+    /// Whether launchd has the agent.
+    pub fn loaded(&self) -> bool {
+        (self.run)(&["print", &self.target()]).is_ok()
     }
 }
 
@@ -192,6 +213,7 @@ mod tests {
             Path::new("/Users/someone/Library/Application Support/CodeFusion Runner/bin/codefusion-runner"),
             Path::new("/Users/someone/.config/codefusion-runner/config.json"),
             Path::new("/Users/someone/Library/Application Support/CodeFusion Runner"),
+            Path::new("/Users/someone/Library/Application Support/CodeFusion Runner/logs/launchd.log"),
         );
         let after = |key: &str| {
             let at = text
@@ -234,7 +256,12 @@ mod tests {
 
     #[test]
     fn a_path_with_markup_in_it_stays_one_string() {
-        let text = plist(Path::new("/a&b/<c>"), Path::new("/config"), Path::new("/state"));
+        let text = plist(
+            Path::new("/a&b/<c>"),
+            Path::new("/config"),
+            Path::new("/state"),
+            Path::new("/state/logs/launchd.log"),
+        );
         assert!(text.contains("<string>/a&amp;b/&lt;c&gt;</string>"), "{text}");
     }
 

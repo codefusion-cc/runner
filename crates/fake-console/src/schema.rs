@@ -260,7 +260,17 @@ fn literal_protocol(v: &Value, path: &str) -> Check {
     }
 }
 
-/// `helloSchema`.
+/// `os`, in `helloSchema` and `reportSchema`: `z.enum(['macos', 'linux']).nullish().catch(null)`. No value is refused;
+/// one the console does not know, a wrong type and `null` are all read as none.
+pub(crate) fn os(v: &Value) -> Option<&'static str> {
+    match v.get("os").and_then(Value::as_str) {
+        Some("macos") => Some("macos"),
+        Some("linux") => Some("linux"),
+        _ => None,
+    }
+}
+
+/// `helloSchema`. `os` refuses nothing ([`os`]).
 pub(crate) fn hello(v: &Value) -> Check {
     let o = object(v, "")?;
     field(o, "", "protocol", Required, literal_protocol)?;
@@ -417,7 +427,7 @@ fn command_result(v: &Value, path: &str) -> Check {
     field(o, path, "at", Required, time)
 }
 
-/// `reportSchema`.
+/// `reportSchema`. `os` refuses nothing ([`os`]).
 pub(crate) fn report(v: &Value) -> Check {
     let o = object(v, "")?;
     field(o, "", "protocol", Required, literal_protocol)?;

@@ -696,6 +696,50 @@ async fn numbers_and_times_are_bounded() {
 }
 
 #[tokio::test]
+async fn the_system_is_macos_or_linux_and_anything_else_is_read_as_none_and_refused_never() {
+    let w = world().await;
+    let read_as = |os: Value| -> Option<&'static str> {
+        match os.as_str() {
+            Some("macos") => Some("macos"),
+            Some("linux") => Some("linux"),
+            _ => None,
+        }
+    };
+    let values = [
+        json!("linux"),
+        json!("macos"),
+        json!("windows"),
+        json!("Linux"),
+        json!(""),
+        json!(7),
+        json!(["linux"]),
+        Value::Null,
+    ];
+    for (n, os) in values.iter().enumerate() {
+        let code = format!("code-{n}");
+        w.fake.add_code(&code);
+        let mut hello = hello_json(&code, &format!("host-{n}"));
+        hello["os"] = os.clone();
+        let got = post_hello(&w.fake, &hello).await;
+        assert_eq!(got.status, 200, "connect with os {os}: {}", got.error());
+        assert_eq!(
+            w.fake.os_of(&format!("host-{n}")).as_deref(),
+            read_as(os.clone()),
+            "connect with os {os}"
+        );
+        report_gets(&w, &format!("os {os}"), &with(|r| r["os"] = os.clone()), 200).await;
+        assert_eq!(
+            w.fake.os_of("mac-a").as_deref(),
+            read_as(os.clone()),
+            "report with os {os}"
+        );
+    }
+    // Left out, as an older Runner does.
+    report_gets(&w, "no os", &report_json("mac-a"), 200).await;
+    assert_eq!(w.fake.os_of("mac-a"), None);
+}
+
+#[tokio::test]
 async fn the_machine_name_is_a_pattern_and_at_most_24_characters() {
     let fake = cf_fake_console::FakeConsole::start().await;
     for (n, (name, ok)) in [

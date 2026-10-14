@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 cf-budget = { path = "../budget" }
 cf-guest-proto = { path = "../guest-proto" }
-cf-host-macos = { path = "../host-macos" }
 cf-lifecycle = { path = "../lifecycle" }
 cf-vmhost = { path = "../vmhost" }
 libc.workspace = true
@@ -27,6 +26,12 @@ time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tracing = "0.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cf-host-macos = { path = "../host-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cf-host-linux = { path = "../host-linux" }
+
 [dev-dependencies]
 cf-fake-console = { path = "../fake-console" }
 cf-fake-github = { path = "../fake-github" }
@@ -34,6 +39,14 @@ proptest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+cf-vmm-ch = { path = "../vmm-ch" }
+
+# A stand-in vm-host is this test's own program, started with the vm-host's arguments, which a harness would not take.
+[[test]]
+name = "scopes"
+harness = false
 
 [lints]
 workspace = true

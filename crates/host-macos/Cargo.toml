@@ -1,6 +1,6 @@
 [package]
 name = "cf-host-macos"
-description = "What the Runner reads from macOS: memory, pressure, swap, the person's idle time, thermal state, power, free disk. Behind the budget's Host trait, with a scripted host for tests."
+description = "What the Runner reads from macOS: memory, pressure, swap, the person's idle time, thermal state, power, free disk. Behind the budget's Host trait."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -669,7 +669,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         if let Some(gap) = late {
             tracing::warn!(
                 gap_ms = gap.0,
-                "a look at the Mac came late; its calm time starts again"
+                "a look at the host came late; its calm time starts again"
             );
         }
         let observed = inner.budget.observe(now, reading);
@@ -707,7 +707,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 .map(|(name, _)| name.clone());
             match job {
                 Some(name) => {
-                    tracing::warn!(job = %name, cause = ?eviction.cause, "the Mac needs room; a job is stopped");
+                    tracing::warn!(job = %name, cause = ?eviction.cause, "the host needs room; a job is stopped");
                     self.feed(&mut inner, &name, now, Event::Evict(eviction.cause));
                 }
                 // A promise or a place in line holds no machine: giving it back is all there is to stop. No start
@@ -837,13 +837,13 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             return;
         }
         match status.closed_by {
-            _ if open => tracing::info!("the Mac is open: a new job gets a machine"),
+            _ if open => tracing::info!("the host is open: a new job gets a machine"),
             Some(cf_budget::Refusal::Calming { left }) => tracing::info!(
                 why,
                 opens_in_s = left.0.div_ceil(1000),
-                "the Mac is closed: a new job waits"
+                "the host is closed: a new job waits"
             ),
-            _ => tracing::info!(why, "the Mac is closed: a new job waits"),
+            _ => tracing::info!(why, "the host is closed: a new job waits"),
         }
     }
 
@@ -862,7 +862,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             if unknown && !said.unknown {
                 tracing::warn!(
                     job = name,
-                    "what the Mac holds for a machine is not known: it counts by its job's peak"
+                    "what the host holds for a machine is not known: it counts by its job's peak"
                 );
             }
             said.unknown = unknown;
@@ -1560,7 +1560,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             tracing::info!(
                 size = size.label(),
                 why,
-                "the Mac is open, but no machine of this size fits now: its jobs stay at GitHub"
+                "the host is open, but no machine of this size fits now: its jobs stay at GitHub"
             );
         }
         0
@@ -1781,7 +1781,7 @@ impl<H: Host + Send, V: Vms> Events for Machines<H, V> {
         let mut inner = self.lock();
         let now = inner.host.now();
         let Some(name) = Self::job_of(&inner, &event.runner) else {
-            tracing::debug!(runner = %event.runner, "a job event for an Actions runner that is not this Mac's any more");
+            tracing::debug!(runner = %event.runner, "a job event for an Actions runner that is not this host's any more");
             return;
         };
         let job = inner.jobs.get_mut(&name).expect("just found");
