@@ -56,6 +56,8 @@ struct Rig {
     battery: Arc<Mutex<Option<Battery>>>,
     /// How the Runner updates itself.
     updates: Arc<FakeUpdate>,
+    /// How long an update waits for the machines that stand, in wall time.
+    update_limit: Duration,
     /// Lets time pass on the Mac and runs the service's rounds, as its loop does, and counts them.
     pump: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)>,
 }
@@ -96,8 +98,18 @@ impl Rig {
         serde_json::to_value(self.service.status()).expect("a report")
     }
 
-    /// A Mac with room for `machines` machines, enrolled at the console, serving [`REPO`] with one workflow.
+    /// A Mac with room for `machines` machines, enrolled at the console, serving [`REPO`] with one workflow. An
+    /// update waits as long for the machines that stand as on a real Mac: a loaded Mac does not cut it short.
     async fn new(machines: u32) -> Rig {
+        Rig::limited(
+            machines,
+            ServiceConfig::new(MACHINE, "", "", RUNNING).update_limit,
+        )
+        .await
+    }
+
+    /// [`Rig::new`], whose updates wait `update_limit` for the machines that stand.
+    async fn limited(machines: u32, update_limit: Duration) -> Rig {
         let github = FakeGithub::start(Options {
             poll_timeout: Duration::from_millis(150),
             auto_assign: true,
@@ -154,7 +166,7 @@ impl Rig {
                 &machines,
                 &enrolled.token,
                 &battery,
-                (&outbox, &updates, folder.path()),
+                (&outbox, &updates, folder.path(), update_limit),
             )),
             github,
             console,
@@ -168,6 +180,7 @@ impl Rig {
             folder,
             battery,
             updates,
+            update_limit,
             pump: None,
         };
         rig.pump();
@@ -286,7 +299,7 @@ impl Rig {
             &self.machines,
             &self.token,
             &self.battery,
-            (&self.outbox, &self.updates, self.folder.path()),
+            (&self.outbox, &self.updates, self.folder.path(), self.update_limit),
         ));
         pass(&self.machines, 61);
     }
@@ -405,8 +418,9 @@ fn service(
     machines: &Arc<TestMachines>,
     token: &Secret<String>,
     battery: &Arc<Mutex<Option<Battery>>>,
-    // What a daemon keeps across its starts: the outbox, the update it builds, the folder of its files.
-    (outbox, updates, folder): (&Arc<Outbox>, &Arc<FakeUpdate>, &std::path::Path),
+    // What stays across a daemon's starts: the outbox, the update it builds, the folder of its files, how long an
+    // update waits for the machines that stand.
+    (outbox, updates, folder, update_limit): (&Arc<Outbox>, &Arc<FakeUpdate>, &std::path::Path, Duration),
 ) -> TestService {
     let battery = battery.clone();
     let mut config = ServiceConfig::new(
@@ -417,7 +431,7 @@ fn service(
     );
     config.poll_timeout = Duration::from_secs(5);
     config.sweep_again = Duration::from_millis(50);
-    config.update_limit = Duration::from_secs(4);
+    config.update_limit = update_limit;
     config.backoff = (
         Duration::from_millis(20),
         Duration::from_millis(100),
@@ -1226,7 +1240,7 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
         &rig.machines,
         &Secret::new("not-this-macs-token".to_string()),
         &rig.battery,
-        (&rig.outbox, &rig.updates, rig.folder.path()),
+        (&rig.outbox, &rig.updates, rig.folder.path(), rig.update_limit),
     );
     rig.finish(&runner, "succeeded");
     until("the end waits to be sent", || {
@@ -3302,7 +3316,7 @@ async fn a_build_that_fails_is_said_and_counted_and_the_mac_goes_on() {
 /// Machines that do not end within the update's limit: nothing is installed, and the Mac takes jobs again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_update_whose_machine_outlasts_its_limit_installs_nothing_and_takes_jobs_again() {
-    let rig = Rig::new(2).await;
+    let rig = Rig::limited(2, Duration::from_secs(4)).await;
     rig.service.discover().await;
     let runner = rig.job_running().await;
     rig.updates.build_gives(Ok(NEWER));
