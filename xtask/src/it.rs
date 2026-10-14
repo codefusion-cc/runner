@@ -1199,10 +1199,7 @@ fn firewall(bench: &Bench) -> Fallible<Vec<String>> {
     )?;
     let mut address = None;
     within(Duration::from_secs(40), || {
-        address = console_of(bench, "it-other")
-            .split("address ")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next().map(str::to_string));
+        address = address_of(&console_of(bench, "it-other"));
         address.is_some()
     });
     let (targets, reached_for) = host_targets(address.as_deref());
@@ -1283,13 +1280,7 @@ sudo -n mknod /tmp/disk b 254 0 2>/dev/null; echo mknod=$?"#,
             tail(&first.console)
         ),
     )?;
-    let own = first
-        .console
-        .split("address ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or("none")
-        .to_string();
+    let own = address_of(&first.console).unwrap_or_else(|| "none".to_string());
     // On a Mac the machines share vmnet's network, each at its own address. On Linux each is alone behind its own
     // pasta, at the same address in a network of its own.
     expect(own != "none", "the machine got no address")?;
@@ -1348,10 +1339,7 @@ fn docker(bench: &Bench) -> Fallible<Vec<String>> {
     )?;
     let mut address = None;
     within(Duration::from_secs(40), || {
-        address = console_of(bench, "it-docker-other")
-            .split("address ")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next().map(str::to_string));
+        address = address_of(&console_of(bench, "it-docker-other"));
         address.is_some()
     });
     let (targets, reached_for) = host_targets(address.as_deref());
@@ -1360,32 +1348,37 @@ fn docker(bench: &Bench) -> Fallible<Vec<String>> {
     // backlog; nothing needs to accept.
     let listening = std::net::TcpListener::bind("0.0.0.0:0")?;
     let open_port = listening.local_addr()?.port();
-    let tries: String = targets
-        .iter()
-        .map(|target| {
-            format!(
-                "try {address} {port} {{}}{name}; try {address} {open_port} {{}}{name}-open; ",
-                address = target.address,
-                port = target.port,
-                name = target.name
-            )
-        })
-        .collect();
+    // What no container may reach: `(name, address, port)`, `$gw` being the gateway the job's network names.
+    let mut unreachable: Vec<(String, String, u16)> = [
+        ("gateway-ssh", "$gw", 22),
+        ("gateway-open", "$gw", open_port),
+        // The job's own loopback, which pasta would hand the gateway's address without `--no-map-gw`.
+        ("job-loopback", "$gw", 9999),
+        ("private", "10.1.2.3", 80),
+        ("metadata", "169.254.169.254", 80),
+        ("tailscale", "100.100.100.100", 80),
+    ]
+    .iter()
+    .map(|(name, address, port)| (name.to_string(), address.to_string(), *port))
+    .collect();
+    for target in &targets {
+        unreachable.push((target.name.clone(), target.address.clone(), target.port));
+        unreachable.push((format!("{}-open", target.name), target.address.clone(), open_port));
+    }
+    // Each `try` waits up to 3 seconds for an answer that does not come, so they all run at once.
     let probes = |prefix: &str| {
-        format!(
-            "try $gw 22 {prefix}gateway-ssh; try $gw {open_port} {prefix}gateway-open; \
-             try $gw 9999 {prefix}job-loopback; try 10.1.2.3 80 {prefix}private; \
-             try 169.254.169.254 80 {prefix}metadata; try 100.100.100.100 80 {prefix}tailscale; {}",
-            tries.replace("{}", prefix)
-        )
+        let tries: String = unreachable
+            .iter()
+            .map(|(name, address, port)| format!("try {address} {port} {prefix}{name} & "))
+            .collect();
+        format!("{tries}wait;")
     };
     let script = format!(
         r#"set -u
-for i in $(seq 1 150); do docker info > /dev/null 2>&1 && break; sleep 0.2; done
+echo hook=$(/run/codefusion/job-started.sh | tr '\n' ' ')
 gw=$(awk '/nameserver/{{print $2; exit}}' /etc/resolv.conf)
 node -e 'require("http").createServer((q, s) => s.end("job")).listen(9999, "127.0.0.1")' &
 echo daemon=$(docker version --format '{{{{.Server.Version}}}}' 2>&1 | head -1)
-echo hook=$(/run/codefusion/job-started.sh | tr '\n' ' ')
 echo socket-link=$(readlink -f /var/run/docker.sock)
 echo job-sees-dockerd=$(ps -eo comm | grep -c '^dockerd$')
 mkdir -p /tmp/stack && cd /tmp/stack
@@ -1399,7 +1392,7 @@ docker compose down -t 1 > /dev/null 2>&1
 docker run --rm --memory 32m --memory-swap 32m alpine:3.22 sh -c 'tail /dev/zero' > /dev/null 2>&1; echo own-limit=$?
 T='{try_in_container}'
 docker run --rm alpine:3.22 sh -c "$T; {plain} wget -q -O /dev/null -T 20 https://github.com && echo c-github=open; awk 'NR==1{{print \"c-root=\" \$2}}' /proc/self/uid_map"
-docker run --rm --network host alpine:3.22 sh -c "$T; try $gw {open_port} h-gateway-open; try 10.1.2.3 80 h-private"
+docker run --rm --network host alpine:3.22 sh -c "$T; try $gw {open_port} h-gateway-open & try 10.1.2.3 80 h-private & wait"
 docker run --rm --privileged alpine:3.22 sh -c "$T; {privileged}
   echo x > /proc/sys/kernel/core_pattern 2>/dev/null && echo p-core-pattern=written || echo p-core-pattern=refused
   echo h > /proc/sysrq-trigger 2>/dev/null && echo p-sysrq=written || echo p-sysrq=refused
@@ -1456,20 +1449,7 @@ echo done"#,
         .collect();
     let mut blocked = vec!["h-gateway-open".to_string(), "h-private".to_string()];
     for prefix in ["c-", "p-"] {
-        for name in [
-            "gateway-ssh",
-            "gateway-open",
-            "job-loopback",
-            "private",
-            "metadata",
-            "tailscale",
-        ] {
-            blocked.push(format!("{prefix}{name}"));
-        }
-        for target in &targets {
-            blocked.push(format!("{prefix}{}", target.name));
-            blocked.push(format!("{prefix}{}-open", target.name));
-        }
+        blocked.extend(unreachable.iter().map(|(name, ..)| format!("{prefix}{name}")));
     }
     wrong.extend(
         blocked
@@ -1504,7 +1484,7 @@ echo done"#,
 /// process the kernel stops, and the job ends `oom` as any other would. (A container stopped at a limit of its own
 /// is not: the `docker` scenario has one.)
 fn docker_oom(bench: &Bench) -> Fallible<Vec<String>> {
-    let script = r#"for i in $(seq 1 150); do docker info > /dev/null 2>&1 && break; sleep 0.2; done
+    let script = r#"/run/codefusion/job-started.sh
 docker run --rm alpine:3.22 sh -c 'tail /dev/zero'; echo after=$?"#;
     let running = start_job(bench, "it-docker-oom", 2048, 240, script, &[], true)?;
     let finished = finish(bench, running, Duration::from_secs(300), &mut |_, _| Ok(()))?;
@@ -1517,6 +1497,14 @@ docker run --rm alpine:3.22 sh -c 'tail /dev/zero'; echo after=$?"#;
             "its step saw {code}"
         ))
     )])
+}
+
+/// The address a machine's supervisor says its network got (`network up in … address 192.168.64.3`).
+fn address_of(console: &str) -> Option<String> {
+    console
+        .split("address ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
 }
 
 /// The last value a job printed as `name=value`.

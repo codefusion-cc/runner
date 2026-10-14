@@ -103,24 +103,23 @@ impl ServePolicy {
         if repo.archived || repo.disabled {
             return false;
         }
-        let listed = |list: &[String]| list.iter().any(|s| s.eq_ignore_ascii_case(&repo.full_name));
-        if !repo.private && !listed(&self.public_repos) {
+        if !repo.private && !listed(&self.public_repos, repo) {
             return false;
         }
-        self.repos.is_empty() || listed(&self.repos) || listed(&self.public_repos)
+        self.repos.is_empty() || listed(&self.repos, repo) || listed(&self.public_repos, repo)
     }
 
     /// Whether a repository's `cf-docker` jobs are served: one the Runner serves, private, and in
     /// [`ServePolicy::docker_repos`]. A public repository never is, even listed: anyone can open a pull request
     /// there, and a Docker job is the most a job can do on a machine.
     pub fn serves_docker(&self, repo: &Repo) -> bool {
-        repo.private
-            && self.serves(repo)
-            && self
-                .docker_repos
-                .iter()
-                .any(|listed| listed.eq_ignore_ascii_case(&repo.full_name))
+        repo.private && self.serves(repo) && listed(&self.docker_repos, repo)
     }
+}
+
+/// Whether a list of `owner/name` repositories names this one; GitHub's names ignore case.
+fn listed(list: &[String], repo: &Repo) -> bool {
+    list.iter().any(|name| name.eq_ignore_ascii_case(&repo.full_name))
 }
 
 #[cfg(test)]

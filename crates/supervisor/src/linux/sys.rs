@@ -162,3 +162,110 @@ pub fn disk_used(path: &str) -> u64 {
         .saturating_sub(stat.f_bfree as u64)
         .saturating_mul(stat.f_frsize as u64)
 }
+
+/// `fork(2)`, for the launchers and the first processes of a container or sandbox: each has one thread, so the
+/// child may do anything.
+pub fn fork() -> Result<libc::pid_t, String> {
+    // SAFETY: the callers have one thread each, so the child is a whole copy of the process.
+    context("fork", check(unsafe { libc::fork() }))
+}
+
+/// `unshare(2)`.
+pub fn unshare(flags: libc::c_int) -> Result<(), String> {
+    // SAFETY: unshare takes no pointers.
+    context("new namespaces", check(unsafe { libc::unshare(flags) }).map(drop))
+}
+
+/// Waits for a child (`-1`: any), through interruptions: its id and wait status, or a negative id when there is
+/// none to wait for.
+pub fn wait(pid: libc::pid_t) -> (libc::pid_t, libc::c_int) {
+    let mut status = 0;
+    loop {
+        // SAFETY: waitpid fills the status we own.
+        let ended = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if ended > 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return (ended, status);
+        }
+    }
+}
+
+/// A wait status as an exit code, the way a shell says it: 128 and the signal for a process a signal ended.
+pub fn exit_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    }
+}
+
+/// `execve(2)`. Returns only when it failed, with why.
+pub fn exec(program: &CString, arguments: &[CString], environment: &[CString]) -> io::Error {
+    let pointers = |strings: &[CString]| {
+        strings
+            .iter()
+            .map(|string| string.as_ptr())
+            .chain([std::ptr::null()])
+            .collect::<Vec<_>>()
+    };
+    let (argv, envp) = (pointers(arguments), pointers(environment));
+    // SAFETY: every pointer is to memory that lives until exec, and both lists end in a null pointer.
+    unsafe { libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    io::Error::last_os_error()
+}
+
+/// The devices of a container's `/dev`, a memory file system already mounted at `{root}/dev`: the six every
+/// program expects and `extra` ones, `(path below /dev, major, minor)`, each for everyone to read and write, and the
+/// links to `/proc/self/fd` and the pseudo-terminals.
+pub fn devices(root: &str, extra: &[(&str, u32, u32)]) -> Result<(), String> {
+    let at = |path: &str| format!("{root}/dev/{path}");
+    for &(name, major, minor) in [
+        ("null", 1, 3),
+        ("zero", 1, 5),
+        ("full", 1, 7),
+        ("random", 1, 8),
+        ("urandom", 1, 9),
+        ("tty", 5, 0),
+    ]
+    .iter()
+    .chain(extra)
+    {
+        if let Some((folder, _)) = name.rsplit_once('/') {
+            context(&format!("device folder {folder}"), fs::create_dir_all(at(folder)))?;
+        }
+        let path = cstr(&at(name));
+        // SAFETY: mknod and chmod take one NUL terminated path each.
+        context(
+            &format!("device {name}"),
+            check(unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(major, minor)) }),
+        )?;
+        // SAFETY: as above; chmod, since mknod's mode passes through the process's mask.
+        unsafe { libc::chmod(path.as_ptr(), 0o666) };
+    }
+    for (link, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+        ("ptmx", "pts/ptmx"),
+    ] {
+        context("device links", std::os::unix::fs::symlink(target, at(link)))?;
+    }
+    Ok(())
+}
+
+/// Makes `root` the process's root and lets go of the one before: `pivot_root(".", ".")` from inside it.
+pub fn pivot_into(root: &str) -> Result<(), String> {
+    context("enter the root", std::env::set_current_dir(root))?;
+    let here = cstr(".");
+    // SAFETY: pivot_root and umount2 take NUL terminated paths.
+    context(
+        "new root",
+        check(unsafe { libc::syscall(libc::SYS_pivot_root, here.as_ptr(), here.as_ptr()) } as libc::c_int),
+    )?;
+    // SAFETY: as above.
+    context(
+        "leave the old root",
+        check(unsafe { libc::umount2(here.as_ptr(), libc::MNT_DETACH) }),
+    )?;
+    context("enter the root", std::env::set_current_dir("/"))
+}

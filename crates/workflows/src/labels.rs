@@ -122,7 +122,7 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
 fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> String {
     evaluate(expression, vars)
         .map(|v| v.trim().to_lowercase())
-        .filter(|v| v == POOL_LABEL || v == DOCKER_LABEL || is_size_label(v))
+        .filter(|v| is_ours(v))
         .unwrap_or_else(|| POOL_LABEL.to_string())
 }
 
@@ -268,5 +268,10 @@ fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
         set.push(label);
     }
     let set = LabelSet::new(set);
-    (set.contains(POOL_LABEL) || set.docker() || set.labels().iter().any(|l| is_size_label(l))).then_some(set)
+    set.labels().iter().any(|l| is_ours(l)).then_some(set)
+}
+
+/// Whether a (lowercase) label is one these Actions runners serve: [`POOL_LABEL`], [`DOCKER_LABEL`] or a size.
+fn is_ours(label: &str) -> bool {
+    label == POOL_LABEL || label == DOCKER_LABEL || is_size_label(label)
 }

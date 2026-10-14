@@ -113,3 +113,9 @@ fn only_tcp_segments_without_any_flag_are_dropped_before_the_daemons_nat() {
         "iptables --wait -t raw -I PREROUTING -p tcp --tcp-flags ALL NONE -j DROP"
     );
 }
+
+#[test]
+fn the_socket_and_the_log_are_in_the_shared_folder() {
+    assert_eq!(SOCKET, format!("{SOCKET_DIR}/{SOCKET_NAME}"));
+    assert_eq!(LOG, format!("{SOCKET_DIR}/{LOG_NAME}"));
+}

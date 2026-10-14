@@ -8,6 +8,8 @@ use cf_guest_proto::{
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +25,45 @@ const LAST_WORDS: Duration = Duration::from_secs(3);
 const HOST_CID: u32 = 2;
 /// The supervisor's own copy, which the job's container and its hooks run.
 pub const SELF_COPY: &str = "/run/cf/supervisor";
+
+/// Starts the supervisor's own copy as a launcher, `role` (`container`, `docker`), with `pass` at descriptor
+/// `at` and the given output, and writes `spec` to its input as JSON, for [`super::container::read_spec`]. The
+/// command holds the ends it was given and goes with this call; the caller drops its own end of `pass` after it,
+/// so the launcher's end is the only one left.
+pub fn spawn_self(
+    role: &str,
+    (pass, at): (&OwnedFd, libc::c_int),
+    (stdout, stderr): (Stdio, Stdio),
+    spec: &impl serde::Serialize,
+) -> Result<Child, String> {
+    let mut command = Command::new(SELF_COPY);
+    command
+        .arg(role)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(stderr);
+    let fd = pass.as_raw_fd();
+    // SAFETY: dup2 is async-signal-safe; the descriptor is open in the child, which is a copy of this process.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(fd, at) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = sys::context(&format!("start the {role} launcher"), command.spawn())?;
+    drop(command);
+    if let Some(mut input) = child.stdin.take() {
+        sys::context(
+            &format!("describe the {role}"),
+            input.write_all(serde_json::to_string(spec).unwrap_or_default().as_bytes()),
+        )?;
+    }
+    Ok(child)
+}
 
 /// The connection to the host, shared by the threads that send.
 #[derive(Clone)]

@@ -7,15 +7,15 @@
 //! `/proc/sys` and `/sys` are read-only, and the network (shared with the supervisor, so no bridge is needed) and
 //! its firewall belong to a namespace their root has no power over.
 
-use super::sys::{self, check, context};
+use super::sys::{self, check, context, fork, unshare, wait};
 use cf_supervisor::outcome::Outcome;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::symlink;
 
 /// The descriptor the launcher reports on.
 pub const STATUS_FD: libc::c_int = 100;
@@ -58,40 +58,50 @@ pub fn launch() -> ! {
     std::process::exit(70)
 }
 
-fn fork() -> Result<libc::pid_t, String> {
-    // SAFETY: the launcher and the container's first process have one thread each, so the child may do anything.
-    context("fork", check(unsafe { libc::fork() }))
-}
-
-fn unshare(flags: libc::c_int) -> Result<(), String> {
-    // SAFETY: unshare takes no pointers.
-    context("new namespaces", check(unsafe { libc::unshare(flags) }).map(drop))
-}
-
-fn wait(pid: libc::pid_t) -> (libc::pid_t, libc::c_int) {
-    let mut status = 0;
-    loop {
-        // SAFETY: waitpid fills the status we own.
-        let ended = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if ended > 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return (ended, status);
-        }
-    }
-}
-
-fn launcher() -> Result<Infallible, String> {
+/// What a launcher is told on its input, read whole; its input is then `/dev/null`. The text may hold what the
+/// workload starts with, so neither it nor the parser's message is kept. `what` names it in an error.
+pub(super) fn read_spec<T: DeserializeOwned>(what: &str) -> Result<T, String> {
     let mut text = String::new();
     context(
-        "read the container's description",
+        &format!("read the {what}'s description"),
         std::io::stdin().read_to_string(&mut text),
     )?;
-    let spec: Spec =
-        serde_json::from_str(&text).map_err(|_| "the container's description is malformed".to_string())?;
+    let spec = serde_json::from_str(&text).map_err(|_| format!("the {what}'s description is malformed"))?;
     drop(text);
     if let Ok(null) = File::open("/dev/null") {
         // SAFETY: dup2 on descriptors we own.
         unsafe { libc::dup2(null.as_raw_fd(), 0) };
     }
+    Ok(spec)
+}
+
+/// The launcher's side of a user namespace's ids: once the first process asks on `ask`, its maps are written and
+/// `done` says so. Closed without the byte, `done` tells the first process that it got no ids, so it does not wait.
+pub(super) fn give_ids(first: libc::pid_t, ask: OwnedFd, done: OwnedFd, maps: (&str, &str), what: &str) {
+    let mut byte = [0u8; 1];
+    let mut done = File::from(done);
+    if File::from(ask).read(&mut byte).unwrap_or(0) == 1 {
+        match fs::write(format!("/proc/{first}/uid_map"), maps.0)
+            .and_then(|()| fs::write(format!("/proc/{first}/gid_map"), maps.1))
+        {
+            Ok(()) => drop(done.write_all(&[1])),
+            Err(error) => eprintln!("cf-supervisor: the {what}'s ids could not be set: {error}"),
+        }
+    }
+}
+
+/// The first process's side, in the user namespace it just made: asks for its ids and waits for them.
+pub(super) fn await_ids(ask: OwnedFd, done: OwnedFd, what: &str) -> Result<(), String> {
+    context("ask for ids", File::from(ask).write_all(&[1]))?;
+    let mut byte = [0u8; 1];
+    if File::from(done).read(&mut byte).unwrap_or(0) != 1 {
+        return Err(format!("the launcher gave the {what} no ids"));
+    }
+    Ok(())
+}
+
+fn launcher() -> Result<Infallible, String> {
+    let spec: Spec = read_spec("container")?;
     // The launcher and the container's first process keep to themselves: the job's root, which shares their
     // user ids, can neither trace them nor open what they hold open (the pipe the job's end is reported on).
     // The workload gets the usual back when it is started as its own program.
@@ -129,25 +139,10 @@ fn launcher() -> Result<Infallible, String> {
     // a job that could give itself -1000 would hang at its limit with nothing for the kernel to stop.
     let _ = fs::write("/proc/self/oom_score_adj", "-1000");
     // The first process asks once it has its user namespace; only real root can give that namespace every id.
-    let mut byte = [0u8; 1];
-    let mut done = File::from(done_write);
-    if File::from(ask_read).read(&mut byte).unwrap_or(0) == 1 {
-        let whole = "0 0 4294967295\n";
-        match fs::write(format!("/proc/{first}/uid_map"), whole)
-            .and_then(|()| fs::write(format!("/proc/{first}/gid_map"), whole))
-        {
-            Ok(()) => drop(done.write_all(&[1])),
-            Err(error) => eprintln!("cf-supervisor: the container's ids could not be set: {error}"),
-        }
-    }
-    // Closed without the byte, this end tells the first process that it got no ids, so it does not wait.
-    drop(done);
+    let whole = "0 0 4294967295\n";
+    give_ids(first, ask_read, done_write, (whole, whole), "container");
     let (_, status) = wait(first);
-    std::process::exit(if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        128 + libc::WTERMSIG(status)
-    })
+    std::process::exit(sys::exit_code(status))
 }
 
 const LOCKED: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
@@ -167,32 +162,7 @@ fn contain(spec: &Spec, ask: OwnedFd, done: OwnedFd) -> Result<libc::c_int, Stri
     sys::mount_at("sysfs", &at("/sys"), "sysfs", LOCKED | libc::MS_RDONLY, "")?;
     sys::mount_at("cgroup2", &at("/sys/fs/cgroup"), "cgroup2", LOCKED, "")?;
     sys::mount_at("dev", &at("/dev"), "tmpfs", libc::MS_NOSUID, "mode=0755,size=4m")?;
-    for (name, major, minor) in [
-        ("null", 1, 3),
-        ("zero", 1, 5),
-        ("full", 1, 7),
-        ("random", 1, 8),
-        ("urandom", 1, 9),
-        ("tty", 5, 0),
-    ] {
-        let path = sys::cstr(&at(&format!("/dev/{name}")));
-        // SAFETY: mknod and chmod take one NUL terminated path each.
-        context(
-            &format!("device {name}"),
-            check(unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(major, minor)) }),
-        )?;
-        // SAFETY: as above; chmod, since mknod's mode passes through the process's mask.
-        unsafe { libc::chmod(path.as_ptr(), 0o666) };
-    }
-    for (link, target) in [
-        ("fd", "/proc/self/fd"),
-        ("stdin", "/proc/self/fd/0"),
-        ("stdout", "/proc/self/fd/1"),
-        ("stderr", "/proc/self/fd/2"),
-        ("ptmx", "pts/ptmx"),
-    ] {
-        context("device links", symlink(target, at(&format!("/dev/{link}"))))?;
-    }
+    sys::devices(root, &[])?;
     sys::mount_at(
         "devpts",
         &at("/dev/pts"),
@@ -245,28 +215,12 @@ fn contain(spec: &Spec, ask: OwnedFd, done: OwnedFd) -> Result<libc::c_int, Stri
         ),
     )?;
 
-    context("enter the root", std::env::set_current_dir(root))?;
-    let here = sys::cstr(".");
-    // SAFETY: pivot_root and umount2 take NUL terminated paths.
-    context(
-        "new root",
-        check(unsafe { libc::syscall(libc::SYS_pivot_root, here.as_ptr(), here.as_ptr()) } as libc::c_int),
-    )?;
-    // SAFETY: as above.
-    context(
-        "leave the old root",
-        check(unsafe { libc::umount2(here.as_ptr(), libc::MNT_DETACH) }),
-    )?;
-    context("enter the root", std::env::set_current_dir("/"))?;
+    sys::pivot_into(root)?;
 
     // From here on root is root of this container only. A mount namespace made with the user namespace locks
     // every mount above.
     unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS)?;
-    context("ask for ids", File::from(ask).write_all(&[1]))?;
-    let mut byte = [0u8; 1];
-    if File::from(done).read(&mut byte).unwrap_or(0) != 1 {
-        return Err("the launcher gave the container no ids".into());
-    }
+    await_ids(ask, done, "container")?;
 
     let workload = fork()?;
     if workload == 0 {
@@ -303,17 +257,9 @@ fn start(spec: &Spec) -> String {
                 return error;
             }
         };
-    let pointers = |strings: &[CString]| {
-        strings
-            .iter()
-            .map(|string| string.as_ptr())
-            .chain([std::ptr::null()])
-            .collect::<Vec<_>>()
-    };
-    let (argv, envp) = (pointers(&arguments), pointers(&environment));
     let groups: Vec<libc::gid_t> = spec.groups.clone();
-    // SAFETY: every pointer is to memory that lives until exec; the calls change only this process, which has one
-    // thread. Rust ignores SIGPIPE, and an ignored signal stays ignored across exec, so it is set back.
+    // SAFETY: every pointer is to memory that lives through the call; the calls change only this process, which has
+    // one thread. Rust ignores SIGPIPE, and an ignored signal stays ignored across exec, so it is set back.
     unsafe {
         libc::setsid();
         libc::umask(0o022);
@@ -327,7 +273,10 @@ fn start(spec: &Spec) -> String {
         if libc::chdir(home.as_ptr()) != 0 {
             libc::chdir(c"/".as_ptr());
         }
-        libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
     }
-    format!("{}: {}", spec.argv[0], std::io::Error::last_os_error())
+    format!(
+        "{}: {}",
+        spec.argv[0],
+        sys::exec(&program, &arguments, &environment)
+    )
 }

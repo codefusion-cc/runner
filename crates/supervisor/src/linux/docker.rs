@@ -9,9 +9,10 @@
 //! - [`sandbox`], the sandbox's first program, as the sandbox's root: a network namespace for the daemon, pasta to
 //!   join it to the machine's network, and the daemon.
 
-use super::init::{SELF_COPY, load_modules};
+use super::container::{await_ids, give_ids, read_spec};
+use super::init::{SELF_COPY, load_modules, spawn_self};
 use super::net;
-use super::sys::{self, check, context, say};
+use super::sys::{self, check, context, exit_code, fork, say, unshare, wait};
 use cf_supervisor::docker::{self as plan, SHIFT};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -71,10 +72,6 @@ pub fn prepare(
     let docker_gid = cf_supervisor::environment::find_group(group, plan::GROUP)
         .ok_or_else(|| format!("the image has no group {}", plan::GROUP))?;
 
-    // The daemon's processes get processor time limits too, where the kernel has the controller.
-    for at in ["/sys/fs/cgroup".to_string(), cgroup.to_string()] {
-        let _ = fs::write(format!("{at}/cgroup.subtree_control"), "+cpu");
-    }
     let sandbox_group = format!("{cgroup}/docker");
     // Delegated to the sandbox's root, which makes a group for each container below it. The job's limits stay one
     // level up, where the sandbox cannot see them. The sandbox's own processes go to a leaf, `daemon`, since a group
@@ -88,7 +85,7 @@ pub fn prepare(
     }
 
     let data = format!("{scratch}/docker");
-    let sockets = format!("{scratch}/cf-docker");
+    let sockets = format!("{scratch}/sockets");
     for (folder, owner_group, mode) in [(&data, SHIFT, 0o700), (&sockets, docker_gid, 0o750)] {
         context(folder, fs::create_dir_all(folder))?;
         chown(folder, SHIFT, owner_group)?;
@@ -103,7 +100,7 @@ pub fn prepare(
     // `/run/docker.sock`, and `/var/run/docker.sock` through the image's link, where tools look first.
     let link = format!("{root}/run/docker.sock");
     let _ = fs::remove_file(&link);
-    context(&link, symlink("cf-docker/docker.sock", &link))?;
+    context(&link, symlink(plan::SOCKET, &link))?;
     context(
         "the daemon's folder",
         fs::create_dir_all(format!("{root}{}", plan::DATA)),
@@ -135,43 +132,26 @@ const VIEW_WAIT_MS: libc::c_int = 10_000;
 /// no daemon, to `problem`, which the job's start hook reads. What the daemon says goes to [`plan::LOG`], which the
 /// job can read.
 pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
-    let log_path = format!("{}/dockerd.log", spec.sockets);
     let log = context(
         "the daemon's log",
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o644)
-            .open(&log_path),
+            .open(format!("{}/{}", spec.sockets, plan::LOG_NAME)),
     )?;
     let (view_read, view_write) = context("pipe", sys::pipe())?;
-    let mut command = Command::new(SELF_COPY);
-    command
-        .arg("docker")
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(context("the daemon's log", log.try_clone())?)
-        .stderr(log);
-    let view_fd = view_write.as_raw_fd();
-    // SAFETY: dup2 is async-signal-safe; the descriptor is open in the child, which is a copy of this process.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(view_fd, VIEW_FD) < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut child = context("start the Docker launcher", command.spawn())?;
-    // The command holds the end the launcher got; while it is open here, the pipe never ends.
-    drop((command, view_write));
-    if let Some(mut input) = child.stdin.take() {
-        context(
-            "describe the sandbox",
-            input.write_all(serde_json::to_string(spec).unwrap_or_default().as_bytes()),
-        )?;
-    }
+    let mut child = spawn_self(
+        "docker",
+        (&view_write, VIEW_FD),
+        (
+            Stdio::from(context("the daemon's log", log.try_clone())?),
+            Stdio::from(log),
+        ),
+        spec,
+    )?;
+    // While the end the launcher got is open here too, the pipe never ends.
+    drop(view_write);
     let mut poll = libc::pollfd {
         fd: view_read.as_raw_fd(),
         events: libc::POLLIN,
@@ -201,35 +181,6 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
     }
 }
 
-fn fork() -> Result<libc::pid_t, String> {
-    // SAFETY: the launcher and the sandbox's first program have one thread each, so the child may do anything.
-    context("fork", check(unsafe { libc::fork() }))
-}
-
-fn unshare(flags: libc::c_int) -> Result<(), String> {
-    // SAFETY: unshare takes no pointers.
-    context("new namespaces", check(unsafe { libc::unshare(flags) }).map(drop))
-}
-
-fn wait(pid: libc::pid_t) -> (libc::pid_t, libc::c_int) {
-    let mut status = 0;
-    loop {
-        // SAFETY: waitpid fills the status we own.
-        let ended = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if ended > 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return (ended, status);
-        }
-    }
-}
-
-fn exit_code(status: libc::c_int) -> i32 {
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        128 + libc::WTERMSIG(status)
-    }
-}
-
 /// The launcher's entry, as the machine's root.
 pub fn launch() -> ! {
     match launcher() {
@@ -242,17 +193,7 @@ pub fn launch() -> ! {
 }
 
 fn launcher() -> Result<i32, String> {
-    let mut text = String::new();
-    context(
-        "read the sandbox's description",
-        std::io::stdin().read_to_string(&mut text),
-    )?;
-    let spec: Spec =
-        serde_json::from_str(&text).map_err(|_| "the sandbox's description is malformed".to_string())?;
-    if let Ok(null) = File::open("/dev/null") {
-        // SAFETY: dup2 on descriptors we own.
-        unsafe { libc::dup2(null.as_raw_fd(), 0) };
-    }
+    let spec: Spec = read_spec("sandbox")?;
     // The job's root, which shares the machine's ids, can neither trace the launcher nor open what it holds.
     // SAFETY: prctl with this option takes numbers only.
     context(
@@ -282,17 +223,13 @@ fn launcher() -> Result<i32, String> {
         std::process::exit(70);
     }
     drop((view, ask_write, done_read));
-    let mut byte = [0u8; 1];
-    let mut done = File::from(done_write);
-    if File::from(ask_read).read(&mut byte).unwrap_or(0) == 1 {
-        match fs::write(format!("/proc/{first}/uid_map"), &spec.uid_map)
-            .and_then(|()| fs::write(format!("/proc/{first}/gid_map"), &spec.gid_map))
-        {
-            Ok(()) => drop(done.write_all(&[1])),
-            Err(error) => eprintln!("cf-supervisor: the sandbox's ids could not be set: {error}"),
-        }
-    }
-    drop(done);
+    give_ids(
+        first,
+        ask_read,
+        done_write,
+        (&spec.uid_map, &spec.gid_map),
+        "sandbox",
+    );
     let (_, status) = wait(first);
     Ok(exit_code(status))
 }
@@ -309,11 +246,7 @@ fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Re
 
     // From here on root is the sandbox's root, a shifted id: what was mounted above is locked.
     unshare(libc::CLONE_NEWUSER)?;
-    context("ask for ids", File::from(ask).write_all(&[1]))?;
-    let mut byte = [0u8; 1];
-    if File::from(done).read(&mut byte).unwrap_or(0) != 1 {
-        return Err("the launcher gave the sandbox no ids".into());
-    }
+    await_ids(ask, done, "sandbox")?;
     // SAFETY: these calls take numbers or a null list of no groups, and change only this process.
     unsafe {
         if libc::setresgid(0, 0, 0) != 0
@@ -327,31 +260,37 @@ fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Re
         }
     }
     unshare(libc::CLONE_NEWNS)?;
-    let program = sys::cstr(SANDBOX_SELF);
-    let arguments = [sys::cstr(SANDBOX_SELF), sys::cstr("docker-sandbox")];
-    let environment: Vec<CString> = sandbox_environment()
+    let environment: Vec<CString> = SANDBOX_ENV
         .iter()
-        .map(|entry| sys::cstr(entry))
+        .map(|(name, value)| sys::cstr(&format!("{name}={value}")))
         .collect();
-    let pointers = |strings: &[CString]| {
-        strings
-            .iter()
-            .map(|string| string.as_ptr())
-            .chain([std::ptr::null()])
-            .collect::<Vec<_>>()
-    };
-    let (argv, envp) = (pointers(&arguments), pointers(&environment));
-    // SAFETY: every pointer is to memory that lives until exec.
-    unsafe { libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-    Err(format!("{SANDBOX_SELF}: {}", std::io::Error::last_os_error()))
+    let error = sys::exec(
+        &sys::cstr(SANDBOX_SELF),
+        &[sys::cstr(SANDBOX_SELF), sys::cstr("docker-sandbox")],
+        &environment,
+    );
+    Err(format!("{SANDBOX_SELF}: {error}"))
 }
 
-fn sandbox_environment() -> Vec<String> {
-    vec![
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-        "HOME=/tmp".into(),
-        "LANG=C.UTF-8".into(),
-    ]
+/// The whole environment of the sandbox's programs.
+const SANDBOX_ENV: [(&str, &str); 3] = [
+    (
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ),
+    ("HOME", "/tmp"),
+    ("LANG", "C.UTF-8"),
+];
+
+/// One of the sandbox's programs, `argv`, with the sandbox's environment and nothing on its input.
+fn sandbox_command(argv: &[String]) -> Command {
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .env_clear()
+        .envs(SANDBOX_ENV)
+        .stdin(Stdio::null());
+    command
 }
 
 const PLAIN: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
@@ -372,35 +311,8 @@ fn view(spec: &Spec) -> Result<(), String> {
     sys::mount_at("sysfs", &at("/sys"), "sysfs", PLAIN, "")?;
     sys::mount_at("cgroup2", &at("/sys/fs/cgroup"), "cgroup2", PLAIN, "")?;
     sys::mount_at("dev", &at("/dev"), "tmpfs", libc::MS_NOSUID, "mode=0755,size=4m")?;
-    context("/dev/net", fs::create_dir_all(at("/dev/net")))?;
-    for (name, major, minor) in [
-        ("null", 1, 3),
-        ("zero", 1, 5),
-        ("full", 1, 7),
-        ("random", 1, 8),
-        ("urandom", 1, 9),
-        ("tty", 5, 0),
-        // pasta's and the daemon's network devices, in namespaces the sandbox owns.
-        ("net/tun", 10, 200),
-    ] {
-        let path = sys::cstr(&at(&format!("/dev/{name}")));
-        // SAFETY: mknod and chmod take one NUL terminated path each.
-        context(
-            &format!("device {name}"),
-            check(unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(major, minor)) }),
-        )?;
-        // SAFETY: as above.
-        unsafe { libc::chmod(path.as_ptr(), 0o666) };
-    }
-    for (link, target) in [
-        ("fd", "/proc/self/fd"),
-        ("stdin", "/proc/self/fd/0"),
-        ("stdout", "/proc/self/fd/1"),
-        ("stderr", "/proc/self/fd/2"),
-        ("ptmx", "pts/ptmx"),
-    ] {
-        context("device links", symlink(target, at(&format!("/dev/{link}"))))?;
-    }
+    // pasta's and the daemon's network devices, in namespaces the sandbox owns.
+    sys::devices(root, &[("net/tun", 10, 200)])?;
     sys::mount_at(
         "devpts",
         &at("/dev/pts"),
@@ -438,20 +350,7 @@ fn view(spec: &Spec) -> Result<(), String> {
             "",
         ),
     )?;
-
-    context("enter the root", std::env::set_current_dir(root))?;
-    let here = sys::cstr(".");
-    // SAFETY: pivot_root and umount2 take NUL terminated paths.
-    context(
-        "new root",
-        check(unsafe { libc::syscall(libc::SYS_pivot_root, here.as_ptr(), here.as_ptr()) } as libc::c_int),
-    )?;
-    // SAFETY: as above.
-    context(
-        "leave the old root",
-        check(unsafe { libc::umount2(here.as_ptr(), libc::MNT_DETACH) }),
-    )?;
-    context("enter the root", std::env::set_current_dir("/"))
+    sys::pivot_into(root)
 }
 
 /// The sandbox's first program, as its root and PID 1 of its process namespace, in the machine's network: makes the
@@ -485,19 +384,7 @@ fn run_sandbox() -> Result<i32, String> {
     }
     let command = plan::pasta_command(&format!("/proc/{daemon}/ns/net"));
     // pasta configures the namespace, then stays in the background and returns here.
-    let status = context(
-        "start pasta",
-        Command::new(&command[0])
-            .args(&command[1..])
-            .env_clear()
-            .envs(
-                sandbox_environment()
-                    .iter()
-                    .filter_map(|entry| entry.split_once('=')),
-            )
-            .stdin(Stdio::null())
-            .status(),
-    )?;
+    let status = context("start pasta", sandbox_command(&command).status())?;
     if !status.success() {
         sys::kill(daemon as u32, libc::SIGKILL);
         return Err(format!("pasta ended with {status}: the daemon has no network"));
@@ -515,47 +402,26 @@ fn run_sandbox() -> Result<i32, String> {
     }
 }
 
-/// The daemon's process: a network namespace of the sandbox's, its loopback up, then, once pasta has joined the
-/// namespace to the machine's network, its one rule ([`plan::flagless_tcp_rule`]) and the daemon. Returns only when
-/// that failed.
+/// The daemon's process: a network namespace of the sandbox's, its loopback up and its one rule
+/// ([`plan::flagless_tcp_rule`]), then the daemon once pasta has joined the namespace to the machine's network.
+/// Returns only when that failed.
 fn daemon_process(ready: OwnedFd, go: OwnedFd) -> Result<Infallible, String> {
     unshare(libc::CLONE_NEWNET)?;
     net::loopback_up()?;
-    context("say ready", File::from(ready).write_all(&[1]))?;
-    let mut byte = [0u8; 1];
-    if File::from(go).read(&mut byte).unwrap_or(0) != 1 {
-        return Err("the daemon's network was not joined".into());
-    }
     let rule = plan::flagless_tcp_rule();
-    let status = context(
-        "the daemon's network rule",
-        Command::new(&rule[0])
-            .args(&rule[1..])
-            .env_clear()
-            .envs(
-                sandbox_environment()
-                    .iter()
-                    .filter_map(|entry| entry.split_once('=')),
-            )
-            .stdin(Stdio::null())
-            .status(),
-    )?;
+    let status = context("the daemon's network rule", sandbox_command(&rule).status())?;
     if !status.success() {
         return Err(format!(
             "the daemon's network rule: {} ended with {status}",
             rule[0]
         ));
     }
+    context("say ready", File::from(ready).write_all(&[1]))?;
+    let mut byte = [0u8; 1];
+    if File::from(go).read(&mut byte).unwrap_or(0) != 1 {
+        return Err("the daemon's network was not joined".into());
+    }
     let command = plan::dockerd_command();
-    let error = Command::new(&command[0])
-        .args(&command[1..])
-        .env_clear()
-        .envs(
-            sandbox_environment()
-                .iter()
-                .filter_map(|entry| entry.split_once('=')),
-        )
-        .stdin(Stdio::null())
-        .exec();
+    let error = sandbox_command(&command).exec();
     Err(format!("{}: {error}", command[0]))
 }

@@ -35,7 +35,7 @@ fn docker_ready() {
                 DOCKER_WAIT.as_secs()
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50));
     };
     let log = fs::read_to_string(docker::LOG).unwrap_or_default();
     println!(

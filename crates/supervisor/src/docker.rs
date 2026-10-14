@@ -20,9 +20,15 @@ pub const IDS: u32 = 65536;
 
 /// The folder of the daemon's socket, the same in the job's container and in the sandbox, and of its log.
 pub const SOCKET_DIR: &str = "/run/cf-docker";
-/// The daemon's socket. `/run/docker.sock` (and `/var/run/docker.sock`) links to it in the job's container.
+/// The socket's name in [`SOCKET_DIR`].
+pub const SOCKET_NAME: &str = "docker.sock";
+/// The log's name in [`SOCKET_DIR`].
+pub const LOG_NAME: &str = "dockerd.log";
+/// The daemon's socket, [`SOCKET_DIR`] and [`SOCKET_NAME`]. `/run/docker.sock` (and `/var/run/docker.sock`) links
+/// to it in the job's container.
 pub const SOCKET: &str = "/run/cf-docker/docker.sock";
-/// What the daemon and the sandbox say, for the job to read when the daemon does not start.
+/// What the daemon and the sandbox say, [`SOCKET_DIR`] and [`LOG_NAME`], for the job to read when the daemon does
+/// not start.
 pub const LOG: &str = "/run/cf-docker/dockerd.log";
 /// Where the daemon keeps images, containers and volumes: a folder on the job's disk.
 pub const DATA: &str = "/var/lib/docker";
@@ -69,10 +75,14 @@ pub fn map_text(extents: &[Extent]) -> String {
         .collect()
 }
 
+fn argv(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| word.to_string()).collect()
+}
+
 /// The daemon's command, as the sandbox's root in the sandbox's network. IPv6 stays off as in the rest of the
 /// machine; the published ports' proxy stays on, since pasta forwards a port it sees bound.
 pub fn dockerd_command() -> Vec<String> {
-    [
+    argv(&[
         "dockerd",
         "--host",
         &format!("unix://{SOCKET}"),
@@ -86,10 +96,7 @@ pub fn dockerd_command() -> Vec<String> {
         "/run/docker.pid",
         "--ip6tables=false",
         "--userland-proxy=true",
-    ]
-    .iter()
-    .map(|text| text.to_string())
-    .collect()
+    ])
 }
 
 /// pasta's command: joins the daemon's network namespace at `netns` to the machine's, IPv4 only. `--no-map-gw`
@@ -97,7 +104,7 @@ pub fn dockerd_command() -> Vec<String> {
 /// Ports bound in the namespace (a container's published port) are forwarded from the machine's side, where the
 /// job reaches them at `localhost`; nothing is forwarded the other way.
 pub fn pasta_command(netns: &str) -> Vec<String> {
-    [
+    argv(&[
         "pasta",
         "--config-net",
         "--quiet",
@@ -114,10 +121,7 @@ pub fn pasta_command(netns: &str) -> Vec<String> {
         "--netns-only",
         "--netns",
         netns,
-    ]
-    .iter()
-    .map(|text| text.to_string())
-    .collect()
+    ])
 }
 
 /// The rule the daemon's network gets before the daemon starts: TCP segments with no flag at all are dropped on the
@@ -125,7 +129,7 @@ pub fn pasta_command(netns: &str) -> Vec<String> {
 /// a receiver ignores such a segment (RFC 9293), but the daemon's NAT takes it for invalid, does not map it to the
 /// container, and the daemon's own kernel answers it with a reset that ends the container's connection.
 pub fn flagless_tcp_rule() -> Vec<String> {
-    [
+    argv(&[
         "iptables",
         "--wait",
         "-t",
@@ -139,8 +143,5 @@ pub fn flagless_tcp_rule() -> Vec<String> {
         "NONE",
         "-j",
         "DROP",
-    ]
-    .iter()
-    .map(|text| text.to_string())
-    .collect()
+    ])
 }

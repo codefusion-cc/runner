@@ -423,7 +423,9 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             let promised = (!self.promised.is_empty()).then(|| self.promised.remove(0).ticket);
             let turn = self.turn_for(taken + n);
             let claim = self.slots.claim_in_turn(self.config.size, promised, turn);
-            if let (true, Claim::Start(ticket) | Claim::Waits { ticket, .. }) = (self.config.docker, &claim) {
+            if self.config.docker
+                && let Claim::Start(ticket) | Claim::Waits { ticket, .. } = &claim
+            {
                 self.slots.mark_docker(*ticket);
             }
             match claim {

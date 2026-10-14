@@ -19,7 +19,7 @@ use cf_console_client::{
 use cf_ghapp::{Clock, GitHubApp};
 use cf_host_macos::Battery;
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
-use cf_workflows::{DOCKER_LABEL, self_hosted_with};
+use cf_workflows::self_hosted_with;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Notify;
@@ -156,6 +156,8 @@ pub struct SetState {
     pub labels: Vec<String>,
     /// The size of its machines.
     pub size: Size,
+    /// Whether its jobs get a Docker daemon (`cf-docker`).
+    pub docker: bool,
     /// Why its listener is not listening, when it is not.
     pub error: Option<String>,
     /// Since when, in seconds since 1970.
@@ -182,6 +184,7 @@ struct Wanted {
     client: ScaleSetClient,
     labels: Vec<String>,
     size: Size,
+    docker: bool,
 }
 
 struct Serving {
@@ -587,6 +590,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 id: 0,
                 labels: want.labels.clone(),
                 size: want.size,
+                docker: want.docker,
                 error: None,
                 error_at: None,
                 statistics: None,
@@ -714,6 +718,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             client: client.clone(),
                             labels: set.labels().to_vec(),
                             size,
+                            docker: set.docker(),
                         },
                     );
                 }
@@ -1478,12 +1483,13 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
     stop: Shutdown,
 ) {
     let bell = shared.nudge.subscribe();
-    let (name, labels, size, repo) = {
+    let (name, labels, size, docker, repo) = {
         let state = state.lock().expect("set");
         (
             state.name.clone(),
             state.labels.clone(),
             state.size,
+            state.docker,
             state.repo.clone(),
         )
     };
@@ -1520,7 +1526,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         repo,
                         machine: shared.config.machine.clone(),
                         size,
-                        docker: labels.iter().any(|label| label == DOCKER_LABEL),
+                        docker,
                     },
                     session.clone(),
                     registry,
