@@ -1,5 +1,6 @@
-//! Prints what the Runner reads from this Linux host, to compare with `free -b`, `/proc/vmstat`, `/proc/pressure`,
-//! the thermal zones and `df`. It only reads and prints, and prints no name of the host.
+//! Prints what the Runner reads from this Linux host, to compare with `free -b`, `/proc/vmstat`,
+//! `/proc/swaps`, `/proc/pressure`, the thermal zones and `df`. It only reads and prints, and prints no name of
+//! the host.
 //!
 //! `cargo run -p cf-host-linux --example linux-probe [the state folder]`
 
@@ -52,6 +53,16 @@ fn probe(disk: &str) -> Result<(), HostError> {
         memory.swap_total_bytes, memory.swap_free_bytes, reading.swap_used_bytes
     );
     println!("pswpout                    {}", raw.swapouts);
+    match &raw.swaps {
+        Some(swaps) => {
+            for swap in swaps {
+                let kind = if swap.zram { "zram" } else { "disk" };
+                println!("/proc/swaps {kind}           used {}", swap.used_bytes);
+            }
+        }
+        None => println!("/proc/swaps                not read, every pswpout counts"),
+    }
+    println!("swap-outs the budget sees  {}", reading.swapouts);
     match raw.memory_pressure {
         Some(psi) => println!(
             "PSI memory avg10           some {:.2}% full {:.2}% ({:?})",

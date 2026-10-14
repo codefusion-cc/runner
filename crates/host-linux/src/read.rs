@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use cf_budget::{Battery, HostError};
 
 use crate::convert::{Supply, Trip, TripKind, Zone, battery_of};
-use crate::parse::{self, CpuTicks, MAX_FILE_BYTES, Meminfo, Psi};
+use crate::parse::{self, CpuTicks, MAX_FILE_BYTES, Meminfo, Psi, Swap};
 
 /// A file under the root, whole. One longer than [`MAX_FILE_BYTES`] or not UTF-8 is an error, never read in part.
 pub(crate) fn text(root: &Path, path: &str) -> io::Result<String> {
@@ -51,6 +51,11 @@ pub(crate) fn meminfo(root: &Path) -> Result<Meminfo, HostError> {
 pub(crate) fn swapouts(root: &Path) -> Result<u64, HostError> {
     parse::counter(&needed(root, "/proc/vmstat")?, "pswpout")
         .ok_or_else(|| parse::implausible("pswpout of /proc/vmstat", "missing"))
+}
+
+/// The swap areas of `/proc/swaps`; `None` when it cannot be read or says something else.
+pub(crate) fn swaps(root: &Path) -> Option<Vec<Swap>> {
+    parse::swaps(&text(root, "/proc/swaps").ok()?)
 }
 
 /// `/proc/pressure/memory`; `None` when the kernel has no such file or refuses to read it (PSI built in but off).

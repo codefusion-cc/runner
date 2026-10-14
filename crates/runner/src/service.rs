@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cf_budget::{Budget, Host as _, HostReading, Settings, Size, admit};
+use cf_budget::{Budget, Host as _, HostFacts, HostReading, Settings, Size, admit};
 use cf_daemon::names::ServePolicy;
 use cf_daemon::update::{STAYS_UP, SelfUpdate, UpdateFile};
 use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
@@ -373,13 +373,6 @@ fn room(config: &Config) -> Result<String, String> {
     let facts = This::host(Path::new("/"))
         .and_then(|host| host.facts())
         .map_err(|error| format!("{}: {error}", This::SYSTEM))?;
-    let settings = This::settings(facts, config.mode());
-    let sizes: Vec<String> = [Size::G2, Size::G4, Size::G6, Size::G8]
-        .into_iter()
-        .filter(|size| settings.can_run(*size).is_ok())
-        .map(|size| format!("{} with {} CPUs", size.label(), settings.vcpus_of(size)))
-        .collect();
-    let side_by_side = settings.side_by_side(&settings.away, Size::G4);
     #[cfg(target_os = "macos")]
     let (whose, when) = match config.mac_use {
         crate::config::Use::Dedicated => ("nobody works here", ""),
@@ -387,18 +380,38 @@ fn room(config: &Config) -> Result<String, String> {
     };
     #[cfg(not(target_os = "macos"))]
     let (whose, when) = ("nobody sits at it", "");
-    Ok(format!(
-        "{} GB and {} cores, {whose}: {} GB for machines{when}; {}; {} cf-4g side by side",
-        facts.total_bytes >> 30,
+    Ok(room_line(
+        facts,
+        &This::settings(facts, config.mode()),
+        whose,
+        when,
+    ))
+}
+
+/// [`room`]'s line for these facts and settings, in GiB as [`memory_now`]'s.
+fn room_line(facts: HostFacts, settings: &Settings, whose: &str, when: &str) -> String {
+    let sizes: Vec<String> = [Size::G2, Size::G4, Size::G6, Size::G8]
+        .into_iter()
+        .filter(|size| settings.can_run(*size).is_ok())
+        .map(|size| format!("{} with {} CPUs", size.label(), settings.vcpus_of(size)))
+        .collect();
+    format!(
+        "{} and {} cores, {whose}: {} for machines{when}; {}; {} cf-4g side by side",
+        gib(facts.total_bytes),
         facts.cores,
-        settings.away.cap_bytes as f64 / f64::from(1u32 << 30),
+        gib(settings.away.cap_bytes),
         if sizes.is_empty() {
             "no size fits".to_string()
         } else {
             sizes.join(", ")
         },
-        side_by_side,
-    ))
+        settings.side_by_side(&settings.away, Size::G4),
+    )
+}
+
+/// Memory as `check` and `install` print it: GiB with two decimals.
+fn gib(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / cf_budget::GIB as f64)
 }
 
 /// The host's memory at this moment against the floor the budget keeps free, and the sizes a machine could have
@@ -413,7 +426,6 @@ fn memory_now(settings: &Settings, reading: &HostReading) -> String {
         }
         Err(error) => return format!("the settings do not fit this host: {error}"),
     };
-    let gib = |bytes: u64| bytes as f64 / cf_budget::GIB as f64;
     let fit: Vec<&str> = [Size::G2, Size::G4, Size::G6, Size::G8]
         .into_iter()
         .filter(|size| admit(settings, &limits, reading.available_bytes, &[], *size).is_ok())
@@ -421,17 +433,17 @@ fn memory_now(settings: &Settings, reading: &HostReading) -> String {
         .collect();
     let floor = limits.floor_bytes;
     format!(
-        "{:.2} GiB of memory available, {}; {}",
+        "{} of memory available, {}; {}",
         gib(reading.available_bytes),
         if reading.available_bytes >= floor {
             format!(
-                "{:.2} GiB above the floor of {:.2} GiB",
+                "{} above the floor of {}",
                 gib(reading.available_bytes - floor),
                 gib(floor)
             )
         } else {
             format!(
-                "{:.2} GiB under the floor of {:.2} GiB",
+                "{} under the floor of {}",
                 gib(floor - reading.available_bytes),
                 gib(floor)
             )
@@ -763,6 +775,38 @@ mod tests {
         let away = memory_line(Mode::Workstation, 16 * GIB, Millis::mins(15));
         assert!(there.contains("above the floor of 4.00 GiB"), "{there}");
         assert!(away.contains("above the floor of 3.00 GiB"), "{away}");
+    }
+
+    #[test]
+    fn the_room_line_gives_memory_in_gib_as_the_memory_line_does() {
+        use cf_budget::{GIB, Mode};
+        // The 8 GB board with 4 fast cores read "7 GB and 8 cores, nobody sits at it: 5.635913014411926 GB for
+        // machines": the budget's cap unrounded, and the whole memory cut down to whole GiB.
+        let board = HostFacts {
+            // Its MemTotal.
+            total_bytes: 8_129_820 * 1024,
+            cores: 8,
+        };
+        assert_eq!(
+            room_line(board, &Settings::for_headless(board, 4), "nobody sits at it", ""),
+            "7.75 GiB and 8 cores, nobody sits at it: 5.64 GiB for machines; cf-2g with 2 CPUs, cf-4g with 2 CPUs; \
+             1 cf-4g side by side"
+        );
+        let mac = HostFacts {
+            total_bytes: 16 * GIB,
+            cores: 8,
+        };
+        assert_eq!(
+            room_line(
+                mac,
+                &Settings::for_host(mac, Mode::Workstation),
+                "someone's own Mac",
+                " while the person is away, none otherwise"
+            ),
+            "16.00 GiB and 8 cores, someone's own Mac: 9.60 GiB for machines while the person is away, none \
+             otherwise; cf-2g with 2 CPUs, cf-4g with 3 CPUs, cf-6g with 4 CPUs, cf-8g with 4 CPUs; \
+             2 cf-4g side by side"
+        );
     }
 
     #[test]

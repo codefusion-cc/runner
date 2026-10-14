@@ -8,6 +8,9 @@
 //! `refused`. The host listens on all its addresses and on its loopback for the whole of each test, so a target of
 //! the host that the firewall let through would answer `ok`.
 //!
+//! A DNS probe asks as a resolver does, again when no answer or a server failure came ([`ASKS`]): one question over
+//! UDP can be lost, or time out, on the way to the host's resolver and beyond.
+//!
 //! It needs pasta (`apt install passt`), user namespaces, and `ip` and `unshare` for the stand-in alone.
 #![cfg(target_os = "linux")]
 
@@ -22,6 +25,9 @@ use std::time::Duration;
 
 /// How long a probe waits for an answer.
 const WAIT: Duration = Duration::from_secs(3);
+/// How often a DNS probe asks before it says `dropped`, [`WAIT`] apart: 9 s in all, as glibc's resolver gives up
+/// after two questions 5 s apart.
+const ASKS: u32 = 3;
 const ROLE: &str = "CF_ISOLATION_ROLE";
 const PROBES: &str = "CF_ISOLATION_PROBES";
 const HOST: &str = "CF_ISOLATION_HOST";
@@ -439,7 +445,9 @@ fn connect(address: &str, port: u16) -> String {
     }
 }
 
-/// `ok` when the name server at `server` answered a question for github.com's address with one, else `dropped`.
+/// `ok` when the name server at `server` answered a question for github.com's address with one, `no-answer` when it
+/// answered without one, else `dropped`. The same question goes out again after each [`WAIT`] without an answer and
+/// after a server failure, and a late answer to an earlier one counts.
 fn ask(server: Ipv4Addr) -> String {
     let mut question = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
     for label in ["github", "com"] {
@@ -449,15 +457,25 @@ fn ask(server: Ipv4Addr) -> String {
     question.extend_from_slice(&[0, 0, 1, 0, 1]);
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.set_read_timeout(Some(WAIT)).unwrap();
-    socket.send_to(&question, (server, 53)).unwrap();
-    let mut answer = [0u8; 512];
-    match socket.recv(&mut answer) {
-        Ok(read)
-            if read > 12 && answer[..2] == [0x12, 0x34] && u16::from_be_bytes([answer[6], answer[7]]) > 0 =>
-        {
-            "ok".into()
+    let mut found = "dropped";
+    for _ in 0..ASKS {
+        socket.send_to(&question, (server, 53)).unwrap();
+        let mut answer = [0u8; 512];
+        match socket.recv(&mut answer) {
+            // A server failure (SERVFAIL): the host's resolver gave up upstream, and a resolver asks again.
+            Ok(read) if read > 12 && answer[..2] == [0x12, 0x34] && answer[3] & 0x0f == 2 => {
+                found = "no-answer";
+            }
+            Ok(read) if read > 12 && answer[..2] == [0x12, 0x34] => {
+                return if u16::from_be_bytes([answer[6], answer[7]]) > 0 {
+                    "ok".into()
+                } else {
+                    "no-answer".into()
+                };
+            }
+            // Not the answer to this question: ask again, as a resolver would.
+            Ok(_) | Err(_) => {}
         }
-        Ok(_) => "no-answer".into(),
-        Err(_) => "dropped".into(),
     }
+    found.into()
 }

@@ -1,14 +1,16 @@
 use cf_budget::{Battery, HostError, HostReading, Millis, Now, Pressure, Thermal};
 
-use crate::parse::{CpuTicks, Meminfo, Psi};
+use crate::parse::{CpuTicks, Meminfo, Psi, Swap};
 
 /// What Linux answered, before anything is made of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Raw {
     /// `/proc/meminfo`. zram counts as swap.
     pub memory: Meminfo,
-    /// `pswpout` of `/proc/vmstat`: pages written to swap since the host started.
+    /// `pswpout` of `/proc/vmstat`: pages written to swap since the host started, to zram too.
     pub swapouts: u64,
+    /// The swap areas of `/proc/swaps`; `None` when it could not be read or said something else.
+    pub swaps: Option<Vec<Swap>>,
     /// `/proc/pressure/memory`; `None` on a kernel without pressure stall information (built without it, or with
     /// it off by default and no `psi=1`). Never zeros in its place: an absent signal is not a calm one.
     pub memory_pressure: Option<Psi>,
@@ -185,6 +187,22 @@ pub(crate) fn battery_of(supplies: &[Supply]) -> Option<Battery> {
     })
 }
 
+/// The swap-outs the budget watches, of which only a change matters. Pages that go to zram stay in memory,
+/// compressed: on a host with zram they are not swapping, and PSI's memory pressure says when memory is short.
+///
+/// - Without zram, or when `/proc/swaps` could not be read: `pswpout`, every page written to swap.
+/// - With zram: what is in use on the swap areas that are not zram, in bytes, which moves when pages go to the
+///   disk or come back from it. `pswpout` does not say which area a page went to. With zram alone it stays 0.
+pub fn swapouts_of(pswpout: u64, swaps: Option<&[Swap]>) -> u64 {
+    match swaps {
+        Some(swaps) if swaps.iter().any(|swap| swap.zram) => swaps
+            .iter()
+            .filter(|swap| !swap.zram)
+            .fold(0, |sum, swap| sum.saturating_add(swap.used_bytes)),
+        _ => pswpout,
+    }
+}
+
 /// The budget's reading from Linux's answers. An answer that cannot be right is an error and closes the host; it
 /// is never guessed at.
 ///
@@ -193,8 +211,8 @@ pub(crate) fn battery_of(supplies: &[Supply]) -> Option<Battery> {
 /// - `available_bytes`: `MemAvailable`, never more than `MemTotal`.
 /// - `pressure`: PSI's memory pressure ([`pressure_of`]), Normal on a kernel without PSI.
 /// - `swap_used_bytes`: `SwapTotal` less `SwapFree`.
-/// - `swapouts`: `pswpout`. The budget looks at how it moves between two readings, its rate, and counts the host
-///   as swapping for 30 s after it moved.
+/// - `swapouts`: what was written to swap on a disk ([`swapouts_of`]). The budget counts the host as swapping for
+///   30 s after it moved between two readings.
 /// - `idle`: zero. Linux has no person's idle time for a service to read, and a headless host has no person;
 ///   such a host is [`Mode::Dedicated`](cf_budget::Mode::Dedicated), where the budget never reads it. On a
 ///   workstation zero counts the person as there, the cautious side, as on a Mac whose idle time is not known.
@@ -220,7 +238,7 @@ pub fn reading(at: Now, raw: &Raw) -> Result<HostReading, HostError> {
         available_bytes: memory.available_bytes,
         pressure: pressure_of(raw.memory_pressure),
         swap_used_bytes,
-        swapouts: raw.swapouts,
+        swapouts: swapouts_of(raw.swapouts, raw.swaps.as_deref()),
         idle: Millis::ZERO,
         thermal: thermal_of(&raw.zones),
         on_battery: on_battery_of(&raw.supplies),
