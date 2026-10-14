@@ -1408,8 +1408,8 @@ T='{try_in_container}'
 docker run --rm alpine:3.22 sh -c "$T; {plain} wget -q -O /dev/null -T 20 https://github.com && echo c-github=open; awk 'NR==1{{print \"c-root=\" \$2}}' /proc/self/uid_map"
 docker run --rm --network host alpine:3.22 sh -c "$T; try $gw {open_port} h-gateway-open & try 10.1.2.3 80 h-private & wait"
 docker run --rm --privileged alpine:3.22 sh -c "$T; {privileged}
-  echo x > /proc/sys/kernel/core_pattern 2>/dev/null && echo p-core-pattern=written || echo p-core-pattern=refused
-  echo h > /proc/sysrq-trigger 2>/dev/null && echo p-sysrq=written || echo p-sysrq=refused
+  (echo x > /proc/sys/kernel/core_pattern) 2>/dev/null && echo p-core-pattern=written || echo p-core-pattern=refused
+  (echo h > /proc/sysrq-trigger) 2>/dev/null && echo p-sysrq=written || echo p-sysrq=refused
   head -c 1 /proc/kcore > /dev/null 2>&1 && echo p-kcore=read || echo p-kcore=refused
   (mknod /tmp/vda b 254 0 && head -c 1 /tmp/vda > /dev/null) 2>/dev/null && echo p-disk=read || echo p-disk=refused
   ip addr add 10.9.9.9/32 dev lo 2>/dev/null; echo p-own-network=\$?"
