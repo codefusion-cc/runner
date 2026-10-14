@@ -190,6 +190,20 @@ impl Rig {
 
     /// Starts again as [`Rig::restart`] does, once `edit` changed what the dead Runner left on disk.
     async fn restart_after(&mut self, edit: impl FnOnce(&Rig)) {
+        self.start_again(edit).await;
+        self.pump();
+    }
+
+    /// Starts again as [`Rig::restart`] does, as the program an update installed: it takes `pending` up before its
+    /// first report, as the binary does, so the command the console sends again is not done again.
+    async fn restart_into(&mut self, pending: &cf_daemon::update::Pending) {
+        self.start_again(|_| {}).await;
+        self.service.take_up(pending);
+        self.pump();
+    }
+
+    /// The new Runner of [`Rig::restart_after`], not yet doing its rounds.
+    async fn start_again(&mut self, edit: impl FnOnce(&Rig)) {
         // From this moment nothing the dying Runner asks reaches GitHub: an answer it got is the last it gets.
         self.github.set_down(true);
         self.stop_pump().await;
@@ -225,7 +239,6 @@ impl Rig {
             (&self.outbox, &self.updates, self.folder.path()),
         ));
         pass(&self.machines, 61);
-        self.pump();
     }
 
     /// The Runner dies at its `writes`th write from now, before or after it is `kept`: from that moment nothing it does
@@ -3051,9 +3064,15 @@ async fn an_update_waits_for_the_machine_that_stands_installs_and_is_said_once_b
         "said by the next Runner"
     );
 
-    rig.restart().await;
-    rig.service.take_up(&pending);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    rig.restart_into(&pending).await;
+    // The console sends the command with every answer until its result comes: once a second report of the new Runner
+    // came, it went through the answer to the first, and a build that started would be counted within a moment.
+    let calls = rig.console.calls();
+    until("two reports of the new Runner", || {
+        rig.console.calls() >= calls + 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         rig.updates.built(),
         1,

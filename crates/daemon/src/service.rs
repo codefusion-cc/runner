@@ -427,14 +427,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// Says what came of a command that is not one of a report's answer: an update the Runner that starts finishes.
     /// Kept until the console has it.
     pub fn said(&self, id: &str, ok: bool, message: &str) {
-        let shared = &self.shared;
-        {
-            let mut update = shared.update.lock().expect("update");
-            if update.command.as_deref() == Some(id) {
-                update.command = None;
-            }
-        }
+        // The result is in before the command is no longer under way, as [`Service::answered`] reads them.
+        let mut update = self.shared.update.lock().expect("update");
         self.push_result(id.to_string(), ok, message.to_string());
+        if update.command.as_deref() == Some(id) {
+            update.command = None;
+        }
     }
 
     /// Takes on an update a Runner before installed, which this one finishes: its command is not done again
@@ -1227,13 +1225,15 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 tracing::warn!(kind = %cut(command.kind, 50), "a command of the console has no id a result can name");
                 continue;
             }
+            // Under way first: a command's result is in before it is no longer under way, so a command that was
+            // taken is one or the other whenever the update ends meanwhile.
+            let under_way = shared.update.lock().expect("update").command.as_deref() == Some(&command.id);
             let done = shared
                 .results
                 .lock()
                 .expect("results")
                 .iter()
                 .any(|result| result.id == command.id);
-            let under_way = shared.update.lock().expect("update").command.as_deref() == Some(&command.id);
             if done || under_way || self.restart_requested() {
                 continue;
             }
@@ -1319,21 +1319,21 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             match outcome {
                 // Installed: the Runner that starts next says how it went.
                 Ok(None) => {}
+                // The result is in before the command is no longer under way, as `answered` reads them.
                 Ok(Some(message)) => {
+                    service.push_result(id, true, message);
                     update.command = None;
                     update.error = None;
                     update.failures = 0;
-                    drop(update);
-                    service.push_result(id, true, message);
                 }
                 Err(message) => {
+                    tracing::warn!(%message, "the update did not take; the Runner goes on as it was");
+                    service.push_result(id, false, message.clone());
                     update.command = None;
-                    update.error = Some((message.clone(), secs(service.shared.clock.now())));
+                    update.error = Some((message, secs(service.shared.clock.now())));
                     update.failures = update.failures.saturating_add(1);
                     drop(update);
                     service.shared.machines.hold_for_update(false);
-                    tracing::warn!(%message, "the update did not take; the Runner goes on as it was");
-                    service.push_result(id, false, message);
                 }
             }
         });
