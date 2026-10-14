@@ -460,9 +460,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if results.iter().any(|result| result.id == id) {
             return;
         }
-        // Never dropped: the console sends the command again until it has the result, and it would be done again.
-        // `answered` takes no command while a report's worth wait, so only an update's result, which ends on its
-        // own, goes over that; reports carry the results that wait a report's worth at a time.
+        // Never dropped: the console would send the command again, and it would be done again. Only an update's
+        // result, which ends on its own, comes while a report's worth wait (see `answered`).
         results.push(CommandResult {
             id,
             ok,
@@ -1244,9 +1243,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     results.len() >= cf_console_client::MAX_RESULTS,
                 )
             };
+            if done || under_way || self.restart_requested() {
+                continue;
+            }
             // Taken only while its result fits in the next report: the console sends the command again with the
             // answer to that report, which takes the results that wait.
-            if done || under_way || full || self.restart_requested() {
+            if full {
+                tracing::info!(id = %command.id, "a command of the console waits for room for its result");
                 continue;
             }
             tracing::info!(id = %command.id, kind = %command.kind, "a command of the console");
