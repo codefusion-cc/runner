@@ -304,7 +304,8 @@ proptest! {
             cpus: settings.vcpus_of(G4),
         };
         let beside = admit(&settings, &limits, settings.total_bytes, &[g4], G2);
-        let room_beside = limits.cap_bytes >= G4.vm_bytes() + G2.vm_bytes();
+        // Whether the memory has room for a cf-2g beside it, whatever CPUs the cf-4g holds.
+        let room_beside = admit(&settings, &limits, settings.total_bytes, &[Charge { cpus: 0, ..g4 }], G2).is_ok();
         if room_beside && limits.cpus >= 4 {
             prop_assert_eq!(beside, Ok(()), "{} MiB, {} CPUs", total_mib, limits.cpus);
         }
