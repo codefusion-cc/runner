@@ -149,8 +149,9 @@ impl Settings {
     ///   workstation whose person is away, and nothing while the person is there. A 16 GB Mac: 12 GB and 9.6 GB.
     /// - Floor: 2 GB, 3 GB and 4 GB on a 16 GB Mac (dedicated, away, in use).
     /// - CPUs: all cores but two; half the cores while the person is there. 2 vCPUs for `cf-2g` and 4 for
-    ///   `cf-6g` and `cf-8g`. `cf-4g` gets half of the CPUs CI may use, at most 4 and at least 2, so that two of
-    ///   them run side by side: 4 on a Mac with 10 cores, 3 on one with 8 (what the Go manager gave a job there).
+    ///   `cf-6g` and `cf-8g`. `cf-4g` gets half of the CPUs CI may use, at most 4 and at least 2, so that another
+    ///   machine runs beside it: 4 on a Mac with 10 cores, 3 on one with 8 (what the Go manager gave a job there).
+    ///   Where the cap leaves no room beside a `cf-4g` (an 8 GB Mac), it takes up to 4 of them ([`vcpus_for`]).
     /// - 15 minutes without the person, a 2 minute reservation, 60 s of calm, 30 s after a swap-out, and a job
     ///   stopped after 10 s of critical pressure on a workstation, 30 s on a dedicated Mac.
     pub fn for_host(facts: HostFacts, mode: Mode) -> Settings {
@@ -187,7 +188,7 @@ impl Settings {
             idle_after: Millis::mins(15),
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
-            vcpus: vcpus_for(all_but_two),
+            vcpus: vcpus_for(all_but_two, away.cap_bytes),
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),
@@ -233,7 +234,8 @@ impl Settings {
     ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
     /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
     ///   two, as on a Mac. 2 vCPUs for cf-2g, half the CPUs for cf-4g (at least 2, at most 4), 4 for the larger
-    ///   sizes: on 4 fast cores, two machines of 2 vCPUs.
+    ///   sizes: on 4 fast cores, two machines of 2 vCPUs. A cf-4g with no room beside it under the cap takes up to
+    ///   4 ([`vcpus_for`]): on 7.75 GB, the four fast cores, which no other machine could use while it runs.
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
         let total = facts.total_bytes;
@@ -243,7 +245,6 @@ impl Settings {
         } else {
             settings.away.cpus
         };
-        settings.vcpus = vcpus_for(cpus);
         let floor = GIB + total / 32;
         let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
         let limits = Profile {
@@ -254,6 +255,7 @@ impl Settings {
             floor_bytes: floor,
             cpus,
         };
+        settings.vcpus = vcpus_for(cpus, limits.cap_bytes);
         settings.away = limits;
         settings.in_use = limits;
         settings
@@ -359,8 +361,13 @@ impl Settings {
     }
 }
 
-/// The vCPUs of each size where CI may use `cpus`: 2 for cf-2g, half of them for cf-4g (at least 2, at most 4), so
-/// that two run side by side, and 4 for the larger sizes.
-fn vcpus_for(cpus: u32) -> [u32; 4] {
-    [2, (cpus / 2).clamp(2, 4), 4, 4]
+/// The vCPUs of each size where CI may use `cpus` and the sizes of all machines may add up to `cap_bytes`: 2 for
+/// cf-2g, 4 for the larger sizes, and for cf-4g half of the CPUs (at least 2, at most 4), so that another machine
+/// runs beside it. Where the cap has no room for even a cf-2g beside a cf-4g, the cf-4g runs alone and takes all of
+/// them, at most 4: half would leave the rest idle for as long as it runs. Measured on an RK3588 board with 4 fast
+/// cores, a Vitest suite took 210 s on 2 of them and 95 s on all 4.
+fn vcpus_for(cpus: u32, cap_bytes: u64) -> [u32; 4] {
+    let alone = cap_bytes < Size::G4.vm_bytes() + Size::G2.vm_bytes();
+    let g4 = if alone { cpus } else { cpus / 2 };
+    [2, g4.clamp(2, 4), 4, 4]
 }

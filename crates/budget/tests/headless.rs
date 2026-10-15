@@ -50,14 +50,15 @@ fn the_board_runs_one_cf_4g_or_two_cf_2g_and_nothing_more() {
         BOARD_BYTES - (GIB + BOARD_BYTES / 32) - GIB / 2 - 2 * OVERHEAD
     );
     assert_eq!(cap / MIB, 5771, "5.63 GB");
-    assert_eq!((settings.away.cpus, settings.vcpus), (4, [2, 2, 4, 4]));
+    // Nothing fits beside a cf-4g, so it has all four fast cores: with two, the other two would stand idle.
+    assert_eq!((settings.away.cpus, settings.vcpus), (4, [2, 4, 4, 4]));
 
     assert_eq!(grants(board(), &[G2, G2]), [Ok(2), Ok(2)]);
-    assert_eq!(grants(board(), &[G4]), [Ok(2)]);
+    assert_eq!(grants(board(), &[G4]), [Ok(4)]);
     assert_eq!(
         grants(board(), &[G4, G2]),
         [
-            Ok(2),
+            Ok(4),
             Err(Refusal::Full {
                 cap_bytes: cap,
                 committed_bytes: 4 * GIB
@@ -141,7 +142,7 @@ fn the_rule_at_each_size_of_host() {
                 BOARD_BYTES - GIB - BOARD_BYTES / 32 - GIB / 2 - 2 * OVERHEAD,
                 GIB + BOARD_BYTES / 32,
                 4,
-                2,
+                4,
             ),
             [true, true, false, false],
         ),
@@ -149,10 +150,11 @@ fn the_rule_at_each_size_of_host() {
             8 * GIB,
             8,
             4,
-            (5 * GIB + 7 * GIB / 8, GIB + GIB / 4, 4, 2),
+            (5 * GIB + 7 * GIB / 8, GIB + GIB / 4, 4, 4),
             [true, true, false, false],
         ),
-        // 16 GB on the same kind of board: the four fast cores decide, not the memory.
+        // 16 GB on the same kind of board: the four fast cores decide, not the memory, and a cf-4g leaves two of
+        // them to the machine beside it.
         (
             16 * GIB,
             8,
@@ -203,6 +205,8 @@ fn a_cf_6g_and_a_cf_4g_beside_a_cf_2g_come_at_8_13_gb() {
     assert!(below.away.cap_bytes < 6 * GIB && above.away.cap_bytes >= 6 * GIB);
     assert!(matches!(below.can_run(G6), Err(Refusal::Full { .. })));
     assert_eq!(above.can_run(G6), Ok(()));
+    // Below, a cf-4g runs alone and takes the four fast cores; above, it leaves two to a cf-2g beside it.
+    assert_eq!(grants(below.clone(), &[G4]), [Ok(4)]);
     assert!(grants(below, &[G4, G2])[1].is_err());
     assert_eq!(grants(above, &[G4, G2]), [Ok(2), Ok(2)]);
 }
@@ -240,7 +244,7 @@ fn ci_takes_the_fast_cores_of_a_board_whose_cores_differ_and_all_but_two_of_one_
     assert_eq!(cpus(2, 0), 1);
     assert_eq!(cpus(1, 0), 1);
     assert_eq!(cpus(1, 1), 1);
-    // cf-4g gets half the CPUs, between 2 and 4.
+    // With room for a machine beside it, cf-4g gets half the CPUs, between 2 and 4.
     let g4 = |cores: u32, fast: u32| Settings::for_headless(host(16 * GIB, cores), fast).vcpus_of(G4);
     assert_eq!(
         [g4(8, 4), g4(8, 0), g4(12, 0), g4(24, 0), g4(4, 0)],
@@ -279,6 +283,34 @@ proptest! {
             );
             prop_assert!(charges.iter().map(|charge| charge.cpus).sum::<u32>() <= limits.cpus);
             prop_assert!(limits.cpus <= cores);
+        }
+    }
+
+    /// A cf-4g leaves the CPUs a machine beside it would need when the cap has room for one, and takes up to 4 of
+    /// them when it has not, since no other machine could use them.
+    #[test]
+    fn a_cf_4g_leaves_idle_only_cpus_another_machine_could_use(
+        total_mib in 1100..96 * 1024u64,
+        cores in 1..64u32,
+        fast in 0..72u32,
+    ) {
+        let settings = Settings::for_headless(host(total_mib * MIB, cores), fast);
+        let limits = settings.away;
+        prop_assume!(settings.can_run(G4).is_ok());
+        let g4 = Charge {
+            vm_bytes: G4.vm_bytes(),
+            host_bytes: settings.host_bytes(G4),
+            resident_bytes: 0,
+            cpus: settings.vcpus_of(G4),
+        };
+        let beside = admit(&settings, &limits, settings.total_bytes, &[g4], G2);
+        let room_beside = limits.cap_bytes >= G4.vm_bytes() + G2.vm_bytes();
+        if room_beside && limits.cpus >= 4 {
+            prop_assert_eq!(beside, Ok(()), "{} MiB, {} CPUs", total_mib, limits.cpus);
+        }
+        if !room_beside {
+            prop_assert!(beside.is_err());
+            prop_assert_eq!(settings.vcpus_of(G4), limits.cpus.min(4));
         }
     }
 }
