@@ -16,6 +16,12 @@ pub const POOL_LABEL: &str = "self-hosted";
 /// Docker; a variable may name it (`CI_RUNNER_DOCKER=cf-docker`), like a size label.
 pub const DOCKER_LABEL: &str = "cf-docker";
 
+/// The label of a light job: lint, types, unit tests, a build. No Worker runtime and no browser, which need more of a
+/// machine than every host has. A machine of the size its other labels name (4 GB with none), like `self-hosted`.
+/// Every Runner serves it; one told to take light jobs alone (`light_only`) serves nothing else. The console's pool
+/// sends a repository's light jobs to these Actions runners by setting `CI_RUNNER_LIGHT=cf-light`.
+pub const LIGHT_LABEL: &str = "cf-light";
+
 /// A workflow file bigger than this is not read, and whoever fetches the files need not fetch it. GitHub's own limit
 /// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
@@ -63,6 +69,11 @@ impl LabelSet {
     pub fn docker(&self) -> bool {
         self.contains(DOCKER_LABEL)
     }
+
+    /// Whether the set asks for a light job ([`LIGHT_LABEL`]).
+    pub fn light(&self) -> bool {
+        self.contains(LIGHT_LABEL)
+    }
 }
 
 /// [`self_hosted_with`] without repository variables: every expression over variables stands for [`POOL_LABEL`].
@@ -72,7 +83,7 @@ pub fn self_hosted(files: &BTreeMap<String, Vec<u8>>) -> Vec<LabelSet> {
 
 /// Every distinct label set that jobs in the given workflow files request from self-hosted Actions runners these
 /// Actions runners can serve: sets that include `self-hosted`, a valid size label (`cf-2g`, `cf-4g`, `cf-6g`,
-/// `cf-8g`) or [`DOCKER_LABEL`], name no other platform, and are plain labels or expressions over repository variables, rather than other
+/// `cf-8g`), [`DOCKER_LABEL`] or [`LIGHT_LABEL`], name no other platform, and are plain labels or expressions over repository variables, rather than other
 /// expressions or Actions runner groups.
 ///
 /// An expression over `vars.` alone (string literals and functions aside) is a job the console's pool may point at
@@ -271,7 +282,8 @@ fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
     set.labels().iter().any(|l| is_ours(l)).then_some(set)
 }
 
-/// Whether a (lowercase) label is one these Actions runners serve: [`POOL_LABEL`], [`DOCKER_LABEL`] or a size.
+/// Whether a (lowercase) label is one these Actions runners serve: [`POOL_LABEL`], [`DOCKER_LABEL`], [`LIGHT_LABEL`] or
+/// a size.
 fn is_ours(label: &str) -> bool {
-    label == POOL_LABEL || label == DOCKER_LABEL || is_size_label(label)
+    label == POOL_LABEL || label == DOCKER_LABEL || label == LIGHT_LABEL || is_size_label(label)
 }

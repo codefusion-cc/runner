@@ -83,6 +83,8 @@ pub struct ServePolicy {
     pub docker_repos: Vec<String>,
     /// The most Docker jobs at once ([`crate::machines::MachineConfig::docker_max_jobs`]).
     pub docker_max_jobs: usize,
+    /// Serve only light jobs, those asking for `cf-light`.
+    pub light_only: bool,
 }
 
 impl Default for ServePolicy {
@@ -92,6 +94,7 @@ impl Default for ServePolicy {
             public_repos: Vec::new(),
             docker_repos: Vec::new(),
             docker_max_jobs: 1,
+            light_only: false,
         }
     }
 }
@@ -114,6 +117,12 @@ impl ServePolicy {
     /// there, and a Docker job is the most a job can do on a machine.
     pub fn serves_docker(&self, repo: &Repo) -> bool {
         repo.private && self.serves(repo) && listed(&self.docker_repos, repo)
+    }
+
+    /// Whether jobs asking for a label set are served at all: every set, or only light ones under
+    /// [`ServePolicy::light_only`].
+    pub fn serves_set(&self, set: &LabelSet) -> bool {
+        !self.light_only || set.light()
     }
 }
 
@@ -269,5 +278,34 @@ mod tests {
             "no list, no Docker"
         );
         assert_eq!(ServePolicy::default().docker_max_jobs, 1);
+    }
+
+    #[test]
+    fn a_light_only_host_serves_light_sets_alone() {
+        let all = ServePolicy::default();
+        let light = ServePolicy {
+            light_only: true,
+            ..ServePolicy::default()
+        };
+        for labels in [
+            &["cf-light"][..],
+            &["cf-light", "self-hosted"],
+            &["CF-Light", "cf-2g"],
+        ] {
+            let set = LabelSet::new(labels);
+            assert!(all.serves_set(&set), "{labels:?}");
+            assert!(light.serves_set(&set), "{labels:?}");
+        }
+        for labels in [
+            &["self-hosted"][..],
+            &["cf-4g"],
+            &["cf-8g"],
+            &["cf-docker"],
+            &["cf-lights"],
+        ] {
+            let set = LabelSet::new(labels);
+            assert!(all.serves_set(&set), "{labels:?}");
+            assert!(!light.serves_set(&set), "{labels:?}");
+        }
     }
 }

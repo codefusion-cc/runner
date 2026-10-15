@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use cf_budget::{Battery, FakeHost, GIB, Millis, Mode, Settings, Size};
 use cf_console_client::{Client, Enroll, JobEvent, MAX_RESULTS, OUTBOX_CAPACITY, Outbox, enroll};
-use cf_daemon::names::job_name;
+use cf_daemon::names::{ServePolicy, job_name};
 use cf_daemon::testing::{
     CrashingStore, FakeSettings, FakeUpdate, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for,
 };
@@ -61,6 +61,8 @@ struct Rig {
     settings: Arc<FakeSettings>,
     /// How long an update waits for the machines that stand, in wall time.
     update_limit: Duration,
+    /// What the Runner's settings file says to serve, read at each start.
+    policy: Mutex<ServePolicy>,
     /// Lets time pass on the Mac and runs the service's rounds, as its loop does, and counts them.
     pump: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)>,
 }
@@ -180,7 +182,14 @@ impl Rig {
                 &machines,
                 &enrolled.token,
                 &battery,
-                (&outbox, &updates, &settings, folder.path(), update_limit),
+                (
+                    &outbox,
+                    &updates,
+                    &settings,
+                    folder.path(),
+                    update_limit,
+                    ServePolicy::default(),
+                ),
             )),
             github,
             console,
@@ -196,6 +205,7 @@ impl Rig {
             updates,
             settings,
             update_limit,
+            policy: Mutex::new(ServePolicy::default()),
             pump: None,
         };
         rig.pump();
@@ -321,6 +331,7 @@ impl Rig {
                 &self.settings,
                 self.folder.path(),
                 self.update_limit,
+                self.policy.lock().expect("policy").clone(),
             ),
         ));
         pass(&self.machines, 61);
@@ -441,13 +452,14 @@ fn service(
     token: &Secret<String>,
     battery: &Arc<Mutex<Option<Battery>>>,
     // What stays across a daemon's starts: the outbox, the update it builds, its settings file, the folder of its
-    // files, how long an update waits for the machines that stand.
-    (outbox, updates, settings, folder, update_limit): (
+    // files, how long an update waits for the machines that stand, what its settings file says to serve.
+    (outbox, updates, settings, folder, update_limit, policy): (
         &Arc<Outbox>,
         &Arc<FakeUpdate>,
         &Arc<FakeSettings>,
         &std::path::Path,
         Duration,
+        ServePolicy,
     ),
 ) -> TestService {
     let battery = battery.clone();
@@ -460,6 +472,7 @@ fn service(
     config.poll_timeout = Duration::from_secs(5);
     config.sweep_again = Duration::from_millis(50);
     config.update_limit = update_limit;
+    config.policy = policy;
     config.backoff = (
         Duration::from_millis(20),
         Duration::from_millis(100),
@@ -586,6 +599,59 @@ async fn a_size_the_mac_never_runs_gets_no_scale_set_and_a_label_from_a_variable
     labels.sort();
     assert_eq!(labels, [vec!["cf-2g", "self-hosted"], vec!["cf-4g"]]);
     assert_eq!(rig.service.discovery_error(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_takes_light_jobs_alone_offers_github_no_other_scale_set() {
+    let mut rig = Rig::new(3).await;
+    rig.github.set_workflow(
+        REPO,
+        "classes.yml",
+        "on: push\njobs:\n  lint:\n    runs-on: ${{ vars.CI_RUNNER_LIGHT || 'ubuntu-latest' }}\n    steps: []\n  \
+         browser:\n    runs-on: ${{ vars.CI_RUNNER_HEAVY || 'ubuntu-latest' }}\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER_LIGHT", "cf-light");
+    rig.github.set_variable(REPO, "CI_RUNNER_HEAVY", "self-hosted");
+    rig.service.discover().await;
+    until("three scale sets", || rig.github.scale_sets().len() == 3).await;
+    let mut labels: Vec<Vec<String>> = rig.github.scale_sets().into_iter().map(|s| s.labels).collect();
+    labels.sort();
+    assert_eq!(
+        labels,
+        [
+            vec!["cf-2g", "self-hosted"],
+            vec!["cf-light"],
+            vec!["self-hosted"]
+        ],
+        "a host that takes every job serves the light label too"
+    );
+
+    rig.restart_after(|rig| rig.policy.lock().expect("policy").light_only = true)
+        .await;
+    rig.service.discover().await;
+    until("the light scale set alone", || rig.github.scale_sets().len() == 1).await;
+    let left: Vec<Vec<String>> = rig.github.scale_sets().into_iter().map(|s| s.labels).collect();
+    assert_eq!(left, [vec!["cf-light"]]);
+    assert_eq!(
+        rig.service.discovery_error(),
+        None,
+        "left out on purpose is no problem"
+    );
+    rig.service.report().await;
+    assert!(last_status(&rig.console).get("notServing").is_none());
+
+    // The pool moved the light jobs elsewhere: the host takes nothing, and says why.
+    rig.github
+        .set_variable(REPO, "CI_RUNNER_LIGHT", "blacksmith-2vcpu-ubuntu-2404");
+    rig.service.discover().await;
+    until("no scale set", || rig.github.scale_sets().is_empty()).await;
+    rig.service.report().await;
+    assert_eq!(
+        last_status(&rig.console)["notServing"],
+        json!(
+            "this host takes light jobs alone (light_only), and no workflow of its repositories asks for cf-light"
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1275,6 +1341,7 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
             &rig.settings,
             rig.folder.path(),
             rig.update_limit,
+            ServePolicy::default(),
         ),
     );
     rig.finish(&runner, "succeeded");

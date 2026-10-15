@@ -49,6 +49,9 @@ ran, each in a machine that was gone when the job ended. What is there:
   `docker compose` work as on GitHub's runners. Its containers, privileged ones too, reach what the job reaches and
   nothing more, and are root of the sandbox, not of the machine. One Docker job at a time per Mac
   (`docker_max_jobs`); `docs/docker.md` says how and why,
+- light jobs (lint, types, unit tests; no Worker runtime, no browser) under `cf-light`, a 4 GB machine like
+  `self-hosted`, or the size beside it. Every Runner serves it, and one whose host is too weak or too slow for the
+  rest takes nothing else (`light_only`). The console's pool sends light jobs here with `CI_RUNNER_LIGHT=cf-light`,
 - the guest: Alpine's `linux-virt` kernel and an initramfs whose PID 1 is the supervisor, built reproducibly by
   `cargo xtask guest` and embedded in the binary,
 - images: an Ed25519 signature over `SHA256SUMS`, every hash and size checked, the root filesystem in parts below
@@ -86,7 +89,7 @@ A configuration file says what the Mac is:
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`
-  jobs get Docker) and `docker_max_jobs` (1). Without `console` the Mac reports to none.
+  jobs get Docker), `docker_max_jobs` (1) and `light_only` (false: true serves the `cf-light` jobs alone). Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.

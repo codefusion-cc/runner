@@ -52,6 +52,10 @@ pub struct Config {
     /// The most Docker jobs at once: a daemon and its builds take more of the Mac's processors than other jobs.
     #[serde(default = "docker_max_jobs")]
     pub docker_max_jobs: usize,
+    /// Take light jobs alone: those asking for `cf-light` (lint, types, unit tests). For a host that runs no Worker
+    /// runtime or browser well; its heavy jobs wait for the other hosts.
+    #[serde(default)]
+    pub light_only: bool,
     /// The console's address, when the Mac reports to one.
     #[serde(default)]
     pub console: Option<String>,
@@ -435,6 +439,17 @@ mod tests {
         }
         assert!(with(|v| v["public_repos"] = serde_json::json!(["org/app"])).is_ok());
         assert!(with(|v| v["use"] = "sometimes".into()).is_err());
+    }
+
+    #[test]
+    fn every_job_is_taken_unless_light_only_is_set() {
+        assert!(!Config::parse(WHOLE).expect("config").light_only);
+        assert!(
+            with(|v| v["light_only"] = true.into())
+                .expect("config")
+                .light_only
+        );
+        assert!(with(|v| v["light_only"] = "yes".into()).is_err());
     }
 
     #[test]

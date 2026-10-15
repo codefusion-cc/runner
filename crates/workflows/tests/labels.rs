@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use cf_workflows::{DOCKER_LABEL, LabelSet, POOL_LABEL, SizeError, self_hosted, self_hosted_with, size_gb};
+use cf_workflows::{
+    DOCKER_LABEL, LIGHT_LABEL, LabelSet, POOL_LABEL, SizeError, self_hosted, self_hosted_with, size_gb,
+};
 use proptest::prelude::*;
 
 fn files(list: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
@@ -661,6 +663,57 @@ fn a_variable_naming_the_docker_label_decides_the_scale_set() {
     for value in ["cf-dockers", "docker", "ubuntu-latest"] {
         assert_eq!(
             keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_DOCKER", value)]))),
+            [POOL_LABEL],
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn the_light_label_is_served_alone_beside_self_hosted_or_with_a_size() {
+    let sets = self_hosted(&files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: cf-light\n  b:\n    runs-on: [self-hosted, CF-Light]\n  c:\n    runs-on: [cf-light, cf-2g]\n  d:\n    runs-on: [cf-light, windows]\n  e:\n    runs-on: [light]\n  f:\n    runs-on: cf-lights\n",
+    )]));
+    assert_eq!(
+        keys(&sets),
+        ["cf-2g,cf-light", "cf-light", "cf-light,self-hosted"]
+    );
+    assert!(sets.iter().all(LabelSet::light));
+    assert!(!LabelSet::new(["self-hosted", "cf-lights"]).light());
+    assert!(!LabelSet::new(["self-hosted"]).light());
+}
+
+#[test]
+fn a_light_job_is_four_gb_unless_a_size_says_otherwise() {
+    let size = |labels: &[&str]| size_gb(&LabelSet::new(labels));
+    assert_eq!(size(&["cf-light"]), Ok(4));
+    assert_eq!(size(&["cf-light", "self-hosted"]), Ok(4));
+    assert_eq!(size(&["cf-light", "cf-2g"]), Ok(2));
+}
+
+#[test]
+fn a_variable_naming_the_light_label_decides_the_scale_set() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  lint:\n    runs-on: ${{ vars.CI_RUNNER_LIGHT || vars.CI_RUNNER || 'ubuntu-latest' }}\n  browser:\n    runs-on: ${{ vars.CI_RUNNER_HEAVY || vars.CI_RUNNER || 'ubuntu-latest' }}\n",
+    )]);
+    let pool = vars(&[
+        ("CI_RUNNER_LIGHT", "cf-light"),
+        ("CI_RUNNER_HEAVY", "self-hosted"),
+    ]);
+    assert_eq!(keys(&self_hosted_with(&wf, &pool)), [LIGHT_LABEL, POOL_LABEL]);
+    // Unset, the light jobs take CI_RUNNER, as GitHub would.
+    assert_eq!(
+        keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER", "cf-light")]))),
+        [LIGHT_LABEL]
+    );
+    for value in ["cf-lights", "light", "blacksmith-2vcpu-ubuntu-2404"] {
+        assert_eq!(
+            keys(&self_hosted_with(
+                &wf,
+                &vars(&[("CI_RUNNER_LIGHT", value), ("CI_RUNNER_HEAVY", "self-hosted")])
+            )),
             [POOL_LABEL],
             "{value:?}"
         );

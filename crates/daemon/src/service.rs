@@ -609,6 +609,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             }
         }
 
+        // A host of light jobs alone takes none until a workflow asks for `cf-light`: the console's pool sets that.
+        let no_light_job = shared.config.policy.light_only && wanted.is_empty();
         for (name, want) in wanted {
             let mut serving = shared.serving.lock().expect("serving");
             if serving.contains_key(&name) {
@@ -630,8 +632,17 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             let task = tokio::spawn(serve(shared.clone(), want.client.clone(), state.clone(), stopped));
             serving.insert(name, Serving { stop, task, state });
         }
-        *shared.not_serving.lock().expect("not serving") = (served == 0 && problems.is_empty())
-            .then(|| "the App is installed on no repository this host serves".to_string());
+        let not_serving = if served == 0 {
+            Some("the App is installed on no repository this host serves")
+        } else if no_light_job {
+            Some(
+                "this host takes light jobs alone (light_only), and no workflow of its repositories asks for cf-light",
+            )
+        } else {
+            None
+        };
+        *shared.not_serving.lock().expect("not serving") =
+            not_serving.filter(|_| problems.is_empty()).map(String::from);
         *shared.discovery_error.lock().expect("discovery") =
             (!problems.is_empty()).then(|| problems.join("; "));
         for problem in &problems {
@@ -724,15 +735,20 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     continue;
                 }
                 for set in self_hosted_with(&files, &variables) {
+                    if !shared.config.policy.serves_set(&set) {
+                        // Not offered to GitHub: the job waits for a host that takes heavy jobs.
+                        tracing::info!(repo = %name, labels = %set.key(), "not served: this host takes light jobs alone (light_only)");
+                        continue;
+                    }
                     if set.docker() && !shared.config.policy.serves_docker(&repo) {
                         // Not offered to GitHub: the job waits for a Mac that gives this repository Docker. A Mac
                         // left out on purpose is no problem of discovery.
                         tracing::info!(repo = %name, labels = %set.key(), "not served: Docker is only for the repositories in docker_repos");
                         continue;
                     }
-                    // `cf-docker` alone is a machine of the size `self-hosted` means.
+                    // `cf-docker` or `cf-light` alone is a machine of the size `self-hosted` means.
                     let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str))
-                        .or_else(|| set.docker().then_some(Size::G4))
+                        .or_else(|| (set.docker() || set.light()).then_some(Size::G4))
                     else {
                         continue;
                     };
