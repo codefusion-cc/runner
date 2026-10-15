@@ -937,7 +937,7 @@ mod tests {
         };
         assert_eq!(
             room_line(board, &Settings::for_headless(board, 4), "nobody sits at it", ""),
-            "7.75 GiB and 8 cores, nobody sits at it: 5.64 GiB for machines; cf-2g with 2 CPUs, cf-4g with 2 CPUs; \
+            "7.75 GiB and 8 cores, nobody sits at it: 5.64 GiB for machines; cf-2g with 2 CPUs, cf-4g with 4 CPUs; \
              1 cf-4g side by side"
         );
         let mac = HostFacts {

@@ -95,6 +95,26 @@ fn the_default_cpus_and_times() {
         );
         assert_eq!(small.away.cpus, 1);
     }
+    // An 8 GB Mac has room for one cf-4g and nothing beside it: that one takes 4 of its 6 CPUs, not 3.
+    let eight = Settings::for_host(
+        HostFacts {
+            total_bytes: 8 * GIB,
+            cores: 8,
+        },
+        Mode::Dedicated,
+    );
+    assert_eq!((eight.away.cpus, eight.vcpus), (6, [2, 4, 4, 4]));
+    assert_eq!(eight.side_by_side(&eight.away, Size::G4), 1);
+    // The same Mac with its person: 4 GB while away, still one cf-4g with nothing beside it.
+    let own = Settings::for_host(
+        HostFacts {
+            total_bytes: 8 * GIB,
+            cores: 8,
+        },
+        Mode::Workstation,
+    );
+    assert_eq!((own.away.cpus, own.vcpus), (6, [2, 4, 4, 4]));
+    assert_eq!(own.check(), Ok(()));
 }
 
 #[test]
