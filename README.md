@@ -50,8 +50,8 @@ ran, each in a machine that was gone when the job ended. What is there:
   nothing more, and are root of the sandbox, not of the machine. One Docker job at a time per Mac
   (`docker_max_jobs`); `docs/docker.md` says how and why,
 - host labels, for a job that must run on a kind of host: `runs-on: [cf-8g, cf-macos]` runs only on a host whose
-  `labels` has `cf-macos`. A host label is `cf-` and a name that is no size and not `docker`; alone it names no
-  size, so it goes beside a size or `self-hosted`. Each host has its system's by default (`cf-macos`, `cf-linux`).
+  `labels` has `cf-macos`. A host label is `cf-` and a name that is no label jobs ask for by itself (a size,
+  `cf-docker`); alone it names no size, so it goes beside a size or `self-hosted`. Each host has its system's by default (`cf-macos`, `cf-linux`).
   A repository variable read with `fromJSON` may hold the list: `runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY ||
   '"ubuntu-latest"') }}` with `CI_RUNNER_HEAVY` set to `["cf-8g","cf-macos"]`. Without `fromJSON` GitHub reads the
   variable as one label, so the Runner does too,
