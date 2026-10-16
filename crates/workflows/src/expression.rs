@@ -89,12 +89,12 @@ pub(crate) fn is_pool_expression(label: &str) -> bool {
 /// What a pool expression evaluates to, when it is a chain of `||` over `vars.NAME`, `vars['NAME']` and string
 /// literals, optionally wrapped in `toJSON(...)` / `fromJSON(...)`: the labels of the first operand that is not
 /// empty. `None` when the expression is anything else or every operand is empty. A value that is a JSON string
-/// (`"cf-8g"`, as `toJSON` makes) comes back unquoted. Under an outer `fromJSON` a JSON list of strings
-/// (`["cf-8g","cf-macos"]`) is every label in it, as GitHub reads it; a list of anything else is one label, which
+/// (`"cf-8g"`, as `toJSON` makes) comes back unquoted. Under `fromJSON` with no `toJSON` anywhere a JSON list of
+/// strings (`["cf-8g","cf-macos"]`) is every label in it, as GitHub reads it; a list of anything else is one label, which
 /// names none of these Actions runners.
 pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
     let mut inner = whole(label)?.trim();
-    let mut parsed = None;
+    let mut list = None;
     loop {
         let lower = inner.to_ascii_lowercase();
         let Some(function) = ["tojson(", "fromjson("]
@@ -106,8 +106,8 @@ pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<V
         if !inner.ends_with(')') {
             break;
         }
-        // The outer function decides: fromJSON makes a list, toJSON a string again.
-        parsed.get_or_insert(function == "fromjson(");
+        // Any toJSON makes a string again, which an outer fromJSON only parses back.
+        list = Some(list.unwrap_or(true) && function == "fromjson(");
         inner = inner[inner.find('(')? + 1..inner.len() - 1].trim();
     }
     for operand in split_or(inner)? {
@@ -116,7 +116,7 @@ pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<V
         if value.is_empty() {
             continue;
         }
-        if parsed == Some(true) && value.starts_with('[') {
+        if list == Some(true) && value.starts_with('[') {
             return Some(
                 serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_string()]),
             );

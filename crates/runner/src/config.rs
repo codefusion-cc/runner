@@ -213,7 +213,7 @@ impl Config {
             if !cf_workflows::is_host_label(label) {
                 return Err(format!(
                     "labels: `{label}` is no host label: `cf-` and a name of lowercase letters, digits and single \
-                     dashes that starts with a letter, 40 characters at most, and names no size nor Docker"
+                     dashes that starts with a letter, 40 characters at most, and no label jobs ask for by itself, such as a size or cf-docker"
                 ));
             }
             if self.labels[..i].contains(label) {
@@ -573,7 +573,7 @@ mod tests {
                 set(serde_json::json!([label])).err(),
                 Some(format!(
                     "labels: `{label}` is no host label: `cf-` and a name of lowercase letters, digits and single \
-                     dashes that starts with a letter, 40 characters at most, and names no size nor Docker"
+                     dashes that starts with a letter, 40 characters at most, and no label jobs ask for by itself, such as a size or cf-docker"
                 )),
                 "{label}"
             );

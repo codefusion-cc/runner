@@ -769,10 +769,11 @@ fn only_from_json_turns_a_list_into_labels_as_github_does() {
         )),
         [POOL_LABEL]
     );
-    // fromJSON inside toJSON is a string again.
+    // fromJSON inside toJSON is a string again, and so is toJSON inside fromJSON: it parses back the string toJSON
+    // made.
     let wf = files(&[(
         "ci.yml",
-        "jobs:\n  a:\n    runs-on: ${{ toJSON(fromJSON(vars.CI_RUNNER)) }}\n",
+        "jobs:\n  a:\n    runs-on: ${{ toJSON(fromJSON(vars.CI_RUNNER)) }}\n  b:\n    runs-on: ${{ fromJSON(toJSON(vars.CI_RUNNER)) }}\n",
     )]);
     assert_eq!(
         keys(&self_hosted_with(

@@ -74,9 +74,10 @@ impl LabelSet {
 }
 
 /// Whether a (lowercase) label names hosts rather than a machine: `cf-` and a name of lowercase letters, digits and
-/// single dashes that starts with a letter, 40 characters in all at most, and is neither a size nor [`DOCKER_LABEL`]
-/// (`cf-macos`, `cf-linux`). A host serves a set with host labels only when its config lists every one of them, so
-/// a job asks for a kind of host with `[cf-8g, cf-macos]`. A host label alone names no size.
+/// single dashes that starts with a letter, 40 characters in all at most, and no label these Actions runners serve
+/// (a size, [`DOCKER_LABEL`]): `cf-macos`, `cf-linux`. A host serves a set with host labels only when its config
+/// lists every one of them, so a job asks for a kind of host with `[cf-8g, cf-macos]`. A host label alone names no
+/// size.
 pub fn is_host_label(label: &str) -> bool {
     let Some(name) = label.strip_prefix("cf-") else {
         return false;
@@ -88,8 +89,8 @@ pub fn is_host_label(label: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        // Sizes (`cf-8g`) start with a digit, so no host label is one.
-        && label != DOCKER_LABEL
+        // Never a label these Actions runners serve themselves (a size, cf-docker), whatever is added to those.
+        && !is_ours(label)
 }
 
 /// [`self_hosted_with`] without repository variables: every expression over variables stands for [`POOL_LABEL`].
