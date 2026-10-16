@@ -460,6 +460,7 @@ fn service(
     );
     config.poll_timeout = Duration::from_secs(5);
     config.policy.host_labels = vec!["cf-macos".into()];
+    config.policy.public_repos = vec![OPEN.into()];
     config.sweep_again = Duration::from_millis(50);
     config.update_limit = update_limit;
     config.backoff = (
@@ -4082,4 +4083,439 @@ async fn the_report_says_the_commands_the_runner_does_and_its_limits() {
         }),
         "a dedicated Mac waits for no person"
     );
+}
+
+// ---- label sets of queued jobs ----
+
+/// A label the default branch's workflow does not name: only a queued job's set has it.
+const PR_LABEL: &str = "pr-only";
+
+/// A public repository the Runner serves on purpose.
+const OPEN: &str = "org/open";
+
+/// A job of a pull request that another Actions runner took at once: it is under way, so it counts as seen, and no
+/// machine of this Mac ever has it.
+fn under_way_elsewhere(rig: &Rig, repo: &str, labels: &[&str]) -> i64 {
+    let id = rig
+        .github
+        .queue_job_at(repo, labels, "build", "refs/pull/7/merge");
+    rig.github.take_job(id);
+    id
+}
+
+/// Waits until the Runner serves a scale set with this label and GitHub has made it: its listener makes it.
+async fn serving(rig: &Rig, label: &str) {
+    until(&format!("a scale set with {label}"), || {
+        served_with(rig, label) == (true, true)
+    })
+    .await;
+}
+
+/// Whether the Runner serves a scale set with this label, and GitHub has it.
+fn served_with(rig: &Rig, label: &str) -> (bool, bool) {
+    let label = label.to_string();
+    (
+        rig.service.sets().iter().any(|s| s.labels.contains(&label)),
+        rig.github.scale_sets().iter().any(|s| s.labels.contains(&label)),
+    )
+}
+
+// added: a pull request that adds a job of new labels gets a scale set of them, and its job a machine, though the
+// default branch's workflows name no such set; main's own set stays as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_job_of_labels_no_workflow_on_main_names_gets_a_scale_set_and_runs() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 1, "main's set");
+    rig.github.queue_job_at(
+        REPO,
+        &["self-hosted", "CF-2g", PR_LABEL],
+        "build",
+        "refs/pull/7/merge",
+    );
+    rig.service.look_at_queue().await;
+    serving(&rig, PR_LABEL).await;
+    let set = rig
+        .service
+        .sets()
+        .into_iter()
+        .find(|s| s.labels.contains(&PR_LABEL.to_string()))
+        .expect("the queued job's set");
+    assert_eq!(
+        set.labels,
+        ["cf-2g", PR_LABEL, "self-hosted"],
+        "as a workflow's set is: lowercased, sorted"
+    );
+    assert_eq!(set.size, Size::G2);
+    assert_eq!(rig.service.sets().len(), 2, "main's set and the job's");
+    assert_eq!(rig.service.discovery_error(), None);
+    // GitHub hands the job to the new set once its polls offered room, as it looks at its queue.
+    rig.settles("a machine for the queued job", || {
+        rig.github.github_looks();
+        rig.standing().len() == 1
+    })
+    .await;
+
+    // A run under way whose next job waits: its set is served too, and a discover keeps both.
+    let ids = rig.github.queue_run(
+        REPO,
+        &[
+            (&["ubuntu-latest"], "lint"),
+            (&["self-hosted", "cf-2g", "after-lint"], "test"),
+        ],
+        "refs/pull/8/merge",
+    );
+    rig.github.take_job(ids[0]);
+    rig.github.take_job(ids[1]);
+    rig.service.discover().await;
+    serving(&rig, "after-lint").await;
+    serving(&rig, PR_LABEL).await;
+    assert_eq!(rig.service.sets().len(), 3);
+}
+
+// added: a set only queued jobs asked for is served 30 minutes after a job of it was last seen queued or running,
+// then closed and deleted as any set nothing asks for. 29 minutes keep it, 31 do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_jobs_set_is_kept_30_minutes_after_its_jobs_were_last_seen() {
+    let rig = Rig::new(2).await;
+    let job = under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    serving(&rig, PR_LABEL).await;
+    // Running for 20 minutes counts as seen all along.
+    rig.later(Duration::from_secs(20 * 60));
+    rig.service.look_at_queue().await;
+    rig.github.end_job(job, "success");
+    rig.later(Duration::from_secs(29 * 60));
+    rig.service.look_at_queue().await;
+    rig.service.discover().await;
+    serving(&rig, PR_LABEL).await;
+    rig.later(Duration::from_secs(2 * 60));
+    rig.service.look_at_queue().await;
+    assert_eq!(
+        served_with(&rig, PR_LABEL),
+        (false, false),
+        "31 minutes after: closed and deleted"
+    );
+    assert_eq!(rig.service.sets().len(), 1, "main's set stays");
+    assert_eq!(rig.service.discovery_error(), None);
+
+    // Seen again, it is served again.
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.look_at_queue().await;
+    serving(&rig, PR_LABEL).await;
+}
+
+// added: a set main's workflows stop naming while its jobs still queue is not dropped from under them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_main_stops_naming_stays_while_its_jobs_wait() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("main's set at GitHub", || rig.github.scale_sets().len() == 1).await;
+    let job = under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g"]);
+    rig.github.set_workflow(
+        REPO,
+        "ci.yml",
+        "on: push\njobs:\n  build:\n    runs-on: [self-hosted, cf-2g, renamed]\n    steps: []\n",
+    );
+    let before: Vec<String> = rig.github.scale_sets().iter().map(|s| s.name.clone()).collect();
+    rig.service.discover().await;
+    let now: Vec<String> = rig.github.scale_sets().iter().map(|s| s.name.clone()).collect();
+    assert!(now.contains(&before[0]), "the old set stays: {now:?}");
+    serving(&rig, "renamed").await;
+    rig.later(Duration::from_secs(31 * 60));
+    rig.service.discover().await;
+    assert!(
+        rig.github.scale_sets().iter().any(|s| s.name == before[0]),
+        "its job still runs"
+    );
+    rig.github.end_job(job, "success");
+    rig.later(Duration::from_secs(31 * 60));
+    rig.service.discover().await;
+    let now: Vec<String> = rig.github.scale_sets().iter().map(|s| s.name.clone()).collect();
+    assert!(
+        !now.contains(&before[0]),
+        "gone once nothing asked for it for 30 minutes: {now:?}"
+    );
+}
+
+// added: at most 8 label sets of queued jobs a repository; the newest are served, the rest are said. Main's sets do
+// not count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_gets_at_most_8_sets_of_queued_jobs_the_newest_and_the_rest_are_said() {
+    let rig = Rig::new(2).await;
+    let labels: Vec<String> = (1..=9).map(|n| format!("pr-{n}")).collect();
+    for label in &labels[..8] {
+        under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", label]);
+    }
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g"]);
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 9, "8 of queued jobs and main's");
+    assert_eq!(rig.service.discovery_error(), None);
+
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", &labels[8]]);
+    rig.service.look_at_queue().await;
+    assert_eq!(rig.service.sets().len(), 9);
+    assert_eq!(served_with(&rig, "pr-1"), (false, false), "the oldest goes");
+    for label in &labels[1..] {
+        serving(&rig, label).await;
+    }
+    let error = rig.service.discovery_error().expect("said");
+    assert!(error.contains(REPO) && error.contains("at most 8"), "{error}");
+}
+
+// added: at most 32 label sets of queued jobs on the host, whatever repositories ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_serves_at_most_32_sets_of_queued_jobs() {
+    let rig = Rig::new(2).await;
+    let repos = ["org/a", "org/b", "org/c", "org/d", "org/e"];
+    for repo in repos {
+        rig.github.add_repo(repo, true);
+    }
+    for (r, repo) in repos.iter().take(4).enumerate() {
+        for n in 0..8 {
+            under_way_elsewhere(&rig, repo, &["self-hosted", "cf-2g", &format!("set-{r}-{n}")]);
+        }
+    }
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 33, "32 of queued jobs and main's");
+    assert_eq!(rig.service.discovery_error(), None);
+    under_way_elsewhere(&rig, "org/e", &["self-hosted", "cf-2g", "set-4-0"]);
+    rig.service.look_at_queue().await;
+    assert_eq!(rig.service.sets().len(), 33);
+    serving(&rig, "set-4-0").await;
+    assert_eq!(served_with(&rig, "set-0-0"), (false, false), "the oldest goes");
+    let error = rig.service.discovery_error().expect("said");
+    assert!(error.contains("at most 32"), "{error}");
+}
+
+// added: on a public repository served on purpose, a pull request from a fork is a stranger's code: its new labels
+// get no set, while those of a pull request from a branch of the repository do. On a private repository, a fork's
+// pull request is code of someone who may read the repository, and its set is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forks_pull_request_gets_no_set_on_a_public_repository() {
+    let rig = Rig::new(2).await;
+    rig.github.add_repo(OPEN, false);
+    let stranger = under_way_elsewhere(&rig, OPEN, &["self-hosted", "cf-2g", "fork-only"]);
+    rig.github.from_fork(stranger);
+    under_way_elsewhere(&rig, OPEN, &["self-hosted", "cf-2g", "branch-only"]);
+    let colleague = under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", "private-fork"]);
+    rig.github.from_fork(colleague);
+    rig.service.discover().await;
+    serving(&rig, "branch-only").await;
+    serving(&rig, "private-fork").await;
+    assert_eq!(served_with(&rig, "fork-only"), (false, false));
+    assert_eq!(
+        rig.service.discovery_error(),
+        None,
+        "a stranger's set needs no word"
+    );
+}
+
+// added: a repository the Runner does not serve (public, not listed) is not asked about its queue at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_of_a_repository_the_runner_does_not_serve_is_not_read() {
+    let rig = Rig::new(2).await;
+    rig.github.add_repo("org/public", false);
+    under_way_elsewhere(&rig, "org/public", &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    rig.service.look_at_queue().await;
+    assert_eq!(rig.github.count("org/public/actions"), 0);
+    assert_eq!(served_with(&rig, PR_LABEL), (false, false));
+    assert!(
+        rig.github.count("org/app/actions/runs") > 0,
+        "the served one's is"
+    );
+}
+
+// added: a queued job's labels are served under a workflow's rules: one of ours, no other platform, only host
+// labels this host has, nothing odd. A control set that keeps them is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_jobs_this_host_must_not_take_get_no_set() {
+    let rig = Rig::new(2).await;
+    let long = "x".repeat(300);
+    let many: Vec<String> = (0..40).map(|n| format!("l{n}")).collect();
+    let mut many: Vec<&str> = many.iter().map(String::as_str).collect();
+    many.extend(["self-hosted", "cf-2g"]);
+    let seventeen: Vec<String> = (0..15).map(|n| format!("m{n}")).collect();
+    let mut seventeen: Vec<&str> = seventeen.iter().map(String::as_str).collect();
+    seventeen.extend(["self-hosted", "cf-2g"]);
+    for labels in [
+        &["self-hosted", "cf-2g", "windows"][..],
+        &["self-hosted", "cf-2g", "macos-latest"],
+        &["ubuntu-latest"],
+        &["gpu-box", "big"],
+        &["self-hosted", "cf-2g", "cf-linux"],
+        &["self-hosted", "cf-2g", "a,b"],
+        &["self-hosted", "cf-2g", "😀"],
+        &["self-hosted", "cf-2g", "evil\u{202e}gpj"],
+        &["self-hosted", "cf-2g", "line\nbreak"],
+        &["self-hosted", "cf-2g", &long],
+        &many,
+        &seventeen,
+        &["self-hosted", "cf-2g", "cf-docker"],
+    ] {
+        under_way_elsewhere(&rig, REPO, labels);
+    }
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", "cf-macos", "fine"]);
+    rig.service.discover().await;
+    rig.service.look_at_queue().await;
+    let sets: Vec<Vec<String>> = rig.service.sets().into_iter().map(|s| s.labels).collect();
+    assert_eq!(sets.len(), 2, "main's and the control's only: {sets:?}");
+    serving(&rig, "fine").await;
+    // Main's set reaches GitHub on its own listener, not necessarily before the control's.
+    until("both sets at GitHub", || rig.github.scale_sets().len() == 2).await;
+    assert_eq!(rig.github.scale_sets().len(), 2);
+    assert_eq!(
+        rig.service.discovery_error(),
+        None,
+        "a job's odd labels are no problem of the host"
+    );
+}
+
+// added: without the App's "Actions: read" GitHub refuses the queue: main's sets are served as before and the
+// console hears what is missing. A refusal or a failed read drops no set a queued job had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_that_cannot_be_read_serves_mains_sets_keeps_the_others_and_says_why() {
+    let rig = Rig::new(2).await;
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    serving(&rig, PR_LABEL).await;
+
+    let denied = json!({"message": "Resource not accessible by integration"});
+    rig.github
+        .fail("/actions/runs", Reply::status_json(403, &denied), 1000);
+    rig.later(Duration::from_secs(31 * 60));
+    rig.service.discover().await;
+    rig.service.look_at_queue().await;
+    let error = rig.service.discovery_error().expect("said");
+    assert!(error.contains("Actions: read") && error.contains(REPO), "{error}");
+    serving(&rig, PR_LABEL).await;
+    assert_eq!(rig.service.sets().len(), 2);
+    let (_, problems) = rig.service.survey().await;
+    assert!(
+        problems.iter().any(|p| p.contains("Actions: read")),
+        "{problems:?}"
+    );
+
+    // GitHub away: the same.
+    let rig = Rig::new(2).await;
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    rig.github
+        .fail("/actions/runs", Reply::text(502, "bad gateway"), 1000);
+    rig.later(Duration::from_secs(31 * 60));
+    rig.service.look_at_queue().await;
+    rig.service.discover().await;
+    serving(&rig, PR_LABEL).await;
+    assert!(
+        rig.service
+            .discovery_error()
+            .is_some_and(|e| e.contains("queued jobs"))
+    );
+}
+
+// added: a rate limit GitHub answers with 403 is no missing permission: the console is not told to grant one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rate_limited_queue_is_not_said_to_need_actions_read() {
+    let rig = Rig::new(2).await;
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    serving(&rig, PR_LABEL).await;
+
+    let limited = json!({"message": "API rate limit exceeded for installation ID 1."});
+    rig.github
+        .fail("/actions/runs", Reply::status_json(403, &limited), 1000);
+    rig.later(Duration::from_secs(31 * 60));
+    rig.service.look_at_queue().await;
+    let error = rig.service.discovery_error().expect("said");
+    assert!(
+        error.contains("queued jobs could not be read") && !error.contains("Actions: read"),
+        "{error}"
+    );
+    serving(&rig, PR_LABEL).await;
+}
+
+// added: an App without "Actions: read" from the start still serves main's sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_actions_read_from_the_start_mains_sets_are_served() {
+    let rig = Rig::new(2).await;
+    let denied = json!({"message": "Resource not accessible by integration"});
+    rig.github
+        .fail("/actions/runs", Reply::status_json(403, &denied), 1000);
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 1);
+    assert_eq!(served_with(&rig, PR_LABEL), (false, false));
+    let error = rig.service.discovery_error().expect("said");
+    assert!(error.contains("Actions: read"), "{error}");
+    rig.queue().await;
+    until("main's job runs", || rig.standing().len() == 1).await;
+}
+
+// added: a queue that did not change costs 304s and no read of a run's jobs, and still counts as seeing them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unchanged_queue_is_answered_304_and_its_sets_stay() {
+    let rig = Rig::new(2).await;
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", PR_LABEL]);
+    rig.service.discover().await;
+    let (before, jobs) = (rig.github.not_modified(), rig.github.count("/jobs"));
+    for _ in 0..2 {
+        rig.later(Duration::from_secs(29 * 60));
+        rig.service.look_at_queue().await;
+    }
+    assert_eq!(rig.github.not_modified(), before + 4, "both listings, twice");
+    assert_eq!(
+        rig.github.count("/jobs"),
+        jobs,
+        "the run did not change: its jobs are not asked for"
+    );
+    serving(&rig, PR_LABEL).await;
+}
+
+// added: a look at GitHub that hangs (here the queue's) holds up neither the console's news nor a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_look_at_github_holds_up_neither_the_news_nor_a_stop() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    rig.github.fail(
+        "/actions/runs",
+        Reply::After(
+            Duration::from_secs(60),
+            Box::new(Reply::status_json(200, &json!({}))),
+        ),
+        1000,
+    );
+    let (stop, stopped) = cf_scaleset::shutdown();
+    let service = rig.service.clone();
+    let running = tokio::spawn(async move { service.run(stopped).await });
+    until("the look at the queue began", || {
+        rig.github.count("/actions/runs") > 0
+    })
+    .await;
+    assert!(rig.outbox.push(started("mac-a-j1")));
+    until("the start on the console's page while the look hangs", || {
+        rig.console.job_event_ids() == ["mac-a-j1/started"]
+    })
+    .await;
+    let asked = std::time::Instant::now();
+    stop.trigger();
+    tokio::time::timeout(Duration::from_secs(15), running)
+        .await
+        .expect("the Runner ended")
+        .expect("no panic");
+    assert!(asked.elapsed() < Duration::from_secs(12), "{:?}", asked.elapsed());
+}
+
+// added: a queued job's set of a size the host's settings stop running goes at the next look at the queue, as main's
+// would at the next discovery; main's set of a size it still runs stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_jobs_set_of_a_size_the_settings_stop_goes() {
+    let rig = Rig::new(2).await;
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-4g", PR_LABEL]);
+    rig.service.discover().await;
+    serving(&rig, PR_LABEL).await;
+    rig.machines.set_settings(settings_for(1)).expect("settings");
+    rig.service.look_at_queue().await;
+    assert_eq!(served_with(&rig, PR_LABEL), (false, false));
+    assert_eq!(rig.service.sets().len(), 1, "main's cf-2g set stays");
 }

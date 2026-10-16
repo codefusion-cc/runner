@@ -18,6 +18,15 @@ pub struct StatusError {
     pub server_time: Option<i64>,
 }
 
+impl StatusError {
+    /// Whether GitHub refused for its rate limits, not for a permission: a 429, or a 403 that asks for a wait or
+    /// says so. A primary limit's 403 asks for none.
+    pub fn is_rate_limited(&self) -> bool {
+        self.status == 429
+            || (self.status == 403 && (self.retry_after.is_some() || self.body.contains("rate limit")))
+    }
+}
+
 impl fmt::Display for StatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}: {} {}", self.method, self.path, self.status, self.body)

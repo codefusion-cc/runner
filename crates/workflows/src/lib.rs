@@ -10,7 +10,7 @@ mod labels;
 mod size;
 
 pub use labels::{
-    DOCKER_LABEL, HOST_LABEL_RULE, LabelSet, MAX_FILE_BYTES, POOL_LABEL, is_host_label, self_hosted,
-    self_hosted_with,
+    DOCKER_LABEL, HOST_LABEL_RULE, LabelSet, MAX_FILE_BYTES, MAX_LABEL_BYTES, MAX_SET_LABELS, POOL_LABEL,
+    is_host_label, self_hosted, self_hosted_with,
 };
 pub use size::{DEFAULT_SIZE_GB, SIZES_GB, SizeError, is_size_label, size_gb};
