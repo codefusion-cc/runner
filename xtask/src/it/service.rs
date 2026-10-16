@@ -9,7 +9,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 
-use cf_budget::Mode;
+use cf_budget::{Limits, Mode};
 use cf_daemon::names::ServePolicy;
 use cf_daemon::{HostMachines, HostService, HostSetup, This, host_service, records_dir};
 use cf_fake_console::FakeConsole;
@@ -106,6 +106,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
             image: bench.image.clone(),
             deadline: Duration::from_secs(300),
             mode: Mode::Dedicated,
+            limits: Limits::default(),
             policy: ServePolicy::default(),
             console: Some((world.console.url(), Secret::new(token.expose().clone()))),
             stand_in: Some(Workload::Command {

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cf_budget::{Host, HostError, HostFacts, Mode, Settings};
+use cf_budget::{Host, HostError, HostFacts, Limits, Mode, Settings};
 use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
@@ -137,6 +137,8 @@ pub struct HostSetup {
     pub deadline: Duration,
     /// Whether a person works on the host.
     pub mode: Mode,
+    /// What the owner set of the budget on top of the host's defaults.
+    pub limits: Limits,
     /// Which repositories are served.
     pub policy: ServePolicy,
     /// The console's address and this host's token, when it reports to one.
@@ -196,7 +198,9 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     let machines = Machines::restore(MachineParts {
         host,
         vms: P::vm_hosts(&setup.program, state),
-        settings: P::settings(facts, setup.mode),
+        settings: P::settings(facts, setup.mode)
+            .limited(&setup.limits)
+            .map_err(|error| format!("the limits for jobs: {error}"))?,
         config,
         roster: roster.clone(),
         store: Arc::new(store),

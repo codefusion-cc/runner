@@ -76,9 +76,9 @@ pub struct HostFacts {
 pub struct HostReading {
     /// When it was taken.
     pub at: Now,
-    /// Memory macOS can hand out without compressing or swapping anyone's pages: free, file cache and purgeable.
-    /// This is what Activity Monitor shows as physical memory minus "Memory Used". It is not
-    /// `kern.memorystatus_level`, which also counts every program's own pages that are not compressed yet.
+    /// Memory the host can hand to a VM without swapping. On a Mac: free, file cache and purgeable, and while the
+    /// Mac is calm what compressing its programs' inactive pages frees (`cf_host_macos::reading`). On Linux:
+    /// `MemAvailable`.
     pub available_bytes: u64,
     /// The memory pressure level.
     pub pressure: Pressure,

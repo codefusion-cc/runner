@@ -41,6 +41,93 @@ pub trait SelfUpdate: Send + Sync {
 pub trait SettingsFile: Send + Sync {
     /// What the file says now, against what the Runner started with. Reads the file; quick, but not async.
     fn look(&self) -> SettingsLook;
+
+    /// Writes `change` into the file, when a Runner could start on what it makes of it, and says whether that
+    /// changed the file; else changes nothing and says why. Quick, but not async.
+    fn change(&self, change: &SettingsChange) -> Result<bool, String>;
+}
+
+/// What the console's `settings` command changes in the settings file. Each field is `None` when the command leaves
+/// it as it is, and `Some(None)` when it puts it back to the default. Whether a value is one a Runner starts on is
+/// the file's to say ([`SettingsFile::change`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SettingsChange {
+    /// The most jobs at once (`maxJobs`).
+    pub max_jobs: Option<Option<u32>>,
+    /// Minutes without the person before a workstation takes jobs (`idleMinutes`).
+    pub idle_minutes: Option<Option<u32>>,
+    /// The memory the host keeps for itself, in percent (`minFreeMemoryPercent`).
+    pub min_free_memory_percent: Option<Option<u32>>,
+    /// The longest a job may run, in minutes (`maxJobHours`, in hours).
+    pub deadline_minutes: Option<Option<u64>>,
+}
+
+impl SettingsChange {
+    /// The change the console's command asks for, or why it is none: an object of the console's keys, each a
+    /// number or `null`. The cf-runners manager's settings that mean nothing here are refused by name.
+    pub fn from_args(args: Option<&serde_json::Value>) -> Result<SettingsChange, String> {
+        let Some(serde_json::Value::Object(args)) = args else {
+            return Err("the command names no settings".into());
+        };
+        if args.is_empty() {
+            return Err("the command changes no setting".into());
+        }
+        let mut change = SettingsChange::default();
+        for (key, value) in args {
+            match key.as_str() {
+                "maxJobs" => change.max_jobs = Some(whole(value, "jobs at once: a whole number")?),
+                "idleMinutes" => change.idle_minutes = Some(whole(value, "idle minutes: a whole number")?),
+                "minFreeMemoryPercent" => {
+                    change.min_free_memory_percent =
+                        Some(whole(value, "the memory kept free: a whole number")?);
+                }
+                "maxJobHours" => {
+                    change.deadline_minutes =
+                        Some(scaled(value, 60.0, "the longest job: hours in whole minutes")?.map(u64::from));
+                }
+                "jobMemoryGb" => {
+                    return Err(
+                        "memory per job: each job gets the memory its label names, cf-2g to cf-8g".into(),
+                    );
+                }
+                "jobCpus" => {
+                    return Err("CPUs per job: each job gets the CPUs of its machine's size".into());
+                }
+                "maxLoadPerCpu" => {
+                    return Err(
+                        "load per CPU: the Runner starts jobs by the memory and CPUs they get, not by load"
+                            .into(),
+                    );
+                }
+                other => {
+                    let other: String = other.chars().take(40).collect();
+                    return Err(format!("`{other}` is no setting of the Runner"));
+                }
+            }
+        }
+        Ok(change)
+    }
+}
+
+/// A whole number of a setting, or `None` for `null`; else `wrong`.
+fn whole(value: &serde_json::Value, wrong: &str) -> Result<Option<u32>, String> {
+    scaled(value, 1.0, wrong)
+}
+
+/// A number of a setting times `scale`, which must come out whole (within what a float of the console's carries),
+/// or `None` for `null`; else `wrong`.
+fn scaled(value: &serde_json::Value, scale: f64, wrong: &str) -> Result<Option<u32>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .map(|number| number * scale)
+        .filter(|number| {
+            (0.0..=f64::from(u32::MAX)).contains(number) && (number - number.round()).abs() < 1e-6
+        })
+        .map(|number| Some(number.round() as u32))
+        .ok_or_else(|| wrong.to_string())
 }
 
 /// What a settings file says now.

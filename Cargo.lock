@@ -263,6 +263,7 @@ dependencies = [
  "cf-budget",
  "cf-clock",
  "libc",
+ "proptest",
  "tempfile",
 ]
 

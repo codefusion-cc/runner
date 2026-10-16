@@ -94,6 +94,8 @@ pub enum Refusal {
     Full { cap_bytes: u64, committed_bytes: u64 },
     /// The vCPUs of the VMs would add up to more than the CPU cap.
     Cpus { cap: u32, committed: u32 },
+    /// As many VMs run as the owner allows at once ([`Settings::max_machines`]).
+    Machines { cap: u32 },
     /// The Mac could not keep its floor if every VM grew to its full size.
     Memory { short_bytes: u64 },
     /// Jobs that GitHub assigned without asking wait for room, and they go first: so many of them.
@@ -113,6 +115,7 @@ impl Refusal {
             Refusal::PersonThere => "person-there",
             Refusal::Full { .. } => "full",
             Refusal::Cpus { .. } => "cpus",
+            Refusal::Machines { .. } => "max-jobs",
             Refusal::Memory { .. } => "memory",
             Refusal::AssignedFirst { .. } => "assigned-first",
             Refusal::MakingRoom { .. } => "making-room",
@@ -284,7 +287,8 @@ pub struct Charge {
 
 /// Whether one more VM of `size` fits: the arithmetic of admission, with no memory of its own.
 ///
-/// It fits when the sizes stay within `limits.cap_bytes`, the vCPUs within `limits.cpus`, and
+/// It fits when the VMs stay within [`Settings::max_machines`], the sizes within `limits.cap_bytes`, the vCPUs
+/// within `limits.cpus`, and
 /// `available_bytes` covers what the VMs in `charges` may still grow by, the new VM in full with its overhead,
 /// and the floor. More available memory, fewer charges or looser limits never turn a yes into a no.
 pub fn admit(
@@ -297,6 +301,11 @@ pub fn admit(
     let mut committed_bytes = 0u64;
     let mut committed_cpus = 0u32;
     let mut to_come = 0u64;
+    if let Some(cap) = settings.max_machines
+        && charges.len() >= cap as usize
+    {
+        return Err(Refusal::Machines { cap });
+    }
     for charge in charges {
         committed_bytes = committed_bytes.saturating_add(charge.vm_bytes);
         committed_cpus = committed_cpus.saturating_add(charge.cpus);

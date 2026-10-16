@@ -50,6 +50,8 @@ pub struct Settings {
     pub guest_overhead_bytes: u64,
     /// vCPUs of a VM of each size, in the order of [`Size::ALL`].
     pub vcpus: [u32; 4],
+    /// The most VMs at once, whatever the caps leave room for; `None` for as many as they do.
+    pub max_machines: Option<u32>,
     /// Once the Mac was under its floor, it must be this far above it before that counts as over.
     pub recover_margin_bytes: u64,
     /// How long nothing may be wrong before slots open again.
@@ -74,6 +76,17 @@ pub struct Settings {
     pub reservation_ttl: Millis,
     /// A reading older than this, or two readings further apart, close the Mac.
     pub stale_after: Millis,
+}
+
+/// What the host's owner set on top of the defaults ([`Settings::limited`]); `None` keeps the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// The most VMs at once: [`Settings::max_machines`].
+    pub max_machines: Option<u32>,
+    /// How long the keyboard and the mouse must rest before the person counts as away: [`Settings::idle_after`].
+    pub idle_after: Option<Millis>,
+    /// The floor in percent of the installed memory, whole: what the host keeps available for itself.
+    pub floor_percent: Option<u32>,
 }
 
 /// A setting the budget refuses, with what is wrong. Settings come from a file, the tray and the console, so a bad
@@ -110,6 +123,12 @@ pub enum SettingsError {
     /// An overhead as large as the smallest VM leaves a job nothing.
     #[error("the guest or host overhead leaves the smallest VM nothing")]
     OverheadTooLarge,
+    /// A limit of no VM at all.
+    #[error("the most machines at once is zero")]
+    NoMachines,
+    /// A floor that is no share of the memory, or all of it.
+    #[error("a floor of {percent}% is not between 1% and 90% of the memory")]
+    FloorPercent { percent: u32 },
     /// A duration of zero where the budget waits or measures.
     #[error("{what} is zero")]
     ZeroDuration { what: &'static str },
@@ -189,6 +208,7 @@ impl Settings {
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
             vcpus: vcpus_for(all_but_two, away.cap_bytes),
+            max_machines: None,
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),
@@ -261,6 +281,46 @@ impl Settings {
         settings
     }
 
+    /// The floor an owner may set, in percent of the memory ([`Limits::floor_percent`]).
+    pub const FLOOR_PERCENT: std::ops::RangeInclusive<u32> = 1..=90;
+
+    /// These settings with what the owner set on top of them, checked.
+    ///
+    /// - The most machines at once, when set.
+    /// - The time without the person, which only a workstation waits for.
+    /// - The floor as a share of the memory, 1% to 90%, and never under [`Settings::LEAST_FLOOR`]. It is the floor
+    ///   on a dedicated host and on a workstation whose person is away; while a workstation's person is there the
+    ///   floor stays the higher of the two. A cap that would leave the host less than its floor is lowered to what is left.
+    pub fn limited(mut self, limits: &Limits) -> Result<Settings, SettingsError> {
+        self.max_machines = limits.max_machines.or(self.max_machines);
+        if let Some(idle_after) = limits.idle_after {
+            self.idle_after = idle_after;
+        }
+        if let Some(percent) = limits.floor_percent {
+            if !Self::FLOOR_PERCENT.contains(&percent) {
+                return Err(SettingsError::FloorPercent { percent });
+            }
+            let floor = crate::percent_of(self.total_bytes, percent);
+            self.away.floor_bytes = floor;
+            self.in_use.floor_bytes = self.in_use.floor_bytes.max(floor);
+            let away_cap = self.away.cap_bytes.min(self.total_bytes.saturating_sub(floor));
+            if away_cap != self.away.cap_bytes {
+                self.away.cap_bytes = away_cap;
+                self.vcpus = vcpus_for(self.away.cpus, away_cap);
+            }
+            self.in_use.cap_bytes = self
+                .in_use
+                .cap_bytes
+                .min(self.total_bytes.saturating_sub(self.in_use.floor_bytes));
+            // Nobody is ever there on a dedicated host: one set of limits.
+            if self.mode == Mode::Dedicated {
+                self.in_use = self.away;
+            }
+        }
+        self.check()?;
+        Ok(self)
+    }
+
     /// The cap "Also while I work" gives a workstation: all memory but 60% (at least 5.5 GB). A 16 GB Mac: 6.4 GB.
     pub fn cap_while_in_use(total_bytes: u64) -> u64 {
         total_bytes.saturating_sub((total_bytes / 5 * 3).max(11 * GIB / 2))
@@ -326,6 +386,9 @@ impl Settings {
                 return Err(SettingsError::ZeroDuration { what });
             }
         }
+        if self.max_machines == Some(0) {
+            return Err(SettingsError::NoMachines);
+        }
         if self.disk_evict_bytes > self.disk_hold_bytes {
             return Err(SettingsError::DiskLimitsCrossed);
         }
@@ -342,7 +405,9 @@ impl Settings {
     /// the Mac has the memory for each is decided when it is asked for.
     pub fn side_by_side(&self, limits: &Profile, size: Size) -> u32 {
         let by_cap = u32::try_from(limits.cap_bytes / size.vm_bytes().max(1)).unwrap_or(u32::MAX);
-        by_cap.min(limits.cpus / self.vcpus_of(size).max(1))
+        by_cap
+            .min(limits.cpus / self.vcpus_of(size).max(1))
+            .min(self.max_machines.unwrap_or(u32::MAX))
     }
 
     /// vCPUs of a VM of this size.

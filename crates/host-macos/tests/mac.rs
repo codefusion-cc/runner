@@ -65,9 +65,8 @@ fn the_battery_is_the_one_pmset_prints_and_none_on_a_mac_without_one() {
     );
 }
 
-#[test]
-fn the_page_counts_are_what_vm_stat_prints() {
-    let host = MacHost::new(Path::new("/")).unwrap();
+/// One look at the page counts beside `vm_stat`'s: what is off, if anything.
+fn page_counts_beside_vm_stat(host: &MacHost) -> Result<(), String> {
     let before = host.raw().unwrap();
     let total_pages = host.facts().unwrap().total_bytes / before.page_bytes;
     // Memory moves between two looks at it, but a field read from the wrong place is off by far more than this.
@@ -93,10 +92,9 @@ fn the_page_counts_are_what_vm_stat_prints() {
             field(&before).max(field(&after)),
         );
         let printed = tool[name];
-        assert!(
-            printed + slack >= low && printed <= high + slack,
-            "{name}: vm_stat {printed}, read {low} to {high}"
-        );
+        if printed + slack < low || printed > high + slack {
+            return Err(format!("{name}: vm_stat {printed}, read {low} to {high}"));
+        }
     }
     // A counter: what the tool printed lies between the two reads.
     assert!(
@@ -113,6 +111,23 @@ fn the_page_counts_are_what_vm_stat_prints() {
         counted <= total_pages && counted >= total_pages / 2,
         "{counted} of {total_pages} pages"
     );
+    Ok(())
+}
+
+#[test]
+fn the_page_counts_are_what_vm_stat_prints() {
+    let host = MacHost::new(Path::new("/")).unwrap();
+    // A Mac short of memory hands out gigabytes within the moment `vm_stat` takes to start, so a count may move past
+    // the slack once; a field read from the wrong place is off at every look.
+    let mut looks = Vec::new();
+    for _ in 0..5 {
+        match page_counts_beside_vm_stat(&host) {
+            Ok(()) => return,
+            Err(off) => looks.push(off),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("off at every look: {looks:#?}");
 }
 
 #[test]

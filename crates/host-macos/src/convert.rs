@@ -21,12 +21,17 @@ pub struct Raw {
     pub wired_pages: u64,
     /// `internal_page_count`: programs' own (anonymous) pages that are not compressed.
     pub anonymous_pages: u64,
-    /// `compressor_page_count`: pages the compressor holds.
+    /// `compressor_page_count`: pages the compressor occupies.
     pub compressor_pages: u64,
+    /// `total_uncompressed_pages_in_compressor`: the pages stored in those, before they were compressed.
+    pub compressed_pages: u64,
     /// `swapouts`: pages written to swap since boot.
     pub swapouts: u64,
     /// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
     pub pressure_level: i32,
+    /// `kern.memorystatus_level`: the share of memory in percent that holds nothing compressed, wired or
+    /// otherwise taken (active, inactive, free and speculative pages); `None` when macOS does not say.
+    pub memorystatus_level: Option<u32>,
     /// `vm.swapusage`, in use.
     pub swap_used_bytes: u64,
     /// `vm.swapusage`, the size of the swap files now.
@@ -45,6 +50,14 @@ pub struct Raw {
 
 /// `IOPSGetTimeRemainingEstimate`'s answer for a Mac on the mains (`kIOPSTimeRemainingUnlimited`).
 const POWER_UNLIMITED: f64 = -2.0;
+
+/// Under this `kern.memorystatus_level` the Mac counts none of its programs' inactive pages as available: the
+/// idle 16 GB Macs read 73 to 76, and 64 was seen with 7.4 GB of swap in use.
+pub const CALM_LEVEL: u32 = 50;
+
+/// With the compressor occupying this share of the installed memory or more, the Mac counts none of its
+/// programs' inactive pages as available: compressing more then means swapping soon.
+pub const HEAVY_COMPRESSOR_SHARE: u64 = 4;
 
 /// The budget's reading from macOS's answers. An answer that cannot be right is an error and closes the Mac; it
 /// is never guessed at.
@@ -76,16 +89,23 @@ pub fn reading(facts: HostFacts, at: Now, raw: &Raw) -> Result<HostReading, Host
         _ => Thermal::Critical,
     };
 
+    if let Some(level) = raw.memorystatus_level.filter(|level| *level > 100) {
+        return Err(HostError::Implausible {
+            what: "kern.memorystatus_level",
+            value: level.to_string(),
+        });
+    }
+
     // Speculative pages are in both counts: free and file-backed.
     let pages = raw
         .free_pages
         .saturating_sub(raw.speculative_pages)
         .saturating_add(raw.file_backed_pages)
         .saturating_add(raw.purgeable_pages);
-    let available_bytes = pages
+    let ready_bytes = pages
         .checked_mul(raw.page_bytes)
         .filter(|bytes| *bytes <= facts.total_bytes);
-    let Some(available_bytes) = available_bytes else {
+    let Some(ready_bytes) = ready_bytes else {
         return Err(HostError::Implausible {
             what: "the available memory",
             value: format!(
@@ -94,6 +114,18 @@ pub fn reading(facts: HostFacts, at: Now, raw: &Raw) -> Result<HostReading, Host
             ),
         });
     };
+
+    let reclaimable_bytes = if pressure == Pressure::Normal {
+        reclaimable_pages(facts, raw).saturating_mul(raw.page_bytes)
+    } else {
+        0
+    };
+    // Never more than macOS itself counts as holding nothing compressed or wired.
+    let uncompressed_bytes = raw
+        .memorystatus_level
+        .map_or(0, |level| cf_budget::percent_of(facts.total_bytes, level));
+    let available_bytes =
+        ready_bytes.saturating_add(reclaimable_bytes.min(uncompressed_bytes.saturating_sub(ready_bytes)));
 
     Ok(HostReading {
         at,
@@ -106,6 +138,40 @@ pub fn reading(facts: HostFacts, at: Now, raw: &Raw) -> Result<HostReading, Host
         on_battery: raw.power_remaining_secs != POWER_UNLIMITED,
         disk_free_bytes: raw.disk_free_bytes,
     })
+}
+
+/// The pages macOS frees by compressing its programs' inactive pages, while the Mac is calm; none otherwise.
+///
+/// The inactive queue holds file pages and programs' own (anonymous) pages; `host_statistics64` counts it as a
+/// whole, so it is split in the share file pages have of the active and inactive pages together. A file page is
+/// counted as available already; an anonymous one is compressed when macOS needs the room, which frees what the
+/// compressor saves on it: the share the pages it holds now save (pages stored against pages occupied), at most
+/// three quarters, and half while it holds nothing. Purgeable pages are anonymous too, and counted already.
+///
+/// Calm is a `kern.memorystatus_level` of [`CALM_LEVEL`] or more and a compressor that occupies less than a
+/// [`HEAVY_COMPRESSOR_SHARE`]th of the memory. Without the level the Mac is not known to be calm. Pressure and
+/// swap are the budget's to judge, from the same reading.
+fn reclaimable_pages(facts: HostFacts, raw: &Raw) -> u64 {
+    let calm = raw.memorystatus_level.is_some_and(|level| level >= CALM_LEVEL);
+    let compressor_bytes = raw.compressor_pages.saturating_mul(raw.page_bytes);
+    if !calm || compressor_bytes >= facts.total_bytes / HEAVY_COMPRESSOR_SHARE {
+        return 0;
+    }
+    let queued = u128::from(raw.active_pages) + u128::from(raw.inactive_pages);
+    if queued == 0 {
+        return 0;
+    }
+    let file = u128::from(raw.file_backed_pages.saturating_sub(raw.speculative_pages));
+    let inactive = u128::from(raw.inactive_pages);
+    let inactive_file = (file * inactive / queued).min(inactive);
+    let inactive_anonymous = (inactive - inactive_file).min(u128::from(
+        raw.anonymous_pages.saturating_sub(raw.purgeable_pages),
+    ));
+    let (saved, stored) = match (u128::from(raw.compressed_pages), u128::from(raw.compressor_pages)) {
+        (0, _) => (1, 2),
+        (stored, occupied) => (stored.saturating_sub(occupied).min(stored * 3 / 4), stored),
+    };
+    u64::try_from(inactive_anonymous * saved / stored).unwrap_or(u64::MAX)
 }
 
 /// The battery in what `pmset -g batt` printed; `None` for a Mac without one, and for a text that is not what
