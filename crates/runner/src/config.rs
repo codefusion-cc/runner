@@ -508,33 +508,37 @@ mod tests {
     #[test]
     fn the_limits_for_jobs_are_the_defaults_unless_set_and_set_only_within_reason() {
         assert_eq!(Config::parse(WHOLE).expect("config").limits(), Limits::default());
-        let workstation = |change: fn(&mut serde_json::Value)| {
-            with(|v| {
-                v["use"] = "workstation".into();
-                change(v);
-            })
-        };
         assert_eq!(
-            workstation(|v| {
+            with(|v| {
                 v["max_jobs"] = 2.into();
-                v["idle_minutes"] = 20.into();
                 v["min_free_memory_percent"] = 8.into();
             })
             .map(|c| c.limits()),
             Ok(Limits {
                 max_machines: Some(2),
-                idle_after: Some(Millis::mins(20)),
+                idle_after: None,
                 floor_percent: Some(8),
             })
         );
-        for (key, low, high) in [
-            ("max_jobs", 1, 32),
-            ("idle_minutes", 1, 1440),
-            ("min_free_memory_percent", 1, 90),
-        ] {
-            let set = |value: i64| {
+        // Idle minutes are a workstation's, and only a Mac is one.
+        let mut bounds = vec![("max_jobs", 1, 32), ("min_free_memory_percent", 1, 90)];
+        if cfg!(target_os = "macos") {
+            assert_eq!(
                 with(|v| {
                     v["use"] = "workstation".into();
+                    v["idle_minutes"] = 20.into();
+                })
+                .map(|c| c.limits().idle_after),
+                Ok(Some(Millis::mins(20)))
+            );
+            bounds.push(("idle_minutes", 1, 1440));
+        }
+        for (key, low, high) in bounds {
+            let set = |value: i64| {
+                with(|v| {
+                    if key == "idle_minutes" {
+                        v["use"] = "workstation".into();
+                    }
                     v[key] = value.into();
                 })
             };

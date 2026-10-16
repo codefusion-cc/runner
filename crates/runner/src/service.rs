@@ -973,7 +973,7 @@ mod tests {
         let wrote = file
             .change(&SettingsChange {
                 max_jobs: Some(Some(2)),
-                min_free_memory_percent: Some(Some(8)),
+                min_free_memory_percent: Some(Some(30)),
                 deadline_minutes: Some(Some(90)),
                 ..SettingsChange::default()
             })
@@ -992,7 +992,7 @@ mod tests {
                 config.min_free_memory_percent,
                 config.deadline_minutes
             ),
-            (Some(2), None, Some(8), 90)
+            (Some(2), None, Some(30), 90)
         );
         assert_eq!(
             config.docker_repos,
@@ -1004,7 +1004,7 @@ mod tests {
             Limits {
                 max_machines: Some(2),
                 idle_after: None,
-                floor_percent: Some(8),
+                floor_percent: Some(30),
             }
         );
         let written = std::fs::read_to_string(&here.path).expect("read");
