@@ -87,25 +87,41 @@ pub(crate) fn is_pool_expression(label: &str) -> bool {
 }
 
 /// What a pool expression evaluates to, when it is a chain of `||` over `vars.NAME`, `vars['NAME']` and string
-/// literals, optionally wrapped in `toJSON(...)` / `fromJSON(...)`: the first operand that is not empty. `None` when
-/// the expression is anything else or every operand is empty. A value that is a JSON string (`"cf-8g"`, as
-/// `toJSON` makes) comes back unquoted.
-pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<String> {
+/// literals, optionally wrapped in `toJSON(...)` / `fromJSON(...)`: the labels of the first operand that is not
+/// empty. `None` when the expression is anything else or every operand is empty. A value that is a JSON string
+/// (`"cf-8g"`, as `toJSON` makes) comes back unquoted. Under an outer `fromJSON` a JSON list of strings
+/// (`["cf-8g","cf-macos"]`) is every label in it, as GitHub reads it; a list of anything else is one label, which
+/// names none of these Actions runners.
+pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
     let mut inner = whole(label)?.trim();
+    let mut parsed = None;
     loop {
         let lower = inner.to_ascii_lowercase();
-        let wrapped = ["tojson(", "fromjson("].iter().any(|f| lower.starts_with(f)) && inner.ends_with(')');
-        if !wrapped {
+        let Some(function) = ["tojson(", "fromjson("]
+            .into_iter()
+            .find(|f| lower.starts_with(f))
+        else {
+            break;
+        };
+        if !inner.ends_with(')') {
             break;
         }
+        // The outer function decides: fromJSON makes a list, toJSON a string again.
+        parsed.get_or_insert(function == "fromjson(");
         inner = inner[inner.find('(')? + 1..inner.len() - 1].trim();
     }
     for operand in split_or(inner)? {
         let value = operand_value(operand.trim(), vars)?;
         let value = value.trim();
-        if !value.is_empty() {
-            return Some(unquote_json(value));
+        if value.is_empty() {
+            continue;
         }
+        if parsed == Some(true) && value.starts_with('[') {
+            return Some(
+                serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_string()]),
+            );
+        }
+        return Some(vec![unquote_json(value)]);
     }
     None
 }

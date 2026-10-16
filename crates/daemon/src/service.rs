@@ -735,6 +735,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         tracing::info!(repo = %name, labels = %set.key(), "not served: Docker is only for the repositories in docker_repos");
                         continue;
                     }
+                    if !shared.config.policy.serves_labels(&set) {
+                        // Pinned to hosts of another kind: left to them, as a size this host never runs.
+                        tracing::info!(repo = %name, labels = %set.key(), "not served: it asks for host labels this host does not have");
+                        continue;
+                    }
                     // `cf-docker` alone is a machine of the size `self-hosted` means.
                     let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str))
                         .or_else(|| set.docker().then_some(Size::G4))

@@ -63,6 +63,33 @@ impl LabelSet {
     pub fn docker(&self) -> bool {
         self.contains(DOCKER_LABEL)
     }
+
+    /// The host labels the set asks for ([`is_host_label`]): only a host that has every one of them serves it.
+    pub fn host_labels(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .iter()
+            .map(String::as_str)
+            .filter(|label| is_host_label(label))
+    }
+}
+
+/// Whether a (lowercase) label names hosts rather than a machine: `cf-` and a name of lowercase letters, digits and
+/// single dashes that starts with a letter, 40 characters in all at most, and is neither a size nor [`DOCKER_LABEL`]
+/// (`cf-macos`, `cf-linux`). A host serves a set with host labels only when its config lists every one of them, so
+/// a job asks for a kind of host with `[cf-8g, cf-macos]`. A host label alone names no size.
+pub fn is_host_label(label: &str) -> bool {
+    let Some(name) = label.strip_prefix("cf-") else {
+        return false;
+    };
+    label.len() <= 40
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        // Sizes (`cf-8g`) start with a digit, so no host label is one.
+        && label != DOCKER_LABEL
 }
 
 /// [`self_hosted_with`] without repository variables: every expression over variables stands for [`POOL_LABEL`].
@@ -111,19 +138,26 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
             if let (true, Some(input)) = (uses, input)
                 && is_pool_expression(input)
             {
-                seen.insert(LabelSet::new([resolve(input, vars)]));
+                seen.insert(LabelSet::new(resolve(input, vars)));
             }
         }
     }
     seen.into_iter().collect()
 }
 
-/// What a pool expression stands for: the label of these Actions runners it evaluates to, else [`POOL_LABEL`].
-fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> String {
+/// What a pool expression stands for: the labels it evaluates to when one of them is a label of these Actions
+/// runners, else [`POOL_LABEL`].
+fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> Vec<String> {
     evaluate(expression, vars)
-        .map(|v| v.trim().to_lowercase())
-        .filter(|v| is_ours(v))
-        .unwrap_or_else(|| POOL_LABEL.to_string())
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|label| label.trim().to_lowercase())
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|labels| labels.iter().any(|label| is_ours(label)))
+        .unwrap_or_else(|| vec![POOL_LABEL.to_string()])
 }
 
 /// A node of a workflow file, as far as labels go: a scalar keeps the text YAML gives it, and a mapping's keys are
@@ -256,16 +290,18 @@ fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
 
     let mut set = Vec::with_capacity(labels.len());
     for label in labels {
-        let label = if is_pool_expression(&label) {
+        let labels = if is_pool_expression(&label) {
             resolve(&label, vars)
         } else {
-            label
+            vec![label]
         };
-        let label = label.trim().to_lowercase();
-        if label.is_empty() || label.contains("${{") || FOREIGN.contains(&label.as_str()) {
-            return None;
+        for label in labels {
+            let label = label.trim().to_lowercase();
+            if label.is_empty() || label.contains("${{") || FOREIGN.contains(&label.as_str()) {
+                return None;
+            }
+            set.push(label);
         }
-        set.push(label);
     }
     let set = LabelSet::new(set);
     set.labels().iter().any(|l| is_ours(l)).then_some(set)

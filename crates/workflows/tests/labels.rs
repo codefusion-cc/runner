@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use cf_workflows::{DOCKER_LABEL, LabelSet, POOL_LABEL, SizeError, self_hosted, self_hosted_with, size_gb};
+use cf_workflows::{
+    DOCKER_LABEL, LabelSet, POOL_LABEL, SizeError, is_host_label, self_hosted, self_hosted_with, size_gb,
+};
 use proptest::prelude::*;
 
 fn files(list: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
@@ -665,4 +667,133 @@ fn a_variable_naming_the_docker_label_decides_the_scale_set() {
             "{value:?}"
         );
     }
+}
+
+// added: host labels, which only the hosts that list them in their config serve
+#[test]
+fn a_host_label_is_a_cf_label_of_a_name_that_is_no_size_and_not_docker() {
+    for label in ["cf-macos", "cf-linux", "cf-mac-studio", "cf-m4", "cf-a"] {
+        assert!(is_host_label(label), "{label}");
+    }
+    let longest = format!("cf-{}", "a".repeat(37));
+    assert!(is_host_label(&longest), "40 characters");
+    for label in [
+        "cf-8g",
+        "cf-2g",
+        "cf-docker",
+        "cf-3g",
+        "cf-4gb",
+        "cf-",
+        "cf--macos",
+        "cf-macos-",
+        "cf-mac--os",
+        "cf-mac_os",
+        "cf-mac os",
+        "cf-macOS",
+        "cf-mäc",
+        "macos",
+        "self-hosted",
+        "xcf-macos",
+        "",
+    ] {
+        assert!(!is_host_label(label), "{label:?}");
+    }
+    assert!(!is_host_label(&format!("{longest}a")), "41 characters");
+}
+
+#[test]
+fn a_set_names_its_host_labels() {
+    let set = LabelSet::new(["CF-8G", "cf-macos", "heyhubs", "cf-docker", "cf-linux"]);
+    assert_eq!(set.host_labels().collect::<Vec<_>>(), ["cf-linux", "cf-macos"]);
+    assert_eq!(LabelSet::new(["cf-8g", "self-hosted"]).host_labels().count(), 0);
+}
+
+#[test]
+fn a_variable_read_through_from_json_may_hold_a_list_of_labels() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  heavy:\n    runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY || '\"ubuntu-latest\"') }}\n",
+    )]);
+    let with = |value: &str| keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_HEAVY", value)])));
+    assert_eq!(
+        keys(&self_hosted_with(&wf, &vars(&[]))),
+        [POOL_LABEL],
+        "no variable: the pool's label"
+    );
+    assert_eq!(with(r#"["cf-8g","cf-macos"]"#), ["cf-8g,cf-macos"]);
+    assert_eq!(
+        with(r#" [ "CF-8G" , "cf-macos", "cf-8g" ] "#),
+        ["cf-8g,cf-macos"],
+        "spaced, cased, repeated"
+    );
+    assert_eq!(with(r#"["self-hosted","cf-macos"]"#), ["cf-macos,self-hosted"]);
+    assert_eq!(with(r#"["cf-6g"]"#), ["cf-6g"], "a list of one");
+    assert_eq!(
+        with(r#""cf-8g""#),
+        ["cf-8g"],
+        "a JSON string is one label, as before"
+    );
+    assert_eq!(with("cf-8g"), ["cf-8g"]);
+    // A list must name a label of these Actions runners besides the host's, else it is the pool's label, as any
+    // value that names none.
+    for value in [
+        r#"["cf-macos"]"#,
+        r#"["ubuntu-latest","cf-8g-ish"]"#,
+        "[]",
+        "[1,2]",
+        r#"["cf-8g",2]"#,
+        r#"["cf-8g""#,
+        r#"{"labels":["cf-8g"]}"#,
+        r#"[["cf-8g"]]"#,
+        "ubuntu-latest",
+    ] {
+        assert_eq!(with(value), [POOL_LABEL], "{value:?}");
+    }
+    // A list that also names another platform asks for that platform: these Actions runners leave it.
+    assert_eq!(with(r#"["cf-8g","macos"]"#), Vec::<String>::new());
+    assert_eq!(with(r#"["cf-8g",""]"#), ["cf-8g"], "an empty label is dropped");
+}
+
+#[test]
+fn only_from_json_turns_a_list_into_labels_as_github_does() {
+    // GitHub takes a variable's text as one label unless fromJSON parses it: such a job waits for a runner with a
+    // label that looks like a list, which none has; it stands for the pool's label, as before.
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}\n  b:\n    runs-on: ${{ toJSON(vars.CI_RUNNER) }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER", r#"["cf-8g","cf-macos"]"#)])
+        )),
+        [POOL_LABEL]
+    );
+    // fromJSON inside toJSON is a string again.
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: ${{ toJSON(fromJSON(vars.CI_RUNNER)) }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER", r#"["cf-8g","cf-macos"]"#)])
+        )),
+        [POOL_LABEL]
+    );
+}
+
+#[test]
+fn a_list_from_a_variable_joins_the_labels_beside_it_and_a_reusable_workflows_input() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  list:\n    runs-on: [\"${{ fromJSON(vars.CI_RUNNER_HEAVY) }}\", heyhubs]\n  call:\n    uses: o/r/.github/workflows/x.yml@main\n    with:\n      runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY || '\"ubuntu-latest\"') }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER_HEAVY", r#"["cf-8g","cf-macos"]"#)])
+        )),
+        ["cf-8g,cf-macos", "cf-8g,cf-macos,heyhubs"]
+    );
 }

@@ -237,6 +237,7 @@ fn service(
             public_repos: config.public_repos.clone(),
             docker_repos: config.docker_repos.clone(),
             docker_max_jobs: config.docker_max_jobs,
+            host_labels: config.labels.clone(),
         },
         console: console(config)?,
         stand_in: None,
