@@ -180,7 +180,7 @@ impl Rig {
                 &machines,
                 &enrolled.token,
                 &battery,
-                (&outbox, &updates, &settings, folder.path(), update_limit),
+                (&outbox, Some(&updates), &settings, folder.path(), update_limit),
             )),
             github,
             console,
@@ -317,7 +317,7 @@ impl Rig {
             &self.battery,
             (
                 &self.outbox,
-                &self.updates,
+                Some(&self.updates),
                 &self.settings,
                 self.folder.path(),
                 self.update_limit,
@@ -440,11 +440,12 @@ fn service(
     machines: &Arc<TestMachines>,
     token: &Secret<String>,
     battery: &Arc<Mutex<Option<Battery>>>,
-    // What stays across a daemon's starts: the outbox, the update it builds, its settings file, the folder of its
-    // files, how long an update waits for the machines that stand.
+    // What stays across a daemon's starts: the outbox, the update it builds (none for a Runner with nowhere to
+    // update from), its settings file, the folder of its files, how long an update waits for the machines that
+    // stand.
     (outbox, updates, settings, folder, update_limit): (
         &Arc<Outbox>,
-        &Arc<FakeUpdate>,
+        Option<&Arc<FakeUpdate>>,
         &Arc<FakeSettings>,
         &std::path::Path,
         Duration,
@@ -485,7 +486,7 @@ fn service(
             boot: Some(1_790_000_000),
             battery: *battery.lock().expect("battery"),
         }),
-        updates: Some(updates.clone()),
+        updates: updates.map(|updates| updates.clone() as Arc<dyn cf_daemon::update::SelfUpdate>),
         results: Some(folder.join("results.json")),
         settings: Some(settings.clone()),
     })
@@ -1272,7 +1273,7 @@ async fn a_mac_whose_token_the_console_does_not_know_asks_rarely_and_keeps_its_r
         &rig.battery,
         (
             &rig.outbox,
-            &rig.updates,
+            Some(&rig.updates),
             &rig.settings,
             rig.folder.path(),
             rig.update_limit,
@@ -3372,6 +3373,153 @@ async fn a_build_that_fails_is_said_and_counted_and_the_mac_goes_on() {
     .await;
 }
 
+/// `update-to` goes the way `update` goes, to the commit it names: the build is asked for that commit, what it built
+/// is installed once no machine stands, and `update` alone still asks for the head of the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_to_a_commit_builds_that_commit_and_installs_what_it_built() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.updates.build_gives(Ok(RUNNING));
+    let update = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &update).is_empty()).await;
+    // The commit that runs, asked for: nothing to do, said as such, and the page says which commit was built.
+    rig.updates.hold_builds();
+    rig.updates.build_gives(Ok(RUNNING));
+    let same = rig
+        .console
+        .queue_command("update-to", Some(json!({"commit": "446125c0a1b2"})));
+    until("building the commit", || {
+        last_status(&rig.console)["reason"] == json!("updating to 446125c0a1b2: building")
+    })
+    .await;
+    rig.updates.release_builds();
+    until("the result", || !results_of(&rig.console, &same).is_empty()).await;
+    assert_eq!(
+        (
+            &results_of(&rig.console, &same)[0]["ok"],
+            &results_of(&rig.console, &same)[0]["message"]
+        ),
+        (
+            &json!(true),
+            &json!(format!("{RUNNING} runs already: it is the commit asked for"))
+        )
+    );
+    let runner = rig.job_running().await;
+    rig.updates.build_gives(Ok(NEWER));
+    let to = rig
+        .console
+        .queue_command("update-to", Some(json!({"commit": "5c0ffee0a1b2"})));
+    rig.settles("no new job while the machine stands", || {
+        last_status(&rig.console)["reason"]
+            == json!(format!("updating to {NEWER}: waiting for 1 machine to end"))
+    })
+    .await;
+    assert_eq!(rig.updates.installed(), []);
+    rig.finish(&runner, "succeeded");
+    rig.settles("installed", || rig.updates.installed().len() == 1)
+        .await;
+    assert_eq!(
+        rig.updates.asked(),
+        [
+            None,
+            Some("446125c0a1b2".to_string()),
+            Some("5c0ffee0a1b2".to_string())
+        ]
+    );
+    assert_eq!(
+        rig.updates.installed(),
+        [cf_daemon::update::Pending {
+            id: to,
+            from: RUNNING.into(),
+            to: NEWER.into(),
+            starts: 0,
+            failed: None,
+        }]
+    );
+    rig.settles("the Runner is to end", || rig.service.restart_requested())
+        .await;
+}
+
+/// An `update-to` whose arguments name no commit is answered with why, and nothing is built: the Mac goes on taking
+/// jobs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_to_that_names_no_commit_says_why_and_builds_nothing() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let not_a_name = "the commit is no commit's name: 7 to 40 lowercase hex characters";
+    for (args, why) in [
+        (None, "the command names no commit"),
+        (Some(json!("5c0ffee")), "the command names no commit"),
+        (Some(json!({})), "the command names no commit"),
+        (Some(json!({"commit": 5})), not_a_name),
+        (Some(json!({"commit": "5C0FFEE"})), not_a_name),
+        (Some(json!({"commit": "5c0ffe"})), not_a_name),
+        (Some(json!({"commit": "a".repeat(41)})), not_a_name),
+        (Some(json!({"commit": "main"})), not_a_name),
+        (Some(json!({"commit": "--upload-pack=touch x"})), not_a_name),
+        (
+            Some(json!({"commit": "5c0ffee", "branch": "pr"})),
+            "`branch` is no argument of update-to",
+        ),
+    ] {
+        let id = rig.console.queue_command("update-to", args.clone());
+        until("the result", || !results_of(&rig.console, &id).is_empty()).await;
+        let heard = &results_of(&rig.console, &id)[0];
+        assert_eq!(
+            (&heard["ok"], &heard["message"]),
+            (&json!(false), &json!(why)),
+            "{args:?}"
+        );
+    }
+    assert_eq!(rig.updates.built(), 0);
+    assert!(!rig.service.restart_requested());
+    rig.job_running().await;
+}
+
+/// A Runner with nowhere to update from offers neither update, and says why when one comes all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_with_nowhere_to_update_from_offers_no_update() {
+    let mut rig = Rig::new(2).await;
+    let alone = service(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+    );
+    let report = serde_json::to_value(alone.status()).expect("a report");
+    assert_eq!(
+        report["status"]["commands"],
+        json!(["restart", "stop-runner", "settings"])
+    );
+    rig.stop_pump().await;
+    let asked = [
+        rig.console.queue_command("update", None),
+        rig.console
+            .queue_command("update-to", Some(json!({"commit": "5c0ffee"}))),
+        rig.console
+            .queue_command("update-to", Some(json!({"commit": "main"}))),
+    ];
+    alone.report().await;
+    alone.report().await;
+    for id in &asked {
+        let heard = &results_of(&rig.console, id)[0];
+        assert_eq!(
+            (&heard["ok"], &heard["message"]),
+            (&json!(false), &json!("this Runner has nowhere to update from")),
+            "{id}"
+        );
+    }
+}
+
 /// Machines that do not end within the update's limit: nothing is installed, and the Mac takes jobs again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_update_whose_machine_outlasts_its_limit_installs_nothing_and_takes_jobs_again() {
@@ -3426,16 +3574,23 @@ async fn while_an_update_builds_it_runs_once_and_another_update_or_a_restart_is_
     })
     .await;
     let second = rig.console.queue_command("update", None);
+    let to = rig
+        .console
+        .queue_command("update-to", Some(json!({"commit": "5c0ffee0a1b2"})));
     let restart = rig.console.queue_command("restart", None);
-    until("both refused", || {
-        !results_of(&rig.console, &second).is_empty() && !results_of(&rig.console, &restart).is_empty()
+    until("all refused", || {
+        [&second, &to, &restart]
+            .iter()
+            .all(|id| !results_of(&rig.console, id).is_empty())
     })
     .await;
-    assert_eq!(results_of(&rig.console, &second)[0]["ok"], json!(false));
-    assert_eq!(
-        results_of(&rig.console, &second)[0]["message"],
-        json!("an update is under way already")
-    );
+    for id in [&second, &to] {
+        assert_eq!(results_of(&rig.console, id)[0]["ok"], json!(false));
+        assert_eq!(
+            results_of(&rig.console, id)[0]["message"],
+            json!("an update is under way already")
+        );
+    }
     assert_eq!(results_of(&rig.console, &restart)[0]["ok"], json!(false));
     assert!(!rig.service.restart_requested());
     until("the first is over", || {
@@ -3915,7 +4070,7 @@ async fn the_report_says_the_commands_the_runner_does_and_its_limits() {
     let report = rig.console.reports().last().expect("a report").clone();
     assert_eq!(
         report["status"]["commands"],
-        json!(["restart", "stop-runner", "update", "settings"])
+        json!(["restart", "stop-runner", "update", "update-to", "settings"])
     );
     assert_eq!(
         report["limits"],

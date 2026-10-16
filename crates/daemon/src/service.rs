@@ -31,7 +31,7 @@ use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
 use crate::traits::{EventKind, Slots};
-use crate::update::{Pending, SelfUpdate, SettingsChange, SettingsFile, SettingsLook};
+use crate::update::{Pending, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, commit_from_args};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -1337,7 +1337,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     self.shared.config.version
                 ),
             ),
-            "update" => return self.update(&command.id),
+            "update" => return self.update(&command.id, Ok(None)),
+            "update-to" => {
+                return self.update(&command.id, commit_from_args(command.args.as_ref()).map(Some));
+            }
             "stop-runner" => {
                 let name = command
                     .args
@@ -1370,7 +1373,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let shared = &self.shared;
         let mut kinds = vec!["restart", "stop-runner"];
         if shared.updates.is_some() {
-            kinds.push("update");
+            kinds.extend(["update", "update-to"]);
         }
         if shared.settings.is_some() {
             kinds.push("settings");
@@ -1423,10 +1426,15 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         })
     }
 
-    /// Starts an update in the background, or says at once why none starts.
-    fn update(&self, id: &str) -> Option<(bool, String)> {
+    /// Starts an update in the background, to the head of the branch or to the commit asked for, or says at once
+    /// why none starts, also when the command asks for no commit the Runner takes.
+    fn update(&self, id: &str, commit: Result<Option<String>, String>) -> Option<(bool, String)> {
         let Some(updates) = self.shared.updates.clone() else {
             return Some((false, "this Runner has nowhere to update from".into()));
+        };
+        let commit = match commit {
+            Ok(commit) => commit,
+            Err(why) => return Some((false, why)),
         };
         if self.shared.applying.lock().expect("applying").under_way {
             return Some((
@@ -1441,14 +1449,17 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 return Some((false, "an update is under way already".into()));
             }
             update.command = Some(id.to_string());
-            update.doing = Some("updating: building".into());
+            update.doing = Some(match &commit {
+                Some(commit) => format!("updating to {commit}: building"),
+                None => "updating: building".into(),
+            });
         }
         let service = Service {
             shared: self.shared.clone(),
         };
         let id = id.to_string();
         tokio::spawn(async move {
-            let outcome = service.updating(&id, updates).await;
+            let outcome = service.updating(&id, updates, commit).await;
             let mut update = service.shared.update.lock().expect("update");
             update.doing = None;
             match outcome {
@@ -1477,18 +1488,28 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
 
     /// Builds, waits for the machines that stand to end, installs and ends the Runner. Answers what to tell the
     /// console when it is over without an install, `None` once the new program is in place.
-    async fn updating(&self, id: &str, updates: Arc<dyn SelfUpdate>) -> Result<Option<String>, String> {
+    async fn updating(
+        &self,
+        id: &str,
+        updates: Arc<dyn SelfUpdate>,
+        commit: Option<String>,
+    ) -> Result<Option<String>, String> {
         let shared = &self.shared;
         let began = Instant::now();
         let running = shared.config.version.clone();
+        let asked_for_one = commit.is_some();
         let built = {
             let updates = updates.clone();
-            tokio::task::spawn_blocking(move || updates.build())
+            tokio::task::spawn_blocking(move || updates.build(commit.as_deref()))
                 .await
                 .map_err(|error| format!("the build stopped: {error}"))??
         };
         if built == running {
-            return Ok(Some(format!("{running} runs already: there is nothing newer")));
+            return Ok(Some(if asked_for_one {
+                format!("{running} runs already: it is the commit asked for")
+            } else {
+                format!("{running} runs already: there is nothing newer")
+            }));
         }
         tracing::info!(from = %running, to = %built, "an update is built; no new job until the machines that stand are gone");
         self.drained(&format!("updating to {built}"), began)
