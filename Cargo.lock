@@ -221,6 +221,7 @@ dependencies = [
  "bytes",
  "cf-fake-github",
  "cf-secret",
+ "cf-workflows",
  "proptest",
  "rand 0.9.5",
  "reqwest",

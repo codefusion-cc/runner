@@ -128,6 +128,6 @@ generated schedules.
   heard: its `unregistered` cannot be told from one it wrote on a 404. Telling the two apart needs a second source,
   such as the guest saying whether `Runner.Worker` ever ran.
 - A machine that ran a job, and whose start and end both went with a session, is reported without GitHub's result.
-  The result can be read only with the App permission `actions: read`.
+  The App's `actions: read` permission lets the Runner read it from the job's REST view; it does not yet.
 - GitHub removing an ephemeral registration that never ran a job, within the minutes of the wait, would read as a
   job. GitHub keeps offline registrations for far longer.

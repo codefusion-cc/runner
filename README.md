@@ -20,7 +20,8 @@ its first jobs from the real GitHub on a MacBook Air: one that passed, one that 
 ran, each in a machine that was gone when the job ended. What is there:
 
 - the service (`codefusion-runner daemon`, kept running by launchd on a Mac and by systemd on Linux): it reads which repositories and `runs-on`
-  labels to serve, keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
+  labels to serve, from the workflows on each default branch and from the jobs GitHub has queued (a pull request's
+  new workflow or labels; `docs/github-protocol.md`), keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
   budget for memory, starts a machine and registers an Actions runner for that one job. When the job ends, however
   it ends, the machine is destroyed, the registration removed, the memory given back, and the console told once,
 - sizes from the label: `cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`; `self-hosted` alone is 4 GB. A machine is counted as

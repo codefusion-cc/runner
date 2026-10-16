@@ -60,8 +60,21 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
   believes awaits a job before a session opens (`reconcile`), and before it removes the registration of a machine
   that ended unheard (`Service::sweep`). A removal's own answer is evidence too: 204 only for a registration that held
   no job, 422 under a job, 404 once a one-job Actions runner removed its own. What each answer proves, and what is
-  written before what is done, is `docs/job-state.md`. The result of a job whose `JobCompleted` was lost cannot be read
-  without the App permission `actions: read`.
+  written before what is done, is `docs/job-state.md`. The App has `actions: read`, so the result of a job whose
+  `JobCompleted` was lost could be read from the job's REST view; the Runner does not read it yet.
+- A scale set is made for each label set the workflows on a repository's default branch ask for, and for each one the
+  jobs GitHub has queued or runs ask for that those workflows do not name: a pull request's new workflow or labels
+  would otherwise wait for ever. The Runner reads them with `actions: read`, about once a minute
+  (`GET /repos/{repo}/actions/runs?status=queued`, the same with `in_progress`, then `/actions/runs/{id}/jobs`): the
+  newest 10 runs and one page of each run's jobs. A listing names the ETag of its last answer, so a queue that did
+  not change costs 304s, which GitHub does not count against the rate limit; the jobs of a run whose `updated_at`
+  did not change are not asked for again, and those of one that did are asked for with their ETag. A job's labels
+  pass the same rules as a workflow's (`LabelSet::served`), and such a set is served for 30 minutes after a job of
+  it was last seen queued or running, 8 of a repository and 32 of a host at most, the newest first. On a public
+  repository, a pull request's from a fork (its run's `head_repository` is another, or none) makes no set: it is a
+  stranger's code, and runs only on the default branch's sets. Without the permission, or when GitHub does not
+  answer, only the default branch's sets are served, the console hears why, and no set a queued job had is closed
+  for it for up to 24 hours, the longest GitHub lets a job wait.
 - Which job goes first is the Runner's to choose only among the jobs it holds: those that wait for room on the Mac,
   across its scale sets, and the offers of one message. Within one scale set, GitHub chooses which assigned job each
   Actions runner gets. A job message names its repository, its name, its run, the run's event and its workflow file at

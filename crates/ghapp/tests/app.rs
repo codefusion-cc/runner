@@ -10,8 +10,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cf_fake_github::harness::{TestClock, elsewhere, fast};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, Options, test_key};
-use cf_ghapp::{AppCredentials, AppKey, Clock, Error, GitHubApp, Http, Installation, RetryPolicy};
+use cf_ghapp::{
+    AppCredentials, AppKey, Clock, Error, GitHubApp, Http, Installation, JOBS_PAGE, MAX_RUN_SETS,
+    RetryPolicy, WAITING_RUNS, Waiting,
+};
 use cf_secret::Secret;
+use cf_workflows::{LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS};
 
 struct Harness {
     fake: FakeGithub,
@@ -867,4 +871,318 @@ fn credentials_load_from_a_folder_and_a_key_others_can_read_is_refused() {
     std::fs::remove_file(&pem).unwrap();
     std::fs::write(dir.path().join("app.json"), r#"{"client_id":"Iv23abc"}"#).unwrap();
     assert!(AppCredentials::load(dir.path()).is_err());
+}
+
+/// The labels of what [`GitHubApp::waiting_jobs`] read, by job, sorted for comparing.
+fn waiting(read: &Waiting) -> Vec<(i64, String)> {
+    let mut jobs: Vec<(i64, String)> = read.jobs.iter().map(|j| (j.id, j.set.key())).collect();
+    jobs.sort();
+    jobs
+}
+
+/// A set's key, as the set of these labels reads it.
+fn key(labels: &[&str]) -> String {
+    LabelSet::new(labels).key()
+}
+
+// added: the jobs GitHub has not finished, from the REST view of the runs that are queued or under way.
+#[tokio::test]
+async fn waiting_jobs_are_the_unfinished_jobs_of_queued_and_running_runs() {
+    let h = harness().await;
+    let queued = h.fake.queue_job("org/app", &["self-hosted", "CF-2g"], "build");
+    // A run under way: its first job runs elsewhere, its second waits for it.
+    let run = h.fake.queue_run(
+        "org/app",
+        &[(&["ubuntu-latest"], "lint"), (&["self-hosted", "cf-4g"], "test")],
+        "refs/pull/7/merge",
+    );
+    h.fake.take_job(run[0]);
+    let over = h.fake.queue_job("org/app", &["self-hosted", "cf-8g"], "old");
+    h.fake.end_job(over, "success");
+    // A run under way whose first job is done: the done one is not waiting.
+    let half = h.fake.queue_run(
+        "org/app",
+        &[
+            (&["self-hosted", "cf-16g"], "done"),
+            (&["self-hosted", "cf-2g"], "next"),
+        ],
+        "refs/heads/main",
+    );
+    h.fake.end_job(half[0], "success");
+    h.fake
+        .queue_job("org/other", &["self-hosted", "cf-6g"], "elsewhere");
+
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(
+        waiting(&read),
+        [
+            (queued, key(&["self-hosted", "cf-2g"])),
+            (run[1], key(&["self-hosted", "cf-4g"])),
+            (half[1], key(&["self-hosted", "cf-2g"])),
+        ],
+        "the sets served, as a set reads them; a job of GitHub's own labels, a finished job and another \
+         repository's are not there"
+    );
+    assert!(read.jobs.iter().all(|j| !j.from_fork), "no run here is a fork's");
+    assert!(read.left_out.is_empty(), "{:?}", read.left_out);
+    assert!(
+        read.jobs.iter().all(|j| j.created > 1_700_000_000),
+        "when each was queued"
+    );
+
+    // Nothing waits: nothing, and no error.
+    let h = harness().await;
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert!(read.jobs.is_empty() && read.left_out.is_empty());
+}
+
+// added: a look that finds nothing changed costs nothing of the rate limit: the listings name the ETag of their last
+// answer, GitHub answers 304, a run that did not change since its jobs were read is not asked about again, and the
+// last result stands.
+#[tokio::test]
+async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
+    let h = harness().await;
+    let first = h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "build");
+    let before = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(h.fake.not_modified(), 0);
+    let requests = h.fake.requests().len();
+
+    let again = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    let asked = h.fake.requests().len() - requests;
+    assert_eq!(asked, 2, "the two listings, not the run's jobs");
+    assert_eq!(h.fake.not_modified(), 2, "both 304");
+    assert_eq!(waiting(&again), waiting(&before));
+    assert_eq!(waiting(&again), [(first, key(&["self-hosted", "cf-2g"]))]);
+
+    // A change is read: the new run in full, the old one still from its 304.
+    let second = h.fake.queue_job("org/app", &["self-hosted", "cf-4g"], "more");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(
+        waiting(&read),
+        [
+            (first, key(&["self-hosted", "cf-2g"])),
+            (second, key(&["self-hosted", "cf-4g"]))
+        ]
+    );
+    // A run that ends leaves.
+    h.fake.end_job(first, "cancelled");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(waiting(&read), [(second, key(&["self-hosted", "cf-4g"]))]);
+
+    // A run under way whose job ends is read again: the job that ended is gone, the one that waits stays.
+    let run = h.fake.queue_run(
+        "org/app",
+        &[(&["self-hosted", "cf-6g"], "a"), (&["self-hosted", "cf-8g"], "b")],
+        "refs/heads/main",
+    );
+    h.app.waiting_jobs(1, "org/app").await.unwrap();
+    h.fake.end_job(run[0], "success");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(
+        waiting(&read),
+        [
+            (second, key(&["self-hosted", "cf-4g"])),
+            (run[1], key(&["self-hosted", "cf-8g"]))
+        ]
+    );
+
+    // A queue forgotten is asked about without ETags.
+    let h = harness().await;
+    h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "build");
+    h.app.waiting_jobs(1, "org/app").await.unwrap();
+    h.app.forget_queues(|repo| repo != "org/app");
+    h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(h.fake.not_modified(), 0);
+    h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(h.fake.not_modified(), 2, "kept again once read");
+}
+
+// added: the App without "Actions: read" is refused, and the caller hears it to say what is missing.
+#[tokio::test]
+async fn a_missing_actions_permission_is_the_error() {
+    let h = harness().await;
+    h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "build");
+    let denied = serde_json::json!({"message": "Resource not accessible by integration"});
+    h.fake.fail("/actions/runs", Reply::status_json(403, &denied), 1);
+    let err = h.app.waiting_jobs(1, "org/app").await.unwrap_err();
+    assert_eq!(err.status(), Some(403));
+    assert!(err.to_string().contains("not accessible"), "{err}");
+    // On a private repository GitHub says 404 instead.
+    h.fake.fail(
+        "/actions/runs",
+        Reply::status_json(404, &serde_json::json!({"message": "Not Found"})),
+        1,
+    );
+    assert_eq!(
+        h.app.waiting_jobs(1, "org/app").await.unwrap_err().status(),
+        Some(404)
+    );
+    // And a refusal of a run's jobs is the error too, not a run without jobs.
+    h.fake.fail("/jobs", Reply::status_json(403, &denied), 1);
+    assert_eq!(
+        h.app.waiting_jobs(1, "org/app").await.unwrap_err().status(),
+        Some(403)
+    );
+    // A server error is an error, not an empty queue.
+    h.fake.fail("/jobs", Reply::text(502, "bad gateway"), 10);
+    assert!(h.app.waiting_jobs(1, "org/app").await.is_err());
+}
+
+// added: a run that went between its listing and the read of its jobs (deleted) is left out, not an error.
+#[tokio::test]
+async fn a_run_gone_before_its_jobs_were_read_is_left_out() {
+    let h = harness().await;
+    let gone = h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "a");
+    let kept = h.fake.queue_job("org/app", &["self-hosted", "cf-4g"], "b");
+    h.fake.fail(
+        &format!("/runs/{}/jobs", 7000 + gone),
+        Reply::status_json(404, &serde_json::json!({"message": "Not Found"})),
+        1,
+    );
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(waiting(&read), [(kept, key(&["self-hosted", "cf-4g"]))]);
+}
+
+// added: what a busy or hostile repository can make the Runner read and keep is bounded: the runs read, the jobs of
+// one, the labels of one job, the distinct sets kept of one run. What is left out is said.
+#[tokio::test]
+async fn the_runs_jobs_and_labels_read_are_bounded_and_what_is_left_out_is_said() {
+    let h = harness().await;
+    let mut ids = Vec::new();
+    for n in 0..(WAITING_RUNS + 5) {
+        ids.push(
+            h.fake
+                .queue_job("org/app", &["self-hosted", &format!("l{n}")], "build"),
+        );
+    }
+    let before = h.fake.count("/jobs");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(
+        h.fake.count("/jobs") - before,
+        WAITING_RUNS,
+        "only so many runs' jobs are read"
+    );
+    let newest: Vec<i64> = ids[ids.len() - WAITING_RUNS..].to_vec();
+    let mut got: Vec<i64> = read.jobs.iter().map(|j| j.id).collect();
+    got.sort();
+    assert_eq!(got, newest, "the newest runs");
+    assert_eq!(
+        read.left_out,
+        [format!(
+            "{} runs waiting, the newest {WAITING_RUNS} read",
+            WAITING_RUNS + 5
+        )]
+    );
+    let listings: Vec<String> = h
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.line.ends_with("/actions/runs"))
+        .filter_map(|r| r.query.into_iter().find(|(name, _)| name == "per_page"))
+        .map(|(_, n)| n)
+        .collect();
+    assert_eq!(
+        listings,
+        [WAITING_RUNS.to_string(), WAITING_RUNS.to_string()],
+        "each listing asks for no more runs than are read"
+    );
+
+    // One run of more jobs than a page, of more distinct sets than are kept.
+    let h = harness().await;
+    let names: Vec<String> = (0..JOBS_PAGE + 20).map(|n| format!("l{n}")).collect();
+    let jobs: Vec<Vec<&str>> = names.iter().map(|n| vec!["self-hosted", n.as_str()]).collect();
+    let jobs: Vec<(&[&str], &str)> = jobs.iter().map(|labels| (labels.as_slice(), "matrix")).collect();
+    h.fake.queue_run("org/app", &jobs, "refs/heads/main");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(read.jobs.len(), MAX_RUN_SETS, "distinct sets kept of one run");
+    assert!(read.left_out.len() >= 2, "{:?}", read.left_out);
+
+    // Labels written in another case or with spaces around are the same set.
+    let h = harness().await;
+    let ids = h.fake.queue_run(
+        "org/app",
+        &[
+            (&["Self-Hosted", "CF-2g"], "a"),
+            (&[" self-hosted", "cf-2g "], "b"),
+            (&["self-hosted", "cf-2g"], "c"),
+        ],
+        "refs/heads/main",
+    );
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(read.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), [ids[2]]);
+
+    // A matrix of one set is one set, however many jobs.
+    let h = harness().await;
+    let jobs: Vec<(&[&str], &str)> = (0..50)
+        .map(|_| (&["self-hosted", "cf-2g"][..], "matrix"))
+        .collect();
+    let ids = h.fake.queue_run("org/app", &jobs, "refs/heads/main");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(read.jobs.len(), 1);
+    assert_eq!(
+        read.jobs[0].id,
+        *ids.iter().max().unwrap(),
+        "the newest job of the set stands for it"
+    );
+    assert!(read.left_out.is_empty(), "{:?}", read.left_out);
+
+    // A job of too many or too long labels is no set served: it is not kept, and needs no word.
+    let h = harness().await;
+    let mut many: Vec<String> = (0..MAX_SET_LABELS).map(|n| format!("l{n}")).collect();
+    many.push("self-hosted".into());
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let long = "x".repeat(MAX_LABEL_BYTES + 1);
+    h.fake.queue_job("org/app", &many, "many");
+    h.fake.queue_job("org/app", &["self-hosted", &long], "long");
+    let fine = h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "fine");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(read.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), [fine]);
+    assert!(read.left_out.is_empty(), "{:?}", read.left_out);
+}
+
+// added: a run of a pull request from a fork says so: on a public repository its jobs are a stranger's code.
+#[tokio::test]
+async fn a_job_of_a_forks_pull_request_says_so() {
+    let h = harness().await;
+    let own = h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "own");
+    let stranger = h.fake.queue_job("org/app", &["self-hosted", "cf-4g"], "stranger");
+    h.fake.from_fork(stranger);
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    let forks: Vec<(i64, bool)> = read.jobs.iter().map(|j| (j.id, j.from_fork)).collect();
+    assert_eq!(forks, [(stranger, true), (own, false)]);
+}
+
+// added: an answer over the body limit is refused, never held, and a slow one gives up at the client's timeout.
+#[tokio::test]
+async fn a_giant_or_slow_answer_is_an_error() {
+    let h = harness().await;
+    // The harness reads at most 64 KiB: a run whose jobs name labels of 40 KiB each is over it.
+    let big = "x".repeat(40 * 1024);
+    h.fake.queue_run(
+        "org/app",
+        &[(&["self-hosted", &big], "a"), (&["self-hosted", &big], "b")],
+        "refs/heads/main",
+    );
+    assert!(matches!(
+        h.app.waiting_jobs(1, "org/app").await,
+        Err(Error::Refused(_))
+    ));
+
+    let h = harness_with(fast(), Duration::from_millis(300)).await;
+    h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "build");
+    h.fake.fail(
+        "/jobs",
+        Reply::After(Duration::from_secs(5), Box::new(Reply::empty(200))),
+        10,
+    );
+    let started = Instant::now();
+    assert!(matches!(
+        h.app.waiting_jobs(1, "org/app").await,
+        Err(Error::Transport(_))
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
 }

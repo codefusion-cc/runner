@@ -20,6 +20,12 @@ pub const DOCKER_LABEL: &str = "cf-docker";
 /// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
 
+/// The most labels one set may name. A `runs-on` names a handful; a stranger's pull request could name thousands.
+pub const MAX_SET_LABELS: usize = 16;
+
+/// The longest label of a set that is served.
+pub const MAX_LABEL_BYTES: usize = 64;
+
 /// Labels that name a platform these Actions runners are not: a job asking for one of them is left to other Actions
 /// runners.
 const FOREIGN: [&str; 6] = ["macos", "osx", "windows", "x64", "x86", "arm"];
@@ -42,6 +48,40 @@ impl LabelSet {
             .filter(|l| !l.is_empty())
             .collect();
         LabelSet(sorted.into_iter().collect())
+    }
+
+    /// The set these Actions runners serve for a job that asks for `labels`: a `runs-on` whose expressions are
+    /// read, or a job's labels as GitHub's jobs API names them. Lowercased and without repeats, at most
+    /// [`MAX_SET_LABELS`] labels, each of letters, digits (in any script), `-`, `_` and `.` and at most
+    /// [`MAX_LABEL_BYTES`] long; none empty, none of another platform, and one of them ours: [`POOL_LABEL`], [`DOCKER_LABEL`] or a
+    /// size. `None` for any other: such a job is left to other Actions runners.
+    pub fn served<I, S>(labels: I) -> Option<LabelSet>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut set = BTreeSet::new();
+        for label in labels {
+            let label = label.as_ref().trim();
+            if label.is_empty() || label.len() > MAX_LABEL_BYTES {
+                return None;
+            }
+            // No comma, space or other sign: a set's key joins its labels with commas, so one label must never
+            // read as two.
+            let label = label.to_lowercase();
+            let plain = label
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !plain || label.len() > MAX_LABEL_BYTES || FOREIGN.contains(&label.as_str()) {
+                return None;
+            }
+            set.insert(label);
+            if set.len() > MAX_SET_LABELS {
+                return None;
+            }
+        }
+        let set = LabelSet(set.into_iter().collect());
+        set.0.iter().any(|label| is_ours(label)).then_some(set)
     }
 
     /// The labels, sorted.
@@ -143,8 +183,9 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
                 .and_then(Node::as_str);
             if let (true, Some(input)) = (uses, input)
                 && is_pool_expression(input)
+                && let Some(set) = LabelSet::served(resolve(input, vars))
             {
-                seen.insert(LabelSet::new(resolve(input, vars)));
+                seen.insert(set);
             }
         }
     }
@@ -296,21 +337,13 @@ fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
 
     let mut set = Vec::with_capacity(labels.len());
     for label in labels {
-        let labels = if is_pool_expression(&label) {
-            resolve(&label, vars)
+        if is_pool_expression(&label) {
+            set.extend(resolve(&label, vars));
         } else {
-            vec![label]
-        };
-        for label in labels {
-            let label = label.trim().to_lowercase();
-            if label.is_empty() || label.contains("${{") || FOREIGN.contains(&label.as_str()) {
-                return None;
-            }
             set.push(label);
         }
     }
-    let set = LabelSet::new(set);
-    set.labels().iter().any(|l| is_ours(l)).then_some(set)
+    LabelSet::served(set)
 }
 
 /// Whether a (lowercase) label is one these Actions runners serve: [`POOL_LABEL`], [`DOCKER_LABEL`] or a size.

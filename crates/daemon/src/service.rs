@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,9 +16,9 @@ use cf_console_client::{
     MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage,
     ScaleSetStatus, SizeStatus, Status, Update,
 };
-use cf_ghapp::{Clock, GitHubApp};
+use cf_ghapp::{Clock, GitHubApp, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
-use cf_workflows::self_hosted_with;
+use cf_workflows::{LabelSet, self_hosted_with};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Notify;
@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 use crate::adapters::SetRegistry;
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
+use crate::queued::{Bounds, Look, Queued, QueuedSet};
 use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
@@ -94,6 +95,16 @@ pub struct ServiceConfig {
     pub update_limit: Duration,
     /// How often the settings file is looked at.
     pub settings_every: Duration,
+    /// How often the jobs GitHub has queued are read, for the label sets the default branch's workflows do not
+    /// name: a pull request's new workflow or labels.
+    pub queue_every: Duration,
+    /// How long one read of every repository's queue may take in all; a repository not read in time keeps what it
+    /// has.
+    pub queue_budget: Duration,
+    /// How long a label set only queued jobs ask for is served after a job of it was last seen queued or running.
+    pub queued_keep: Duration,
+    /// The most label sets of queued jobs served for one repository, and for the host: the newest are.
+    pub queued_bounds: (usize, usize),
 }
 
 impl ServiceConfig {
@@ -120,6 +131,10 @@ impl ServiceConfig {
             ),
             update_limit: Duration::from_secs(50 * 60),
             settings_every: Duration::from_secs(30),
+            queue_every: Duration::from_secs(60),
+            queue_budget: Duration::from_secs(45),
+            queued_keep: Duration::from_secs(30 * 60),
+            queued_bounds: (8, 32),
         }
     }
 }
@@ -181,10 +196,20 @@ struct Read {
     /// Repositories that could not be read: nothing is concluded about them.
     unread: BTreeSet<String>,
     problems: Vec<String>,
-    /// How many repositories this Mac serves.
-    served: usize,
+    /// The repositories this Mac serves, with the installation that gives each.
+    repos: Vec<(Repo, i64)>,
 }
 
+/// One look's reading of the jobs GitHub has queued: the sets this host would serve for them that main does not
+/// name, the repositories whose queue could not be read, and what went wrong.
+#[derive(Default)]
+struct QueueRead {
+    seen: Vec<(String, QueuedSet)>,
+    unread: BTreeSet<String>,
+    problems: Vec<String>,
+}
+
+#[derive(Clone)]
 struct Wanted {
     repo: String,
     client: ScaleSetClient,
@@ -241,6 +266,14 @@ struct Shared<H, V> {
     clients: Mutex<BTreeMap<String, ScaleSetClient>>,
     discovery_error: Mutex<Option<String>>,
     not_serving: Mutex<Option<String>>,
+    /// The last look at the default branches, which a look at the queue alone builds on; none before the first
+    /// and once the Mac wants no scale sets.
+    main: Mutex<Option<Arc<Read>>>,
+    /// The label sets of queued jobs that are served beside main's.
+    queued: Mutex<Queued>,
+    /// Where the next look at the queues starts among the repositories: the first one the last look had no time
+    /// for, so that no repository is late every time.
+    queue_cursor: AtomicUsize,
     results: Mutex<Vec<CommandResult>>,
     /// Registrations GitHub would not remove, and when each is tried again.
     refused: Mutex<BTreeMap<String, Instant>>,
@@ -319,6 +352,8 @@ const STATUS_TEXT_MAX: usize = 1000;
 const HOST_ERROR_MAX: usize = 300;
 /// The most labels a scale set lists to the console.
 const MAX_LABELS: usize = 30;
+/// How many repositories' queues are read at once.
+const QUEUE_READS: usize = 4;
 
 /// `text` cut to `max` characters, with an ellipsis where it was cut: one long error must not make the console
 /// refuse the Mac's whole report.
@@ -421,6 +456,13 @@ impl Reports for LoggedReports {
 }
 
 impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
+    /// Another handle on this service, for a task of its own.
+    fn handle(&self) -> Service<H, V> {
+        Service {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// A service that does nothing until its rounds are called.
     pub fn new(parts: ServiceParts<H, V>) -> Service<H, V> {
         Service {
@@ -437,6 +479,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 clients: Mutex::new(BTreeMap::new()),
                 discovery_error: Mutex::new(None),
                 not_serving: Mutex::new(None),
+                main: Mutex::new(None),
+                queued: Mutex::new(Queued::default()),
+                queue_cursor: AtomicUsize::new(0),
                 refused: Mutex::new(BTreeMap::new()),
                 console_paused: Mutex::new(false),
                 told: Mutex::new((0, false)),
@@ -549,17 +594,52 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         self.look(true).await;
     }
 
+    /// Reads the jobs GitHub has queued and serves the label sets of those no workflow on a default branch names,
+    /// as [`Service::discover`] does, on the repositories and workflows the last discovery read. Only a change of
+    /// those sets reaches GitHub: one more to serve, one that expired.
+    pub async fn look_at_queue(&self) {
+        let Some(read) = self.shared.main.lock().expect("main").clone() else {
+            return;
+        };
+        let before: BTreeMap<String, String> = self
+            .shared
+            .queued
+            .lock()
+            .expect("queued")
+            .sets()
+            .iter()
+            .map(|(name, q)| (name.clone(), q.repo.clone()))
+            .collect();
+        let (queued, queue_problems) = self.queued_wanted(&read).await;
+        let mut problems = read.problems.clone();
+        problems.extend(queue_problems);
+        // Only the repositories whose sets changed need their scale sets listed.
+        let mut changed: BTreeSet<String> = before
+            .iter()
+            .filter(|(name, _)| !queued.contains_key(*name))
+            .map(|(_, repo)| repo.clone())
+            .collect();
+        changed.extend(
+            queued
+                .iter()
+                .filter(|(name, _)| !before.contains_key(*name))
+                .map(|(_, want)| want.repo.clone()),
+        );
+        if changed.is_empty() {
+            self.say(problems, read.repos.len(), false);
+            return;
+        }
+        let mut wanted = read.wanted.clone();
+        wanted.extend(queued);
+        self.apply(wanted, &read.unread, Some(&changed), problems, read.repos.len())
+            .await;
+    }
+
     /// One look at GitHub. `wants`: whether this Mac still wants scale sets; when not, every one of its own goes.
     /// Says which scale sets of this Mac it could not delete.
     async fn look(&self, wants: bool) -> Vec<String> {
         let shared = &self.shared;
-        let machine = &shared.config.machine;
-        let Read {
-            wanted,
-            unread,
-            problems,
-            served,
-        } = match self.read(wants).await {
+        let read = match self.read(wants).await {
             Ok(read) => read,
             Err(error) => {
                 // Nothing is known: everything stays as it is.
@@ -568,6 +648,33 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 return vec!["GitHub could not be asked for this host's scale sets".into()];
             }
         };
+        let mut wanted = read.wanted.clone();
+        let mut problems = read.problems.clone();
+        if wants {
+            let (queued, queue_problems) = self.queued_wanted(&read).await;
+            wanted.extend(queued);
+            problems.extend(queue_problems);
+        } else {
+            shared.queued.lock().expect("queued").clear();
+        }
+        let read = Arc::new(read);
+        *shared.main.lock().expect("main") = wants.then(|| read.clone());
+        self.apply(wanted, &read.unread, None, problems, read.repos.len())
+            .await
+    }
+
+    /// Serves the scale sets `wanted` and closes, and once no Actions runner of it is left deletes, every other of
+    /// this Mac at GitHub, but for those of a repository that could not be read. Says which it could not delete.
+    async fn apply(
+        &self,
+        wanted: BTreeMap<String, Wanted>,
+        unread: &BTreeSet<String>,
+        only: Option<&BTreeSet<String>>,
+        problems: Vec<String>,
+        served: usize,
+    ) -> Vec<String> {
+        let shared = &self.shared;
+        let machine = &shared.config.machine;
 
         // Scale sets of this Mac that nothing asks for any more, from this run of the Runner or one before.
         let clients: Vec<(String, ScaleSetClient)> = shared
@@ -580,7 +687,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let prefix = format!("{machine}--");
         let mut kept: Vec<String> = Vec::new();
         for (repo, client) in clients {
-            if unread.contains(&repo) {
+            if unread.contains(&repo) || only.is_some_and(|only| !only.contains(&repo)) {
                 continue;
             }
             let sets = match client.list_scale_sets().await {
@@ -635,15 +742,228 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             let task = tokio::spawn(serve(shared.clone(), want.client.clone(), state.clone(), stopped));
             serving.insert(name, Serving { stop, task, state });
         }
+        kept.extend(self.say(problems, served, true));
+        kept
+    }
+
+    /// Keeps what a look found wrong for the console, and logs it: `always`, or when it is news.
+    fn say(&self, problems: Vec<String>, served: usize, always: bool) -> Vec<String> {
+        let shared = &self.shared;
         *shared.not_serving.lock().expect("not serving") = (served == 0 && problems.is_empty())
             .then(|| "the App is installed on no repository this host serves".to_string());
-        *shared.discovery_error.lock().expect("discovery") =
-            (!problems.is_empty()).then(|| problems.join("; "));
-        for problem in &problems {
-            tracing::warn!(%problem, "discovery");
+        let said = (!problems.is_empty()).then(|| problems.join("; "));
+        let before = std::mem::replace(
+            &mut *shared.discovery_error.lock().expect("discovery"),
+            said.clone(),
+        );
+        if always || before != said {
+            for problem in &problems {
+                tracing::warn!(%problem, "discovery");
+            }
         }
-        kept.extend(problems);
-        kept
+        problems
+    }
+
+    /// The scale sets of queued jobs to serve beside main's, from a new look at the queue and those seen before,
+    /// and what went wrong or was left out.
+    async fn queued_wanted(&self, read: &Read) -> (BTreeMap<String, Wanted>, Vec<String>) {
+        let shared = &self.shared;
+        let QueueRead {
+            seen,
+            unread,
+            mut problems,
+        } = self.read_queue(read).await;
+        let unread: BTreeSet<String> = read.unread.iter().cloned().chain(unread).collect();
+        let served: BTreeSet<String> = read
+            .repos
+            .iter()
+            .map(|(repo, _)| repo.full_name.clone())
+            .collect();
+        let main: BTreeSet<String> = read.wanted.keys().cloned().collect();
+        let (per_repo, per_host) = shared.config.queued_bounds;
+        let bounds = Bounds {
+            keep: shared.config.queued_keep,
+            per_repo,
+            per_host,
+        };
+        let look = Look {
+            now: shared.clock.now(),
+            served: &served,
+            unread: &unread,
+            main: &main,
+        };
+        let settings = shared.machines.settings();
+        let mut queued = shared.queued.lock().expect("queued");
+        for (name, set) in seen {
+            queued.seen(name, set);
+        }
+        // What the settings or the policy stopped serving since a set was seen goes now, as main's would.
+        queued.retain(
+            |q| match read.repos.iter().find(|(repo, _)| repo.full_name == q.repo) {
+                Some((repo, _)) => self.size_here(repo, &q.set, &settings) == Ok(q.size),
+                None => true,
+            },
+        );
+        problems.extend(queued.select(&look, bounds));
+        let clients = shared.clients.lock().expect("clients");
+        let wanted = queued
+            .sets()
+            .iter()
+            .filter_map(|(name, q)| {
+                let want = Wanted {
+                    repo: q.repo.clone(),
+                    client: clients.get(&q.repo)?.clone(),
+                    labels: q.set.labels().to_vec(),
+                    size: q.size,
+                    docker: q.set.docker(),
+                };
+                Some((name.clone(), want))
+            })
+            .collect();
+        (wanted, problems)
+    }
+
+    /// Reads the jobs GitHub has queued or runs in the repositories `read` served and read, for the label sets this
+    /// host would serve that main does not name. It only reads, [`QUEUE_READS`] repositories at once. The whole
+    /// look takes at most [`ServiceConfig::queue_budget`]: a repository not read by then counts as not read, and
+    /// the next look starts with it.
+    async fn read_queue(&self, read: &Read) -> QueueRead {
+        let shared = &self.shared;
+        let machine = &shared.config.machine;
+        let settings = shared.machines.settings();
+        let now = shared.clock.now();
+        let deadline = tokio::time::Instant::now() + shared.config.queue_budget;
+        let repos: Vec<&(Repo, i64)> = read
+            .repos
+            .iter()
+            .filter(|(repo, _)| !read.unread.contains(&repo.full_name))
+            .collect();
+        let first = shared.queue_cursor.load(Ordering::Relaxed) % repos.len().max(1);
+        let order: Vec<usize> = (0..repos.len()).map(|k| (first + k) % repos.len()).collect();
+        let mut answers: Vec<Option<Result<cf_ghapp::Waiting, cf_ghapp::Error>>> =
+            repos.iter().map(|_| None).collect();
+        let mut next = order.iter().copied();
+        let mut reads = tokio::task::JoinSet::new();
+        loop {
+            while reads.len() < QUEUE_READS
+                && let Some(i) = next.next()
+            {
+                let (app, installation, name) =
+                    (shared.app.clone(), repos[i].1, repos[i].0.full_name.clone());
+                reads.spawn(async move { (i, app.waiting_jobs(installation, &name).await) });
+            }
+            match tokio::time::timeout_at(deadline, reads.join_next()).await {
+                Ok(Some(Ok((i, answer)))) => answers[i] = Some(answer),
+                // A read that panicked counts as one not made in time.
+                Ok(Some(Err(error))) => tracing::error!(%error, "a read of a queue failed"),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // Out of time: the reads still going end here.
+        drop(reads);
+        // What the queue of a repository no longer served last read as is not needed again.
+        shared
+            .app
+            .forget_queues(|name| read.repos.iter().any(|(repo, _)| repo.full_name == name));
+        if let Some(&i) = order.iter().find(|&&i| answers[i].is_none()) {
+            shared.queue_cursor.store(i, Ordering::Relaxed);
+        }
+        let mut queue = QueueRead::default();
+        let mut late: Vec<String> = Vec::new();
+        for ((repo, _), answer) in repos.into_iter().zip(answers) {
+            let name = &repo.full_name;
+            let waiting = match answer {
+                Some(Ok(waiting)) => waiting,
+                // Refused, not limited: a rate limit is no missing permission.
+                Some(Err(cf_ghapp::Error::Status(refused)))
+                    if matches!(refused.status, 403 | 404) && !refused.is_rate_limited() =>
+                {
+                    queue.problems.push(format!(
+                        "{name}: its queued jobs could not be read ({refused}); only the label sets of the \
+                         workflows on its default branch are served (the App needs \"Actions: read\")"
+                    ));
+                    queue.unread.insert(name.clone());
+                    continue;
+                }
+                Some(Err(error)) => {
+                    queue
+                        .problems
+                        .push(format!("{name}: its queued jobs could not be read ({error})"));
+                    queue.unread.insert(name.clone());
+                    continue;
+                }
+                None => {
+                    late.push(name.clone());
+                    queue.unread.insert(name.clone());
+                    continue;
+                }
+            };
+            for why in &waiting.left_out {
+                tracing::info!(repo = %name, %why, "a queued job's labels were not read");
+            }
+            for job in waiting.jobs {
+                // A public repository's pull request from a fork is a stranger's code: it runs on main's sets, if
+                // its labels are theirs, but makes none of its own.
+                if job.from_fork && !repo.private {
+                    tracing::debug!(repo = %name, job = job.id, "a fork's queued job makes no set on a public repository");
+                    continue;
+                }
+                let set = job.set;
+                let set_name = scale_set_name(machine, name, &set);
+                if read.wanted.contains_key(&set_name) {
+                    continue;
+                }
+                match self.size_here(repo, &set, &settings) {
+                    Ok(size) => queue.seen.push((
+                        set_name,
+                        QueuedSet {
+                            repo: name.clone(),
+                            set,
+                            size,
+                            last_seen: now,
+                            newest: (job.created, job.id),
+                        },
+                    )),
+                    Err(why) => {
+                        tracing::debug!(repo = %name, labels = %set.key(), why = why.unwrap_or("no size"), "a queued job's set is not served")
+                    }
+                }
+            }
+        }
+        if !late.is_empty() {
+            queue.problems.push(format!(
+                "the queued jobs of {} were not read in time",
+                late.join(", ")
+            ));
+        }
+        queue
+    }
+
+    /// The size of the machines this host serves a repository's label set with, or why it serves none: none when
+    /// the set names no size, which needs no word.
+    fn size_here(
+        &self,
+        repo: &Repo,
+        set: &LabelSet,
+        settings: &cf_budget::Settings,
+    ) -> Result<Size, Option<&'static str>> {
+        let policy = &self.shared.config.policy;
+        if set.docker() && !policy.serves_docker(repo) {
+            // Not offered to GitHub: the job waits for a Mac that gives this repository Docker. A Mac left out on
+            // purpose is no problem of discovery.
+            return Err(Some("Docker is only for the repositories in docker_repos"));
+        }
+        if !policy.serves_labels(set) {
+            // Pinned to hosts of another kind: left to them, as a size this host never runs.
+            return Err(Some("it asks for host labels this host does not have"));
+        }
+        // `cf-docker` alone is a machine of the size `self-hosted` means.
+        let size = Size::of_labels(set.labels().iter().map(String::as_str))
+            .or_else(|| set.docker().then_some(Size::G4))
+            .ok_or(None)?;
+        // Not offered to GitHub at all: a job nobody here can run is left to the other Macs.
+        settings.can_run(size).map_err(|refusal| Some(refusal.name()))?;
+        Ok(size)
     }
 
     /// What GitHub shows of the repositories this Mac serves: the scale sets their workflows ask for (none when
@@ -656,7 +976,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let mut wanted: BTreeMap<String, Wanted> = BTreeMap::new();
         let mut unread: BTreeSet<String> = BTreeSet::new();
         let mut problems: Vec<String> = Vec::new();
-        let mut served = 0usize;
+        let mut served: Vec<(Repo, i64)> = Vec::new();
         let installations = shared.app.installations().await?;
         for installation in installations {
             let repos = match shared.app.repositories(installation.id).await {
@@ -677,7 +997,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !shared.config.policy.serves(&repo) {
                     continue;
                 }
-                served += 1;
+                served.push((repo.clone(), installation.id));
                 let name = repo.full_name.clone();
                 let client = shared
                     .clients
@@ -729,28 +1049,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     continue;
                 }
                 for set in self_hosted_with(&files, &variables) {
-                    if set.docker() && !shared.config.policy.serves_docker(&repo) {
-                        // Not offered to GitHub: the job waits for a Mac that gives this repository Docker. A Mac
-                        // left out on purpose is no problem of discovery.
-                        tracing::info!(repo = %name, labels = %set.key(), "not served: Docker is only for the repositories in docker_repos");
-                        continue;
-                    }
-                    if !shared.config.policy.serves_labels(&set) {
-                        // Pinned to hosts of another kind: left to them, as a size this host never runs.
-                        tracing::info!(repo = %name, labels = %set.key(), "not served: it asks for host labels this host does not have");
-                        continue;
-                    }
-                    // `cf-docker` alone is a machine of the size `self-hosted` means.
-                    let Some(size) = Size::of_labels(set.labels().iter().map(String::as_str))
-                        .or_else(|| set.docker().then_some(Size::G4))
-                    else {
-                        continue;
+                    let size = match self.size_here(&repo, &set, &settings) {
+                        Ok(size) => size,
+                        Err(Some(why)) => {
+                            tracing::info!(repo = %name, labels = %set.key(), %why, "a label set is not served");
+                            continue;
+                        }
+                        Err(None) => continue,
                     };
-                    if let Err(refusal) = settings.can_run(size) {
-                        // Not offered to GitHub at all: a job nobody here can run is left to the other Macs.
-                        tracing::info!(repo = %name, size = size.label(), why = refusal.name(), "a size this host never runs is not served");
-                        continue;
-                    }
                     wanted.insert(
                         scale_set_name(machine, &name, &set),
                         Wanted {
@@ -768,7 +1074,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             wanted,
             unread,
             problems,
-            served,
+            repos: served,
         })
     }
 
@@ -777,23 +1083,35 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// second list is what could not be read. For a check before the service is installed: a missing permission
     /// of the App (its variables, its workflows) shows here.
     pub async fn survey(&self) -> (Vec<String>, Vec<String>) {
-        match self.read(true).await {
-            Ok(read) => (
-                read.wanted
-                    .values()
-                    .map(|want| {
-                        format!(
-                            "{}: [{}] as {}",
-                            want.repo,
-                            want.labels.join(", "),
-                            want.size.label()
-                        )
-                    })
-                    .collect(),
-                read.problems,
-            ),
-            Err(error) => (Vec::new(), vec![format!("GitHub: {error}")]),
-        }
+        let read = match self.read(true).await {
+            Ok(read) => read,
+            Err(error) => return (Vec::new(), vec![format!("GitHub: {error}")]),
+        };
+        let queue = self.read_queue(&read).await;
+        let mut lines: Vec<String> = read
+            .wanted
+            .values()
+            .map(|want| {
+                format!(
+                    "{}: [{}] as {}",
+                    want.repo,
+                    want.labels.join(", "),
+                    want.size.label()
+                )
+            })
+            .collect();
+        let queued: BTreeMap<&String, &QueuedSet> = queue.seen.iter().map(|(name, q)| (name, q)).collect();
+        lines.extend(queued.values().map(|q| {
+            format!(
+                "{}: [{}] as {}, for queued jobs",
+                q.repo,
+                q.set.labels().join(", "),
+                q.size.label()
+            )
+        }));
+        let mut problems = read.problems;
+        problems.extend(queue.problems);
+        (lines, problems)
     }
 
     /// The client of a repository no look at GitHub has shown since the Runner started: a registration of before
@@ -1454,9 +1772,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 None => "updating: building".into(),
             });
         }
-        let service = Service {
-            shared: self.shared.clone(),
-        };
+        let service = self.handle();
         let id = id.to_string();
         tokio::spawn(async move {
             let outcome = service.updating(&id, updates, commit).await;
@@ -1598,9 +1914,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 tracing::info!(
                     "new settings; no new job until the machines that stand are gone, then the Runner starts again on them"
                 );
-                let service = Service {
-                    shared: self.shared.clone(),
-                };
+                let service = self.handle();
                 tokio::spawn(async move { service.apply_settings(id, settings).await });
             }
         }
@@ -1666,7 +1980,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         });
-        let mut discover = tokio::time::interval(config.discover_every);
+        // The looks at GitHub go on beside the loop: one that waits on GitHub holds up no report and no stop.
+        let (looks_stop, looking) = cf_scaleset::shutdown();
+        let looks = tokio::spawn(self.handle().look_now_and_then(looking));
         let mut sweep = tokio::time::interval(config.sweep_every);
         let mut settings = tokio::time::interval(config.settings_every);
         settings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1680,7 +1996,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     tracing::info!("the Runner ends to start again");
                     break;
                 }
-                _ = discover.tick() => self.discover().await,
                 _ = sweep.tick() => self.sweep().await,
                 _ = settings.tick() => self.look_at_settings(),
                 () = &mut report => {
@@ -1698,9 +2013,39 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
+        looks_stop.trigger();
+        if let Err(error) = looks.await {
+            tracing::error!(%error, "the looks at GitHub failed");
+        }
         self.shutdown().await;
         tick_stop.trigger();
         let _ = ticks.await;
+    }
+
+    /// [`Service::discover`] every [`ServiceConfig::discover_every`] and [`Service::look_at_queue`] every
+    /// [`ServiceConfig::queue_every`], one at a time, until `stop`. A look under way when it comes is given up: the
+    /// shutdown that follows closes every scale set anyway.
+    async fn look_now_and_then(self, mut stop: Shutdown) {
+        let config = &self.shared.config;
+        let mut discover = tokio::time::interval(config.discover_every);
+        let mut queue = tokio::time::interval(config.queue_every);
+        queue.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let looks = async {
+            loop {
+                tokio::select! {
+                    _ = discover.tick() => {
+                        self.discover().await;
+                        // A discovery reads the queue too: the next look at it is a whole interval away.
+                        queue.reset();
+                    }
+                    _ = queue.tick() => self.look_at_queue().await,
+                }
+            }
+        };
+        tokio::select! {
+            () = stop.wait() => {}
+            () = looks => {}
+        }
     }
 
     /// Closes every scale set's session at GitHub, one after the other.
