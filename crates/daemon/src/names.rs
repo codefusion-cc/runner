@@ -123,9 +123,8 @@ impl ServePolicy {
     /// Whether this host serves a label set: it has every host label the set asks for.
     pub fn serves_labels(&self, set: &LabelSet) -> bool {
         set.host_labels().all(|wanted| {
-            self.host_labels
-                .iter()
-                .any(|label| label.eq_ignore_ascii_case(wanted))
+            // Both lowercase: a LabelSet's and the config's own, which takes no other.
+            self.host_labels.iter().any(|label| label == wanted)
         })
     }
 }

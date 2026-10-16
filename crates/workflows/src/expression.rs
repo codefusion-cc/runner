@@ -94,20 +94,17 @@ pub(crate) fn is_pool_expression(label: &str) -> bool {
 /// names none of these Actions runners.
 pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
     let mut inner = whole(label)?.trim();
-    let mut list = None;
-    loop {
-        let lower = inner.to_ascii_lowercase();
-        let Some(function) = ["tojson(", "fromjson("]
-            .into_iter()
-            .find(|f| lower.starts_with(f))
-        else {
-            break;
-        };
+    let (mut from_json, mut to_json) = (false, false);
+    while let Some(function) = ["tojson(", "fromjson("].into_iter().find(|f| {
+        inner
+            .get(..f.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(f))
+    }) {
         if !inner.ends_with(')') {
             break;
         }
-        // Any toJSON makes a string again, which an outer fromJSON only parses back.
-        list = Some(list.unwrap_or(true) && function == "fromjson(");
+        from_json |= function == "fromjson(";
+        to_json |= function == "tojson(";
         inner = inner[inner.find('(')? + 1..inner.len() - 1].trim();
     }
     for operand in split_or(inner)? {
@@ -116,10 +113,12 @@ pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<V
         if value.is_empty() {
             continue;
         }
-        if list == Some(true) && value.starts_with('[') {
-            return Some(
-                serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| vec![value.to_string()]),
-            );
+        // Any toJSON makes a string again, which a fromJSON around it only parses back.
+        if from_json
+            && !to_json
+            && let Ok(labels) = serde_json::from_str::<Vec<String>>(value)
+        {
+            return Some(labels);
         }
         return Some(vec![unquote_json(value)]);
     }

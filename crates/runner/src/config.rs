@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cf_budget::{Limits, Millis, Mode, Settings};
+use cf_console_client::Os;
 use cf_daemon::names::slug;
 use serde::Deserialize;
 
@@ -97,12 +98,11 @@ const fn docker_max_jobs() -> usize {
 }
 
 fn labels() -> Vec<String> {
-    let system = if cfg!(target_os = "macos") {
-        "cf-macos"
-    } else {
-        "cf-linux"
-    };
-    vec![system.into()]
+    match Os::this() {
+        Some(Os::Macos) => vec!["cf-macos".into()],
+        Some(Os::Linux) => vec!["cf-linux".into()],
+        None => Vec::new(),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -212,8 +212,8 @@ impl Config {
         for (i, label) in self.labels.iter().enumerate() {
             if !cf_workflows::is_host_label(label) {
                 return Err(format!(
-                    "labels: `{label}` is no host label: `cf-` and a name of lowercase letters, digits and single \
-                     dashes that starts with a letter, 40 characters at most, and no label jobs ask for by itself, such as a size or cf-docker"
+                    "labels: `{label}` is no host label: {}",
+                    cf_workflows::HOST_LABEL_RULE
                 ));
             }
             if self.labels[..i].contains(label) {
@@ -572,8 +572,8 @@ mod tests {
             assert_eq!(
                 set(serde_json::json!([label])).err(),
                 Some(format!(
-                    "labels: `{label}` is no host label: `cf-` and a name of lowercase letters, digits and single \
-                     dashes that starts with a letter, 40 characters at most, and no label jobs ask for by itself, such as a size or cf-docker"
+                    "labels: `{label}` is no host label: {}",
+                    cf_workflows::HOST_LABEL_RULE
                 )),
                 "{label}"
             );

@@ -73,12 +73,17 @@ impl LabelSet {
     }
 }
 
+/// What [`is_host_label`] takes, for a person who wrote another label.
+pub const HOST_LABEL_RULE: &str = "`cf-` and a name of lowercase letters, digits and single dashes that starts with a \
+     letter, 40 characters at most, and no label jobs ask for by itself, such as a size or cf-docker";
+
 /// Whether a (lowercase) label names hosts rather than a machine: `cf-` and a name of lowercase letters, digits and
 /// single dashes that starts with a letter, 40 characters in all at most, and no label these Actions runners serve
 /// (a size, [`DOCKER_LABEL`]): `cf-macos`, `cf-linux`. A host serves a set with host labels only when its config
 /// lists every one of them, so a job asks for a kind of host with `[cf-8g, cf-macos]`. A host label alone names no
 /// size.
 pub fn is_host_label(label: &str) -> bool {
+    // HOST_LABEL_RULE says this in words.
     let Some(name) = label.strip_prefix("cf-") else {
         return false;
     };
