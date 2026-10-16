@@ -87,25 +87,40 @@ pub(crate) fn is_pool_expression(label: &str) -> bool {
 }
 
 /// What a pool expression evaluates to, when it is a chain of `||` over `vars.NAME`, `vars['NAME']` and string
-/// literals, optionally wrapped in `toJSON(...)` / `fromJSON(...)`: the first operand that is not empty. `None` when
-/// the expression is anything else or every operand is empty. A value that is a JSON string (`"cf-8g"`, as
-/// `toJSON` makes) comes back unquoted.
-pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<String> {
+/// literals, optionally wrapped in `toJSON(...)` / `fromJSON(...)`: the labels of the first operand that is not
+/// empty. `None` when the expression is anything else or every operand is empty. A value that is a JSON string
+/// (`"cf-8g"`, as `toJSON` makes) comes back unquoted. Under `fromJSON` with no `toJSON` anywhere a JSON list of
+/// strings (`["cf-8g","cf-macos"]`) is every label in it, as GitHub reads it; a list of anything else is one label, which
+/// names none of these Actions runners.
+pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<Vec<String>> {
     let mut inner = whole(label)?.trim();
-    loop {
-        let lower = inner.to_ascii_lowercase();
-        let wrapped = ["tojson(", "fromjson("].iter().any(|f| lower.starts_with(f)) && inner.ends_with(')');
-        if !wrapped {
+    let (mut from_json, mut to_json) = (false, false);
+    while let Some(function) = ["tojson(", "fromjson("].into_iter().find(|f| {
+        inner
+            .get(..f.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(f))
+    }) {
+        if !inner.ends_with(')') {
             break;
         }
+        from_json |= function == "fromjson(";
+        to_json |= function == "tojson(";
         inner = inner[inner.find('(')? + 1..inner.len() - 1].trim();
     }
     for operand in split_or(inner)? {
         let value = operand_value(operand.trim(), vars)?;
         let value = value.trim();
-        if !value.is_empty() {
-            return Some(unquote_json(value));
+        if value.is_empty() {
+            continue;
         }
+        // Any toJSON makes a string again, which a fromJSON around it only parses back.
+        if from_json
+            && !to_json
+            && let Ok(labels) = serde_json::from_str::<Vec<String>>(value)
+        {
+            return Some(labels);
+        }
+        return Some(vec![unquote_json(value)]);
     }
     None
 }

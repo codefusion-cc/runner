@@ -458,6 +458,7 @@ fn service(
         "0.1.0+446125c0a1b2",
     );
     config.poll_timeout = Duration::from_secs(5);
+    config.policy.host_labels = vec!["cf-macos".into()];
     config.sweep_again = Duration::from_millis(50);
     config.update_limit = update_limit;
     config.backoff = (
@@ -1401,6 +1402,29 @@ async fn a_registration_of_a_repository_no_look_has_shown_is_removed_all_the_sam
     until("the end at the console", || rig.events().len() == 2).await;
     rig.nothing_left().await;
     assert_eq!(rig.service.sets(), [], "no scale set was served to do it");
+}
+
+/// A job pinned to a kind of host (`[cf-4g, cf-macos]`, from a variable read with fromJSON) is served only by a
+/// host whose config lists every host label it asks for; the others leave it to the hosts that have them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_that_asks_for_host_labels_is_served_only_by_a_host_that_has_them() {
+    let rig = Rig::new(3).await;
+    rig.github.set_workflow(
+        REPO,
+        "pinned.yml",
+        "on: push\njobs:\n  heavy:\n    runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY || '\"ubuntu-latest\"') }}\n    steps: []\n  linux:\n    runs-on: [cf-4g, cf-linux]\n    steps: []\n  both:\n    runs-on: [cf-4g, cf-linux, cf-macos]\n    steps: []\n",
+    );
+    rig.github
+        .set_variable(REPO, "CI_RUNNER_HEAVY", r#"["cf-4g","cf-macos"]"#);
+    let (served, problems) = rig.service.survey().await;
+    assert_eq!(
+        served,
+        [
+            "org/app: [cf-2g, self-hosted] as cf-2g",
+            "org/app: [cf-4g, cf-macos] as cf-4g"
+        ]
+    );
+    assert_eq!(problems, Vec::<String>::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

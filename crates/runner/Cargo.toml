@@ -23,6 +23,7 @@ cf-scaleset = { path = "../scaleset" }
 cf-secret = { path = "../secret" }
 cf-vmhost = { path = "../vmhost" }
 cf-vmm = { path = "../vmm" }
+cf-workflows = { path = "../workflows" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

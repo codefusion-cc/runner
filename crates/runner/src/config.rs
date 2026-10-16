@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cf_budget::{Limits, Millis, Mode, Settings};
+use cf_console_client::Os;
 use cf_daemon::names::slug;
 use serde::Deserialize;
 
@@ -77,6 +78,11 @@ pub struct Config {
     /// commit and builds in. Without it the Runner is updated by hand: a person's checkout is never touched.
     #[serde(default)]
     pub build_folder: Option<PathBuf>,
+    /// The host labels this host has, 8 at most: a job that asks for host labels (`runs-on: [cf-8g, cf-macos]`)
+    /// runs only on a host that has every one of them. Left out for its system's: `cf-macos` on a Mac, `cf-linux`
+    /// on Linux.
+    #[serde(default = "labels")]
+    pub labels: Vec<String>,
 }
 
 fn github_api() -> String {
@@ -89,6 +95,14 @@ const fn deadline_minutes() -> u64 {
 
 const fn docker_max_jobs() -> usize {
     1
+}
+
+fn labels() -> Vec<String> {
+    match Os::this() {
+        Some(Os::Macos) => vec!["cf-macos".into()],
+        Some(Os::Linux) => vec!["cf-linux".into()],
+        None => Vec::new(),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -191,6 +205,20 @@ impl Config {
                 Settings::FLOOR_PERCENT.start(),
                 Settings::FLOOR_PERCENT.end()
             ));
+        }
+        if self.labels.len() > 8 {
+            return Err("labels: 8 at most".into());
+        }
+        for (i, label) in self.labels.iter().enumerate() {
+            if !cf_workflows::is_host_label(label) {
+                return Err(format!(
+                    "labels: `{label}` is no host label: {}",
+                    cf_workflows::HOST_LABEL_RULE
+                ));
+            }
+            if self.labels[..i].contains(label) {
+                return Err(format!("labels: `{label}` is listed twice"));
+            }
         }
         if !(1..=8).contains(&self.docker_max_jobs) {
             return Err("docker_max_jobs: between 1 and 8".into());
@@ -503,6 +531,61 @@ mod tests {
             assert!(with(|v| v["docker_max_jobs"] = max.into()).is_err(), "{max}");
         }
         assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
+    }
+
+    #[test]
+    fn a_hosts_labels_are_its_systems_unless_set_and_only_host_labels() {
+        let system = if cfg!(target_os = "macos") {
+            "cf-macos"
+        } else {
+            "cf-linux"
+        };
+        assert_eq!(with(|_| ()).expect("config").labels, [system]);
+        let set = |labels: serde_json::Value| with(|v| v["labels"] = labels);
+        assert_eq!(
+            set(serde_json::json!(["cf-macos", "cf-studio"]))
+                .expect("set")
+                .labels,
+            ["cf-macos", "cf-studio"]
+        );
+        assert_eq!(
+            set(serde_json::json!([])).expect("none").labels,
+            Vec::<String>::new(),
+            "a host with none serves only what asks for none"
+        );
+        let eight: Vec<String> = (0..8).map(|i| format!("cf-host{i}")).collect();
+        assert!(set(serde_json::json!(eight)).is_ok(), "eight");
+        let nine: Vec<String> = (0..9).map(|i| format!("cf-host{i}")).collect();
+        assert_eq!(
+            set(serde_json::json!(nine)).err().as_deref(),
+            Some("labels: 8 at most")
+        );
+        for label in [
+            "cf-8g",
+            "cf-docker",
+            "macos",
+            "CF-MACOS",
+            "cf-",
+            "self-hosted",
+            "cf-mac os",
+        ] {
+            assert_eq!(
+                set(serde_json::json!([label])).err(),
+                Some(format!(
+                    "labels: `{label}` is no host label: {}",
+                    cf_workflows::HOST_LABEL_RULE
+                )),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            set(serde_json::json!(["cf-macos", "cf-macos"])).err().as_deref(),
+            Some("labels: `cf-macos` is listed twice")
+        );
+        assert!(
+            set(serde_json::json!("cf-macos")).is_err(),
+            "a list, not one label"
+        );
     }
 
     #[test]
