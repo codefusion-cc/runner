@@ -4362,6 +4362,8 @@ async fn queued_jobs_this_host_must_not_take_get_no_set() {
     let sets: Vec<Vec<String>> = rig.service.sets().into_iter().map(|s| s.labels).collect();
     assert_eq!(sets.len(), 2, "main's and the control's only: {sets:?}");
     serving(&rig, "fine").await;
+    // Main's set reaches GitHub on its own listener, not necessarily before the control's.
+    until("both sets at GitHub", || rig.github.scale_sets().len() == 2).await;
     assert_eq!(rig.github.scale_sets().len(), 2);
     assert_eq!(
         rig.service.discovery_error(),
