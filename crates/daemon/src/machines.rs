@@ -1393,6 +1393,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// The longest a job may run.
+    pub fn deadline(&self) -> Duration {
+        self.config.deadline
+    }
+
     /// The budget's numbers.
     pub fn settings(&self) -> Settings {
         self.lock().budget.settings().clone()

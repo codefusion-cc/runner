@@ -113,6 +113,7 @@ pub fn status(machine: &str) -> Status {
         idle_with_jobs_waiting_seconds: 0,
         idle_with_jobs_waiting_reason: None,
         sizes: vec![],
+        commands: vec![],
         scale_sets: vec![ScaleSetStatus {
             repo: "org/app".into(),
             name: "mac-a--app-1a2b".into(),
@@ -138,6 +139,7 @@ pub fn report(machine: &str) -> Report {
         model: "Apple M5".into(),
         os: Some(cf_console_client::Os::Macos),
         settings: None,
+        limits: None,
         image: None,
         jobs: vec![],
         results: vec![],

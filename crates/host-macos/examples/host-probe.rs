@@ -41,11 +41,13 @@ fn main() -> std::process::ExitCode {
     println!("File-backed pages          {}", raw.file_backed_pages);
     println!("Anonymous pages            {}", raw.anonymous_pages);
     println!("Pages occupied by compressor {}", raw.compressor_pages);
+    println!("Pages stored in compressor {}", raw.compressed_pages);
     println!("Swapouts                   {}", raw.swapouts);
     println!(
         "pressure level             {} ({:?})",
         raw.pressure_level, reading.pressure
     );
+    println!("memorystatus level         {:?}", raw.memorystatus_level);
     println!(
         "swap used / total bytes    {} / {}",
         raw.swap_used_bytes, raw.swap_total_bytes

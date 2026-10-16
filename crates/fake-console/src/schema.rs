@@ -369,6 +369,8 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "notServing", Nullish, text(300))?;
     field(o, path, "scaleSets", Nullish, list(500, scale_set))?;
     field(o, path, "runners", Nullish, list(64, runner))
+    // `commands`, the console's commands this Runner does, is read with `.catch`: one the console cannot read is
+    // dropped and the console assumes the commands of a Runner before it, so no value refuses a report.
 }
 
 fn settings(v: &Value, path: &str) -> Check {
@@ -447,6 +449,7 @@ pub(crate) fn report(v: &Value) -> Check {
     field(o, "", "hostname", Default, text(255))?;
     field(o, "", "model", Default, text(200))?;
     field(o, "", "settings", Nullish, settings)?;
+    // `limits`, what the `settings` command changes, is read with `.catch` as `commands` is: never a refusal.
     field(o, "", "image", Nullish, |v, p| {
         let i = object(v, p)?;
         field(i, p, "commit", Default, text(64))?;

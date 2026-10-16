@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cf_budget::Mode;
+use cf_budget::{Limits, Millis, Mode, Settings};
 use cf_daemon::names::slug;
 use serde::Deserialize;
 
@@ -63,6 +63,16 @@ pub struct Config {
     /// The longest a job may run, in minutes.
     #[serde(default = "deadline_minutes")]
     pub deadline_minutes: u64,
+    /// The most jobs at once, 1 to 32; left out for as many as memory and CPUs let run.
+    #[serde(default)]
+    pub max_jobs: Option<u32>,
+    /// Minutes without a key or the mouse before a workstation takes jobs, 1 to 1440; left out for 15.
+    #[serde(default)]
+    pub idle_minutes: Option<u32>,
+    /// The memory the host keeps for itself, in percent of the installed memory: 1 to 90, and at least 1 GB. Left out
+    /// for the default, 2 GB on a 16 GB Mac nobody works at.
+    #[serde(default)]
+    pub min_free_memory_percent: Option<u32>,
     /// The git checkout that belongs to the Runner alone, which the console's `update` fetches, checks out at a
     /// commit and builds in. Without it the Runner is updated by hand: a person's checkout is never touched.
     #[serde(default)]
@@ -157,6 +167,31 @@ impl Config {
                 return Err(format!("`{url}` is no https address"));
             }
         }
+        if self.max_jobs.is_some_and(|jobs| !(1..=32).contains(&jobs)) {
+            return Err("max_jobs: between 1 and 32".into());
+        }
+        if self
+            .idle_minutes
+            .is_some_and(|minutes| !(1..=24 * 60).contains(&minutes))
+        {
+            return Err("idle_minutes: between 1 and 1440".into());
+        }
+        if self.idle_minutes.is_some() && self.mac_use != Use::Workstation {
+            return Err(
+                "idle_minutes: only a workstation waits for its person; a dedicated host takes jobs at any time"
+                    .into(),
+            );
+        }
+        if self
+            .min_free_memory_percent
+            .is_some_and(|percent| !Settings::FLOOR_PERCENT.contains(&percent))
+        {
+            return Err(format!(
+                "min_free_memory_percent: between {} and {}",
+                Settings::FLOOR_PERCENT.start(),
+                Settings::FLOOR_PERCENT.end()
+            ));
+        }
         if !(1..=8).contains(&self.docker_max_jobs) {
             return Err("docker_max_jobs: between 1 and 8".into());
         }
@@ -181,6 +216,15 @@ impl Config {
         match self.mac_use {
             Use::Dedicated => Mode::Dedicated,
             Use::Workstation => Mode::Workstation,
+        }
+    }
+
+    /// What the file sets of the budget on top of its defaults.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            max_machines: self.max_jobs,
+            idle_after: self.idle_minutes.map(|minutes| Millis::mins(minutes.into())),
+            floor_percent: self.min_free_memory_percent,
         }
     }
 
@@ -459,6 +503,63 @@ mod tests {
             assert!(with(|v| v["docker_max_jobs"] = max.into()).is_err(), "{max}");
         }
         assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
+    }
+
+    #[test]
+    fn the_limits_for_jobs_are_the_defaults_unless_set_and_set_only_within_reason() {
+        assert_eq!(Config::parse(WHOLE).expect("config").limits(), Limits::default());
+        assert_eq!(
+            with(|v| {
+                v["max_jobs"] = 2.into();
+                v["min_free_memory_percent"] = 8.into();
+            })
+            .map(|c| c.limits()),
+            Ok(Limits {
+                max_machines: Some(2),
+                idle_after: None,
+                floor_percent: Some(8),
+            })
+        );
+        // Idle minutes are a workstation's, and only a Mac is one.
+        let mut bounds = vec![("max_jobs", 1, 32), ("min_free_memory_percent", 1, 90)];
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                with(|v| {
+                    v["use"] = "workstation".into();
+                    v["idle_minutes"] = 20.into();
+                })
+                .map(|c| c.limits().idle_after),
+                Ok(Some(Millis::mins(20)))
+            );
+            bounds.push(("idle_minutes", 1, 1440));
+        }
+        for (key, low, high) in bounds {
+            let set = |value: i64| {
+                with(|v| {
+                    if key == "idle_minutes" {
+                        v["use"] = "workstation".into();
+                    }
+                    v[key] = value.into();
+                })
+            };
+            assert!(set(low).is_ok(), "{key} {low}");
+            assert!(set(high).is_ok(), "{key} {high}");
+            assert_eq!(
+                set(low - 1).err(),
+                Some(format!("{key}: between {low} and {high}"))
+            );
+            assert_eq!(
+                set(high + 1).err(),
+                Some(format!("{key}: between {low} and {high}"))
+            );
+            assert!(set(-1).is_err(), "{key} -1");
+        }
+        assert_eq!(
+            with(|v| v["idle_minutes"] = 20.into()).err().as_deref(),
+            Some(
+                "idle_minutes: only a workstation waits for its person; a dedicated host takes jobs at any time"
+            )
+        );
     }
 
     #[cfg(target_os = "macos")]

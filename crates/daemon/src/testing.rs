@@ -669,33 +669,70 @@ impl Events for EventLog {
     }
 }
 
-/// A settings file a test changes: what it says now, and how often it was looked at.
+/// A settings file a test changes: what it says now, how often it was looked at, the changes written into it, and
+/// why the next change is refused, when it is.
 #[derive(Debug)]
-pub struct FakeSettings(Mutex<(crate::update::SettingsLook, usize)>);
+pub struct FakeSettings(Mutex<FakeFile>);
+
+#[derive(Debug)]
+struct FakeFile {
+    look: crate::update::SettingsLook,
+    looks: usize,
+    changes: Vec<crate::update::SettingsChange>,
+    refuse: Option<String>,
+}
 
 impl Default for FakeSettings {
     fn default() -> FakeSettings {
-        FakeSettings(Mutex::new((crate::update::SettingsLook::Same, 0)))
+        FakeSettings(Mutex::new(FakeFile {
+            look: crate::update::SettingsLook::Same,
+            looks: 0,
+            changes: Vec::new(),
+            refuse: None,
+        }))
     }
 }
 
 impl FakeSettings {
     /// From now on the file says `look`.
     pub fn says(&self, look: crate::update::SettingsLook) {
-        self.0.lock().expect("settings").0 = look;
+        self.0.lock().expect("settings").look = look;
     }
 
     /// How often the file was looked at.
     pub fn looks(&self) -> usize {
-        self.0.lock().expect("settings").1
+        self.0.lock().expect("settings").looks
+    }
+
+    /// The changes written into the file, in order.
+    pub fn changes(&self) -> Vec<crate::update::SettingsChange> {
+        self.0.lock().expect("settings").changes.clone()
+    }
+
+    /// The next change is refused for `why`, and nothing is written.
+    pub fn refuse_next(&self, why: &str) {
+        self.0.lock().expect("settings").refuse = Some(why.to_string());
     }
 }
 
 impl crate::update::SettingsFile for FakeSettings {
     fn look(&self) -> crate::update::SettingsLook {
         let mut file = self.0.lock().expect("settings");
-        file.1 += 1;
-        file.0.clone()
+        file.looks += 1;
+        file.look.clone()
+    }
+
+    /// A change written makes the file say other settings, named by how many were written.
+    fn change(&self, change: &crate::update::SettingsChange) -> Result<bool, String> {
+        let mut file = self.0.lock().expect("settings");
+        if let Some(why) = file.refuse.take() {
+            return Err(why);
+        }
+        file.changes.push(change.clone());
+        file.look = crate::update::SettingsLook::Changed {
+            id: format!("change-{}", file.changes.len()),
+        };
+        Ok(true)
     }
 }
 

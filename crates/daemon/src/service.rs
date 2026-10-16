@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, MAX_RUNNERS, MAX_SCALE_SETS,
-    MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
-    Status, Update,
+    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, JobLimits, MAX_RUNNERS,
+    MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage,
+    ScaleSetStatus, SizeStatus, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -31,7 +31,7 @@ use crate::roster::Roster;
 use crate::scaler::{Scaler, ScalerConfig, reconcile};
 use crate::secs;
 use crate::traits::{EventKind, Slots};
-use crate::update::{Pending, SelfUpdate, SettingsFile, SettingsLook};
+use crate::update::{Pending, SelfUpdate, SettingsChange, SettingsFile, SettingsLook};
 use crate::vms::Vms;
 
 /// Wakes every listener, so that each asks its scaler again: a slot opened, or a job that waited may start.
@@ -469,6 +469,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// meanwhile.
     pub fn take_up(&self, pending: &Pending) {
         self.shared.update.lock().expect("update").command = Some(pending.id.clone());
+    }
+
+    /// Whether an update is under way: it starts the Runner again itself.
+    fn update_under_way(&self) -> bool {
+        self.shared.update.lock().expect("update").command.is_some()
     }
 
     /// Whether the Runner is to end so that the service manager starts it again.
@@ -1130,6 +1135,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         short_bytes: room.short_bytes,
                     })
                     .collect(),
+                commands: self.commands(),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)
@@ -1195,6 +1201,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             model: shared.config.model.clone(),
             os: shared.config.os,
             settings: None,
+            limits: self.limits(&settings),
             image: None,
             jobs: Vec::new(),
             results: Vec::new(),
@@ -1309,7 +1316,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// instead of waiting.
     async fn command(&self, command: &Command) -> Option<(bool, String)> {
         Some(match command.kind.as_str() {
-            "restart" if self.shared.update.lock().expect("update").command.is_some() => (
+            "restart" if self.update_under_way() => (
                 false,
                 "an update is under way; it starts the Runner again itself".into(),
             ),
@@ -1348,7 +1355,66 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 self.shared.machines.stop(crate::names::job_name(name));
                 (true, format!("{name} is being stopped"))
             }
+            "settings" => return Some(self.change_settings(command)),
             kind => (false, format!("this Runner does not do `{kind}` yet")),
+        })
+    }
+
+    /// The kinds of command this Runner does, for the console to offer no other.
+    fn commands(&self) -> Vec<String> {
+        let shared = &self.shared;
+        let mut kinds = vec!["restart", "stop-runner"];
+        if shared.updates.is_some() {
+            kinds.push("update");
+        }
+        if shared.settings.is_some() {
+            kinds.push("settings");
+        }
+        kinds.into_iter().map(str::to_string).collect()
+    }
+
+    /// Writes the console's new settings into the settings file, which the Runner then takes up as it does any
+    /// change of the file: no new job until the machines that stand are gone, then it starts again on them.
+    fn change_settings(&self, command: &Command) -> (bool, String) {
+        let Some(file) = self.shared.settings.clone() else {
+            return (false, "this Runner has no settings file to write them to".into());
+        };
+        if self.update_under_way() {
+            return (
+                false,
+                "an update is under way; send the settings once it is over".into(),
+            );
+        }
+        let change = match SettingsChange::from_args(command.args.as_ref()) {
+            Ok(change) => change,
+            Err(why) => return (false, why),
+        };
+        match file.change(&change) {
+            Err(why) => (false, why),
+            Ok(false) => (true, "the Runner runs with these settings already".into()),
+            Ok(true) => {
+                tracing::info!(?change, "the console's new settings are in the settings file");
+                self.look_at_settings();
+                (
+                    true,
+                    "the new settings are in the settings file; the Runner starts again on them once no machine stands"
+                        .into(),
+                )
+            }
+        }
+    }
+
+    /// The limits the `settings` command changes, as they are now; none without a settings file to change them in.
+    fn limits(&self, settings: &cf_budget::Settings) -> Option<JobLimits> {
+        self.shared.settings.as_ref()?;
+        let floor = settings.away.floor_bytes as f64 / settings.total_bytes.max(1) as f64 * 100.0;
+        Some(JobLimits {
+            max_jobs: settings.max_machines,
+            idle_minutes: (settings.mode == cf_budget::Mode::Workstation)
+                .then(|| u32::try_from(settings.idle_after.0 / 60_000).unwrap_or(u32::MAX)),
+            min_free_memory_percent: (floor * 100.0).round() / 100.0,
+            // Not rounded: hours that come back as they went are whole minutes again.
+            max_job_hours: self.shared.machines.deadline().as_secs_f64() / 3600.0,
         })
     }
 
@@ -1479,7 +1545,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let Some(settings) = self.shared.settings.clone() else {
             return;
         };
-        if self.restart_requested() || self.shared.update.lock().expect("update").command.is_some() {
+        if self.restart_requested() || self.update_under_way() {
             return;
         }
         let mut applying = self.shared.applying.lock().expect("applying");

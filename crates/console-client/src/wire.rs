@@ -265,6 +265,10 @@ pub struct Status {
     /// What one more machine of each size meets now. Left out by a Runner that does not say it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sizes: Vec<SizeStatus>,
+    /// The kinds of [`Command`] this Runner does, so that the console offers no other. Left out by a Runner from
+    /// before it said them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     /// Its scale sets, at most 500.
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
@@ -327,7 +331,25 @@ pub struct VmSettings {
     pub disk_gb: u32,
 }
 
-/// The settings the host runs with, which the console can change with a `settings` command.
+/// The limits a host's jobs run under that the console's `settings` command changes, as they are now. A key that is
+/// left out is one this host does not take.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobLimits {
+    /// The most jobs at once; `null` for as many as memory and CPUs let run.
+    #[serde(default)]
+    pub max_jobs: Option<u32>,
+    /// Minutes without a key or the mouse before a workstation takes jobs; left out on a host nobody works at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u32>,
+    /// The memory the host keeps for itself, in percent of the installed memory.
+    pub min_free_memory_percent: f64,
+    /// The longest a job may run, in hours.
+    pub max_job_hours: f64,
+}
+
+/// The settings of the cf-runners manager, which the console can change with a `settings` command. The Runner
+/// reports [`JobLimits`] instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -491,6 +513,9 @@ pub struct Report {
     /// The settings in effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    /// The limits the console's `settings` command changes; left out by a Runner that has no settings file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<JobLimits>,
     /// The guest image in use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Image>,

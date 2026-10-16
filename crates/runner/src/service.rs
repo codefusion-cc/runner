@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use cf_budget::{Budget, Host as _, HostFacts, HostReading, Settings, Size, admit};
 use cf_daemon::names::ServePolicy;
-use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsFile, SettingsLook, UpdateFile};
+use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, UpdateFile};
 use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
 use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_secret::Secret;
@@ -88,13 +88,24 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
     Ok(Some((address.clone(), Secret::new(token))))
 }
 
-/// The settings in `path`, when a Runner can start on them: the file is one it takes, the image it names is
-/// installed (no job is taken from GitHub to fail for a missing image), and the App's key and the console's token
-/// are where it says.
+/// The budget's numbers on this host under the configuration: the defaults with what the file sets on top.
+fn budget_of(facts: HostFacts, config: &Config) -> Result<Settings, String> {
+    This::settings(facts, config.mode())
+        .limited(&config.limits())
+        .map_err(|error| format!("the limits for jobs: {error}"))
+}
+
+/// The settings in `path`, when a Runner can start on them: the file is one it takes, its limits are ones the budget
+/// takes on this host, the image it names is installed (no job is taken from GitHub to fail for a missing image),
+/// and the App's key and the console's token are where it says.
 fn startable(path: &Path) -> Result<Config, String> {
     let config = Config::load(path)?;
     #[cfg(target_os = "macos")]
     crate::config::check_beside_old_manager(&config, &home()?, &hostname())?;
+    let facts = This::host(Path::new("/"))
+        .and_then(|host| host.facts())
+        .map_err(|error| format!("{}: {error}", This::SYSTEM))?;
+    budget_of(facts, &config)?;
     installed_image(&config)?;
     app(&config)?;
     console(&config)?;
@@ -127,6 +138,61 @@ impl SettingsFile for ConfigFile {
                 why: format!("{}: {error}", self.path.display()),
             },
         }
+    }
+
+    /// Sets the console's keys in the file as it is now and keeps every other one; a key put back to its default
+    /// is taken out. The new text is checked as a Runner that starts would check it, in a file of its own beside
+    /// this one, which then takes this one's place in one step.
+    fn change(&self, change: &SettingsChange) -> Result<bool, String> {
+        let said = |error: &dyn std::fmt::Display| format!("{}: {error}", self.path.display());
+        let text = std::fs::read_to_string(&self.path).map_err(|error| said(&error))?;
+        let was: serde_json::Value = serde_json::from_str(&text).map_err(|error| said(&error))?;
+        let mut file = was.clone();
+        let keys = file.as_object_mut().ok_or_else(|| said(&"no JSON object"))?;
+        let mut set = |key: &str, value: Option<Option<serde_json::Value>>| match value {
+            None => {}
+            Some(None) => {
+                keys.remove(key);
+            }
+            Some(Some(value)) => {
+                keys.insert(key.to_string(), value);
+            }
+        };
+        set("max_jobs", change.max_jobs.map(|v| v.map(Into::into)));
+        set("idle_minutes", change.idle_minutes.map(|v| v.map(Into::into)));
+        set(
+            "min_free_memory_percent",
+            change.min_free_memory_percent.map(|v| v.map(Into::into)),
+        );
+        set(
+            "deadline_minutes",
+            change.deadline_minutes.map(|v| v.map(Into::into)),
+        );
+        if file == was {
+            // Rewritten, the same settings would read as new ones, and the Runner would start again for nothing.
+            return Ok(false);
+        }
+        let mut written = serde_json::to_string_pretty(&file).map_err(|error| said(&error))?;
+        written.push('\n');
+
+        let next = self.path.with_extension("json.next");
+        cf_secret::replace_private(&next, written.as_bytes()).map_err(|error| said(&error))?;
+        let checked = startable(&next).and_then(|config| {
+            if (&config.state_dir, &config.machine) == (&self.started.0, &self.started.1) {
+                Ok(())
+            } else {
+                Err("`state_dir` and `machine` change only with `uninstall` and `install`".into())
+            }
+        });
+        if let Err(why) = checked {
+            let _ = std::fs::remove_file(&next);
+            return Err(why.replace(&next.display().to_string(), &self.path.display().to_string()));
+        }
+        std::fs::rename(&next, &self.path).map_err(|error| {
+            let _ = std::fs::remove_file(&next);
+            said(&error)
+        })?;
+        Ok(true)
     }
 }
 
@@ -165,6 +231,7 @@ fn service(
         image: config.image.clone(),
         deadline: config.deadline(),
         mode: config.mode(),
+        limits: config.limits(),
         policy: ServePolicy {
             repos: config.repos.clone(),
             public_repos: config.public_repos.clone(),
@@ -439,12 +506,7 @@ fn room(config: &Config) -> Result<String, String> {
     };
     #[cfg(not(target_os = "macos"))]
     let (whose, when) = ("nobody sits at it", "");
-    Ok(room_line(
-        facts,
-        &This::settings(facts, config.mode()),
-        whose,
-        when,
-    ))
+    Ok(room_line(facts, &budget_of(facts, config)?, whose, when))
 }
 
 /// [`room`]'s line for these facts and settings, in GiB as [`memory_now`]'s.
@@ -522,7 +584,10 @@ fn now_line(config: &Config) -> String {
         Ok((facts, host.read()?))
     });
     match read {
-        Ok((facts, reading)) => memory_now(&This::settings(facts, config.mode()), &reading),
+        Ok((facts, reading)) => match budget_of(facts, config) {
+            Ok(settings) => memory_now(&settings, &reading),
+            Err(error) => error,
+        },
         Err(error) => format!("{} could not be read: {error}", This::SYSTEM),
     }
 }
@@ -772,39 +837,72 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cf_budget::Limits;
+
+    /// A folder a Runner could start in: its state folder with image `2026.10.1` installed, a GitHub App, and
+    /// `config.json`, which `write` writes with the mode a settings file must have.
+    struct Startable {
+        folder: tempfile::TempDir,
+        state: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Startable {
+        fn new() -> Startable {
+            use std::os::unix::fs::PermissionsExt as _;
+            let folder = tempfile::tempdir().expect("folder");
+            let (state, path) = (folder.path().join("state"), folder.path().join("config.json"));
+            let installed = state.join("images").join("2026.10.1");
+            std::fs::create_dir_all(&installed).expect("an image's folder");
+            std::fs::write(installed.join(cf_image::store::ROOTFS_NAME), b"").expect("an image");
+            let app = folder.path().join("app");
+            std::fs::create_dir_all(&app).expect("the App's folder");
+            std::fs::write(app.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+            std::fs::write(app.join("app.pem"), &cf_fake_github::test_key().private_pem)
+                .expect("the App's key");
+            std::fs::set_permissions(app.join("app.pem"), std::fs::Permissions::from_mode(0o600))
+                .expect("a mode");
+            Startable { folder, state, path }
+        }
+
+        fn app(&self) -> PathBuf {
+            self.folder.path().join("app")
+        }
+
+        fn text(&self, image: &str, more: &str) -> String {
+            format!(
+                r#"{{"machine": "settings-test-vm", "state_dir": "{}", "app_dir": "{}", "image": "{image}", "use": "dedicated"{more}}}"#,
+                self.state.display(),
+                self.app().display(),
+            )
+        }
+
+        fn write(&self, text: &str) {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(&self.path, text).expect("written");
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        }
+
+        /// The settings file of a Runner started on what the file holds now.
+        fn file(&self) -> ConfigFile {
+            ConfigFile {
+                path: self.path.clone(),
+                read: std::fs::read(&self.path).expect("read"),
+                started: (self.state.clone(), "settings-test-vm".into()),
+            }
+        }
+    }
 
     #[test]
     fn the_settings_file_is_new_when_its_bytes_are_and_usable_when_a_runner_could_start_on_it() {
         use std::os::unix::fs::PermissionsExt as _;
-        let folder = tempfile::tempdir().expect("folder");
-        let (state, path) = (folder.path().join("state"), folder.path().join("config.json"));
-        let text = |image: &str, more: &str| {
-            format!(
-                r#"{{"machine": "settings-test-vm", "state_dir": "{}", "app_dir": "{}", "image": "{image}", "use": "dedicated"{more}}}"#,
-                state.display(),
-                folder.path().join("app").display(),
-            )
-        };
-        let write = |text: &str| {
-            std::fs::write(&path, text).expect("written");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
-        };
-        let installed = state.join("images").join("2026.10.1");
-        std::fs::create_dir_all(&installed).expect("an image's folder");
-        std::fs::write(installed.join(cf_image::store::ROOTFS_NAME), b"").expect("an image");
-        let app = folder.path().join("app");
-        std::fs::create_dir_all(&app).expect("the App's folder");
-        std::fs::write(app.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
-        std::fs::write(app.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
-        std::fs::set_permissions(app.join("app.pem"), std::fs::Permissions::from_mode(0o600))
-            .expect("a mode");
+        let here = Startable::new();
+        let (folder, state, path, app) = (here.folder.path(), &here.state, &here.path, here.app());
+        let text = |image: &str, more: &str| here.text(image, more);
+        let write = |text: &str| here.write(text);
         let started = text("2026.10.1", "");
         write(&started);
-        let file = ConfigFile {
-            path: path.clone(),
-            read: std::fs::read(&path).expect("read"),
-            started: (state.clone(), "settings-test-vm".into()),
-        };
+        let file = here.file();
         assert_eq!(file.look(), SettingsLook::Same);
 
         write(&text("2026.10.1", r#", "docker_repos": ["org/app"]"#));
@@ -833,7 +931,7 @@ mod tests {
         unusable("run `enroll` first");
         write(&started.replace("settings-test-vm", "other-vm"));
         unusable("change only with `uninstall` and `install`");
-        let elsewhere = folder.path().join("elsewhere");
+        let elsewhere = folder.join("elsewhere");
         std::fs::create_dir_all(elsewhere.join("images").join("2026.10.1")).expect("an image's folder");
         std::fs::write(
             elsewhere
@@ -853,13 +951,204 @@ mod tests {
         unusable(&path.display().to_string());
         write(&text("2026.10.1", r#", "docker_max_jobs": "one""#));
         unusable("expected usize");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("a mode");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).expect("a mode");
         unusable("others can write it");
-        std::fs::remove_file(&path).expect("removed");
+        std::fs::remove_file(path).expect("removed");
         unusable(&path.display().to_string());
 
         write(&started);
         assert_eq!(file.look(), SettingsLook::Same, "put back as it was");
+    }
+
+    /// The console's `settings` command, written by the Runner into its settings file: each setting is set or
+    /// taken out, everything else stays as it was, and a Runner started on the file runs with those limits.
+    #[test]
+    fn a_settings_change_is_written_into_the_file_and_a_runner_started_on_it_has_those_limits() {
+        let here = Startable::new();
+        here.write(&here.text(
+            "2026.10.1",
+            r#", "docker_repos": ["org/app"], "deadline_minutes": 360"#,
+        ));
+        let file = here.file();
+        let wrote = file
+            .change(&SettingsChange {
+                max_jobs: Some(Some(2)),
+                min_free_memory_percent: Some(Some(30)),
+                deadline_minutes: Some(Some(90)),
+                ..SettingsChange::default()
+            })
+            .expect("written");
+        assert!(wrote);
+        assert!(
+            matches!(file.look(), SettingsLook::Changed { .. }),
+            "{:?}",
+            file.look()
+        );
+        let config = startable(&here.path).expect("a Runner starts on it");
+        assert_eq!(
+            (
+                config.max_jobs,
+                config.idle_minutes,
+                config.min_free_memory_percent,
+                config.deadline_minutes
+            ),
+            (Some(2), None, Some(30), 90)
+        );
+        assert_eq!(
+            config.docker_repos,
+            vec!["org/app".to_string()],
+            "the other settings stay"
+        );
+        assert_eq!(
+            config.limits(),
+            Limits {
+                max_machines: Some(2),
+                idle_after: None,
+                floor_percent: Some(30),
+            }
+        );
+        let written = std::fs::read_to_string(&here.path).expect("read");
+        assert!(written.ends_with("}\n"), "{written}");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&here.path).expect("there").permissions().mode() & 0o777,
+            0o600,
+            "only its owner reads the file"
+        );
+
+        // A Runner started on the file: these limits are what it would run with.
+        let restarted = here.file();
+        assert_eq!(restarted.look(), SettingsLook::Same);
+        let wrote = restarted
+            .change(&SettingsChange {
+                max_jobs: Some(None),
+                min_free_memory_percent: Some(None),
+                deadline_minutes: Some(None),
+                ..SettingsChange::default()
+            })
+            .expect("written");
+        assert!(wrote);
+        let config = startable(&here.path).expect("a Runner starts on it");
+        assert_eq!(config.limits(), Limits::default(), "null takes a setting out");
+        assert_eq!(
+            config.deadline_minutes,
+            Config::parse(&here.text("2026.10.1", ""))
+                .expect("parsed")
+                .deadline_minutes
+        );
+        let keys: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&here.path).expect("read")).expect("JSON");
+        for key in ["max_jobs", "min_free_memory_percent", "deadline_minutes"] {
+            assert!(keys.get(key).is_none(), "{key} is out: {keys}");
+        }
+        assert!(!here.path.with_extension("json.next").exists());
+    }
+
+    /// A value the Runner could not start on is refused before the file changes, so the Runner keeps running
+    /// on the file as it was.
+    #[test]
+    fn a_settings_change_the_runner_could_not_start_on_leaves_the_file_as_it_was() {
+        let here = Startable::new();
+        here.write(&here.text("2026.10.1", r#", "max_jobs": 3"#));
+        let before = std::fs::read(&here.path).expect("read");
+        let file = here.file();
+        let change = |change: SettingsChange| file.change(&change).expect_err("refused");
+        for (refused, why) in [
+            (
+                SettingsChange {
+                    max_jobs: Some(Some(0)),
+                    ..SettingsChange::default()
+                },
+                "max_jobs",
+            ),
+            (
+                SettingsChange {
+                    max_jobs: Some(Some(33)),
+                    ..SettingsChange::default()
+                },
+                "max_jobs",
+            ),
+            (
+                SettingsChange {
+                    idle_minutes: Some(Some(20)),
+                    ..SettingsChange::default()
+                },
+                "only a workstation waits for its person",
+            ),
+            (
+                SettingsChange {
+                    min_free_memory_percent: Some(Some(0)),
+                    ..SettingsChange::default()
+                },
+                "min_free_memory_percent",
+            ),
+            (
+                SettingsChange {
+                    min_free_memory_percent: Some(Some(91)),
+                    ..SettingsChange::default()
+                },
+                "min_free_memory_percent",
+            ),
+            (
+                SettingsChange {
+                    deadline_minutes: Some(Some(0)),
+                    ..SettingsChange::default()
+                },
+                "deadline_minutes",
+            ),
+            (
+                SettingsChange {
+                    deadline_minutes: Some(Some(1441)),
+                    ..SettingsChange::default()
+                },
+                "deadline_minutes",
+            ),
+        ] {
+            let said = change(refused.clone());
+            assert!(said.contains(why), "{refused:?}: {said}");
+            assert!(
+                said.contains(&here.path.display().to_string()),
+                "names the settings file: {said}"
+            );
+            assert!(!said.contains("json.next"), "{said}");
+            assert_eq!(std::fs::read(&here.path).expect("read"), before, "{refused:?}");
+            assert!(!here.path.with_extension("json.next").exists(), "{refused:?}");
+        }
+        assert_eq!(file.look(), SettingsLook::Same);
+
+        // The settings the file has already: written again in another layout, they would read as new ones.
+        assert_eq!(
+            file.change(&SettingsChange {
+                max_jobs: Some(Some(3)),
+                idle_minutes: Some(None),
+                ..SettingsChange::default()
+            }),
+            Ok(false)
+        );
+        assert_eq!(
+            std::fs::read(&here.path).expect("read"),
+            before,
+            "the same settings are not written again"
+        );
+        assert_eq!(file.look(), SettingsLook::Same);
+
+        here.write("[]");
+        assert!(
+            change(SettingsChange {
+                max_jobs: Some(Some(2)),
+                ..SettingsChange::default()
+            })
+            .contains("no JSON object")
+        );
+        std::fs::remove_file(&here.path).expect("removed");
+        assert!(
+            change(SettingsChange {
+                max_jobs: Some(Some(2)),
+                ..SettingsChange::default()
+            })
+            .contains(&here.path.display().to_string())
+        );
+        assert!(!here.path.exists(), "a settings file is never made");
     }
 
     fn config(state: &Path, app: &Path, console: bool) -> Config {

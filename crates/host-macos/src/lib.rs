@@ -13,12 +13,16 @@
 //! # What "available" means
 //!
 //! [`HostReading::available_bytes`](cf_budget::HostReading::available_bytes) is free memory plus the file cache
-//! plus purgeable memory: what Activity Monitor shows as physical memory minus "Memory Used". It is what macOS can
-//! hand to a VM without compressing or swapping anybody's pages.
+//! plus purgeable memory: what Activity Monitor shows as physical memory minus "Memory Used", which macOS hands to
+//! a VM without compressing anybody's pages. While the Mac is calm it also counts what compressing its programs'
+//! inactive pages frees, which macOS does before it swaps: an idle 16 GB Mac mini held 5.4 GB so and 2.2 GB more
+//! in inactive pages, and a 4 GB machine needs 6.2 GB with the floor.
 //!
-//! It is not `kern.memorystatus_level`. That percentage also counts every program's own pages that are not
-//! compressed yet (measured: (active + inactive + free + speculative) / usable memory), so it read 64% and
-//! pressure "normal" on a 16 GB Mac that had 7.4 of 8.2 GB of swap in use and 3 GB available.
+//! `kern.memorystatus_level` alone is no measure of it. That percentage counts every program's own pages that are
+//! not compressed yet, active ones too (measured: (active + inactive + free + speculative) / usable memory), so it
+//! read 64% and pressure "normal" on a 16 GB Mac that had 7.4 of 8.2 GB of swap in use and 3 GB available. It is
+//! what says the Mac is calm ([`CALM_LEVEL`]), with a compressor that holds little ([`HEAVY_COMPRESSOR_SHARE`]),
+//! and the most the count may reach.
 
 mod backup;
 mod convert;
@@ -29,6 +33,6 @@ mod mac;
 pub use backup::exclude_from_backup;
 pub use backup::{ATTRIBUTE, Attributes, Exclusion, VALUE, exclude_with};
 pub use cf_budget::Battery;
-pub use convert::{Raw, battery_in, model_name, reading};
+pub use convert::{CALM_LEVEL, HEAVY_COMPRESSOR_SHARE, Raw, battery_in, model_name, reading};
 #[cfg(target_os = "macos")]
 pub use mac::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, program_of};

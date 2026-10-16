@@ -15,7 +15,7 @@ use cf_daemon::names::job_name;
 use cf_daemon::testing::{
     CrashingStore, FakeSettings, FakeUpdate, FakeVms, ReportLog, TestMachines, TestParts, pass, settings_for,
 };
-use cf_daemon::update::SettingsLook;
+use cf_daemon::update::{SettingsChange, SettingsLook};
 use cf_daemon::{
     Claim, Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
     ServiceConfig, ServiceParts, Slots,
@@ -3787,4 +3787,120 @@ async fn each_actions_runner_reports_its_machines_size_and_what_the_budget_count
     );
     assert_eq!(counted, budget.committed_bytes);
     assert_eq!(json!(counted), report["status"]["memoryForJobsBytes"]);
+}
+
+/// The console's `settings` command, as the console sends it: written into the settings file, which the Runner then
+/// takes up by starting again once no machine stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_command_is_written_to_the_file_and_the_runner_starts_again_on_it() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    let id = rig.console.queue_command(
+        "settings",
+        Some(json!({"maxJobs": 2, "idleMinutes": null, "minFreeMemoryPercent": 8.0, "maxJobHours": 1.5})),
+    );
+    until("the command's result", || {
+        !results_of(&rig.console, &id).is_empty()
+    })
+    .await;
+    let result = &results_of(&rig.console, &id)[0];
+    assert_eq!(result["ok"], json!(true), "{result}");
+    assert_eq!(
+        result["message"],
+        json!(
+            "the new settings are in the settings file; the Runner starts again on them once no machine stands"
+        )
+    );
+    assert_eq!(
+        rig.settings.changes(),
+        vec![SettingsChange {
+            max_jobs: Some(Some(2)),
+            idle_minutes: Some(None),
+            min_free_memory_percent: Some(Some(8)),
+            deadline_minutes: Some(Some(90)),
+        }]
+    );
+    // The machine of the running job stands until its job is over; then the Runner starts again.
+    until("the hold", || last_status(&rig.console)["open"] == json!(false)).await;
+    assert!(!rig.service.restart_requested());
+    rig.finish(&runner, "succeeded");
+    until("the restart", || rig.service.restart_requested()).await;
+}
+
+/// A setting the Runner does not have, a value of the wrong kind, and a value the file refuses: each is said in
+/// the command's result, and nothing is written or restarted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_command_the_runner_cannot_take_says_why_and_changes_nothing() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.settings.refuse_next("max_jobs: between 1 and 32");
+    for (args, why) in [
+        (
+            json!({"jobMemoryGb": 6}),
+            "memory per job: each job gets the memory its label names, cf-2g to cf-8g",
+        ),
+        (json!({"maxJobs": 2.5}), "jobs at once: a whole number"),
+        (json!({}), "the command changes no setting"),
+        (json!({"maxJobs": 40}), "max_jobs: between 1 and 32"),
+    ] {
+        let id = rig.console.queue_command("settings", Some(args.clone()));
+        until("the command's result", || {
+            !results_of(&rig.console, &id).is_empty()
+        })
+        .await;
+        let result = &results_of(&rig.console, &id)[0];
+        assert_eq!(result["ok"], json!(false), "{args}");
+        assert_eq!(result["message"], json!(why), "{args}");
+    }
+    assert_eq!(rig.settings.changes(), vec![]);
+    assert!(!rig.service.restart_requested());
+    assert_eq!(last_status(&rig.console)["open"], json!(true));
+}
+
+/// While an update is under way new settings are refused: it starts the Runner again itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_command_waits_for_no_update() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.updates.build_takes(Duration::from_millis(1500));
+    rig.updates.build_gives(Ok(RUNNING));
+    rig.console.queue_command("update", None);
+    until("building", || {
+        last_status(&rig.console)["reason"] == json!("updating: building")
+    })
+    .await;
+    let id = rig.console.queue_command("settings", Some(json!({"maxJobs": 1})));
+    until("the command's result", || {
+        !results_of(&rig.console, &id).is_empty()
+    })
+    .await;
+    assert_eq!(
+        results_of(&rig.console, &id)[0]["message"],
+        json!("an update is under way; send the settings once it is over")
+    );
+    assert_eq!(rig.settings.changes(), vec![]);
+}
+
+/// The report says which commands the Runner does and the limits the `settings` command changes, as they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_says_the_commands_the_runner_does_and_its_limits() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("a report", || !rig.console.reports().is_empty()).await;
+    let report = rig.console.reports().last().expect("a report").clone();
+    assert_eq!(
+        report["status"]["commands"],
+        json!(["restart", "stop-runner", "update", "settings"])
+    );
+    assert_eq!(
+        report["limits"],
+        json!({
+            "maxJobs": null,
+            // The 5 GiB floor of a 64 GiB dedicated Mac, 7.8125% of its memory, to two places.
+            "minFreeMemoryPercent": 7.81,
+            "maxJobHours": 6.0,
+        }),
+        "a dedicated Mac waits for no person"
+    );
 }

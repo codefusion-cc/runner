@@ -43,10 +43,15 @@ pub use budget::{
 pub use fake::FakeHost;
 pub use host::{Battery, Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};
-pub use settings::{DEFER_LIMIT, Mode, Profile, Settings, SettingsError};
+pub use settings::{DEFER_LIMIT, Limits, Mode, Profile, Settings, SettingsError};
 pub use size::Size;
 
 /// One mebibyte. The plan's "MB" and "GB" are these: a 16 GB Mac reports 16 × 2^30 bytes.
 pub const MIB: u64 = 1 << 20;
 /// One gibibyte.
 pub const GIB: u64 = 1 << 30;
+
+/// `percent`% of `bytes`, rounded down, with no overflow on the way.
+pub fn percent_of(bytes: u64, percent: u32) -> u64 {
+    u64::try_from(u128::from(bytes) * u128::from(percent) / 100).unwrap_or(u64::MAX)
+}
