@@ -1,4 +1,5 @@
-//! The Runner's updates of itself, which the console asks for with `update`.
+//! The Runner's updates of itself, which the console asks for with `update` (the head of the branch) or `update-to`
+//! (one commit of it).
 //!
 //! The service decides when ([`crate::Service`]): it builds while jobs run, holds new jobs until no machine
 //! stands, then installs and ends, and the service manager starts the new program. How a build and an install go
@@ -28,13 +29,40 @@ pub trait SelfUpdate: Send + Sync {
     /// Where updates come from, for the console: the checkout and the branch.
     fn source(&self) -> String;
 
-    /// Fetches the source and builds it. Answers the version of the program built and ready to install, or the
-    /// running version when the source has nothing newer, in which case nothing was built.
-    fn build(&self) -> Result<String, String>;
+    /// Fetches the source and builds the head of its branch, or `commit` when one is named: a commit of the branch
+    /// ([`is_commit`] says which names are taken), never one older than the running program. Answers the version of
+    /// the program built and ready to install, or the running version when that is what it would build, in which
+    /// case nothing was built.
+    fn build(&self, commit: Option<&str>) -> Result<String, String>;
 
     /// Puts the program built last in place of the running one, keeping the running one to go back to, with
     /// `pending` written down first. Refused while a machine has a record.
     fn install(&self, pending: &Pending) -> Result<(), String>;
+}
+
+/// How many characters a commit's name has: at least what git shortens one to, at most all of it.
+pub const COMMIT_CHARS: std::ops::RangeInclusive<usize> = 7..=40;
+
+/// Whether `name` names a commit as git writes one: [`COMMIT_CHARS`] lowercase hex characters. A commit the console
+/// asks for reaches git only so, never as an option, a branch or anything git would look up.
+pub fn is_commit(name: &str) -> bool {
+    COMMIT_CHARS.contains(&name.len()) && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The commit the console's `update-to` asks for, or why it asks for none: an object whose one key, `commit`, is a
+/// commit's name ([`is_commit`]).
+pub fn commit_from_args(args: Option<&serde_json::Value>) -> Result<String, String> {
+    let Some(serde_json::Value::Object(args)) = args else {
+        return Err("the command names no commit".into());
+    };
+    if let Some(other) = args.keys().find(|key| *key != "commit") {
+        return Err(format!("`{}` is no argument of update-to", key_said(other)));
+    }
+    match args.get("commit") {
+        None => Err("the command names no commit".into()),
+        Some(serde_json::Value::String(commit)) if is_commit(commit) => Ok(commit.clone()),
+        Some(_) => Err("the commit is no commit's name: 7 to 40 lowercase hex characters".into()),
+    }
 }
 
 /// The Runner's settings file, which it reads when it starts: new settings take effect when it starts again.
@@ -99,14 +127,16 @@ impl SettingsChange {
                             .into(),
                     );
                 }
-                other => {
-                    let other: String = other.chars().take(40).collect();
-                    return Err(format!("`{other}` is no setting of the Runner"));
-                }
+                other => return Err(format!("`{}` is no setting of the Runner", key_said(other))),
             }
         }
         Ok(change)
     }
+}
+
+/// A key of the console's arguments that is not known here, cut to fit in what the Runner says of it.
+fn key_said(key: &str) -> String {
+    key.chars().take(40).collect()
 }
 
 /// A whole number of a setting, or `None` for `null`; else `wrong`.
@@ -327,6 +357,69 @@ mod tests {
                 failed: None,
             }))
         );
+    }
+
+    #[test]
+    fn update_to_takes_a_commit_and_nothing_else() {
+        use serde_json::json;
+        let commit = |args: serde_json::Value| commit_from_args(Some(&args));
+        assert_eq!(commit(json!({"commit": "5c0ffee"})), Ok("5c0ffee".into()));
+        let full = "5c0ffee0a1b25c0ffee0a1b25c0ffee0a1b2abcd";
+        assert_eq!(commit(json!({ "commit": full })), Ok(full.into()));
+        let no_commit = Err("the command names no commit".to_string());
+        let not_a_name = Err("the commit is no commit's name: 7 to 40 lowercase hex characters".to_string());
+        assert_eq!(commit_from_args(None), no_commit);
+        for args in [json!(null), json!("5c0ffee"), json!(["5c0ffee"]), json!({})] {
+            assert_eq!(commit(args.clone()), no_commit, "{args}");
+        }
+        for value in [
+            json!(null),
+            json!(5),
+            json!(["5c0ffee"]),
+            json!({"sha": "5c0ffee"}),
+            json!("5c0ffe"),
+            json!(format!("{full}a")),
+            json!("5C0FFEE"),
+            json!("5c0ffeg"),
+            json!("--upload-pack=x"),
+            json!("main"),
+            json!("5c0ffee~1"),
+            json!("5c0ffee^{tree}"),
+            json!(" 5c0ffee"),
+            json!("5c0ffee\n"),
+            json!("５c0ffee"),
+            json!(""),
+        ] {
+            assert_eq!(commit(json!({ "commit": value })), not_a_name, "{value}");
+        }
+        assert_eq!(
+            commit(json!({"commit": "5c0ffee", "branch": "pr"})),
+            Err("`branch` is no argument of update-to".into())
+        );
+        let said = commit(json!({"commit": "5c0ffee", "x".repeat(1000): 1})).expect_err("refused");
+        assert_eq!(said, format!("`{}` is no argument of update-to", "x".repeat(40)));
+    }
+
+    proptest! {
+        /// A commit's name is taken as it is, whatever its length within the bounds.
+        #[test]
+        fn every_lowercase_hex_name_of_7_to_40_characters_is_taken(name in "[0-9a-f]{7,40}") {
+            prop_assert_eq!(commit_from_args(Some(&serde_json::json!({"commit": name.clone()}))), Ok(name));
+        }
+
+        /// Text is taken only when it is 7 to 40 of the sixteen lowercase hex characters, and never beside another
+        /// key.
+        #[test]
+        fn any_other_text_or_key_is_refused(name in "\\PC{0,48}|[0-9a-fA-F]{0,48}|[0-9a-f]{0,48}", key in "\\PC{1,12}") {
+            let hex = name.chars().all(|c| "0123456789abcdef".contains(c));
+            let taken = commit_from_args(Some(&serde_json::json!({"commit": name.clone()})));
+            prop_assert_eq!(taken.is_ok(), hex && (7..=40).contains(&name.chars().count()), "{:?}", taken);
+            prop_assume!(key != "commit");
+            let mut args = serde_json::Map::new();
+            args.insert("commit".into(), serde_json::json!("5c0ffee"));
+            args.insert(key, serde_json::json!(name));
+            prop_assert!(commit_from_args(Some(&serde_json::Value::Object(args))).is_err());
+        }
     }
 
     proptest! {

@@ -748,7 +748,8 @@ struct UpdateScript {
     build_takes: Duration,
     /// Builds wait while this is set.
     held: bool,
-    built: usize,
+    /// What each build was asked for: `None` for the head of the branch.
+    asked: Vec<Option<String>>,
     installed: Vec<crate::update::Pending>,
 }
 
@@ -783,7 +784,12 @@ impl FakeUpdate {
 
     /// How many builds started.
     pub fn built(&self) -> usize {
-        self.0.lock().expect("update").built
+        self.0.lock().expect("update").asked.len()
+    }
+
+    /// What each build that started was asked for, in order: `None` for the head of the branch, else a commit.
+    pub fn asked(&self) -> Vec<Option<String>> {
+        self.0.lock().expect("update").asked.clone()
     }
 
     /// What was installed, in order.
@@ -797,10 +803,10 @@ impl crate::update::SelfUpdate for FakeUpdate {
         "/src/runner main".into()
     }
 
-    fn build(&self) -> Result<String, String> {
+    fn build(&self, commit: Option<&str>) -> Result<String, String> {
         let (takes, answer) = {
             let mut script = self.0.lock().expect("update");
-            script.built += 1;
+            script.asked.push(commit.map(str::to_string));
             let mut script = self.1.wait_while(script, |script| script.held).expect("update");
             let answer = script
                 .builds
