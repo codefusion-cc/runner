@@ -22,7 +22,7 @@ fn job(secret: &str) -> Job {
             shm_bytes: 1 << 30,
             cpus: 4,
         },
-        env: vec![("CI".into(), "true".into())],
+        env: vec![("CI".into(), String::from("true").into())],
         oom_grace_ms: 15_000,
         blocked: vec![([203, 0, 113, 0], 24)],
         docker: true,
@@ -475,4 +475,15 @@ fn a_job_from_a_host_before_docker_has_none() {
             ..job("x")
         }
     );
+}
+
+#[test]
+fn an_environment_value_goes_as_a_plain_pair_and_shows_in_no_debug_print() {
+    let mut job = job("jit");
+    job.env = vec![("CF_RUN_TOKEN".into(), String::from("cfrt_value").into())];
+    let wire = serde_json::to_value(&job).expect("json");
+    assert_eq!(wire["env"], serde_json::json!([["CF_RUN_TOKEN", "cfrt_value"]]));
+    let back: Job = serde_json::from_value(wire).expect("read back");
+    assert_eq!(back.env[0].1.expose(), "cfrt_value");
+    assert!(!format!("{job:?}").contains("cfrt_value"));
 }

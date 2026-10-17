@@ -32,6 +32,7 @@ use crate::queued::{Bounds, Look, Queued, QueuedSet};
 use crate::roster::{Roster, Runner};
 use crate::scaler::{Scaler, ScalerConfig, Start, reconcile, start_runner};
 use crate::secs;
+use crate::test_run::{self, Admission, TestRun, Waited};
 use crate::traits::{Claim, EventKind, Hosts, Slots, Ticket};
 use crate::update::{Pending, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, commit_from_args};
 use crate::vms::Vms;
@@ -325,6 +326,9 @@ struct Shared<H, V> {
     restarting: Notify,
     /// Set while the Runner ends: the last report says so instead of serving nothing.
     ending: AtomicBool,
+    /// The command of the test run that waits for its turn, which is not done again while it waits, and whether the
+    /// console still sends it.
+    test_run: Mutex<Option<(String, Arc<AtomicBool>)>>,
 }
 
 /// What the console's page says of a settings file no Runner could start on.
@@ -526,6 +530,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 restart: AtomicBool::new(false),
                 restarting: Notify::new(),
                 ending: AtomicBool::new(false),
+                test_run: Mutex::new(None),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
                 results_file: parts.results,
             }),
@@ -573,8 +578,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if results.iter().any(|result| result.id == id) {
             return;
         }
-        // Never dropped: the console would send the command again, and it would be done again. Only an update's
-        // result, which ends on its own, comes while a report's worth wait (see `answered`).
+        // Never dropped: the console would send the command again, and it would be done again. Only the results that
+        // come later by themselves (an update's, a test run's that waited for room) come while a report's worth
+        // wait (see `answered`).
         results.push(CommandResult {
             id,
             ok,
@@ -1831,6 +1837,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     async fn answered(&self, answer: Answer) -> Duration {
         let shared = &self.shared;
         *shared.console_paused.lock().expect("paused") = answer.paused;
+        // The console sends a command until it has its result, and stops for a test run that ended or was cancelled
+        // there: one that waits for room and is not in this answer is not wanted any more.
+        if let Some((id, wanted)) = shared.test_run.lock().expect("test run").as_ref()
+            && !answer.commands.iter().any(|command| &command.id == id)
+        {
+            wanted.store(false, Ordering::SeqCst);
+        }
         shared.machines.pause(answer.paused);
         for command in answer.commands {
             // A result names its command by the id. One the console would not read back cannot be answered, and a
@@ -1841,7 +1854,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             }
             // Under way first: a command's result is in before it is no longer under way, so a command that was
             // taken is one or the other whenever the update ends meanwhile.
-            let under_way = shared.update.lock().expect("update").command.as_deref() == Some(&command.id);
+            let under_way = shared.update.lock().expect("update").command.as_deref() == Some(&command.id)
+                || shared
+                    .test_run
+                    .lock()
+                    .expect("test run")
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &command.id);
             let (done, full) = {
                 let results = shared.results.lock().expect("results");
                 (
@@ -1920,6 +1939,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 (true, format!("{name} is being stopped"))
             }
             "settings" => return Some(self.change_settings(command)),
+            "test-run" => return self.test_run(command),
             kind => (false, format!("this Runner does not do `{kind}` yet")),
         })
     }
@@ -1935,7 +1955,99 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if shared.settings.is_some() {
             kinds.push("settings");
         }
+        if shared.console.is_some() {
+            kinds.push("test-run");
+        }
         kinds.into_iter().map(str::to_string).collect()
+    }
+
+    /// Starts a test run's machine ([`crate::test_run`]), or says at once why none starts. One that waits for room says
+    /// what came of it when its wait is over: the report loop never waits with it.
+    fn test_run(&self, command: &Command) -> Option<(bool, String)> {
+        let shared = &self.shared;
+        let console = shared
+            .console
+            .as_ref()
+            .map_or("", |console| console.client.base());
+        let run = match TestRun::from_args(command.args.as_ref(), console) {
+            Ok(run) => run,
+            Err(why) => return Some((false, why)),
+        };
+        let runner = run.runner();
+        // The console sends a command again until it has its result: a Runner that died between the start and the
+        // result finds the machine it started.
+        if shared.machines.knows(&runner) {
+            return Some((true, format!("started {runner}")));
+        }
+        let busy = if self.update_under_way() {
+            Some("an update is under way".to_string())
+        } else if shared.applying.lock().expect("applying").under_way {
+            Some("the Runner waits to start again on new settings".to_string())
+        } else {
+            shared
+                .test_run
+                .lock()
+                .expect("test run")
+                .is_some()
+                .then(|| "a test run waits for room on this host".to_string())
+        };
+        if let Some(why) = busy {
+            return Some((false, format!("busy: {why}")));
+        }
+        if let Err(why) = run.timeout_within(shared.machines.deadline()) {
+            return Some((false, format!("never: {why}")));
+        }
+        let other = shared.machines.test_run_on();
+        match test_run::admit(&*shared.machines, &run, other.as_deref()) {
+            Admission::Start(ticket) => Some(self.start_test_run(ticket, &run)),
+            Admission::Busy(why) => Some((false, format!("busy: {why}"))),
+            Admission::Never(why) => Some((false, format!("never: {why}"))),
+            Admission::Waits(ticket) => {
+                tracing::info!(%runner, wait_s = run.wait_s, "a test run waits for room");
+                let wanted = Arc::new(AtomicBool::new(true));
+                *shared.test_run.lock().expect("test run") = Some((command.id.clone(), wanted.clone()));
+                let service = self.handle();
+                let id = command.id.clone();
+                tokio::spawn(async move {
+                    let wait = Duration::from_secs(run.wait_s);
+                    let waited = test_run::wait_turn(&*service.shared.machines, ticket, wait, || {
+                        wanted.load(Ordering::SeqCst)
+                    })
+                    .await;
+                    let result = match waited {
+                        Waited::Ready => Some(service.start_test_run(ticket, &run)),
+                        Waited::RanOut => Some((false, format!("busy: no room within {}s", run.wait_s))),
+                        // The console asks no more: nothing is said to it of this run.
+                        Waited::Withdrawn => {
+                            tracing::info!(%id, "the console no longer sends a test run that waited; its place is given back");
+                            None
+                        }
+                    };
+                    // The result is in before the run no longer waits, as `answered` reads them.
+                    let mut waiting = service.shared.test_run.lock().expect("test run");
+                    if let Some((ok, message)) = result {
+                        service.push_result(id, ok, message);
+                    }
+                    *waiting = None;
+                });
+                None
+            }
+        }
+    }
+
+    /// Starts a test run's machine on its slot, which goes back when none starts.
+    fn start_test_run(&self, ticket: crate::traits::Ticket, run: &TestRun) -> (bool, String) {
+        let machines = &self.shared.machines;
+        match machines.start_test_run(ticket, run) {
+            Ok(runner) => (true, format!("started {runner}")),
+            Err(error) => {
+                machines.release(ticket);
+                match error {
+                    test_run::StartError::Closed => (false, format!("busy: {error}")),
+                    test_run::StartError::Failed(_) => (false, error.to_string()),
+                }
+            }
+        }
     }
 
     /// Writes the console's new settings into the settings file, which the Runner then takes up as it does any

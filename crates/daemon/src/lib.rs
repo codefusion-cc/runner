@@ -21,6 +21,7 @@ mod records;
 mod roster;
 mod scaler;
 mod service;
+pub mod test_run;
 #[doc(hidden)]
 pub mod testing;
 mod traits;
@@ -38,7 +39,8 @@ pub use machines::{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use platform::{HostMachines, HostService, HostSetup, Platform, This, host_service, records_dir};
 pub use records::{
-    Disagrees, DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, Upgrade,
+    Disagrees, DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, TestRunFacts,
+    Upgrade,
 };
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};

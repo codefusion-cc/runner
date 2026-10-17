@@ -16,6 +16,10 @@ pub struct Turn {
     /// The repository, `owner/name`. Of the jobs of one kind, those of the repository that started a job least
     /// recently go first, so one busy repository does not keep another waiting.
     pub repo: String,
+    /// Not GitHub's job but one the Mac may turn away (a test run): it gets room only as a claim does, while the Mac
+    /// takes jobs and under the limits in force (the in-use ones while the person is there), never as a job that is
+    /// already the Mac's. Waiting, it is passed over while it does not fit so, and those behind it go on.
+    pub refusable: bool,
 }
 
 /// One assigned job that waits for room.
@@ -500,7 +504,12 @@ impl Budget {
                 continue;
             };
             let size = self.waiting[index].size;
-            if self.assigned_fits(now, size).is_err() {
+            if self.waiter_fits(now, size, &self.waiting[index].turn).is_err() {
+                // A job that may be turned away holds up nobody behind it while it is: each behind it asks for
+                // itself.
+                if self.waiting[index].turn.refusable {
+                    continue;
+                }
                 break;
             }
             let Some(waiter) = self.waiting.remove(index) else {
@@ -551,7 +560,9 @@ impl Budget {
             return Assigned::Never(never);
         }
         let slot = self.next_id();
-        let fits = self.in_turn(size).and_then(|()| self.assigned_fits(now, size));
+        let fits = self
+            .in_turn(size)
+            .and_then(|()| self.waiter_fits(now, size, &turn));
         match fits {
             Ok(()) => {
                 self.started(&turn);
@@ -831,6 +842,17 @@ impl Budget {
         self.admits(reading, &limits, size)
     }
 
+    /// Whether a job of this turn may start now: an assigned one as [`Budget::assigned_fits`] says, one that may be
+    /// turned away ([`Turn::refusable`]) as a claim would be, under the limits in force.
+    fn waiter_fits(&self, now: Now, size: Size, turn: &Turn) -> Result<(), Refusal> {
+        if !turn.refusable {
+            return self.assigned_fits(now, size);
+        }
+        let reading = self.takes_jobs(now)?;
+        self.made_for(size)?;
+        self.admits(reading, profile_for(&self.settings, Some(reading)), size)
+    }
+
     /// The arithmetic for one more slot of `size` under `limits`, on what `reading` shows.
     fn admits(&self, reading: &HostReading, limits: &Profile, size: Size) -> Result<(), Refusal> {
         admit(
@@ -896,11 +918,13 @@ impl Budget {
                     .unwrap_or(waiter),
                 Err(_) => waiter,
             })
-            .map(|&Waiter { slot, size, .. }| {
+            .map(|Waiter { slot, size, turn, .. }| {
+                let (slot, size) = (*slot, *size);
                 let ruled_out = self.settings.can_run(size).err();
                 let why = match ruled_out {
                     Some(limit) => Some(limit),
-                    None if ahead == 0 => self.assigned_fits(now, size).err(),
+                    // What keeps the first one out is what `observe` asks of it: a test run fits as a claim would.
+                    None if ahead == 0 => self.waiter_fits(now, size, turn).err(),
                     None => Some(Refusal::AssignedFirst { waiting: ahead }),
                 };
                 ahead += usize::from(ruled_out.is_none());

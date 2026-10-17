@@ -92,6 +92,13 @@ jobs:
       - name: pasta and OpenSSL's headers
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends passt pkg-config libssl-dev
       - run: cargo clippy --locked $LINUX_CRATES --all-targets -j4 -- -D warnings
+      # The test run's agent runs in the guest's Linux on the image's Node 24: its tests start real bash suites against
+      # a fake console and check that what they stop is gone, process groups and all.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: The test run's agent
+        run: node --test crates/daemon/src/test_run/agent.test.mjs
       - name: Tests
         run: cargo test --locked $LINUX_CRATES -j4
         env:

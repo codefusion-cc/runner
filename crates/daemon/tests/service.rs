@@ -3499,7 +3499,14 @@ async fn a_runner_with_nowhere_to_update_from_offers_no_update() {
     let report = serde_json::to_value(alone.status()).expect("a report");
     assert_eq!(
         report["status"]["commands"],
-        json!(["pause", "resume", "restart", "stop-runner", "settings"])
+        json!([
+            "pause",
+            "resume",
+            "restart",
+            "stop-runner",
+            "settings",
+            "test-run"
+        ])
     );
     rig.stop_pump().await;
     let asked = [
@@ -4078,7 +4085,8 @@ async fn the_report_says_the_commands_the_runner_does_and_its_limits() {
             "stop-runner",
             "update",
             "update-to",
-            "settings"
+            "settings",
+            "test-run"
         ])
     );
     assert_eq!(
@@ -4875,4 +4883,162 @@ async fn held_jobs_get_one_actions_runner_of_their_own_at_a_time() {
         let _ = rig.report();
     }
     assert_eq!(own_runners(&rig).len(), 1, "a report starts nothing");
+}
+
+/// The console's `test-run` for a run of this id, on this console, as the console sends it.
+fn test_run_args(console: &FakeConsole, run: &str, wait_s: u64) -> Value {
+    json!({
+        "run": run,
+        "url": format!("{}/agent/runners/runs/{run}", console.url()),
+        "token": format!("cfrt_{}", "t".repeat(43)),
+        "size": "cf-2g",
+        "docker": false,
+        "timeoutS": 600,
+        "waitS": wait_s,
+        "repo": "codefusion-cc/codefusion-console",
+        "label": "feat/x: npm test"
+    })
+}
+
+/// A test run from the console's command to its end: one machine however often the console sends the command, its
+/// start and end at the console as a job's, and a command it cannot take answered with why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_run_starts_one_machine_and_reports_it_as_a_job() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let run = "tr_abcdefghijklmnopqrstuvwxyz";
+    let machine = "tr-abcdefghijklmnopqrstuvwxyz";
+    let bad = rig.console.queue_command(
+        "test-run",
+        Some(json!({"run": run, "url": "https://elsewhere.example/agent/runners/runs/x"})),
+    );
+    let id = rig
+        .console
+        .queue_command("test-run", Some(test_run_args(&rig.console, run, 0)));
+    rig.settles("both results", || {
+        !results_of(&rig.console, &id).is_empty() && !results_of(&rig.console, &bad).is_empty()
+    })
+    .await;
+    assert_eq!(results_of(&rig.console, &id)[0]["ok"], json!(true));
+    assert_eq!(
+        results_of(&rig.console, &id)[0]["message"],
+        json!(format!("started {machine}"))
+    );
+    assert_eq!(results_of(&rig.console, &bad)[0]["ok"], json!(false));
+    rig.settles("its start at the console", || {
+        rig.console
+            .job_event_ids()
+            .contains(&format!("{machine}/started"))
+    })
+    .await;
+    let started: Vec<_> = rig
+        .parts
+        .vms
+        .started()
+        .into_iter()
+        .filter(|request| request.job == job_name(machine))
+        .collect();
+    assert_eq!(started.len(), 1, "the command was done twice");
+    let event = rig
+        .console
+        .job_events()
+        .into_iter()
+        .find(|event| event["id"] == json!(format!("{machine}/started")))
+        .expect("the start");
+    assert_eq!(event["workflow"], json!("test-remote"));
+    assert_eq!(event["event"], json!("test-run"));
+    assert_eq!(event["job"], json!("feat/x: npm test"));
+    let runners = &rig.report()["status"]["runners"];
+    assert!(
+        runners
+            .as_array()
+            .is_some_and(|all| all.iter().any(|r| r["name"] == json!(machine))),
+        "{runners}"
+    );
+
+    rig.parts.vms.end(job_name(machine), End::Ok);
+    rig.settles("its end at the console", || {
+        rig.console
+            .job_event_ids()
+            .contains(&format!("{machine}/completed"))
+    })
+    .await;
+    let end = rig
+        .console
+        .job_events()
+        .into_iter()
+        .find(|event| event["id"] == json!(format!("{machine}/completed")))
+        .expect("the end");
+    assert_eq!(
+        (&end["result"], &end["end"]),
+        (&json!("success"), &json!("success"))
+    );
+    assert!(
+        rig.github.runners().is_empty(),
+        "something was registered at GitHub"
+    );
+    rig.settles("its slot back", || {
+        rig.machines.snapshot().budget.slots.is_empty()
+    })
+    .await;
+}
+
+/// A test run that waits for room never holds up the reports, is not taken again while it waits, and says when its
+/// wait ran out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_run_that_waits_holds_up_no_report_and_says_when_its_wait_ran_out() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    let run = "tr_bbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let id = rig
+        .console
+        .queue_command("test-run", Some(test_run_args(&rig.console, run, 2)));
+    let reports = rig.console.reports().len();
+    rig.settles("its result", || !results_of(&rig.console, &id).is_empty())
+        .await;
+    assert!(
+        rig.console.reports().len() >= reports + 2,
+        "the reports waited for the run"
+    );
+    let results = results_of(&rig.console, &id);
+    assert_eq!(results.len(), 1, "it was answered twice: {results:?}");
+    assert_eq!(results[0]["ok"], json!(false));
+    assert_eq!(results[0]["message"], json!("busy: no room within 2s"));
+    assert_eq!(rig.machines.snapshot().waiting, 0);
+    assert_eq!(rig.standing(), [runner.as_str()]);
+}
+
+/// A test run that waits for room and that the console stops sending (it ended or was cancelled there) gives its
+/// place back and is answered no more; the room that comes is not its.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_waiting_test_run_the_console_no_longer_sends_gives_its_place_back() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    let id = rig.console.queue_command(
+        "test-run",
+        Some(test_run_args(&rig.console, "tr_cccccccccccccccccccccccccc", 3600)),
+    );
+    rig.settles("its place in line", || rig.machines.snapshot().waiting == 1)
+        .await;
+    rig.console.withdraw_command(&id);
+    rig.settles("its place given back", || rig.machines.snapshot().waiting == 0)
+        .await;
+    rig.finish(&runner, "succeeded");
+    rig.settles("the CI job's end", || rig.events().len() == 2).await;
+    let reports = rig.console.reports().len();
+    rig.settles("a few more reports", || {
+        rig.console.reports().len() >= reports + 3
+    })
+    .await;
+    assert!(
+        results_of(&rig.console, &id).is_empty(),
+        "the withdrawn run was answered"
+    );
+    assert_eq!(
+        rig.parts.vms.started().len(),
+        1,
+        "a machine started for the withdrawn run"
+    );
 }

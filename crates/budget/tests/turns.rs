@@ -11,6 +11,7 @@ fn pull(repo: &str) -> Turn {
     Turn {
         urgent: false,
         repo: repo.into(),
+        refusable: false,
     }
 }
 
@@ -18,6 +19,7 @@ fn main_of(repo: &str) -> Turn {
     Turn {
         urgent: true,
         repo: repo.into(),
+        refusable: false,
     }
 }
 
@@ -198,7 +200,7 @@ proptest! {
             }
             while next < jobs.len() && arrive_at <= at {
                 let job = &jobs[next];
-                let turn = Turn { urgent: job.urgent, repo: format!("acme/{}", job.repo) };
+                let turn = Turn { urgent: job.urgent, repo: format!("acme/{}", job.repo), refusable: false };
                 match budget.assign_in_turn(secs(at), Size::G8, turn) {
                     Assigned::Start(grant) => {
                         prop_assert!(running.is_none() && waiting.is_empty());

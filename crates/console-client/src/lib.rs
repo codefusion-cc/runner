@@ -15,7 +15,7 @@ mod wire;
 
 pub use client::{
     Client, MACHINE_NAME_MAX, MAX_BODY_BYTES, MAX_JOB_EVENTS, MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS,
-    RESULT_ID_MAX, RUNNER_NAME_MAX, enroll, is_machine_name,
+    RESULT_ID_MAX, RUNNER_NAME_MAX, enroll, is_machine_name, units,
 };
 pub use error::Error;
 pub use outbox::{EVENT_ID_MAX, OUTBOX_CAPACITY, Outbox, REPORT_BATCH, SENT_MEMORY};

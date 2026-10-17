@@ -555,7 +555,9 @@ pub struct Command {
     /// Its id, which the result names.
     pub id: String,
     /// `restart`, `update`, `update-to` (with `{"commit": "<7 to 40 hex>"}`, a commit of main), `rebuild-image`,
-    /// `stop-runner` or `settings`; a kind not known here is answered with a failed [`CommandResult`].
+    /// `stop-runner`, `settings` or `test-run` (a developer's test suite in one job machine: `{run, url, token, size,
+    /// docker, timeoutS, waitS, repo, label}`, answered `started <machine>`, `busy: <why>` or `never: <why>`); a kind
+    /// not known here is answered with a failed [`CommandResult`].
     pub kind: String,
     /// What the kind needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]

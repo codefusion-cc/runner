@@ -167,6 +167,13 @@ install and start again. A new program that does not stay up for a minute three 
 and the console hears why; a start that ends as asked (a signal, `restart`) does not count. `restart` ends the Runner
 at once and launchd (systemd on Linux) starts it again; machines that run go on and are adopted.
 
+`test-run` runs a developer's test suite in one machine of the image CI jobs get, instead of on their laptop. The Runner
+takes it like a main-branch job GitHub assigned: before the CI jobs that wait, never stopping one that runs, waiting for
+room as long as the command's `waitS` allows, and `busy: …` while the Mac takes no new job or has a test run on it. The
+machine runs the agent embedded in the Runner (`crates/daemon/src/test_run/agent.mjs`), which fetches the commit from the
+console as git bundles, runs the suite and sends its output to the console itself. The console's page and job events
+show it as a job of workflow `test-remote` on a machine named `tr-…`; nothing of it is registered at GitHub.
+
 `uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
 could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
 

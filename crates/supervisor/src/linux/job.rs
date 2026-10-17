@@ -326,7 +326,14 @@ pub fn run(
         shared: SHARED.into(),
         cgroup: format!("{CGROUP}/run"),
         argv,
-        env: workload_environment(&home, USER, &job.env),
+        env: workload_environment(
+            &home,
+            USER,
+            &job.env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.expose().clone()))
+                .collect::<Vec<_>>(),
+        ),
         uid,
         gid,
         groups,
