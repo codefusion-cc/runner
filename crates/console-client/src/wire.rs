@@ -131,6 +131,25 @@ pub struct ScaleSetStatus {
     pub error_at: Option<String>,
 }
 
+/// The most entries of [`Status::held_jobs`].
+pub const MAX_HELD_JOBS: usize = 32;
+
+/// Jobs of one repository and label set that GitHub holds back from this host's scale set although its polls
+/// offered room for them: GitHub hands a job over only when it looks at its queue, and the Runner starts an Actions
+/// runner of the job's own beside the scale set for them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldJobs {
+    /// `owner/name`.
+    pub repo: String,
+    /// The labels the jobs ask for, at most 30.
+    pub labels: Vec<String>,
+    /// How many jobs wait so.
+    pub jobs: u32,
+    /// For how many seconds the oldest of them has waited since it was queued.
+    pub oldest_wait_seconds: u64,
+}
+
 /// The job an Actions runner has.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,6 +288,11 @@ pub struct Status {
     /// before it said them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<String>,
+    /// The jobs GitHub holds back from a scale set of this host whose polls offered room, per repository and label
+    /// set, the longest wait first, at most [`MAX_HELD_JOBS`]. Left out while none waits so, and by a Runner from
+    /// before it said them; a console from before ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_jobs: Vec<HeldJobs>,
     /// Its scale sets, at most 500.
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.

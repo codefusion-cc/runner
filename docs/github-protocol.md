@@ -28,6 +28,21 @@ the capacity the poll offered; it counts the jobs already assigned, as the Runne
 | J3 | The same, a third job | Not assigned in 3 minutes |
 | K | A job queued 457 s while the polls offered 0, then room | Assigned 222 s after room came |
 
+Run 2026-10-17 the same way, by a Rust program, against a throwaway repository and a scale set made for the probe;
+from K2 on, two more scale sets of the same labels polled with 0 beside it, as on a host that serves several. Each
+call came 20 to 150 s after room appeared. A try counts only when the job was still held at the call: in about half
+of them GitHub assigned it by itself first, 4 to 102 s after room appeared.
+
+| Probe | What was done | What GitHub did |
+|---|---|---|
+| K2 | A job queued while the polls offered 0, then room, nothing else | Not assigned 706 s after room came |
+| L1 | Scale set updated unchanged (`PATCH`) | Assigned 23 s and 29 s after the call; not in 120 s at the third try |
+| L2 | Session refreshed (`PATCH`) | Assigned 14 s after the call, then 45 s after |
+| L3 | Session deleted and opened again | Assigned 13 s after the call, then not in 120 s |
+| L4 | An Actions runner of the scale set registered (`generatejitconfig`), never started | Not assigned in 120 s |
+| M | REST `POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig` with a name, `runner_group_id: 1` and labels | 201. The Actions runner carries exactly the labels given, no default ones, is online within seconds of starting (`ghcr.io/actions/actions-runner`), and its removal by the agents API (`DELETE .../pools/0/agents/{id}`) answers 204 while it is idle; the REST view says 404 after. Its process does not end by itself after the removal |
+| N | Such an Actions runner started while the job was held, five tries | Each time GitHub looked 4 to 5 s after it came online and handed the job to the scale set, not to it; it was then removed with 204 |
+
 Every count in every probe said `totalAvailableJobs: 0` while a job waited unassigned.
 
 The Mac mini's log of the same day agrees: at 18:39 a slot freed while the other scale sets' newest polls offered 0,
@@ -39,7 +54,9 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
 |---|---|---|
 | GitHub looks at its queue when a job is queued, ends, is cancelled or taken back | E/F, I2, J2, the mini at 18:52:50 | Seen for a queued job and a take-back; inferred for an end and a cancel |
 | It also looks by itself, at moments nobody can predict: within 30 s of room, or not in 3 minutes, or 13 minutes on the mini. The fake looks only when a test says so (`github_looks`) | A, G, I2, J1, J3, K, the mini 18:39 to 18:52 | Seen; the pattern behind the moments is unknown |
-| Nothing the Runner does makes it look: not a session opened, not a scale set updated, not an Actions runner registered | E, F, I1, J1 to J3 | Seen; I2 is the one case that may say otherwise, and J1 shows GitHub looks on its own at such moments |
+| No call to the scale set service makes it look every time: not a session opened, refreshed or opened again, not a scale set updated, not an Actions runner of a scale set registered | E, F, I1, J1 to J3, L1 to L4 | Seen; the assignments that followed a call came 13 to 45 s later, as GitHub's own looks do, and each call also failed once |
+| An Actions runner registered outside any scale set makes it look as it comes online, and the job may go to a scale set rather than to it. The fake looks when a test says it came online (`runner_online`) | N | Seen five times of five |
+| Such an Actions runner carries exactly the labels it was registered with, and takes a queued job of its repository whose labels it has | M | Seen for the labels; that it takes such a job is GitHub's documented meaning, and in N the scale set got the job first |
 | A look gives each scale set with a session as many jobs as the smaller room of its last two polls leaves | E (the poll before the newest), J1 (the newest alone) | Which poll GitHub reads is inferred; the smaller of the two is no kinder than either reading |
 | A session's opening hands out nothing | E, F | Seen |
 | The counts never name a job GitHub holds | every probe | Seen |
@@ -50,8 +67,18 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
 
 ## What follows for the Runner
 
-- No call of the Runner makes GitHub hand over a job it holds. A Mac whose room comes back gets the job only at
-  GitHub's next look: the next job queued or ended in the repository, or GitHub's own, which can take minutes.
+- No call to the scale set service makes GitHub hand over a job it holds. A Mac whose room comes back gets the job
+  at GitHub's next look: the next job queued or ended in the repository, or GitHub's own, which can take many
+  minutes (K2). So a job that waited two minutes while its scale set's polls showed room for as long gets an Actions
+  runner of its own (`held.rs`): registered for its repository outside the scale set, with exactly the scale set's
+  labels (M), in a slot the budget gives as to any job. Its arrival makes GitHub look (N); the job goes to the scale
+  set or to it. Whichever gets it runs it. The other waits for nothing, so at the next look at the queue that finds
+  no job it could take, or after five minutes, its registration's removal is asked for; GitHub answers 204 only for
+  one that ran no job, and 422 for one that took it (`docs/job-state.md`). A scale set gets one at a time and one in
+  five minutes at most, and a paused or full host none. It carries all the set's labels, so GitHub could give it a
+  queued job of the repository that asks for only some of them and wants another size: while one waits, it gets
+  none, and the log says why. The console's report names the held jobs per repository and
+  label set (`heldJobs`).
 - GitHub hands a job only to a scale set whose polls show room, and takes back one that waits in line unacquired after
   five minutes. A larger size on a Mac that keeps running smaller jobs would never show room, and its job never come.
   So the Runner makes room for it (`making.rs`): smaller sizes are held back while it waits, and its scale set offers a

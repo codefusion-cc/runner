@@ -1455,8 +1455,16 @@ fn facts(record: &Record) -> MachineFacts {
 /// Why a Docker job's slot is refused: as many Docker jobs as the Mac allows hold one.
 pub const DOCKER_FULL: &str = "docker-full";
 
-impl<H: Host + Send, V: Vms> Machines<H, V> {
-    fn reserve_as(&self, size: Size, docker: bool) -> Result<Ticket, Refusal> {
+impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
+    fn reserve(&self, size: Size) -> Result<Ticket, Refusal> {
+        self.reserve_for(size, false)
+    }
+
+    fn reserve_docker(&self, size: Size) -> Result<Ticket, Refusal> {
+        self.reserve_for(size, true)
+    }
+
+    fn reserve_for(&self, size: Size, docker: bool) -> Result<Ticket, Refusal> {
         let mut inner = self.lock();
         if docker && inner.docker_held() >= self.config.docker_max_jobs {
             return Err(Refusal(DOCKER_FULL.to_string()));
@@ -1485,16 +1493,6 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 Err(Refusal(refusal.name().to_string()))
             }
         }
-    }
-}
-
-impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
-    fn reserve(&self, size: Size) -> Result<Ticket, Refusal> {
-        self.reserve_as(size, false)
-    }
-
-    fn reserve_docker(&self, size: Size) -> Result<Ticket, Refusal> {
-        self.reserve_as(size, true)
     }
 
     fn mark_docker(&self, ticket: Ticket) {

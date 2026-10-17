@@ -440,10 +440,7 @@ pub fn scaler_with(parts: &Parts<'_>, repo: &str, docker: bool) -> TestScaler {
             docker,
         },
         parts.session.clone(),
-        SetRegistry {
-            client: parts.client.clone(),
-            scale_set_id: parts.set.id,
-        },
+        SetRegistry::of_set(parts.client.clone(), parts.set.id),
         parts.hosts.clone(),
         Arc::new(parts.slots.clone()),
         parts.roster.clone(),

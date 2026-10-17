@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, HostStatus, JobKind, JobLimits, MAX_RUNNERS,
+    Activity, Answer, Client, Command, CommandResult, HeldJobs, HostStatus, JobKind, JobLimits, MAX_RUNNERS,
     MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage,
     ScaleSetStatus, SizeStatus, Status, Update,
 };
@@ -25,13 +25,14 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
+use crate::held::{self, HeldSet, OwnRunners, SetView};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::queued::{Bounds, Look, Queued, QueuedSet};
-use crate::roster::Roster;
-use crate::scaler::{Scaler, ScalerConfig, reconcile};
+use crate::roster::{Roster, Runner};
+use crate::scaler::{Scaler, ScalerConfig, Start, reconcile, start_runner};
 use crate::secs;
-use crate::traits::{EventKind, Slots};
+use crate::traits::{Claim, EventKind, Hosts, Slots, Ticket};
 use crate::update::{Pending, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, commit_from_args};
 use crate::vms::Vms;
 
@@ -187,6 +188,9 @@ pub struct SetState {
     pub statistics: Option<Statistics>,
     /// Why a job assigned to it can never start on this Mac, when one cannot.
     pub never: Option<String>,
+    /// Since when every poll of its listener offered GitHub room beyond the jobs GitHub counts as assigned to it;
+    /// none while the last did not, or none listens.
+    pub room_since: Option<SystemTime>,
 }
 
 /// One look's reading of GitHub.
@@ -205,8 +209,35 @@ struct Read {
 #[derive(Default)]
 struct QueueRead {
     seen: Vec<(String, QueuedSet)>,
+    queued: QueuedNow,
     unread: BTreeSet<String>,
     problems: Vec<String>,
+}
+
+/// The jobs the REST view calls queued in the repositories one look read.
+#[derive(Debug, Default)]
+struct QueuedNow {
+    /// By the scale set this host would serve them with; a set none of whose jobs is queued is not named.
+    jobs: BTreeMap<String, QueuedJobs>,
+    /// The repositories whose queue was read.
+    read: BTreeSet<String>,
+}
+
+/// The queued jobs of one label set of a repository.
+#[derive(Debug, Default)]
+struct QueuedJobs {
+    repo: String,
+    labels: Vec<String>,
+    /// When each was queued and its ID, the oldest first.
+    jobs: Vec<(i64, i64)>,
+}
+
+/// The jobs GitHub holds back from scale sets with room, as the last look at the queue found them, and the Actions
+/// runners of their own the scale sets got ([`crate::held`]).
+#[derive(Debug, Default)]
+struct Held {
+    sets: Vec<HeldSet>,
+    own: OwnRunners,
 }
 
 #[derive(Clone)]
@@ -283,6 +314,7 @@ struct Shared<H, V> {
     told: Mutex<(u64, bool)>,
     /// Jobs that wait while the Mac could run them, since the first look that saw them.
     stall: Mutex<Option<Stall>>,
+    held: Mutex<Held>,
     updates: Option<Arc<dyn SelfUpdate>>,
     results_file: Option<PathBuf>,
     update: Mutex<Updating>,
@@ -486,6 +518,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 console_paused: Mutex::new(false),
                 told: Mutex::new((0, false)),
                 stall: Mutex::new(None),
+                held: Mutex::new(Held::default()),
                 updates: parts.updates,
                 update: Mutex::new(Updating::default()),
                 settings: parts.settings,
@@ -610,7 +643,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .iter()
             .map(|(name, q)| (name.clone(), q.repo.clone()))
             .collect();
-        let (queued, queue_problems) = self.queued_wanted(&read).await;
+        let (queued, queue_problems, now_queued) = self.queued_wanted(&read).await;
         let mut problems = read.problems.clone();
         problems.extend(queue_problems);
         // Only the repositories whose sets changed need their scale sets listed.
@@ -627,12 +660,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         );
         if changed.is_empty() {
             self.say(problems, read.repos.len(), false);
-            return;
+        } else {
+            let mut wanted = read.wanted.clone();
+            wanted.extend(queued);
+            self.apply(wanted, &read.unread, Some(&changed), problems, read.repos.len())
+                .await;
         }
-        let mut wanted = read.wanted.clone();
-        wanted.extend(queued);
-        self.apply(wanted, &read.unread, Some(&changed), problems, read.repos.len())
-            .await;
+        self.held_jobs(&now_queued).await;
     }
 
     /// One look at GitHub. `wants`: whether this Mac still wants scale sets; when not, every one of its own goes.
@@ -650,17 +684,22 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         };
         let mut wanted = read.wanted.clone();
         let mut problems = read.problems.clone();
-        if wants {
-            let (queued, queue_problems) = self.queued_wanted(&read).await;
+        let now_queued = if wants {
+            let (queued, queue_problems, queued_now) = self.queued_wanted(&read).await;
             wanted.extend(queued);
             problems.extend(queue_problems);
+            queued_now
         } else {
             shared.queued.lock().expect("queued").clear();
-        }
+            QueuedNow::default()
+        };
         let read = Arc::new(read);
         *shared.main.lock().expect("main") = wants.then(|| read.clone());
-        self.apply(wanted, &read.unread, None, problems, read.repos.len())
-            .await
+        let kept = self
+            .apply(wanted, &read.unread, None, problems, read.repos.len())
+            .await;
+        self.held_jobs(&now_queued).await;
+        kept
     }
 
     /// Serves the scale sets `wanted` and closes, and once no Actions runner of it is left deletes, every other of
@@ -737,6 +776,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 error_at: None,
                 statistics: None,
                 never: None,
+                room_since: None,
             }));
             let (stop, stopped) = cf_scaleset::shutdown();
             let task = tokio::spawn(serve(shared.clone(), want.client.clone(), state.clone(), stopped));
@@ -766,10 +806,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
 
     /// The scale sets of queued jobs to serve beside main's, from a new look at the queue and those seen before,
     /// and what went wrong or was left out.
-    async fn queued_wanted(&self, read: &Read) -> (BTreeMap<String, Wanted>, Vec<String>) {
+    async fn queued_wanted(&self, read: &Read) -> (BTreeMap<String, Wanted>, Vec<String>, QueuedNow) {
         let shared = &self.shared;
         let QueueRead {
             seen,
+            queued: now_queued,
             unread,
             mut problems,
         } = self.read_queue(read).await;
@@ -820,7 +861,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 Some((name.clone(), want))
             })
             .collect();
-        (wanted, problems)
+        (wanted, problems, now_queued)
     }
 
     /// Reads the jobs GitHub has queued or runs in the repositories `read` served and read, for the label sets this
@@ -901,15 +942,29 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             for why in &waiting.left_out {
                 tracing::info!(repo = %name, %why, "a queued job's labels were not read");
             }
+            queue.queued.read.insert(name.clone());
             for job in waiting.jobs {
+                let set = job.set;
+                let set_name = scale_set_name(machine, name, &set);
+                // A fork's job too: it runs on main's sets.
+                if !job.queued.is_empty() {
+                    let queued = queue
+                        .queued
+                        .jobs
+                        .entry(set_name.clone())
+                        .or_insert_with(|| QueuedJobs {
+                            repo: name.clone(),
+                            labels: set.labels().to_vec(),
+                            jobs: Vec::new(),
+                        });
+                    queued.jobs.extend(job.queued);
+                }
                 // A public repository's pull request from a fork is a stranger's code: it runs on main's sets, if
                 // its labels are theirs, but makes none of its own.
                 if job.from_fork && !repo.private {
                     tracing::debug!(repo = %name, job = job.id, "a fork's queued job makes no set on a public repository");
                     continue;
                 }
-                let set = job.set;
-                let set_name = scale_set_name(machine, name, &set);
                 if read.wanted.contains_key(&set_name) {
                     continue;
                 }
@@ -935,6 +990,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 "the queued jobs of {} were not read in time",
                 late.join(", ")
             ));
+        }
+        for queued in queue.queued.jobs.values_mut() {
+            queued.jobs.sort_unstable();
         }
         queue
     }
@@ -1142,6 +1200,170 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .expect("clients")
             .insert(repo.to_string(), client.clone());
         Some(client)
+    }
+
+    /// Finds the jobs GitHub holds back from this host's scale sets while they have room ([`crate::held`]), keeps
+    /// them for the report, retires the Actions runners of their own that have nothing left to take, and gives
+    /// each scale set with held jobs one of its own when a slot of its size is free. A paused host (the console's
+    /// pause is [`Machines::pause`]) and a full one give no slot, so they start none.
+    async fn held_jobs(&self, queued: &QueuedNow) {
+        let shared = &self.shared;
+        let now = shared.clock.now();
+        let sets = self.sets();
+        let views: Vec<SetView> = sets
+            .iter()
+            .filter(|set| queued.read.contains(&set.repo))
+            .map(|set| SetView {
+                name: set.name.clone(),
+                repo: set.repo.clone(),
+                labels: set.labels.clone(),
+                room_since: set.room_since,
+                assigned_unstarted: set.statistics.as_ref().map_or(0, Statistics::unstarted),
+                queued: queued
+                    .jobs
+                    .get(&set.name)
+                    .map(|queued| queued.jobs.clone())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let found = held::held(now, &views);
+        // The slots are taken, and the tries counted, under the lock: a look at the same time starts none twice.
+        let starts: Vec<(&SetState, &HeldSet, Ticket)> = {
+            let mut held = shared.held.lock().expect("held");
+            held.own.retain(|name| sets.iter().any(|set| set.name == name));
+            self.retire_own(&held.own, &sets, &views, now);
+            held.sets.clone_from(&found);
+            let mut starts = Vec::new();
+            // One that took a job waits for none: the jobs held behind it get another.
+            let waits = |runner: &str| shared.roster.get(runner).is_some_and(|runner| runner.waits());
+            for set in &found {
+                let Some(state) = sets.iter().find(|state| state.name == set.name) else {
+                    continue;
+                };
+                if !held.own.due(now, &set.name, waits) {
+                    continue;
+                }
+                // It carries all the set's labels, so GitHub could give it a job that asks for only some of them,
+                // and wants a machine of another size.
+                let others = queued
+                    .jobs
+                    .values()
+                    .map(|other| (other.repo.as_str(), other.labels.as_slice()));
+                if held::narrower_waits(&set.repo, &set.labels, others) {
+                    held.own.tried(now, &set.name, String::new());
+                    tracing::info!(
+                        repo = %set.repo,
+                        labels = %set.labels.join(","),
+                        job = set.oldest,
+                        "GitHub holds a job back from a scale set with room, but no Actions runner of its own is \
+                         started for it: a queued job of the repository with only some of its labels could go to it"
+                    );
+                    continue;
+                }
+                if let Some(ticket) = self.own_slot(state) {
+                    held.own.tried(now, &set.name, String::new());
+                    starts.push((state, set, ticket));
+                }
+            }
+            starts
+        };
+        for (state, set, ticket) in starts {
+            if let Some(runner) = self.own_runner(state, set, ticket).await {
+                shared
+                    .held
+                    .lock()
+                    .expect("held")
+                    .own
+                    .tried(now, &set.name, runner);
+            }
+        }
+    }
+
+    /// Asks for the removal of the Actions runners of their own that wait for a job when their scale set's queue
+    /// holds none they could take, or they waited [`held::OWN_WAIT`]. One that took a job is refused by GitHub, and
+    /// one that is not idle any more is left as it is (`Hosts::retire`).
+    fn retire_own(&self, own: &OwnRunners, sets: &[SetState], views: &[SetView], now: SystemTime) {
+        let shared = &self.shared;
+        let repos: BTreeSet<&str> = sets.iter().map(|set| set.repo.as_str()).collect();
+        for repo in repos {
+            let idle: Vec<String> = shared
+                .roster
+                .runners(repo, held::OWN)
+                .into_iter()
+                .filter(Runner::waits)
+                .filter(|runner| {
+                    let unassigned = own
+                        .set_of(&runner.name)
+                        .and_then(|set| views.iter().find(|view| view.name == set))
+                        .map(|view| view.unassigned().len());
+                    held::own_done(now.duration_since(runner.started).unwrap_or_default(), unassigned)
+                })
+                .map(|runner| runner.name)
+                .collect();
+            // Every one of them: those of the repository's other scale sets that already ask are no surplus of these,
+            // and would hold them back if counted against them.
+            if !idle.is_empty() {
+                Hosts::retire(&*shared.machines, repo, held::OWN, usize::MAX, &idle);
+            }
+        }
+    }
+
+    /// A slot for an Actions runner of a scale set's own, as the budget gives one to any job it is offered: none
+    /// while the host is paused, full, or someone works on it.
+    fn own_slot(&self, state: &SetState) -> Option<Ticket> {
+        let machines = &*self.shared.machines;
+        let promised = machines.reserve_for(state.size, state.docker).ok()?;
+        match machines.claim(state.size, Some(promised)) {
+            Claim::Start(ticket) => {
+                if state.docker {
+                    machines.mark_docker(ticket);
+                }
+                Some(ticket)
+            }
+            Claim::Waits { ticket, .. } => {
+                machines.withdraw(ticket);
+                None
+            }
+            Claim::Never(_) => None,
+        }
+    }
+
+    /// Starts an Actions runner of its own for a scale set's held jobs in the slot `ticket`, registered outside the
+    /// scale set with exactly its labels. Says its name; none when GitHub would not register it, and the slot is
+    /// then given back.
+    async fn own_runner(&self, state: &SetState, set: &HeldSet, ticket: Ticket) -> Option<String> {
+        let shared = &self.shared;
+        let machines = &*shared.machines;
+        let Some(client) = self.client_for(&state.repo).await else {
+            machines.release(ticket);
+            return None;
+        };
+        let registry = SetRegistry::own(client, state.labels.clone());
+        let at = Start {
+            machine: &shared.config.machine,
+            repo: &state.repo,
+            scale_set_id: held::OWN,
+            size: state.size,
+        };
+        match start_runner(&registry, machines, &shared.roster, &*shared.clock, at, ticket).await {
+            Ok(runner) => {
+                tracing::info!(
+                    %runner, repo = %set.repo, labels = %set.labels.join(","), job = set.oldest, jobs = set.jobs,
+                    waited = shared.clock.now().duration_since(set.queued).unwrap_or_default().as_secs(),
+                    room = set.room.as_secs(),
+                    "GitHub holds a job back from a scale set with room: an Actions runner of its own takes it"
+                );
+                Some(runner)
+            }
+            Err(error) => {
+                machines.release(ticket);
+                tracing::warn!(
+                    repo = %set.repo, labels = %set.labels.join(","), %error,
+                    "an Actions runner of its own for a held job could not start"
+                );
+                None
+            }
+        }
     }
 
     /// Ends everything this Mac has, for an uninstall: no new job is taken, every machine is stopped, every
@@ -1459,6 +1681,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     })
                     .collect(),
                 commands: self.commands(),
+                held_jobs: self.held_report(),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)
@@ -1529,6 +1752,21 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             jobs: Vec::new(),
             results: Vec::new(),
         }
+    }
+
+    /// The jobs GitHub held back as the last look found them, each wait as of now.
+    fn held_report(&self) -> Vec<HeldJobs> {
+        let held = self.shared.held.lock().expect("held");
+        let now = self.shared.clock.now();
+        held.sets
+            .iter()
+            .map(|set| HeldJobs {
+                repo: set.repo.clone(),
+                labels: set.labels.iter().take(MAX_LABELS).cloned().collect(),
+                jobs: u32::try_from(set.jobs).unwrap_or(u32::MAX),
+                oldest_wait_seconds: now.duration_since(set.queued).unwrap_or_default().as_secs(),
+            })
+            .collect()
     }
 
     /// Reports to the console, with the job events that wait, and does what its answer says. Returns when the
@@ -2111,10 +2349,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     set = %name, id = set.id, %repo, labels = %labels.join(","), size = size.label(),
                     "a scale set at GitHub"
                 );
-                let registry = SetRegistry {
-                    client: client.clone(),
-                    scale_set_id: set.id,
-                };
+                let registry = SetRegistry::of_set(client.clone(), set.id);
                 let machines = shared.machines.clone();
                 reconcile(&registry, &shared.roster, &repo, set.id, |runner, answer| {
                     machines.answered(runner, answer);
@@ -2150,15 +2385,23 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     state.error_at = None;
                 }
                 let watch = {
-                    let state = state.clone();
-                    move || {
+                    let (state, clock) = (state.clone(), shared.clock.clone());
+                    move |capacity: Option<usize>| {
                         let mut state = state.lock().expect("set");
                         state.statistics.clone_from(&statistics.lock().expect("statistics"));
                         state.never.clone_from(&never.lock().expect("never"));
+                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here.
+                        let assigned = state.statistics.as_ref().map_or(0, Statistics::assigned);
+                        state.room_since = match capacity {
+                            Some(capacity) if capacity > assigned => state.room_since.or_else(|| Some(clock.now())),
+                            _ => None,
+                        };
                     }
                 };
                 let listened = listen_nudged(&session, &mut Watched(&mut scaler, &watch), stop, &bell).await;
                 drop(scaler);
+                // No poll offers room until the next session's first.
+                state.lock().expect("set").room_since = None;
                 match session.close().await {
                     Ok(()) => tracing::info!(set = %name, "the session is closed"),
                     Err(error) => {
@@ -2178,13 +2421,14 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
     .await;
 }
 
-/// A scaler whose counts are copied to the scale set's state after every message.
+/// A scaler whose counts, and the room it offers GitHub next (none after a failure), are copied to the scale set's
+/// state after every message.
 struct Watched<'a, S, F>(&'a mut S, &'a F);
 
-impl<S: cf_scaleset::Scaler, F: Fn() + Send + Sync> cf_scaleset::Scaler for Watched<'_, S, F> {
+impl<S: cf_scaleset::Scaler, F: Fn(Option<usize>) + Send + Sync> cf_scaleset::Scaler for Watched<'_, S, F> {
     async fn scale(&mut self, message: Option<&cf_scaleset::Message>) -> Result<usize, cf_scaleset::Error> {
         let capacity = self.0.scale(message).await;
-        (self.1)();
+        (self.1)(capacity.as_ref().ok().copied());
         capacity
     }
 }

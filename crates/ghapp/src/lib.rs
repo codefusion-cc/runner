@@ -11,7 +11,8 @@ mod http;
 mod jwt;
 
 pub use client::{
-    API, GitHubApp, Installation, JOBS_PAGE, MAX_RUN_SETS, Repo, WAITING_RUNS, Waiting, WaitingJob,
+    API, DEFAULT_RUNNER_GROUP, GitHubApp, Installation, JOBS_PAGE, MAX_RUN_SETS, PlainJit, Repo,
+    WAITING_RUNS, Waiting, WaitingJob,
 };
 pub use credentials::{AppCredentials, AppKey, KeyError};
 pub use error::{Error, StatusError};
