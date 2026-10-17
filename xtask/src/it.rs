@@ -95,6 +95,7 @@ sudo -n unshare -m -n sh -c 'mount -t sysfs sysfs /tmp/at 2>/dev/null && grep -q
 sudo -n sh -c 'dd if=/dev/zero of=/tmp/swap bs=1M count=8 2>/dev/null && chmod 600 /tmp/swap && mkswap /tmp/swap >/dev/null 2>&1 && swapon /tmp/swap' 2>/dev/null; echo swap=$?
 echo swaps=$(tail -n +2 /proc/swaps | wc -l)
 grep -Eq '^overlay / overlay [^ ]*nodev' /proc/mounts; echo root-nodev=$?
+grep -Eq '^overlay / overlay [^ ]*xino=on' /proc/mounts; echo root-xino=$?
 sudo -n perl -e '
   $SIG{ALRM} = sub { print "vsock-host=silent\n"; exit };
   alarm 5;
@@ -1600,6 +1601,14 @@ fn inside(bench: &Bench) -> Fallible<Vec<String>> {
         format!(
             "the job's root got at its own machine ({}): {line}",
             open.join(", ")
+        ),
+    )?;
+    // The kernel took xino=on: a folder keeps its inode number when memory pressure drops it (disks.rs).
+    expect(
+        value("root-xino") == "0",
+        format!(
+            "the job's root has no stable inode numbers: root-xino={}",
+            value("root-xino")
         ),
     )?;
     // What the job wrote at the pipe its end is reported on changed nothing: its end is its own exit code.
