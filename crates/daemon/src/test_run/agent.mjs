@@ -18,9 +18,9 @@
 // A network error, a redirect, a 429 and a 5xx are tried again, 1 s and twice as long each time up to 30 s, and so is
 // a 2xx without the console's JSON. 409 says the console has another offset: the output goes on from there. 422 says
 // a post was not UTF-8: those bytes are skipped. Any other 4xx ends the output, as do ten answers in a row that move
-// nothing; past the 8 MiB the console keeps only heartbeats go. The end then says why, and its tail carries the last
-// of the output. 401 and 410 say the run is over at the console: the suite is killed and the agent ends at once,
-// saying nothing more.
+// nothing, and the 8 MiB the console keeps: from then on only heartbeats go, which still carry the cancel. The end
+// then says why, and its tail carries the last of the output. 401 and 410 say the run is over at the console: the
+// suite is killed and the agent ends at once, saying nothing more.
 //
 // Node's own modules and fetch only: the image has Node 24 and no packages for this. The `CF_RUN_*_MS` knobs,
 // CF_RUN_KEEP_BYTES and CF_RUN_DIR are for the agent's own tests; the Runner gives the machine none of them.
@@ -184,12 +184,11 @@ class Sender {
     const file = await open(SPOOL, 'r');
     try {
       for (;;) {
-        // Nothing more is sent once the console refused the output: the end says why.
-        if (this.over) return;
         const final = this.final;
         const size = (await file.stat()).size;
-        // Past what the console keeps only heartbeats go; the end's tail carries the end.
-        const room = Math.max(0, KEEP - (this.sent - this.dropped));
+        // Past what the console keeps, or once it refused the output, only heartbeats go: they still carry its
+        // cancel. The end's tail carries the end, and its message says why.
+        const room = this.over ? 0 : Math.max(0, KEEP - (this.sent - this.dropped));
         let length = Math.max(0, Math.min(size - this.sent, CHUNK, room));
         let body = Buffer.alloc(0);
         if (length > 0) {
@@ -253,8 +252,12 @@ class Sender {
     if (!response.ok) {
       // Another 4xx (Access or a firewall in front of the console, a 404, a 413, a 409 that says no offset) is not
       // one that sending again mends: the output ends here, and the end goes with the tail.
-      this.over = `the console answered ${response.status} to the output at ${offset} bytes; the rest is in the tail`;
-      log(this.over);
+      if (!this.over) {
+        this.over = `the console answered ${response.status} to the output at ${offset} bytes; the rest is in the tail`;
+        log(this.over);
+      }
+      // The next heartbeat comes in its time, not at once.
+      this.last = Date.now();
       return;
     }
     if (have === null) {
@@ -275,8 +278,11 @@ class Sender {
   async strayed(what) {
     this.stray++;
     if (this.stray >= STRAY_ANSWERS) {
-      this.over = `the console's answers to the output were ${what}; the rest is in the tail`;
-      log(this.over);
+      if (!this.over) {
+        this.over = `the console's answers to the output were ${what}; the rest is in the tail`;
+        log(this.over);
+      }
+      this.last = Date.now();
       return true;
     }
     await pause(Math.min(BACKOFF_MIN_MS * 2 ** this.stray, BACKOFF_MAX_MS), this.stopped.signal);
@@ -398,8 +404,13 @@ function suite(spec, timeoutS, sender) {
     const bytes = Buffer.from(text);
     if (!failed) {
       try {
-        fs.writeSync(output, bytes);
-        kept += bytes.length;
+        const written = fs.writeSync(output, bytes);
+        kept += written;
+        if (written === bytes.length) return;
+        // A disk that took part of it is full: the rest is not kept, as with ENOSPC.
+        failed = 'a short write';
+        log(`the output is not kept past ${kept} bytes: ${failed}`);
+        lost += bytes.length - written;
         return;
       } catch (error) {
         failed = error.code || error.message;

@@ -1442,7 +1442,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         // The Mac may have stopped taking jobs since the slot was given (a wait for room ends while it is paused, or
         // an update holds): a run is not a job it has to take.
         if inner.paused || inner.draining || inner.holding {
-            return Err(HostError("the host takes no new job now".into()));
+            return Err(HostError(HOST_CLOSED.into()));
         }
         if inner.jobs.contains_key(&name) {
             return Err(HostError(format!("a machine named {runner} is there already")));
@@ -1475,10 +1475,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             self.store.remove(&request.job);
             return Err(error);
         }
-        if run.docker {
-            // Counted against the Mac's Docker jobs, as a CI job's daemon would be.
-            inner.docker.insert(ticket);
-        }
+        // A Docker run's slot counts against the Mac's Docker jobs since `test_run::admit` took it.
         tracing::info!(%runner, size = run.size.label(), repo = %run.repo, "a test run's machine starts");
         Ok(runner)
     }
@@ -1667,6 +1664,10 @@ fn facts(record: &Record) -> MachineFacts {
 
 /// Why a Docker job's slot is refused: as many Docker jobs as the Mac allows hold one.
 pub const DOCKER_FULL: &str = "docker-full";
+
+/// Why a test run's slot starts no machine on a Mac that stopped taking jobs since it was given: the console hears
+/// `busy: ` and this, as it would have before the slot.
+pub const HOST_CLOSED: &str = "the host takes no new job now";
 
 impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
     fn reserve(&self, size: Size) -> Result<Ticket, Refusal> {

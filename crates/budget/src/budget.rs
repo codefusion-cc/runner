@@ -918,11 +918,13 @@ impl Budget {
                     .unwrap_or(waiter),
                 Err(_) => waiter,
             })
-            .map(|&Waiter { slot, size, .. }| {
+            .map(|Waiter { slot, size, turn, .. }| {
+                let (slot, size) = (*slot, *size);
                 let ruled_out = self.settings.can_run(size).err();
                 let why = match ruled_out {
                     Some(limit) => Some(limit),
-                    None if ahead == 0 => self.assigned_fits(now, size).err(),
+                    // What keeps the first one out is what `observe` asks of it: a test run fits as a claim would.
+                    None if ahead == 0 => self.waiter_fits(now, size, turn).err(),
                     None => Some(Refusal::AssignedFirst { waiting: ahead }),
                 };
                 ahead += usize::from(ruled_out.is_none());

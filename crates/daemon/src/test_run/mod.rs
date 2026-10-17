@@ -261,7 +261,7 @@ pub fn admit(slots: &impl Slots, run: &TestRun, other: Option<&str>) -> Admissio
         // Not GitHub's job: no room the Mac would refuse a claim, and none while someone is at it.
         refusable: true,
     };
-    match slots.claim_in_turn(run.size, None, turn) {
+    let admission = match slots.claim_in_turn(run.size, None, turn) {
         Claim::Start(ticket) => Admission::Start(ticket),
         Claim::Waits { ticket, why } if run.wait_s == 0 => {
             slots.withdraw(ticket);
@@ -269,7 +269,14 @@ pub fn admit(slots: &impl Slots, run: &TestRun, other: Option<&str>) -> Admissio
         }
         Claim::Waits { ticket, .. } => Admission::Waits(ticket),
         Claim::Never(why) => Admission::Never(why),
+    };
+    // Its Docker room is held from here, while it waits too: a CI job's Docker daemon cannot take it meanwhile.
+    if run.docker
+        && let Admission::Start(ticket) | Admission::Waits(ticket) = &admission
+    {
+        slots.mark_docker(*ticket);
     }
+    admission
 }
 
 /// How a test run's wait for its place in line ended ([`wait_turn`]).

@@ -578,8 +578,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if results.iter().any(|result| result.id == id) {
             return;
         }
-        // Never dropped: the console would send the command again, and it would be done again. Only an update's
-        // result, which ends on its own, comes while a report's worth wait (see `answered`).
+        // Never dropped: the console would send the command again, and it would be done again. Only the results that
+        // come later by themselves (an update's, a test run's that waited for room) come while a report's worth
+        // wait (see `answered`).
         results.push(CommandResult {
             id,
             ok,
@@ -2041,6 +2042,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             Ok(runner) => (true, format!("started {runner}")),
             Err(error) => {
                 machines.release(ticket);
+                if error.0 == crate::machines::HOST_CLOSED {
+                    return (false, format!("busy: {}", error.0));
+                }
                 (false, format!("the machine did not start: {error}"))
             }
         }

@@ -552,6 +552,28 @@ async fn a_docker_run_past_the_macs_docker_jobs_is_busy() {
     w.m.release(held);
 }
 
+#[tokio::test]
+async fn a_docker_run_holds_its_docker_room_while_it_waits() {
+    let mut w = World::new(1);
+    w.running().await;
+    let Admission::Waits(ticket) = test_run::admit(&*w.m, &run(json!({"docker": true, "waitS": 60})), None)
+    else {
+        panic!("no place in line");
+    };
+    assert_eq!(
+        w.m.docker_room(),
+        0,
+        "a waiting Docker run left its Docker room to others"
+    );
+    assert_eq!(
+        w.m.reserve_docker(Size::G2).map_err(|refusal| refusal.0),
+        Err("docker-full".to_string())
+    );
+    // Given up, its room is everyone's again.
+    w.m.withdraw(ticket);
+    assert_eq!(w.m.docker_room(), 1);
+}
+
 #[test]
 fn the_agents_own_time_ends_before_the_machines_deadline() {
     let long = run(json!({"timeoutS": 7200}));

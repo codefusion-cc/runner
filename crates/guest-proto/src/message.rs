@@ -287,7 +287,6 @@ pub enum GuestEnd {
     Stopped(StopReason),
 }
 
-/// A secret as a plain string in a message: the one place a [`Secret`] is written out, to the end that needs it.
 /// Environment variables whose values are [`Secret`]s, written as the `[name, value]` pairs they always were.
 pub mod secret_env {
     use cf_secret::Secret;
@@ -310,6 +309,7 @@ pub mod secret_env {
     }
 }
 
+/// A secret as a plain string in a message: the one place a [`Secret`] is written out, to the end that needs it.
 mod on_the_wire {
     use cf_secret::Secret;
     use serde::{Deserialize, Deserializer, Serializer};

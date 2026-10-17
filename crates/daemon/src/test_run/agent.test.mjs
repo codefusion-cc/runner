@@ -427,6 +427,24 @@ for (const [status, answer] of [
   });
 }
 
+test('a console that refused the output still cancels the suite through its heartbeats', async () => {
+  const console = await fakeConsole({
+    suite: 'sleep 300 & echo $! > ../pid; echo started; wait',
+    fault: (kind, state, body) => (kind === 'output' && body.length > 0 ? 413 : undefined),
+  });
+  const { dir, done } = start(console);
+  const pid = await pidIn(dir);
+  console.cancel = true;
+  const { code } = await done;
+  await console.close();
+  assert.equal(code, 0);
+  assert.equal(console.ends[0].exit, 130);
+  assert.equal(console.ends[0].reason, 'cancelled');
+  assert.match(console.ends[0].message, /413/);
+  assert.equal(console.stored.length, 0);
+  assert.ok(await gone(pid), 'the suite\'s sleep is still there');
+});
+
 test('a console that answers 409 at the offset the agent sends backs off and ends the output', async () => {
   const console = await fakeConsole({
     suite: slowLines(5),
