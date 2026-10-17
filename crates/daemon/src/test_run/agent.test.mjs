@@ -22,7 +22,8 @@ const BASE = `/agent/runners/runs/${RUN}`;
 const agents = new Set();
 after(() => agents.forEach((child) => child.kill('SIGKILL')));
 /** A test that hangs (an agent that never ends) fails after half a minute. */
-const test = (name, fn) => nodeTest(name, { timeout: 30_000 }, fn);
+const test = (name, options, fn) =>
+  fn ? nodeTest(name, { timeout: 30_000, ...options }, fn) : nodeTest(name, { timeout: 30_000 }, options);
 
 /** A repository of two commits, as two bundles: the first commit, and the second on top of it. */
 function repository() {
@@ -80,6 +81,11 @@ async function fakeConsole({ suite, image = null, timeoutS = 60, partBytes = 300
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(value));
     };
+    // Where a sign-in page in front of the console sends what it stops: a page, not the console's answer.
+    if (req.url === '/login') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end('<html>sign in</html>');
+    }
     if (req.headers.authorization !== `Bearer ${TOKEN}`) return reply(401, {});
     const url = new URL(req.url, 'http://x');
     if (!url.pathname.startsWith(BASE)) return reply(404, {});
@@ -87,6 +93,10 @@ async function fakeConsole({ suite, image = null, timeoutS = 60, partBytes = 300
     const kind = route === '/spec' ? 'spec' : route === '/output' ? 'output' : route === '/end' ? 'end' : 'part';
     const faulted = fault?.(kind, state, body);
     if (typeof faulted === 'number') return reply(faulted, {});
+    if (faulted && typeof faulted === 'object') {
+      res.writeHead(faulted.status, faulted.headers ?? {});
+      return res.end(faulted.body ?? '');
+    }
     if (req.method === 'GET' && kind === 'spec') return reply(200, state.spec);
     const part = route.match(/^\/bundles\/(\d+)\/parts\/(\d+)$/);
     if (req.method === 'GET' && part) {
@@ -128,8 +138,9 @@ async function fakeConsole({ suite, image = null, timeoutS = 60, partBytes = 300
 }
 
 /** Starts the agent against `console` in a folder of its own. Says the folder, and its exit code once it exits. */
-function start(console, { timeoutS = 60, knobs = {} } = {}) {
+function start(console, { timeoutS = 60, knobs = {}, prepare } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-agent-'));
+  prepare?.(dir);
   const env = { ...process.env };
   for (const name of Object.keys(env)) if (name.startsWith('CF_')) delete env[name];
   Object.assign(env, {
@@ -389,4 +400,104 @@ test('a 422 from the console skips those bytes once and the output goes on after
   assert.equal(console.stored.toString(), 'first\nthird\n');
   assert.ok(contiguous(console.posts), JSON.stringify(console.posts));
   assert.equal(console.ends[0].exit, 0);
+});
+
+const lines = (n) => Array.from({ length: n }, (_, i) => `line ${i + 1}\n`).join('');
+const slowLines = (n) => `for i in $(seq 1 ${n}); do echo "line $i"; sleep 0.02; done`;
+
+for (const [status, answer] of [
+  [403, { status: 403, headers: { 'content-type': 'text/html' }, body: '<html>forbidden</html>' }],
+  [404, 404],
+  [413, 413],
+  ['409 without have', { status: 409, headers: { 'content-type': 'application/json' }, body: '{}' }],
+]) {
+  test(`a ${status} to the output ends the output, and the end says so with the tail`, async () => {
+    const console = await fakeConsole({
+      suite: `${slowLines(10)}; echo last`,
+      fault: (kind, state, body) => (kind === 'output' && body.length > 0 && state.stored.length > 0 ? answer : undefined),
+    });
+    const { code } = await agent(console);
+    await console.close();
+    assert.equal(code, 0);
+    assert.equal(console.ends.length, 1);
+    assert.equal(console.ends[0].exit, 0);
+    assert.match(console.ends[0].message, /output/);
+    assert.ok(console.ends[0].tail.endsWith('last\n'));
+    assert.ok(console.posts.length < 40, `${console.posts.length} posts`);
+  });
+}
+
+test('a console that answers 409 at the offset the agent sends backs off and ends the output', async () => {
+  const console = await fakeConsole({
+    suite: slowLines(5),
+    fault: (kind, state, body) =>
+      kind === 'output' && body.length > 0
+        ? { status: 409, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ have: state.stored.length }) }
+        : undefined,
+  });
+  const began = Date.now();
+  await agent(console);
+  await console.close();
+  assert.equal(console.ends.length, 1);
+  assert.match(console.ends[0].message, /output/);
+  const conflicts = console.posts.filter((post) => post.length > 0).length;
+  assert.ok(conflicts <= 12, `${conflicts} posts that met a 409`);
+  assert.ok(Date.now() - began < 20_000);
+});
+
+test('a redirect or a page that is not the console\'s answer delivers nothing: the output and the end go again', async () => {
+  let redirected = 0;
+  let pages = 0;
+  let endRedirected = false;
+  const console = await fakeConsole({
+    suite: slowLines(20),
+    fault: (kind, state, body) => {
+      if (kind === 'output' && body.length > 0 && redirected < 2) {
+        redirected++;
+        return { status: 302, headers: { location: '/login' } };
+      }
+      if (kind === 'output' && body.length > 0 && pages < 2) {
+        pages++;
+        return { status: 200, headers: { 'content-type': 'text/html' }, body: '<html>sign in</html>' };
+      }
+      if (kind === 'end' && !endRedirected) {
+        endRedirected = true;
+        return { status: 302, headers: { location: '/login' } };
+      }
+      return undefined;
+    },
+  });
+  await agent(console);
+  await console.close();
+  assert.equal(redirected, 2);
+  assert.equal(pages, 2);
+  assert.equal(console.stored.toString(), lines(20));
+  assert.equal(console.ends.length, 1, 'the end was taken as sent');
+});
+
+test('past what the console keeps, only heartbeats go, and the end\'s tail carries the end', async () => {
+  const console = await fakeConsole({ suite: "head -c 5000 /dev/zero | tr '\\0' x; echo; echo END" });
+  await agent(console, { knobs: { CF_RUN_KEEP_BYTES: '1000' } });
+  await console.close();
+  assert.equal(console.stored.toString(), 'x'.repeat(1000));
+  assert.ok(console.posts.every((post) => post.offset + post.length <= 1000));
+  assert.ok(console.ends[0].tail.endsWith('END\n'));
+  assert.match(console.ends[0].message ?? '', /1000 bytes/);
+  assert.equal(console.ends[0].exit, 0);
+});
+
+test('a full disk stops the spool, not the suite: the end says so', { skip: !fs.existsSync('/dev/full') }, async () => {
+  const console = await fakeConsole({ suite: 'echo one; echo two; touch ../ran' });
+  const { code, dir } = await agent(console, {
+    prepare: (dir) => {
+      fs.mkdirSync(path.join(dir, '.cf-test-run'));
+      fs.symlinkSync('/dev/full', path.join(dir, '.cf-test-run', 'output.log'));
+    },
+  });
+  await console.close();
+  assert.equal(code, 0);
+  assert.ok(fs.existsSync(path.join(dir, 'ran')), 'the suite did not run to its end');
+  assert.equal(console.ends.length, 1);
+  assert.equal(console.ends[0].exit, 0);
+  assert.match(console.ends[0].message ?? '', /not kept/);
 });

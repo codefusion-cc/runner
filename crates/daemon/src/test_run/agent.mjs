@@ -8,19 +8,22 @@
 //   commit checked out.
 // - The suite: `bash -lc <suite>` in a process group of its own, or in `docker run` when the spec names an image, with
 //   the machine's environment less CF_RUN_* and with CI=true and CF_TEST_REMOTE=1. Its output, standard output and
-//   error as one stream, goes to a file first, so a console that does not answer never holds it up, and from there
+//   error as one stream decoded as UTF-8 (U+FFFD for what is not), goes to a file first, so a console that does not answer never holds it up, and from there
 //   to `POST <url>/output?offset=<n>` by byte offset, 256 KiB at most at a time, cut where no UTF-8 character is
 //   split. An empty post is the heartbeat, and its answer carries the console's cancel.
 // - The end: once the console has all the output, `POST <url>/end` with the exit, why it ended and the last 64 KiB.
 //   The suite's time over: SIGTERM to its group (and `docker kill`), SIGKILL 20 s later, exit 124. Cancelled: the
 //   same, exit 130. Killed by a signal: 128 and its number.
 //
-// A network error, a 429 and a 5xx are tried again, 1 s and twice as long each time up to 30 s. 409 says the console
-// has another offset: the output goes on from there. 401 and 410 say the run is over at the console: the suite is
-// killed and the agent ends at once, saying nothing more.
+// A network error, a redirect, a 429 and a 5xx are tried again, 1 s and twice as long each time up to 30 s, and so is
+// a 2xx without the console's JSON. 409 says the console has another offset: the output goes on from there. 422 says
+// a post was not UTF-8: those bytes are skipped. Any other 4xx ends the output, as do ten answers in a row that move
+// nothing; past the 8 MiB the console keeps only heartbeats go. The end then says why, and its tail carries the last
+// of the output. 401 and 410 say the run is over at the console: the suite is killed and the agent ends at once,
+// saying nothing more.
 //
-// Node's own modules and fetch only: the image has Node 24 and no packages for this. The `CF_RUN_*_MS` knobs and
-// CF_RUN_DIR are for the agent's own tests; the Runner gives the machine none of them.
+// Node's own modules and fetch only: the image has Node 24 and no packages for this. The `CF_RUN_*_MS` knobs,
+// CF_RUN_KEEP_BYTES and CF_RUN_DIR are for the agent's own tests; the Runner gives the machine none of them.
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -46,6 +49,9 @@ const BACKOFF_MIN_MS = knob('CF_RUN_BACKOFF_MIN_MS', 1_000);
 const BACKOFF_MAX_MS = knob('CF_RUN_BACKOFF_MAX_MS', 30_000);
 const POLL_MS = knob('CF_RUN_POLL_MS', 250);
 const REQUEST_MS = knob('CF_RUN_REQUEST_MS', 60_000);
+const KEEP = knob('CF_RUN_KEEP_BYTES', 8 * 1024 * 1024);
+/** How many answers in a row that are not the console's own, or 409s that move nothing, end the output. */
+const STRAY_ANSWERS = 10;
 const CHUNK = 256 * 1024;
 const TAIL = 64 * 1024;
 const HOME = env.CF_RUN_DIR || env.HOME || os.homedir();
@@ -79,6 +85,9 @@ async function call(method, suffix, { body, type, signal, timeoutMs = REQUEST_MS
         method,
         headers: { authorization: `Bearer ${TOKEN}`, ...(type ? { 'content-type': type } : {}) },
         body,
+        // A redirect is never the console's answer (a sign-in page in front of it answers 200 with its page): it is
+        // an error, tried again as one.
+        redirect: 'error',
         signal: AbortSignal.any(signals),
       });
     } catch (error) {
@@ -103,11 +112,13 @@ async function call(method, suffix, { body, type, signal, timeoutMs = REQUEST_MS
   }
 }
 
+/** The answer's JSON object, or null when it has none. */
 async function json(response) {
   try {
-    return await response.json();
+    const value = await response.json();
+    return value && typeof value === 'object' ? value : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
@@ -139,6 +150,17 @@ class Sender {
     this.wake = null;
     this.done = null;
     this.cancelled = false;
+    /** Why the output stopped before its end, for the end's message. */
+    this.over = null;
+    /** Answers in a row that were not the console's, or 409s that moved nothing. */
+    this.stray = 0;
+  }
+
+  /** What the end's message says of the output, when not all of it went. */
+  note() {
+    if (this.over) return this.over;
+    if (this.sent - this.dropped >= KEEP) return `the console keeps ${KEEP} bytes of output; the rest is in the tail`;
+    return undefined;
   }
 
   start() {
@@ -162,16 +184,22 @@ class Sender {
     const file = await open(SPOOL, 'r');
     try {
       for (;;) {
+        // Nothing more is sent once the console refused the output: the end says why.
+        if (this.over) return;
         const final = this.final;
         const size = (await file.stat()).size;
-        let length = Math.max(0, Math.min(size - this.sent, CHUNK));
+        // Past what the console keeps only heartbeats go; the end's tail carries the end.
+        const room = Math.max(0, KEEP - (this.sent - this.dropped));
+        let length = Math.max(0, Math.min(size - this.sent, CHUNK, room));
         let body = Buffer.alloc(0);
         if (length > 0) {
           body = Buffer.alloc(length);
           const { bytesRead } = await file.read(body, 0, length, this.sent);
           body = body.subarray(0, bytesRead);
           // A character cut short waits for its last bytes, unless nothing more can come.
-          if (!(final && this.sent + body.length === size)) body = body.subarray(0, boundary(body));
+          if (!(final && this.sent + body.length === size && room >= size - this.sent)) {
+            body = body.subarray(0, boundary(body));
+          }
           length = body.length;
         }
         const heartbeat = Date.now() - this.last >= HEARTBEAT_MS;
@@ -179,7 +207,7 @@ class Sender {
           await this.post(body);
           continue;
         }
-        if (final && this.sent >= size) {
+        if (final && (this.sent >= size || room === 0)) {
           this.done?.();
           return;
         }
@@ -203,10 +231,13 @@ class Sender {
       signal: this.stopped.signal,
     });
     const answer = await json(response);
-    const have = Number.isSafeInteger(answer.have) && answer.have >= 0 ? answer.have : null;
+    const have = Number.isSafeInteger(answer?.have) && answer.have >= 0 ? answer.have : null;
     if (response.status === 409 && have !== null) {
       log(`the console has ${have} bytes, not ${offset}: from there`);
       this.sent = have + this.dropped;
+      // A console that keeps saying the offset sent is not its own moves nothing: wait longer each time, then stop.
+      if (have === offset && (await this.strayed('409s that move nothing'))) return;
+      if (have !== offset) this.stray = 0;
       return;
     }
     if (response.status === 422 && body.length > 0) {
@@ -220,16 +251,36 @@ class Sender {
       return;
     }
     if (!response.ok) {
-      log(`POST /output: ${response.status}; again in ${BACKOFF_MIN_MS} ms`);
-      await pause(BACKOFF_MIN_MS, this.stopped.signal);
+      // Another 4xx (Access or a firewall in front of the console, a 404, a 413, a 409 that says no offset) is not
+      // one that sending again mends: the output ends here, and the end goes with the tail.
+      this.over = `the console answered ${response.status} to the output at ${offset} bytes; the rest is in the tail`;
+      log(this.over);
       return;
     }
+    if (have === null) {
+      // A 2xx that is not the console's answer (a page in front of it): nothing counts as delivered.
+      await this.strayed('answers that are not the console\'s');
+      return;
+    }
+    this.stray = 0;
     this.last = Date.now();
-    this.sent = have !== null ? have + this.dropped : this.sent + body.length;
+    this.sent = have + this.dropped;
     if (answer.cancel === true && !this.cancelled) {
       this.cancelled = true;
       this.onCancel();
     }
+  }
+
+  /** One more answer that moved nothing: a wait that doubles each time, and the end of the output after so many. */
+  async strayed(what) {
+    this.stray++;
+    if (this.stray >= STRAY_ANSWERS) {
+      this.over = `the console's answers to the output were ${what}; the rest is in the tail`;
+      log(this.over);
+      return true;
+    }
+    await pause(Math.min(BACKOFF_MIN_MS * 2 ** this.stray, BACKOFF_MAX_MS), this.stopped.signal);
+    return false;
   }
 }
 
@@ -270,7 +321,7 @@ function check(spec) {
 async function setup(signal) {
   const response = await call('GET', '/spec', { signal });
   if (!response.ok) throw new SetupError(`the console answered ${response.status} to the spec`);
-  const spec = check(await json(response));
+  const spec = check((await json(response)) ?? {});
   await rm(WORK, { recursive: true, force: true });
   await mkdir(WORK, { recursive: true });
   await run('git', ['init', '-q', WORK], { signal });
@@ -338,7 +389,25 @@ function suite(spec, timeoutS, sender) {
   });
   const output = fs.openSync(SPOOL, 'a');
   const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
-  const spool = (text) => text && fs.writeSync(output, text);
+  // A full disk stops the spool, never the suite: what does not fit is counted and the end says so.
+  let kept = 0;
+  let lost = 0;
+  let failed = null;
+  const spool = (text) => {
+    if (!text) return;
+    const bytes = Buffer.from(text);
+    if (!failed) {
+      try {
+        fs.writeSync(output, bytes);
+        kept += bytes.length;
+        return;
+      } catch (error) {
+        failed = error.code || error.message;
+        log(`the output is not kept past ${kept} bytes: ${failed}`);
+      }
+    }
+    lost += bytes.length;
+  };
   child.stdout?.on('data', (bytes) => spool(decoder.decode(bytes, { stream: true })));
   // A process that left the suite's group may hold the pipe: it is not waited for long.
   const drained = new Promise((resolve) => {
@@ -391,18 +460,34 @@ function suite(spec, timeoutS, sender) {
       child.stdout?.destroy();
       spool(decoder.decode());
       fs.closeSync(output);
+      const unkept = failed ? `the output past ${kept} bytes was not kept on the machine (${failed}, ${lost} bytes)` : undefined;
       if (spec.image) spawn('docker', ['rm', '-f', RUN], { stdio: 'ignore' }).on('error', () => {});
-      if (stopping === 'timeout') {
-        return resolve({ exit: 124, reason: 'timeout', message: `the suite ran past its ${timeoutS} s` });
-      }
-      if (stopping === 'cancelled') return resolve({ exit: 130, reason: 'cancelled', message: 'cancelled at the console' });
-      if (error) return resolve({ exit: null, reason: 'setup', message: `${program} did not start: ${error.message}` });
-      const exit = code ?? 128 + (os.constants.signals[signal] ?? 0);
-      resolve({ exit, reason: 'exited', message: signal ? `the suite was killed by ${signal}` : undefined });
+      const done = (exit, reason, message) => resolve({ exit, reason, message: [message, unkept].filter(Boolean).join('; ') || undefined });
+      if (stopping === 'timeout') return done(124, 'timeout', `the suite ran past its ${timeoutS} s`);
+      if (stopping === 'cancelled') return done(130, 'cancelled', 'cancelled at the console');
+      if (error) return done(null, 'setup', `${program} did not start: ${error.message}`);
+      done(code ?? 128 + (os.constants.signals[signal] ?? 0), 'exited', signal ? `the suite was killed by ${signal}` : undefined);
     };
     child.on('error', (error) => end(null, null, error));
     child.on('exit', (code, signal) => end(code, signal));
   });
+}
+
+/** Sends the end until the console's own JSON answer takes it, or a 4xx says it never will. */
+async function end(body) {
+  let wait = BACKOFF_MIN_MS;
+  for (let tries = 1; ; tries++) {
+    const response = await call('POST', '/end', { body, type: 'application/json' });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return log(`POST /end: ${response.status}; the console did not take the end`);
+    }
+    if ((await json(response)) !== null) return;
+    if (tries >= STRAY_ANSWERS) return log('POST /end: the answers were not the console\'s; the end is given up');
+    log(`POST /end: an answer that is not the console's; again in ${wait} ms`);
+    await pause(wait);
+    wait = Math.min(wait * 2, BACKOFF_MAX_MS);
+  }
 }
 
 async function main() {
@@ -441,12 +526,12 @@ async function main() {
     outcome = await suite(spec, timeoutS, sender);
   }
   await sender.drain();
-  const body = JSON.stringify({ ...outcome, tail: tail() });
-  const response = await call('POST', '/end', { body, type: 'application/json' }).catch((error) => {
+  const message = [outcome.message, sender.note()].filter(Boolean).join('; ') || undefined;
+  const body = JSON.stringify({ ...outcome, message, tail: tail() });
+  await end(body).catch((error) => {
     if (error instanceof Gone) gone(error);
     throw error;
   });
-  if (!response.ok) log(`POST /end: ${response.status}; the console did not take the end`);
   log(`ended: ${outcome.reason} ${outcome.exit ?? ''}`);
   process.exit(0);
 }
