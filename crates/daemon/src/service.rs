@@ -1686,10 +1686,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         })
     }
 
-    /// The kinds of command this Runner does, for the console to offer no other.
+    /// The kinds of command this Runner does, for the console to offer no other. `pause` and `resume` are the
+    /// console's `paused` in each answer, which every Runner on every system takes: no new job, running ones finish.
     fn commands(&self) -> Vec<String> {
         let shared = &self.shared;
-        let mut kinds = vec!["restart", "stop-runner"];
+        let mut kinds = vec!["pause", "resume", "restart", "stop-runner"];
         if shared.updates.is_some() {
             kinds.extend(["update", "update-to"]);
         }
