@@ -7,6 +7,9 @@ client.
 
 ## The probes
 
+Probes run against `codefusion-cc/runner-probe`, a private repository kept for them: reuse it, with a scale set made
+for the probe and removed at the end, instead of making a new repository.
+
 Run 2026-10-12 against a throwaway repository with one `workflow_dispatch` workflow and one scale set made for the
 probe, deleted at the end. A Python script spoke the protocol by hand: a session, long polls with a chosen
 `X-ScaleSetMaxCapacity`, and no Actions runner ever ran a job. Every job was cancelled at the end. `cap` below is
@@ -28,7 +31,7 @@ the capacity the poll offered; it counts the jobs already assigned, as the Runne
 | J3 | The same, a third job | Not assigned in 3 minutes |
 | K | A job queued 457 s while the polls offered 0, then room | Assigned 222 s after room came |
 
-Run 2026-10-17 the same way, by a Rust program, against a throwaway repository and a scale set made for the probe;
+Run 2026-10-17 the same way, by a Rust program, against `runner-probe` (then `runner-probe-held`) and a scale set made for the probe;
 from K2 on, two more scale sets of the same labels polled with 0 beside it, as on a host that serves several. Each
 call came 20 to 150 s after room appeared. A try counts only when the job was still held at the call: in about half
 of them GitHub assigned it by itself first, 4 to 102 s after room appeared.
