@@ -119,6 +119,19 @@ pub struct Record {
     /// [`Record::upgrade`], and written under these rules from then on.
     #[serde(default)]
     pub rules: u32,
+    /// A test run's ([`crate::test_run`]): a machine with no Actions runner and no registration at GitHub, so
+    /// `unregistered` from the start and no word of GitHub's ever. None for an Actions runner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_run: Option<TestRunFacts>,
+}
+
+/// What a test run's record keeps beside an Actions runner's: what its job events name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestRunFacts {
+    /// What the developer calls the run, the job's name in its events.
+    pub label: String,
+    /// When its machine said it is up, in seconds since 1970: the job's start.
+    pub started_at: Option<i64>,
 }
 
 /// The rules every record is written under now.

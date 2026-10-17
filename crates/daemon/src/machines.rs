@@ -22,8 +22,9 @@ use cf_vmhost::{JobRequest, JobState, OutOfMemory, Stage};
 use crate::ends::{EndKind, machine_end};
 use crate::making::{Making, Offered, theirs};
 use crate::names::job_name;
-use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, Upgrade};
+use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, TestRunFacts, Upgrade};
 use crate::roster::{JobInfo, Roster, Runner};
+use crate::test_run::{self, TestRun};
 use crate::traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
 };
@@ -582,7 +583,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             });
             // A registration that is gone takes no job, and its machine no longer counts.
             let done = alive && record.unregistered;
-            if alive {
+            if alive && record.test_run.is_some() {
+                // No Actions runner, so nothing for the scalers to count: its slot is the budget's alone.
+                tracing::info!(runner = %record.runner, job = %name, "a test run of the Runner before was adopted");
+            } else if alive {
                 tracing::info!(runner = %record.runner, job = %name, "a machine of the Runner before was adopted");
                 self.roster.adopt(Runner {
                     name: record.runner.clone(),
@@ -983,6 +987,26 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         for event in events {
             self.feed(inner, name, now, event);
         }
+        self.test_run_up(inner, name, now);
+    }
+
+    /// A test run's machine is up: its job starts there and then, since no Actions runner waits for one and GitHub
+    /// never says anything of it. Without this the lifecycle would wait for a job, ask GitHub to remove a
+    /// registration that never was, and stop the machine as one without a job.
+    fn test_run_up(&self, inner: &mut Inner<H>, name: &str, now: Now) {
+        let at = self.wall();
+        let Some(job) = inner.jobs.get_mut(name) else {
+            return;
+        };
+        if job.life.phase() != Phase::Idle {
+            return;
+        }
+        let Some(facts) = job.record.test_run.as_mut() else {
+            return;
+        };
+        let at = *facts.started_at.get_or_insert(at);
+        tracing::info!(runner = %job.record.runner, job = %name, "a test run's machine is up; its suite starts");
+        self.hear(inner, name, now, Event::JobStarted, at, true);
     }
 
     /// Tells every machine of the time the Mac slept since they were last told, before anything else happens to
@@ -1116,24 +1140,47 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         };
         let (kind, at) = (EndKind::from_name(&ending.kind), ending.at);
         let mut opened = false;
+        // A test run has no word of GitHub's to wait for: the Mac knows all there is.
+        let test_run = job.record.test_run.is_some();
         if !job.record.end_reported {
             let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
             let result = job.record.github.as_ref().and_then(|g| g.result.clone());
-            if result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
+            if !test_run && result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
                 return false;
             }
             // Whether a job ran is GitHub's to say, by its answer to the removal.
-            if job.record.unheard() && !deaf {
+            if !test_run && job.record.unheard() && !deaf {
                 return false;
             }
-            if let Some(github) = job.record.github.clone() {
+            if test_run && !job.record.start_reported {
+                // Its machine never came up: the console still hears of the run that it ended, and a completion
+                // needs a start.
+                job.record.start_reported = true;
+                self.reports.job(JobReport {
+                    id: format!("{}/started", job.record.runner),
+                    kind: EventKind::Started,
+                    runner: job.record.runner.clone(),
+                    github: reported_job(&job.record).unwrap_or_default(),
+                    end: None,
+                    out_of_memory: false,
+                    at: job.record.created_at,
+                    machine: facts(&job.record),
+                });
+            }
+            if let Some(github) = reported_job(&job.record) {
                 let base = kind.unwrap_or(EndKind::GuestLost);
+                let end = match (test_run, base) {
+                    // The machine ended by itself: the agent ran the suite and told the console how it went.
+                    (true, EndKind::Finished) => EndKind::Success,
+                    (true, base) => base,
+                    (false, base) => base.with_result(result.as_deref()),
+                };
                 self.reports.job(JobReport {
                     id: format!("{}/completed", job.record.runner),
                     kind: EventKind::Completed,
                     runner: job.record.runner.clone(),
                     github,
-                    end: Some(base.with_result(result.as_deref())),
+                    end: Some(end),
                     out_of_memory: job.record.oom,
                     at,
                     machine: facts(&job.record),
@@ -1286,7 +1333,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 id: format!("{}/started", job.record.runner),
                 kind: EventKind::Started,
                 runner: job.record.runner.clone(),
-                github: job.record.github.clone().unwrap_or_default(),
+                github: reported_job(&job.record).unwrap_or_default(),
                 end: None,
                 out_of_memory: false,
                 at,
@@ -1306,6 +1353,143 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             self.store.save(&job.record);
         }
         self.settle(inner, name, now)
+    }
+
+    /// A record of a machine about to start on a grant, as [`Machines::launch`] writes it.
+    fn record(
+        &self,
+        runner: &str,
+        repo: &str,
+        scale_set_id: i64,
+        size: Size,
+        grant: &Grant,
+        request: &JobRequest,
+    ) -> Record {
+        Record {
+            job: request.job.clone(),
+            runner: runner.to_string(),
+            runner_id: None,
+            scale_set_id,
+            repo: repo.to_string(),
+            size: Some(size.label().to_string()),
+            docker: request.docker,
+            memory_bytes: grant.vm_bytes,
+            limit_bytes: grant.job_limit_bytes,
+            cpus: grant.cpus,
+            origin: grant.origin.name().to_string(),
+            slot: None,
+            created_at: self.wall(),
+            boot: self.config.boot.clone(),
+            unregistered: false,
+            github: None,
+            start_reported: false,
+            ended: None,
+            end_reported: false,
+            oom: false,
+            rules: RULES,
+            test_run: None,
+        }
+    }
+
+    /// Starts a vm-host for `request` on the slot `ticket` grants, with `record` written first: a Runner that dies
+    /// right here finds the record and no machine. After an error no machine stands and the slot is still the
+    /// caller's.
+    fn launch(
+        &self,
+        inner: &mut Inner<H>,
+        now: Now,
+        ticket: Ticket,
+        mut record: Record,
+        request: &JobRequest,
+    ) -> Result<(), HostError> {
+        self.woke(inner, now);
+        let mut life = Slot::reserved(self.config.limits);
+        let effects = life.on(now.elapsed, Event::Assigned);
+        debug_assert_eq!(effects, [Effect::StartVm]);
+        record.slot = Some(life.saved().into());
+        // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
+        self.store.save(&record);
+        if let Err(error) = self.vms.start(request) {
+            inner.breaker.failed(now.elapsed);
+            self.vms.clean(&request.job);
+            return Err(HostError(error.to_string()));
+        }
+        inner.ready.remove(&ticket);
+        inner.jobs.insert(
+            request.job.clone(),
+            Job {
+                record,
+                slot: Some(ticket),
+                life,
+                last: None,
+                ended_at: None,
+                restored_end: None,
+                hold_said: HoldSaid::default(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Starts a test run's machine on the slot `ticket` grants ([`test_run::admit`]): the image CI jobs run in, the
+    /// agent as its workload, the run's address and token in its environment, and no Actions runner. Its record has
+    /// no registration at GitHub from the start, so the sweep never asks GitHub anything of it. After an error no
+    /// machine stands and the slot is still the caller's.
+    pub fn start_test_run(&self, ticket: Ticket, run: &TestRun) -> Result<String, HostError> {
+        let mut inner = self.lock();
+        let now = inner.host.now();
+        let runner = run.runner();
+        let name = job_name(&runner).to_string();
+        if inner.jobs.contains_key(&name) {
+            return Err(HostError(format!("a machine named {runner} is there already")));
+        }
+        let Some(grant) = inner.grants.get(&ticket).copied() else {
+            return Err(HostError(format!("slot {} is not granted", ticket.0)));
+        };
+        let request = JobRequest {
+            job: name,
+            host: self.config.host.clone(),
+            memory_bytes: grant.vm_bytes,
+            cpus: grant.cpus,
+            scratch_bytes: self.config.scratch_bytes,
+            image: self.config.image.clone(),
+            workload: test_run::workload(),
+            env: run.env(),
+            deadline_s: run.deadline(self.config.deadline).as_secs(),
+            docker: run.docker,
+        };
+        let record = Record {
+            unregistered: true,
+            test_run: Some(TestRunFacts {
+                label: run.label.clone(),
+                started_at: None,
+            }),
+            ..self.record(&runner, &run.repo, test_run::SET, run.size, &grant, &request)
+        };
+        if let Err(error) = self.launch(&mut inner, now, ticket, record, &request) {
+            // Nothing stands and nothing is registered: no record is left of it.
+            self.store.remove(&request.job);
+            return Err(error);
+        }
+        if run.docker {
+            // Counted against the Mac's Docker jobs, as a CI job's daemon would be.
+            inner.docker.insert(ticket);
+        }
+        tracing::info!(%runner, size = run.size.label(), repo = %run.repo, "a test run's machine starts");
+        Ok(runner)
+    }
+
+    /// The test run on this Mac whose machine stands, by its name; none while there is none.
+    pub fn test_run_on(&self) -> Option<String> {
+        self.lock()
+            .jobs
+            .values()
+            .find(|job| job.record.test_run.is_some() && job.record.ended.is_none())
+            .map(|job| job.record.runner.clone())
+    }
+
+    /// Whether this Actions runner, or test run, still has its machine here or a report to make.
+    pub fn knows(&self, runner: &str) -> bool {
+        Self::job_of(&self.lock(), runner).is_some()
     }
 
     /// Whether an Actions runner that is gone had lost a process for memory.
@@ -1382,7 +1566,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                         .as_ref()
                         .and_then(|s| s.usage.as_ref())
                         .map(|u| u.memory_bytes),
-                    github: job.record.github.clone(),
+                    github: reported_job(&job.record),
                 })
                 .collect(),
             host_error: inner.host_error.clone(),
@@ -1434,6 +1618,30 @@ fn workload_ran(state: &JobState) -> bool {
 /// that starts again read it the same way.
 fn came_up(state: &JobState) -> bool {
     state.boot_ms.is_some() || workload_ran(state)
+}
+
+/// The job a machine's reports and status name: GitHub's, as its messages told it, or a test run's, which the Runner
+/// tells itself. A test run that ended by itself is a `success` whatever its suite did: the agent tells the console
+/// how the suite went, and the Runner only how the machine did.
+fn reported_job(record: &Record) -> Option<GithubJob> {
+    let Some(facts) = &record.test_run else {
+        return record.github.clone();
+    };
+    let ended = record.ended.as_ref();
+    Some(GithubJob {
+        repo: record.repo.clone(),
+        job: facts.label.clone(),
+        workflow: test_run::WORKFLOW.to_string(),
+        run_id: 0,
+        event: test_run::EVENT.to_string(),
+        queued_at: Some(record.created_at),
+        started_at: Some(facts.started_at.unwrap_or(record.created_at)),
+        result: ended
+            .filter(|ending| EndKind::from_name(&ending.kind) == Some(EndKind::Finished))
+            .map(|_| EndKind::Success.name().to_string()),
+        completed_at: ended.map(|ending| ending.at),
+        inferred: false,
+    })
 }
 
 fn facts(record: &Record) -> MachineFacts {
@@ -1675,6 +1883,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             end_reported: true,
             oom: false,
             rules: RULES,
+            test_run: None,
         };
         self.store.save(&record);
         self.lock().intents.insert(name.to_string(), (record, false));
@@ -1771,60 +1980,28 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             deadline_s: self.config.deadline.as_secs(),
             docker: inner.docker.contains(&spec.ticket),
         };
-        self.woke(&mut inner, now);
-        let mut life = Slot::reserved(self.config.limits);
-        let effects = life.on(now.elapsed, Event::Assigned);
-        debug_assert_eq!(effects, [Effect::StartVm]);
+        let record = self.record(
+            &spec.name,
+            &spec.repo,
+            spec.scale_set_id,
+            spec.size,
+            &grant,
+            &request,
+        );
         let record = Record {
-            job: name.clone(),
-            runner: spec.name.clone(),
             runner_id: Some(spec.runner_id),
-            scale_set_id: spec.scale_set_id,
-            repo: spec.repo.clone(),
-            size: Some(spec.size.label().to_string()),
-            docker: request.docker,
-            memory_bytes: grant.vm_bytes,
-            limit_bytes: grant.job_limit_bytes,
-            cpus: grant.cpus,
-            origin: grant.origin.name().to_string(),
-            slot: Some(life.saved().into()),
-            created_at: self.wall(),
-            boot: self.config.boot.clone(),
-            unregistered: false,
-            github: None,
-            start_reported: false,
-            ended: None,
-            end_reported: false,
-            oom: false,
-            rules: RULES,
+            ..record
         };
-        // Written before the vm-host exists: a Runner that dies right here finds the record and no machine.
-        self.store.save(&record);
-        if let Err(error) = self.vms.start(&request) {
-            inner.breaker.failed(now.elapsed);
-            self.vms.clean(&name);
+        if let Err(error) = self.launch(&mut inner, now, spec.ticket, record.clone(), &request) {
             // Back to a registration without a machine, which the caller removes; the slot stays the caller's.
             let mut intent = record;
             intent.slot = None;
             intent.end_reported = true;
             self.store.save(&intent);
             inner.intents.insert(spec.name.clone(), (intent, true));
-            return Err(HostError(error.to_string()));
+            return Err(error);
         }
         inner.intents.remove(&spec.name);
-        inner.ready.remove(&spec.ticket);
-        inner.jobs.insert(
-            name.clone(),
-            Job {
-                record,
-                slot: Some(spec.ticket),
-                life,
-                last: None,
-                ended_at: None,
-                restored_end: None,
-                hold_said: HoldSaid::default(),
-            },
-        );
         Ok(name)
     }
 

@@ -190,6 +190,12 @@ impl Client {
         }
     }
 
+    /// The console's address this client talks to, as it was given: what a command may name of the console is
+    /// checked against it.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     async fn post(&self, call: &str, body: Vec<u8>) -> Result<Response, Error> {
         // A token of another shape is not the console's: it would be refused, and may not even be a header.
         if !is_token(self.token.expose()) {
