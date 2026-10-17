@@ -160,11 +160,15 @@ function start(console, { timeoutS = 60, knobs = {} } = {}) {
 /** Runs the agent against `console` until it exits. */
 const agent = (console, options) => start(console, options).done;
 
-/** Whether a process of this number is gone, within two seconds. */
+/**
+ * Whether a process of this number is gone, within two seconds. A zombie counts as gone: it runs nothing and holds
+ * nothing, and in a container whose first process reaps no orphans (`docker run` without `--init`) it stays one.
+ */
 async function gone(pid) {
   for (let i = 0; i < 100; i++) {
     try {
       process.kill(pid, 0);
+      if (/^\d+ \(.*\) Z /s.test(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'))) return true;
     } catch (error) {
       if (error.code === 'ESRCH') return true;
     }
