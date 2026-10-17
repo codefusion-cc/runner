@@ -65,6 +65,11 @@ impl Runner {
     pub fn is_of(&self, repo: &str, scale_set_id: i64) -> bool {
         self.scale_set_id == scale_set_id && self.repo.eq_ignore_ascii_case(repo)
     }
+
+    /// Whether it waits for a job: it took none, and its machine is not going away.
+    pub fn waits(&self) -> bool {
+        !self.busy && self.done.is_none()
+    }
 }
 
 /// The Actions runners of this machine, for every scale set. Safe to share between the scalers and whoever watches

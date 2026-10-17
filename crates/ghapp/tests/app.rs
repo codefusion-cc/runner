@@ -1186,3 +1186,77 @@ async fn a_giant_or_slow_answer_is_an_error() {
         started.elapsed()
     );
 }
+
+// added: a set's queued jobs, the oldest first, beside its newest unfinished one: a job under way and a finished one
+// are not queued, and another set's queued job is its own.
+#[tokio::test]
+async fn a_sets_queued_jobs_are_named_the_oldest_first() {
+    let h = harness().await;
+    let run = h.fake.queue_run(
+        "org/app",
+        &[
+            (&["self-hosted", "cf-2g"], "a"),
+            (&["self-hosted", "cf-2g"], "b"),
+            (&["self-hosted", "cf-2g"], "c"),
+            (&["self-hosted", "cf-2g"], "d"),
+            (&["self-hosted", "cf-4g"], "e"),
+        ],
+        "refs/heads/main",
+    );
+    h.fake.take_job(run[1]);
+    h.fake.end_job(run[3], "success");
+    let queued = |read: &cf_ghapp::Waiting, labels: &[&str]| -> Vec<i64> {
+        let job = read
+            .jobs
+            .iter()
+            .find(|j| j.set.key() == key(labels))
+            .expect("the set");
+        assert!(
+            job.queued.windows(2).all(|w| w[0] < w[1]),
+            "the oldest first: {:?}",
+            job.queued
+        );
+        job.queued.iter().map(|&(_, id)| id).collect()
+    };
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(queued(&read, &["self-hosted", "cf-2g"]), [run[0], run[2]]);
+    assert_eq!(queued(&read, &["self-hosted", "cf-4g"]), [run[4]]);
+
+    // Nothing queued: the set waits on a job under way, and names none.
+    h.fake.take_job(run[0]);
+    h.fake.take_job(run[2]);
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(queued(&read, &["self-hosted", "cf-2g"]), Vec::<i64>::new());
+}
+
+// added: an Actions runner for one job outside any scale set is registered with exactly the labels asked for; a name
+// taken is refused with 409 and registers nothing more.
+#[tokio::test]
+async fn a_plain_actions_runner_is_registered_with_exactly_its_labels() {
+    let h = harness().await;
+    let labels = vec!["self-hosted".to_string(), "cf-2g".to_string()];
+    let jit = h
+        .app
+        .generate_jit_config(1, "org/app", "mac-b-1", &labels)
+        .await
+        .unwrap();
+    assert!(jit.id > 0);
+    assert!(!jit.encoded.expose().is_empty());
+    assert_eq!(
+        h.fake.plain_runners(),
+        [("mac-b-1".to_string(), "org/app".to_string(), labels.clone())]
+    );
+    let again = h
+        .app
+        .generate_jit_config(1, "org/app", "mac-b-1", &labels)
+        .await
+        .unwrap_err();
+    assert_eq!(again.status(), Some(409));
+    assert_eq!(h.fake.plain_runners().len(), 1);
+    let unknown = h
+        .app
+        .generate_jit_config(1, "org/none", "mac-b-2", &labels)
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.status(), Some(404));
+}

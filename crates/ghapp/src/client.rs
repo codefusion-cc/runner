@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD;
 use cf_secret::Secret;
 use cf_workflows::LabelSet;
 use reqwest::Method;
-use reqwest::header::{AUTHORIZATION, ETAG, IF_NONE_MATCH, LINK};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LINK};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
@@ -78,6 +78,22 @@ pub struct WaitingJob {
     /// Whether its run is a pull request's from another repository, a fork: on a public repository, a stranger's
     /// code. A run that names no head repository counts as one.
     pub from_fork: bool,
+    /// The run's jobs of this set that wait for an Actions runner (`queued`): when each was queued, in seconds since
+    /// 1970, and its ID, the oldest first. A job GitHub assigned to a scale set stays `queued` until its Actions
+    /// runner takes it.
+    pub queued: Vec<(i64, i64)>,
+}
+
+/// The runner group every repository has. A repository's own Actions runners and the Runner's scale sets are in it.
+pub const DEFAULT_RUNNER_GROUP: i64 = 1;
+
+/// An Actions runner registered for one job outside any scale set ([`GitHubApp::generate_jit_config`]).
+#[derive(Debug)]
+pub struct PlainJit {
+    /// GitHub's ID for it.
+    pub id: i64,
+    /// What the Actions runner starts with. A credential: it never reaches a log.
+    pub encoded: Secret<String>,
 }
 
 /// What one look at a repository's queue found.
@@ -139,8 +155,8 @@ fn read_runs(repo: &str, response: &Response) -> Result<Listing, Error> {
     })
 }
 
-/// What a run's jobs read as: the newest unfinished job of each distinct label set served, at most
-/// [`MAX_RUN_SETS`] of them, and what the bounds left out.
+/// What a run's jobs read as: the newest unfinished job of each distinct label set served, with the set's queued
+/// ones, at most [`MAX_RUN_SETS`] of them, and what the bounds left out.
 struct RunRead {
     jobs: Vec<WaitingJob>,
     left_out: Vec<String>,
@@ -176,24 +192,28 @@ fn read_jobs(run: &Run, response: &Response) -> Result<RunRead, Error> {
         let Some(set) = LabelSet::served(&job.labels) else {
             continue;
         };
-        if sets.get(&set).is_some_and(|kept| kept.id > job.id) {
-            continue;
-        }
         let created = OffsetDateTime::parse(&job.created_at, &Rfc3339)
             .map_err(|e| Error::Decode {
                 what: "workflow run jobs".into(),
                 why: format!("created_at: {e}"),
             })?
             .unix_timestamp();
-        sets.insert(
-            set.clone(),
-            WaitingJob {
-                id: job.id,
-                set,
-                created,
-                from_fork: run.from_fork,
-            },
-        );
+        let kept = sets.entry(set.clone()).or_insert_with(|| WaitingJob {
+            id: job.id,
+            set,
+            created,
+            from_fork: run.from_fork,
+            queued: Vec::new(),
+        });
+        if job.id > kept.id {
+            (kept.id, kept.created) = (job.id, created);
+        }
+        if job.status == "queued" {
+            kept.queued.push((created, job.id));
+        }
+    }
+    for job in sets.values_mut() {
+        job.queued.sort_unstable();
     }
     let mut jobs: Vec<WaitingJob> = sets.into_values().collect();
     jobs.sort_by_key(|job| std::cmp::Reverse(job.id));
@@ -351,21 +371,28 @@ impl GitHubApp {
         url: &str,
         auth: &Secret<String>,
         etag: Option<&str>,
+        body: Option<&serde_json::Value>,
     ) -> Result<Response, Error> {
         let url = url.to_string();
         let bearer = format!("Bearer {}", auth.expose());
+        let body = body.map(|body| body.to_string());
         self.inner
             .http
             .send(|c| {
-                let request = c
+                let mut request = c
                     .request(method.clone(), &url)
                     .header("Accept", "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", API_VERSION)
                     .header(AUTHORIZATION, &bearer);
-                match etag {
-                    Some(tag) => request.header(IF_NONE_MATCH, tag),
-                    None => request,
+                if let Some(tag) = etag {
+                    request = request.header(IF_NONE_MATCH, tag);
                 }
+                if let Some(body) = &body {
+                    request = request
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body.clone());
+                }
+                request
             })
             .await
     }
@@ -377,7 +404,7 @@ impl GitHubApp {
         let mut learned = false;
         loop {
             let jwt = self.jwt()?;
-            match self.request(method.clone(), &url, &jwt, None).await {
+            match self.request(method.clone(), &url, &jwt, None, None).await {
                 Err(Error::Status(s)) if s.status == 401 && !learned => {
                     learned = true;
                     match s.server_time {
@@ -397,22 +424,24 @@ impl GitHubApp {
         method: Method,
         path: &str,
     ) -> Result<Response, Error> {
-        self.as_installation_if(installation, method, path, None).await
+        self.as_installation_with(installation, method, path, None, None)
+            .await
     }
 
-    /// [`Self::as_installation`] with `If-None-Match`.
-    async fn as_installation_if(
+    /// [`Self::as_installation`] with `If-None-Match`, a JSON body, or both.
+    async fn as_installation_with(
         &self,
         installation: i64,
         method: Method,
         path: &str,
         etag: Option<&str>,
+        body: Option<&serde_json::Value>,
     ) -> Result<Response, Error> {
         let url = self.url(path);
         let mut retried = false;
         loop {
             let token = self.installation_token(installation).await?;
-            match self.request(method.clone(), &url, &token, etag).await {
+            match self.request(method.clone(), &url, &token, etag, body).await {
                 Err(Error::Status(s)) if s.status == 401 && !retried => {
                     retried = true;
                     self.forget_token(installation, &token).await;
@@ -514,6 +543,39 @@ impl GitHubApp {
         let response = self.as_installation(installation, Method::POST, &path).await?;
         let parsed = self.token_from("Actions runner registration token", &response)?;
         Ok(Secret::new(parsed.token))
+    }
+
+    /// Registers an Actions runner for one job with a repository, outside any scale set, in the repository's default
+    /// runner group: GitHub hands it any queued job of the repository whose labels it has. It carries exactly
+    /// `labels`; GitHub adds none (probe L, `docs/github-protocol.md`).
+    pub async fn generate_jit_config(
+        &self,
+        installation: i64,
+        repo: &str,
+        name: &str,
+        labels: &[String],
+    ) -> Result<PlainJit, Error> {
+        #[derive(Deserialize)]
+        struct Registered {
+            id: i64,
+        }
+        #[derive(Deserialize)]
+        struct JitAnswer {
+            runner: Registered,
+            encoded_jit_config: String,
+        }
+        let body = serde_json::json!({
+            "name": name, "runner_group_id": DEFAULT_RUNNER_GROUP, "labels": labels, "work_folder": "_work",
+        });
+        let path = format!("/repos/{repo}/actions/runners/generate-jitconfig");
+        let response = self
+            .as_installation_with(installation, Method::POST, &path, None, Some(&body))
+            .await?;
+        let answer: JitAnswer = decode("Actions runner configuration", &response)?;
+        Ok(PlainJit {
+            id: answer.runner.id,
+            encoded: Secret::new(answer.encoded_jit_config),
+        })
     }
 
     /// Whether a registered Actions runner of a repository has a job, by GitHub's own record. `None` when GitHub no
@@ -833,7 +895,7 @@ impl GitHubApp {
         etag: Option<&str>,
     ) -> Result<Option<Response>, Error> {
         match self
-            .as_installation_if(installation, Method::GET, path, etag)
+            .as_installation_with(installation, Method::GET, path, etag, None)
             .await
         {
             Ok(response) => Ok(Some(response)),

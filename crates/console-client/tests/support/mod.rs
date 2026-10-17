@@ -114,6 +114,7 @@ pub fn status(machine: &str) -> Status {
         idle_with_jobs_waiting_reason: None,
         sizes: vec![],
         commands: vec![],
+        held_jobs: vec![],
         scale_sets: vec![ScaleSetStatus {
             repo: "org/app".into(),
             name: "mac-a--app-1a2b".into(),

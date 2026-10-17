@@ -33,8 +33,9 @@ pub struct Options {
     /// - It looks at no other time unless a test says so ([`FakeGithub::github_looks`]). Seen: GitHub also looks by
     ///   itself, sometimes within 30 s of room (probes J1, I2), sometimes after 2.5 minutes (A, G), sometimes not in
     ///   3 minutes (J2, J3), and not for 13 minutes on the mini (18:39 to 18:52). Nothing the Runner does makes it
-    ///   look: not a session opened (probes E, F), not a scale set updated (I1), not an Actions runner registered
-    ///   (J1 to J3).
+    ///   look: not a session opened (probes E, F), not a scale set updated (I1, L), not an Actions runner registered
+    ///   (J1 to J3, L), but for one registered outside any scale set that comes online (N,
+    ///   [`FakeGithub::runner_online`]).
     /// - It gives each scale set with a session as many jobs as the smaller room of its last two polls' `x-scalesetmaxcapacity`
     ///   leaves. Seen: probe E assigned against the poll before the newest, probe J1 against the newest alone; the
     ///   smaller is no kinder than either. Inferred: which poll GitHub reads.
@@ -131,8 +132,15 @@ struct ScaleSet {
 struct Runner {
     id: i64,
     name: String,
+    /// Its scale set; [`PLAIN`] for one registered outside any.
     scale_set: i64,
+    repo: String,
+    /// What one registered outside a scale set carries: it takes a queued job of its repository whose labels it has.
+    labels: Vec<String>,
 }
+
+/// The scale set of an Actions runner registered outside any, with the REST API's `generate-jitconfig`.
+const PLAIN: i64 = 0;
 
 #[derive(Debug, Clone)]
 struct Repo {
@@ -739,6 +747,24 @@ impl FakeGithub {
         self.inner.notify.notify_waiters();
     }
 
+    /// The Actions runner of this name, registered outside any scale set, comes online: GitHub looks at its queue,
+    /// as it did within seconds in probe N, and may hand a job to a scale set rather than to it. An Actions runner
+    /// of a scale set, or one not registered, changes nothing (probes J1 to J3, L).
+    pub fn runner_online(&self, runner_name: &str) {
+        let mut st = self.lock();
+        if !st
+            .runners
+            .iter()
+            .any(|r| r.name == runner_name && r.scale_set == PLAIN)
+        {
+            return;
+        }
+        take_back(&mut st);
+        look_at_the_queue(&mut st);
+        drop(st);
+        self.inner.notify.notify_waiters();
+    }
+
     /// Another Actions runner takes the job before this one's scale sets do.
     pub fn take_job(&self, request_id: i64) {
         let mut st = self.lock();
@@ -750,7 +776,9 @@ impl FakeGithub {
         self.inner.notify.notify_waiters();
     }
 
-    /// The Actions runner with this name takes its job and starts it.
+    /// The Actions runner with this name takes its job and starts it: one of a scale set a job assigned to the scale
+    /// set, one registered outside any the oldest queued job of its repository whose labels it has. Nothing happens
+    /// when there is none.
     pub fn start_job(&self, runner_name: &str) {
         let mut st = self.lock();
         if take_back(&mut st) {
@@ -759,21 +787,28 @@ impl FakeGithub {
         let Some(runner) = st.runners.iter().find(|r| r.name == runner_name).cloned() else {
             return;
         };
-        let Some(i) = st
-            .jobs
-            .iter()
-            .position(|j| j.state == JobState::Acquired(runner.scale_set))
-        else {
+        let Some(i) = st.jobs.iter().position(|j| {
+            if runner.scale_set == PLAIN {
+                j.state == JobState::Available && j.repo == runner.repo && matches(&runner.labels, &j.labels)
+            } else {
+                j.state == JobState::Acquired(runner.scale_set)
+            }
+        }) else {
             return;
         };
         st.jobs[i].state = JobState::Running(runner.name.clone());
         let job = st.jobs[i].clone();
-        let msg = st.job_message(
-            "JobStarted",
-            &job,
-            json!({"runnerId": runner.id, "runnerName": runner.name}),
-        );
-        st.push(runner.scale_set, vec![msg]);
+        if runner.scale_set == PLAIN {
+            // A job taken from the queue, as by an Actions runner elsewhere.
+            look_at_the_queue(&mut st);
+        } else {
+            let msg = st.job_message(
+                "JobStarted",
+                &job,
+                json!({"runnerId": runner.id, "runnerName": runner.name}),
+            );
+            st.push(runner.scale_set, vec![msg]);
+        }
         drop(st);
         self.inner.notify.notify_waiters();
     }
@@ -849,6 +884,16 @@ impl FakeGithub {
     /// The names of the Actions runners currently registered.
     pub fn runners(&self) -> Vec<String> {
         self.lock().runners.iter().map(|r| r.name.clone()).collect()
+    }
+
+    /// The Actions runners currently registered outside any scale set, each with its repository and labels.
+    pub fn plain_runners(&self) -> Vec<(String, String, Vec<String>)> {
+        self.lock()
+            .runners
+            .iter()
+            .filter(|r| r.scale_set == PLAIN)
+            .map(|r| (r.name.clone(), r.repo.clone(), r.labels.clone()))
+            .collect()
     }
 
     /// The Actions runners whose registration a DELETE removed (answered 204), not their own end after a job.
@@ -1120,11 +1165,7 @@ impl FakeGithub {
                 let name = format!("{owner}/{repo}");
                 let id: i64 = id.parse().unwrap_or(0);
                 self.with_installation(&req, |st| {
-                    let Some(runner) = st
-                        .registered
-                        .get(&id)
-                        .filter(|r| st.scale_sets.iter().any(|s| s.id == r.scale_set && s.repo == name))
-                        .cloned()
+                    let Some(runner) = st.registered.get(&id).filter(|r| r.repo == name).cloned()
                     else {
                         return Reply::status_json(404, &json!({"message": "Not Found"}));
                     };
@@ -1141,6 +1182,12 @@ impl FakeGithub {
                         None => Reply::status_json(404, &json!({"message": "Not Found"})),
                     }
                 })
+            }
+            // Probe M, 2026-10-17: an Actions runner for one job outside any scale set, with exactly the labels asked
+            // for, in the repository's default runner group; a name taken is refused.
+            ("POST", ["repos", owner, repo, "actions", "runners", "generate-jitconfig"]) => {
+                let name = format!("{owner}/{repo}");
+                self.with_installation(&req, |st| generate_plain_jit(st, &name, &req))
             }
             ("POST", ["actions", "runner-registration"]) => self.runner_registration(&req),
             (_, ["svc", rest @ ..]) => self.actions_service(&req, rest).await,
@@ -1696,27 +1743,78 @@ fn acquire_jobs(st: &mut State, id: i64, req: &Request) -> Reply {
     Reply::json(&json!({"count": got.len(), "value": got}))
 }
 
+fn generate_plain_jit(st: &mut State, repo: &str, req: &Request) -> Reply {
+    if !st.repos.contains_key(repo) {
+        return Reply::status_json(404, &json!({"message": "Not Found"}));
+    }
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+    let name = body["name"].as_str().unwrap_or_default().to_string();
+    let labels: Vec<String> = body["labels"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    if name.is_empty() || labels.is_empty() || body["runner_group_id"].as_i64().is_none() {
+        return Reply::status_json(
+            422,
+            &json!({"message": "Invalid request: name, runner_group_id and labels are required"}),
+        );
+    }
+    let Some(rid) = register(st, &name, PLAIN, repo.to_string(), labels.clone()) else {
+        return Reply::status_json(
+            409,
+            &json!({"message": "Already exists - A runner with this name already exists."}),
+        );
+    };
+    let labels: Vec<Value> = labels
+        .iter()
+        .map(|l| json!({"name": l, "type": "custom"}))
+        .collect();
+    Reply::status_json(
+        201,
+        &json!({
+            "runner": {"id": rid, "name": name, "os": "unknown", "status": "offline", "busy": false, "labels": labels},
+            "encoded_jit_config": b64url(format!("jit-config-for-{name}").as_bytes()),
+        }),
+    )
+}
+
+/// Registers an Actions runner and says its ID; none when the name is taken.
+fn register(st: &mut State, name: &str, scale_set: i64, repo: String, labels: Vec<String>) -> Option<i64> {
+    if st.runners.iter().any(|r| r.name == name) {
+        return None;
+    }
+    st.next_runner += 1;
+    let rid = st.next_runner;
+    let runner = Runner {
+        id: rid,
+        name: name.to_string(),
+        scale_set,
+        repo,
+        labels,
+    };
+    st.registered.insert(rid, runner.clone());
+    st.runners.push(runner);
+    Some(rid)
+}
+
 fn generate_jit(st: &mut State, id: i64, req: &Request) -> Reply {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
     let name = body["name"].as_str().unwrap_or_default().to_string();
     if name.is_empty() {
         return json_error(400, "InvalidRunnerException", "name required");
     }
-    if st.scale_set(id).is_none() {
+    let Some(repo) = st.scale_set(id).map(|set| set.repo.clone()) else {
         return json_error(404, "RunnerScaleSetNotFoundException", "scale set not found");
-    }
-    if st.runners.iter().any(|r| r.name == name) {
-        return json_error(409, "AgentExistsException", "a runner with this name exists");
-    }
-    st.next_runner += 1;
-    let rid = st.next_runner;
-    let runner = Runner {
-        id: rid,
-        name: name.clone(),
-        scale_set: id,
     };
-    st.registered.insert(rid, runner.clone());
-    st.runners.push(runner);
+    let Some(rid) = register(st, &name, id, repo, Vec::new()) else {
+        return json_error(409, "AgentExistsException", "a runner with this name exists");
+    };
     Reply::json(&json!({
         "runner": {"id": rid, "name": name, "runnerScaleSetId": id},
         "encodedJITConfig": b64url(format!("jit-config-for-{name}").as_bytes()),

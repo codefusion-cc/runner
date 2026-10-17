@@ -4527,3 +4527,352 @@ async fn a_queued_jobs_set_of_a_size_the_settings_stop_goes() {
     assert_eq!(served_with(&rig, PR_LABEL), (false, false));
     assert_eq!(rig.service.sets().len(), 1, "main's cf-2g set stays");
 }
+
+/// A job GitHub holds back from a Mac with room: queued while the Mac had no room, then room came back and GitHub
+/// did not look at its queue again. Says its ID.
+async fn held_job(rig: &Rig) -> i64 {
+    held_jobs(rig, &[&["self-hosted", "cf-2g"]]).await[0]
+}
+
+/// Jobs of these labels GitHub holds back from a Mac with room, as [`held_job`]. Says their IDs.
+async fn held_jobs(rig: &Rig, labels: &[&[&str]]) -> Vec<i64> {
+    rig.service.discover().await;
+    rig.settles("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    hold(rig, labels).await
+}
+
+/// Jobs of these labels queued while the Mac had no room, then room came back and GitHub did not look at its queue
+/// again. Says their IDs.
+async fn hold(rig: &Rig, labels: &[&[&str]]) -> Vec<i64> {
+    let short = rig.parts.settings.away.floor_bytes + (1 << 30);
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = short));
+    rig.settles("no room offered", || !rig.github.offers_room(REPO))
+        .await;
+    let jobs: Vec<i64> = labels
+        .iter()
+        .map(|labels| rig.github.queue_job(REPO, labels, "build"))
+        .collect();
+    rig.machines
+        .with_host(|host| host.set(|reading| reading.available_bytes = 64 << 30));
+    rig.settles("room offered again", || rig.github.offers_room(REPO))
+        .await;
+    for &job in &jobs {
+        assert_eq!(
+            rig.github.job_state(job),
+            Some(JobState::Available),
+            "GitHub holds it"
+        );
+    }
+    jobs
+}
+
+/// The labels of the test's scale set, as GitHub registers them.
+fn set_labels() -> Vec<String> {
+    vec!["cf-2g".to_string(), "self-hosted".to_string()]
+}
+
+/// The Actions runners of their own: registered at GitHub outside any scale set, by name.
+fn own_runners(rig: &Rig) -> Vec<String> {
+    rig.github
+        .plain_runners()
+        .into_iter()
+        .map(|(name, repo, labels)| {
+            assert_eq!((repo.as_str(), labels), (REPO, set_labels()), "{name}");
+            name
+        })
+        .collect()
+}
+
+/// The one Actions runner of its own, once its machine is up and waits for a job.
+async fn the_own_runner(rig: &Rig) -> String {
+    let own = own_runners(rig);
+    assert_eq!(own.len(), 1, "one Actions runner of its own: {own:?}");
+    let own = own[0].clone();
+    rig.settles("its machine up and waiting for a job", || {
+        rig.machines
+            .snapshot()
+            .machines
+            .iter()
+            .any(|machine| machine.runner == own && machine.state == "idle")
+    })
+    .await;
+    own
+}
+
+// added: a job GitHub holds while the Mac has room is not left to wait for GitHub's own look. After two minutes of
+// waiting and of room, the Mac starts an Actions runner of its own with the job's labels, says so once, and the
+// console hears of the held job; its arrival makes GitHub look, the scale set gets the job within three minutes of
+// its queueing, and the Actions runner of its own, which ran nothing, is removed with GitHub's 204.
+#[tokio::test]
+async fn a_job_github_holds_from_a_mac_with_room_runs_within_three_minutes() {
+    let log = support::Log::start();
+    let rig = Rig::new(2).await;
+    let job = held_job(&rig).await;
+    // 100 s: GitHub may still look by itself.
+    rig.later(Duration::from_secs(100));
+    rig.service.look_at_queue().await;
+    assert_eq!(own_runners(&rig), Vec::<String>::new());
+    assert_eq!(rig.report()["status"].get("heldJobs"), None);
+
+    rig.later(Duration::from_secs(30));
+    rig.service.look_at_queue().await;
+    let own = the_own_runner(&rig).await;
+    let said = log.lines("an Actions runner of its own takes it");
+    assert_eq!(said.len(), 1, "{said:?}");
+    for words in [
+        format!("runner={own}"),
+        format!("repo={REPO}"),
+        "labels=cf-2g,self-hosted".to_string(),
+        format!("job={job}"),
+        "jobs=1".to_string(),
+    ] {
+        assert!(said[0].contains(&words), "{words} in {}", said[0]);
+    }
+    let status = rig.report()["status"].clone();
+    let held = status["heldJobs"].as_array().expect("heldJobs").clone();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0]["repo"], json!(REPO));
+    assert_eq!(held[0]["labels"], json!(set_labels()));
+    assert_eq!(held[0]["jobs"], json!(1));
+    let waited = held[0]["oldestWaitSeconds"].as_u64().expect("seconds");
+    assert!((130..160).contains(&waited), "{waited}");
+    rig.settles("the console took a report with it", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["heldJobs"][0]["jobs"] == json!(1))
+    })
+    .await;
+
+    // It comes online, GitHub looks, and the scale set's Actions runner takes the job.
+    rig.github.runner_online(&own);
+    rig.github.start_job(&own);
+    rig.settles("a machine for the job", || rig.standing().len() == 2)
+        .await;
+    let runner = rig
+        .standing()
+        .into_iter()
+        .find(|r| *r != own)
+        .expect("the scale set's");
+    rig.github.start_job(&runner);
+    assert_eq!(rig.github.job_state(job), Some(JobState::Running(runner.clone())));
+
+    rig.later(Duration::from_secs(60));
+    rig.service.look_at_queue().await;
+    rig.settles("the Actions runner of its own removed with a 204", || {
+        rig.github.removed_at_request().contains(&own)
+    })
+    .await;
+    rig.settles("its machine gone", || !rig.standing().contains(&own))
+        .await;
+    assert_eq!(rig.standing(), std::slice::from_ref(&runner));
+    assert_eq!(rig.report()["status"].get("heldJobs"), None, "nothing held now");
+    rig.finish(&runner, "succeeded");
+    rig.settles("the job heard", || heard(&rig, &runner) == (true, true))
+        .await;
+    assert_eq!(
+        heard(&rig, &own),
+        (false, false),
+        "the Actions runner of its own ran nothing"
+    );
+    assert_eq!(log.lines("an Actions runner of its own takes it").len(), 1);
+}
+
+// added: the Actions runner of its own takes the held job as GitHub looks at its queue at the same moment: GitHub
+// hands it out once, the scale set starts no machine for it, the removal GitHub refuses for the job is the job's
+// start, and the console hears of the job once, from the machine that ran it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_job_the_actions_runner_of_its_own_takes_runs_once() {
+    let rig = Rig::new(2).await;
+    let job = held_job(&rig).await;
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    let own = the_own_runner(&rig).await;
+    rig.github.start_job(&own);
+    rig.github.runner_online(&own);
+    rig.github.github_looks();
+    assert_eq!(rig.github.job_state(job), Some(JobState::Running(own.clone())));
+
+    rig.later(Duration::from_secs(60));
+    rig.service.look_at_queue().await;
+    rig.settles("its job heard from the refused removal", || {
+        heard(&rig, &own) == (true, false)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.standing(), std::slice::from_ref(&own), "no second machine");
+    assert!(!rig.github.removed_at_request().contains(&own));
+    assert_eq!(rig.github.job_state(job), Some(JobState::Running(own.clone())));
+
+    rig.finish(&own, "succeeded");
+    rig.settles("its end heard", || heard(&rig, &own) == (true, true))
+        .await;
+    assert_eq!(rig.events().len(), 2, "{:?}", rig.events());
+    rig.nothing_left().await;
+}
+
+// added: an Actions runner of its own that took the held job waits for none, so a job GitHub holds behind it while the
+// Mac has room gets another once five minutes are over, not only once that job ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_held_behind_one_that_took_its_job_gets_another() {
+    let rig = Rig::new(3).await;
+    let job = held_job(&rig).await;
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    let first = the_own_runner(&rig).await;
+    rig.github.start_job(&first);
+    assert_eq!(rig.github.job_state(job), Some(JobState::Running(first.clone())));
+    rig.later(Duration::from_secs(60));
+    rig.service.look_at_queue().await;
+    rig.settles("its job heard from the refused removal", || {
+        heard(&rig, &first) == (true, false)
+    })
+    .await;
+
+    // Another job, queued while the Mac had no room, then held while it has room again.
+    hold(&rig, &[&["self-hosted", "cf-2g"]]).await;
+    rig.later(Duration::from_secs(250));
+    rig.service.look_at_queue().await;
+    let own = own_runners(&rig);
+    assert_eq!(own.len(), 2, "a second beside the one that runs a job: {own:?}");
+    assert!(own.contains(&first));
+    assert_eq!(rig.github.job_state(job), Some(JobState::Running(first)));
+}
+
+// added: an Actions runner of its own carries all the held job's labels, so GitHub could give it a job of the same
+// repository that asks for only some of them and wants a machine of another size. While such a job waits, the held
+// job gets none; the Mac says why once, and the console still hears of the held job.
+#[tokio::test]
+async fn a_held_job_gets_none_of_its_own_while_one_with_fewer_labels_waits() {
+    let log = support::Log::start();
+    let rig = Rig::new(3).await;
+    let jobs = held_jobs(&rig, &[&["self-hosted", "cf-2g"], &["self-hosted"]]).await;
+    let mut own_of_the_set = BTreeSet::new();
+    for _ in 0..4 {
+        rig.later(Duration::from_secs(40));
+        rig.service.look_at_queue().await;
+        own_of_the_set.extend(
+            rig.github
+                .plain_runners()
+                .into_iter()
+                .filter(|(_, _, labels)| *labels == set_labels())
+                .map(|(name, ..)| name),
+        );
+    }
+    assert_eq!(own_of_the_set, BTreeSet::new());
+    assert_eq!(rig.github.job_state(jobs[1]), Some(JobState::Available));
+    let said = log.lines("only some of its labels");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains(&format!("job={}", jobs[0])), "{}", said[0]);
+    let held = rig.report()["status"]["heldJobs"].clone();
+    assert!(
+        held.as_array()
+            .expect("heldJobs")
+            .iter()
+            .any(|set| set["labels"] == json!(set_labels()) && set["jobs"] == json!(1)),
+        "{held}"
+    );
+}
+
+// added: a job with fewer labels that already runs elsewhere is no job GitHub could give an Actions runner of the held
+// job's own: the held job gets one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_with_fewer_labels_that_runs_already_keeps_none_back() {
+    let rig = Rig::new(3).await;
+    let running = under_way_elsewhere(&rig, REPO, &["self-hosted"]);
+    held_job(&rig).await;
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    assert_eq!(own_runners(&rig).len(), 1);
+    assert_eq!(rig.github.job_state(running), Some(JobState::TakenElsewhere));
+}
+
+// added: a paused Mac starts no Actions runner of its own for a job that waits, and says no job is held: GitHub holds
+// none from a Mac that offers no room. Once the pause ends, room comes back and the held job gets one after two more
+// minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_mac_starts_nothing_for_a_job_that_waits() {
+    let rig = Rig::new(2).await;
+    held_job(&rig).await;
+    rig.console.pause(true);
+    rig.settles("the Mac is paused and offers no room", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["paused"] == json!(true))
+            && !rig.github.offers_room(REPO)
+    })
+    .await;
+    for _ in 0..3 {
+        rig.later(Duration::from_secs(150));
+        rig.service.look_at_queue().await;
+    }
+    assert_eq!(own_runners(&rig), Vec::<String>::new());
+    assert_eq!(rig.report()["status"].get("heldJobs"), None);
+    assert!(rig.standing().is_empty());
+
+    rig.console.pause(false);
+    rig.settles("room offered again", || rig.github.offers_room(REPO))
+        .await;
+    rig.service.look_at_queue().await;
+    assert_eq!(
+        own_runners(&rig),
+        Vec::<String>::new(),
+        "room for less than two minutes"
+    );
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    assert_eq!(own_runners(&rig).len(), 1);
+}
+
+// added: a full Mac starts no Actions runner of its own for a job that waits for its slot, and says none is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_mac_starts_nothing_for_a_job_that_waits() {
+    let rig = Rig::new(1).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.settles("no room offered", || !rig.github.offers_room(REPO))
+        .await;
+    let job = rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    for _ in 0..3 {
+        rig.later(Duration::from_secs(150));
+        rig.service.look_at_queue().await;
+    }
+    assert_eq!(own_runners(&rig), Vec::<String>::new());
+    assert_eq!(rig.report()["status"].get("heldJobs"), None);
+    assert_eq!(rig.standing(), std::slice::from_ref(&runner));
+    assert_eq!(rig.github.job_state(job), Some(JobState::Available));
+}
+
+// added: however many jobs GitHub holds and however often the queue is read, a scale set gets one Actions runner of its
+// own at a time and one in five minutes at most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_jobs_get_one_actions_runner_of_their_own_at_a_time() {
+    let rig = Rig::new(3).await;
+    held_job(&rig).await;
+    for _ in 0..9 {
+        rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "more");
+    }
+    // A job queued is a look: GitHub hands one to the Mac's room. The rest it holds.
+    rig.settles("the one GitHub handed over has a machine", || {
+        rig.standing().len() == 1
+    })
+    .await;
+    let mut seen = BTreeSet::new();
+    for _ in 0..20 {
+        rig.later(Duration::from_secs(10));
+        rig.service.look_at_queue().await;
+        seen.extend(own_runners(&rig));
+    }
+    assert_eq!(seen.len(), 1, "200 s, many looks: {seen:?}");
+    let status = rig.report()["status"].clone();
+    assert_eq!(status["heldJobs"][0]["jobs"], json!(9));
+    for _ in 0..10 {
+        let _ = rig.report();
+    }
+    assert_eq!(own_runners(&rig).len(), 1, "a report starts nothing");
+}

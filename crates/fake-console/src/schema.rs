@@ -371,6 +371,8 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "runners", Nullish, list(64, runner))
     // `commands`, the console's commands this Runner does, is read with `.catch`: one the console cannot read is
     // dropped and the console assumes the commands of a Runner before it, so no value refuses a report.
+    // `heldJobs`, the jobs GitHub holds back from scale sets with room, is not read: the schema drops keys it does not
+    // know, so a console from before it takes the report as one without it.
 }
 
 fn settings(v: &Value, path: &str) -> Check {
