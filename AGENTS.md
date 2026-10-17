@@ -22,12 +22,12 @@ Ours is the Runner, `codefusion-runner`. GitHub's program inside the VM is the A
 - Tests come from the spec and the ways it fails, not from the code; break the code on purpose and watch them go red.
   Mock only network, time and randomness.
 - No `unsafe` without a `SAFETY:` comment naming why the call is sound.
-- Workflows name every action by its commit, with the version as a comment. The one exception is the organization's
-  own automerge action, which `automerge.yml` takes from `codefusion-cc/codefusion`'s main, as every repository does.
+- Workflows name every action by its commit, with the version as a comment.
   A job that holds a secret checks out and compiles nothing: it runs what a job without secrets built.
 - Branches are `feat/`, `fix/`, `docs/` and so on. No attribution lines in commits or PR bodies.
 - Once checks pass and CI is green, a session adds the label `automerge` (`gh pr edit <n> --add-label automerge`);
-  leave it off a draft or a pull request that must wait.
+  leave it off a draft or a pull request that must wait. CodeFusion Console merges it once its CI tested it with the
+  newest main (codefusion-console `docs/AUTOMERGE.md`).
 
 ## Image
 
