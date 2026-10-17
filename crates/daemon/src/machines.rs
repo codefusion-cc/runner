@@ -1439,6 +1439,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let now = inner.host.now();
         let runner = run.runner();
         let name = job_name(&runner).to_string();
+        // The Mac may have stopped taking jobs since the slot was given (a wait for room ends while it is paused, or
+        // an update holds): a run is not a job it has to take.
+        if inner.paused || inner.draining || inner.holding {
+            return Err(HostError("the host takes no new job now".into()));
+        }
         if inner.jobs.contains_key(&name) {
             return Err(HostError(format!("a machine named {runner} is there already")));
         }
@@ -1453,7 +1458,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             scratch_bytes: self.config.scratch_bytes,
             image: self.config.image.clone(),
             workload: test_run::workload(),
-            env: run.env(),
+            env: run.env(self.config.deadline),
             deadline_s: run.deadline(self.config.deadline).as_secs(),
             docker: run.docker,
         };

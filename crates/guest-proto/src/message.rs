@@ -48,9 +48,10 @@ pub struct Job {
     pub workload: Workload,
     /// The job's limits.
     pub limits: Limits,
-    /// Environment variables added to the workload's (later entries win over the supervisor's defaults).
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
+    /// Environment variables added to the workload's (later entries win over the supervisor's defaults). Their values
+    /// may be credentials (a test run's token): no debug print shows them; on the wire they are plain pairs.
+    #[serde(default, with = "secret_env")]
+    pub env: Vec<(String, Secret<String>)>,
     /// How long a step gets to fail by itself after the kernel stopped one of its processes for memory, before the
     /// supervisor stops the rest of the step's processes.
     pub oom_grace_ms: u64,
@@ -287,6 +288,28 @@ pub enum GuestEnd {
 }
 
 /// A secret as a plain string in a message: the one place a [`Secret`] is written out, to the end that needs it.
+/// Environment variables whose values are [`Secret`]s, written as the `[name, value]` pairs they always were.
+pub mod secret_env {
+    use cf_secret::Secret;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes the pairs with their values.
+    pub fn serialize<S: Serializer>(env: &[(String, Secret<String>)], to: S) -> Result<S::Ok, S::Error> {
+        to.collect_seq(env.iter().map(|(name, value)| (name, value.expose())))
+    }
+
+    /// Reads the pairs, each value a secret.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        from: D,
+    ) -> Result<Vec<(String, Secret<String>)>, D::Error> {
+        Vec::<(String, String)>::deserialize(from).map(|env| {
+            env.into_iter()
+                .map(|(name, value)| (name, Secret::new(value)))
+                .collect()
+        })
+    }
+}
+
 mod on_the_wire {
     use cf_secret::Secret;
     use serde::{Deserialize, Deserializer, Serializer};

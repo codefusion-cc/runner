@@ -20,6 +20,7 @@ pub fn turn_of(job: &JobBase) -> Turn {
     Turn {
         urgent: deploys(job) || on_main(job),
         repo: job.repository(),
+        refusable: false,
     }
 }
 

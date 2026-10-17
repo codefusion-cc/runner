@@ -158,19 +158,35 @@ impl TestRun {
         format!("tr-{}", &self.run[3..])
     }
 
-    /// The longest the machine may stand: the suite's time and [`SLACK`], and never past the longest any job on this
-    /// Runner may run, which the lifecycle's own backstop is set by.
-    pub fn deadline(&self, longest: Duration) -> Duration {
-        (Duration::from_secs(self.timeout_s) + SLACK).min(longest)
+    /// The suite's time on a Runner whose jobs run for `longest` at most: what the console asked for, or less, so
+    /// that the agent's own timeout and its end come before the machine's deadline ([`SLACK`] before it). A Runner
+    /// whose longest job leaves less than the shortest time a run may ask for takes none.
+    pub fn timeout_within(&self, longest: Duration) -> Result<u64, String> {
+        let room = longest.saturating_sub(SLACK).as_secs();
+        if room < *TIMEOUT_S.start() {
+            return Err(format!(
+                "this host's jobs run for {} s at most, too short for a test run",
+                longest.as_secs()
+            ));
+        }
+        Ok(self.timeout_s.min(room))
     }
 
-    /// What the machine's workload is told: where the run is, its token, and the suite's time. Nothing else of the
-    /// Runner's reaches it.
-    pub fn env(&self) -> Vec<(String, String)> {
+    /// The longest the machine may stand: the suite's time and [`SLACK`], never past `longest`, the longest any job on
+    /// this Runner may run, which the lifecycle's own backstop is set by.
+    pub fn deadline(&self, longest: Duration) -> Duration {
+        let timeout = self.timeout_within(longest).unwrap_or(self.timeout_s);
+        (Duration::from_secs(timeout) + SLACK).min(longest)
+    }
+
+    /// What the machine's workload is told: where the run is, its token, and the suite's time on a Runner whose jobs
+    /// run for `longest` at most. Nothing else of the Runner's reaches it, and no value shows in a debug print.
+    pub fn env(&self, longest: Duration) -> Vec<(String, Secret<String>)> {
+        let timeout = self.timeout_within(longest).unwrap_or(self.timeout_s);
         vec![
-            ("CF_RUN_URL".into(), self.url.clone()),
-            ("CF_RUN_TOKEN".into(), self.token.expose().clone()),
-            ("CF_RUN_TIMEOUT_S".into(), self.timeout_s.to_string()),
+            ("CF_RUN_URL".into(), Secret::new(self.url.clone())),
+            ("CF_RUN_TOKEN".into(), self.token.clone()),
+            ("CF_RUN_TIMEOUT_S".into(), Secret::new(timeout.to_string())),
         ]
     }
 }
@@ -235,9 +251,15 @@ pub fn admit(slots: &impl Slots, run: &TestRun, other: Option<&str>) -> Admissio
     if let Some(other) = other {
         return Admission::Busy(format!("test run {other} is on this host"));
     }
+    // As many Docker jobs as the Mac allows hold a slot: a test run is held to that cap as a CI job is.
+    if run.docker && slots.docker_room() == 0 {
+        return Admission::Busy(crate::DOCKER_FULL.to_string());
+    }
     let turn = Turn {
         urgent: true,
         repo: TURN_REPO.to_string(),
+        // Not GitHub's job: no room the Mac would refuse a claim, and none while someone is at it.
+        refusable: true,
     };
     match slots.claim_in_turn(run.size, None, turn) {
         Claim::Start(ticket) => Admission::Start(ticket),

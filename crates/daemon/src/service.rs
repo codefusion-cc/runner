@@ -1993,6 +1993,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if let Some(why) = busy {
             return Some((false, format!("busy: {why}")));
         }
+        if let Err(why) = run.timeout_within(shared.machines.deadline()) {
+            return Some((false, format!("never: {why}")));
+        }
         let other = shared.machines.test_run_on();
         match test_run::admit(&*shared.machines, &run, other.as_deref()) {
             Admission::Start(ticket) => Some(self.start_test_run(ticket, &run)),

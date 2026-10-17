@@ -273,6 +273,7 @@ async fn an_urgent_test_run_goes_before_a_ci_job_that_waited_longer() {
         Turn {
             urgent: false,
             repo: "org/other".into(),
+            refusable: false,
         },
     ) else {
         panic!("the CI job got room");
@@ -306,7 +307,7 @@ async fn the_machine_runs_the_agent_with_the_runs_address_alone_and_its_slot_goe
     let env: Vec<(&str, &str)> = request
         .env
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .map(|(k, v)| (k.as_str(), v.expose().as_str()))
         .collect();
     assert_eq!(
         env,
@@ -492,4 +493,128 @@ async fn a_run_the_console_no_longer_asks_for_gives_its_place_back() {
     pass(&w.m, 3);
     assert_eq!(w.slots(), 0, "the room went to the run nobody wants");
     assert_eq!(w.parts.vms.started().len(), 1);
+}
+
+/// A workstation's settings: room for `machines` cf-2g machines while its person is away, `in_use` while they are
+/// there (0: none at all).
+fn workstation(machines: u32, in_use: u32) -> cf_budget::Settings {
+    let mut settings = cf_daemon::testing::settings_for(machines);
+    settings.mode = cf_budget::Mode::Workstation;
+    settings.in_use.cap_bytes = u64::from(in_use) * Size::G2.vm_bytes();
+    settings
+}
+
+#[tokio::test]
+async fn a_waiting_run_does_not_start_while_someone_is_at_the_mac() {
+    let mut w = World::on(workstation(1, 0));
+    pass(&w.m, 15 * 60);
+    let ci = w.running().await;
+    let Admission::Waits(ticket) = test_run::admit(&*w.m, &run(json!({"waitS": 3600})), None) else {
+        panic!("no place in line");
+    };
+    // The person comes back while the CI job ends: a job GitHub assigned would start; a test run waits for them.
+    w.m.with_host(|host| host.touch());
+    w.parts.vms.end(job_name(&ci), End::Ok);
+    w.github(EventKind::Completed, &ci, "succeeded");
+    pass(&w.m, 2);
+    assert!(!w.m.ready(ticket), "the test run started with someone at the Mac");
+    assert_eq!(w.slots(), 0);
+    // They leave: it starts.
+    pass(&w.m, 16 * 60);
+    assert!(w.m.ready(ticket), "the test run never started once they left");
+}
+
+#[tokio::test]
+async fn a_run_takes_room_only_under_the_limits_of_a_mac_in_use() {
+    // Two machines while away, one while someone is there, who is there now: a CI job GitHub assigned runs.
+    let mut w = World::on(workstation(2, 1));
+    w.running().await;
+    let admission = test_run::admit(&*w.m, &run(json!({"waitS": 0})), None);
+    assert!(
+        matches!(&admission, Admission::Busy(why) if why.starts_with("no room now")),
+        "{admission:?}"
+    );
+    assert_eq!(w.slots(), 1);
+}
+
+#[tokio::test]
+async fn a_docker_run_past_the_macs_docker_jobs_is_busy() {
+    let w = World::new(3);
+    let held = w.m.reserve_docker(Size::G2).expect("a Docker job's promise");
+    let admission = test_run::admit(&*w.m, &run(json!({"docker": true})), None);
+    assert_eq!(admission, Admission::Busy("docker-full".into()));
+    assert_eq!(w.slots(), 1);
+    // One without Docker is not held to it.
+    assert!(matches!(
+        test_run::admit(&*w.m, &run(json!({})), None),
+        Admission::Start(_)
+    ));
+    w.m.release(held);
+}
+
+#[test]
+fn the_agents_own_time_ends_before_the_machines_deadline() {
+    let long = run(json!({"timeoutS": 7200}));
+    assert_eq!(long.timeout_within(Duration::from_secs(6 * 3600)), Ok(7200));
+    // A Runner whose jobs may run an hour: the suite gets what is left after the setup's and the end's time.
+    assert_eq!(long.timeout_within(Duration::from_secs(3600)), Ok(3600 - 900));
+    assert_eq!(long.timeout_within(Duration::from_secs(900 + 60)), Ok(60));
+    assert!(long.timeout_within(Duration::from_secs(900 + 59)).is_err());
+    let env = long.env(Duration::from_secs(3600));
+    assert_eq!(env[2].0, "CF_RUN_TIMEOUT_S");
+    assert_eq!(env[2].1.expose(), "2700");
+    assert_eq!(
+        long.deadline(Duration::from_secs(3600)),
+        Duration::from_secs(3600)
+    );
+}
+
+#[tokio::test]
+async fn a_slot_given_to_a_paused_or_holding_host_starts_no_machine() {
+    let w = World::new(2);
+    let run = run(json!({}));
+    for hold in [
+        |m: &cf_daemon::testing::TestMachines, on| m.pause(on),
+        |m: &cf_daemon::testing::TestMachines, on| m.hold_for_restart(on),
+    ] {
+        let Admission::Start(ticket) = test_run::admit(&*w.m, &run, None) else {
+            panic!("no slot");
+        };
+        hold(&w.m, true);
+        assert!(
+            w.m.start_test_run(ticket, &run).is_err(),
+            "a machine started on a held host"
+        );
+        w.m.release(ticket);
+        hold(&w.m, false);
+        assert_eq!(w.slots(), 0);
+        assert!(w.parts.vms.started().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn the_token_shows_in_no_debug_print_of_the_machines_request() {
+    let w = World::new(1);
+    let run = run(json!({}));
+    started(&w, &run);
+    let request = w.parts.vms.started().pop().expect("a machine");
+    let shown = format!("{request:?}");
+    assert!(!shown.contains(run.token.expose().as_str()), "{shown}");
+    let message = cf_guest_proto::Job {
+        name: request.job.clone(),
+        host: request.host.clone(),
+        workload: request.workload.clone(),
+        limits: request.limits(),
+        env: request.env.clone(),
+        oom_grace_ms: 0,
+        blocked: Vec::new(),
+        docker: false,
+    };
+    assert!(!format!("{message:?}").contains(run.token.expose().as_str()));
+    // On the wire it is there, as before: the vm-host and the guest read it.
+    let wire = serde_json::to_string(&request).expect("json");
+    assert!(
+        wire.contains(&format!(r#"["CF_RUN_TOKEN","{}"]"#, run.token.expose())),
+        "{wire}"
+    );
 }
