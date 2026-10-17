@@ -8,6 +8,7 @@ use super::sys::{self, context, say};
 use cf_guest_proto::{
     GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason, Summary, Usage, Workload,
 };
+use cf_supervisor::disks::overlay_options;
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::oom::{self, Kill};
 use cf_supervisor::outcome::{REPORT_BYTES, workload_end};
@@ -233,7 +234,7 @@ pub fn run(
         ROOT,
         "overlay",
         libc::MS_NODEV,
-        &format!("lowerdir={IMAGE},upperdir={SCRATCH}/upper,workdir={SCRATCH}/work"),
+        &overlay_options(IMAGE, &format!("{SCRATCH}/upper"), &format!("{SCRATCH}/work")),
     )
     .map_err(disks)?;
 
