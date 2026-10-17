@@ -406,6 +406,8 @@ function suite(spec, timeoutS, sender) {
       try {
         const written = fs.writeSync(output, bytes);
         kept += written;
+        // The sender goes at once rather than at its next look.
+        sender.wake?.();
         if (written === bytes.length) return;
         // A disk that took part of it is full: the rest is not kept, as with ENOSPC.
         failed = 'a short write';

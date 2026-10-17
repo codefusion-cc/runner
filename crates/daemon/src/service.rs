@@ -2042,10 +2042,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             Ok(runner) => (true, format!("started {runner}")),
             Err(error) => {
                 machines.release(ticket);
-                if error.0 == crate::machines::HOST_CLOSED {
-                    return (false, format!("busy: {}", error.0));
+                match error {
+                    test_run::StartError::Closed => (false, format!("busy: {error}")),
+                    test_run::StartError::Failed(_) => (false, error.to_string()),
                 }
-                (false, format!("the machine did not start: {error}"))
             }
         }
     }

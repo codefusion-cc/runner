@@ -34,7 +34,7 @@ pub fn is_machine_name(name: &str) -> bool {
 }
 
 /// The number of UTF-16 units, which is how the console counts a text's length.
-pub(crate) fn units(text: &str) -> usize {
+pub fn units(text: &str) -> usize {
     text.encode_utf16().count()
 }
 

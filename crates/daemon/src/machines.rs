@@ -24,7 +24,7 @@ use crate::making::{Making, Offered, theirs};
 use crate::names::job_name;
 use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, TestRunFacts, Upgrade};
 use crate::roster::{JobInfo, Roster, Runner};
-use crate::test_run::{self, TestRun};
+use crate::test_run::{self, StartError, TestRun};
 use crate::traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
 };
@@ -994,17 +994,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// never says anything of it. Without this the lifecycle would wait for a job, ask GitHub to remove a
     /// registration that never was, and stop the machine as one without a job.
     fn test_run_up(&self, inner: &mut Inner<H>, name: &str, now: Now) {
-        let at = self.wall();
         let Some(job) = inner.jobs.get_mut(name) else {
+            return;
+        };
+        let Some(facts) = job.record.test_run.as_mut() else {
             return;
         };
         if job.life.phase() != Phase::Idle {
             return;
         }
-        let Some(facts) = job.record.test_run.as_mut() else {
-            return;
-        };
-        let at = *facts.started_at.get_or_insert(at);
+        let at = *facts.started_at.get_or_insert_with(|| secs(self.clock.now()));
         tracing::info!(runner = %job.record.runner, job = %name, "a test run's machine is up; its suite starts");
         self.hear(inner, name, now, Event::JobStarted, at, true);
     }
@@ -1434,7 +1433,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// agent as its workload, the run's address and token in its environment, and no Actions runner. Its record has
     /// no registration at GitHub from the start, so the sweep never asks GitHub anything of it. After an error no
     /// machine stands and the slot is still the caller's.
-    pub fn start_test_run(&self, ticket: Ticket, run: &TestRun) -> Result<String, HostError> {
+    pub fn start_test_run(&self, ticket: Ticket, run: &TestRun) -> Result<String, StartError> {
         let mut inner = self.lock();
         let now = inner.host.now();
         let runner = run.runner();
@@ -1442,13 +1441,14 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         // The Mac may have stopped taking jobs since the slot was given (a wait for room ends while it is paused, or
         // an update holds): a run is not a job it has to take.
         if inner.paused || inner.draining || inner.holding {
-            return Err(HostError(HOST_CLOSED.into()));
+            return Err(StartError::Closed);
         }
+        let failed = |why: String| Err(StartError::Failed(HostError(why)));
         if inner.jobs.contains_key(&name) {
-            return Err(HostError(format!("a machine named {runner} is there already")));
+            return failed(format!("a machine named {runner} is there already"));
         }
         let Some(grant) = inner.grants.get(&ticket).copied() else {
-            return Err(HostError(format!("slot {} is not granted", ticket.0)));
+            return failed(format!("slot {} is not granted", ticket.0));
         };
         let request = JobRequest {
             job: name,
@@ -1473,7 +1473,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         if let Err(error) = self.launch(&mut inner, now, ticket, record, &request) {
             // Nothing stands and nothing is registered: no record is left of it.
             self.store.remove(&request.job);
-            return Err(error);
+            return Err(StartError::Failed(error));
         }
         // A Docker run's slot counts against the Mac's Docker jobs since `test_run::admit` took it.
         tracing::info!(%runner, size = run.size.label(), repo = %run.repo, "a test run's machine starts");
@@ -1664,10 +1664,6 @@ fn facts(record: &Record) -> MachineFacts {
 
 /// Why a Docker job's slot is refused: as many Docker jobs as the Mac allows hold one.
 pub const DOCKER_FULL: &str = "docker-full";
-
-/// Why a test run's slot starts no machine on a Mac that stopped taking jobs since it was given: the console hears
-/// `busy: ` and this, as it would have before the slot.
-pub const HOST_CLOSED: &str = "the host takes no new job now";
 
 impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
     fn reserve(&self, size: Size) -> Result<Ticket, Refusal> {

@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use cf_budget::{Size, Turn};
+use cf_console_client::units;
 use cf_guest_proto::Workload;
 use cf_secret::Secret;
 use serde_json::Value;
@@ -128,13 +129,14 @@ impl TestRun {
         let timeout_s = number("timeoutS", TIMEOUT_S)?;
         let wait_s = number("waitS", WAIT_S)?;
         let repo = text("repo")?;
-        if repo.is_empty() || repo.chars().count() > REPO_MAX || repo.chars().any(char::is_control) {
+        // Counted as the console counts a text, in UTF-16 units.
+        if repo.is_empty() || units(repo) > REPO_MAX || repo.chars().any(char::is_control) {
             return Err(format!(
                 "`repo` is empty, longer than {REPO_MAX} characters or has control characters"
             ));
         }
         let label = text("label")?;
-        if label.chars().count() > LABEL_MAX || label.chars().any(char::is_control) {
+        if units(label) > LABEL_MAX || label.chars().any(char::is_control) {
             return Err(format!(
                 "`label` is longer than {LABEL_MAX} characters or has control characters"
             ));
@@ -222,6 +224,18 @@ fn is_token(token: &str) -> bool {
         && token[5..]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Why a test run's machine did not start on the slot it was given.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StartError {
+    /// The Mac stopped taking jobs since the slot was given (paused, draining, holding for an update or new
+    /// settings): the console hears `busy: `, as it would have before the slot.
+    #[error("the host takes no new job now")]
+    Closed,
+    /// The machine itself did not start.
+    #[error("the machine did not start: {0}")]
+    Failed(crate::HostError),
 }
 
 /// What the budget said to a test run.
