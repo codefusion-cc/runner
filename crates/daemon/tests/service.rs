@@ -3499,7 +3499,7 @@ async fn a_runner_with_nowhere_to_update_from_offers_no_update() {
     let report = serde_json::to_value(alone.status()).expect("a report");
     assert_eq!(
         report["status"]["commands"],
-        json!(["restart", "stop-runner", "settings"])
+        json!(["pause", "resume", "restart", "stop-runner", "settings"])
     );
     rig.stop_pump().await;
     let asked = [
@@ -4071,7 +4071,15 @@ async fn the_report_says_the_commands_the_runner_does_and_its_limits() {
     let report = rig.console.reports().last().expect("a report").clone();
     assert_eq!(
         report["status"]["commands"],
-        json!(["restart", "stop-runner", "update", "update-to", "settings"])
+        json!([
+            "pause",
+            "resume",
+            "restart",
+            "stop-runner",
+            "update",
+            "update-to",
+            "settings"
+        ])
     );
     assert_eq!(
         report["limits"],
