@@ -138,10 +138,10 @@ async function fakeConsole({ suite, image = null, timeoutS = 60, partBytes = 300
 }
 
 /** Starts the agent against `console` in a folder of its own. Says the folder, and its exit code once it exits. */
-function start(console, { timeoutS = 60, knobs = {}, prepare } = {}) {
+function start(console, { timeoutS = 60, knobs = {}, prepare, docker = 3 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cf-agent-'));
   prepare?.(dir);
-  const env = { ...process.env };
+  const env = { ...process.env, ...fakeDocker(dir, docker) };
   for (const name of Object.keys(env)) if (name.startsWith('CF_')) delete env[name];
   Object.assign(env, {
     CF_RUN_URL: console.url,
@@ -232,6 +232,50 @@ test('the suite sees CI and CF_TEST_REMOTE, and none of the run\'s own variables
   await agent(console);
   await console.close();
   assert.equal(console.stored.toString(), 'CF_TEST_REMOTE=1\nCI=true\n');
+});
+
+/**
+ * A `docker` on the PATH for Docker mode: `docker info` fails until `ready` tries have been made (a VM's daemon still
+ * starting), `docker pull` succeeds, and `docker run` says it is in the image and runs its last word, the suite, with
+ * bash in the checkout. Its calls go to `calls` in the agent's folder.
+ */
+function fakeDocker(dir, ready) {
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'docker'), `#!/bin/bash
+echo "$1" >> ${JSON.stringify(path.join(dir, 'calls'))}
+case "$1" in
+  info) n=$(grep -c '^info$' ${JSON.stringify(path.join(dir, 'calls'))}); [ "$n" -gt ${ready} ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; } ;;
+  pull) exit 0 ;;
+  run) echo "in image"; exec bash -c "\${@: -1}" ;;
+  kill|rm) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  return { PATH: `${bin}:${process.env.PATH}` };
+}
+
+test('in Docker mode the suite waits for the VM\'s daemon, then runs in the image', async () => {
+  const console = await fakeConsole({ suite: 'echo suite ran', image: 'node:24-bookworm' });
+  const { dir, done } = start(console, { knobs: { CF_RUN_DOCKER_POLL_MS: '20' } });
+  await done;
+  await console.close();
+  assert.equal(console.stored.toString(), 'in image\nsuite ran\n');
+  assert.deepEqual(console.ends, [{ exit: 0, reason: 'exited', tail: 'in image\nsuite ran\n', stored: 19 }]);
+  const said = fs.readFileSync(path.join(dir, 'calls'), 'utf8').trim().split('\n');
+  assert.deepEqual(said.slice(0, 6), ['info', 'info', 'info', 'info', 'pull', 'run']);
+  // Then the container is removed, which the agent doesn't wait for.
+  assert.ok(said.slice(6).every((call) => call === 'rm'), said.join(' '));
+});
+
+test('in Docker mode a daemon that never answers fails the setup and runs nothing', async () => {
+  const console = await fakeConsole({ suite: 'echo never', image: 'node:24-bookworm' });
+  await agent(console, { knobs: { CF_RUN_DOCKER_POLL_MS: '20', CF_RUN_DOCKER_MS: '300' }, docker: 1e9 });
+  await console.close();
+  assert.equal(console.stored.length, 0);
+  assert.equal(console.ends.length, 1);
+  assert.equal(console.ends[0].reason, 'setup');
+  assert.equal(console.ends[0].exit, null);
+  assert.match(console.ends[0].message, /^the VM's Docker daemon did not answer within 0\.3 s/);
 });
 
 test('an empty output is an empty end, and heartbeats go while the suite says nothing', async () => {
