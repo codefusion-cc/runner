@@ -5212,6 +5212,32 @@ async fn the_docker_check_decides_whether_docker_jobs_and_runs_come_here() {
     assert_eq!(rig.parts.vms.started().len(), started);
 }
 
+/// A test run with Docker that started before a check failed is answered `started` when the console sends it again,
+/// as it does until it has the result: its machine stands, and a `never:` would have the console start it elsewhere too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_docker_run_that_started_before_a_failed_check_is_answered_started_again() {
+    const RUN: &str = "tr_dddddddddddddddddddddddddd";
+    let mut rig = Rig::new(3).await;
+    rig.stop_pump().await;
+    // Room for the run and the check's machine side by side.
+    rig.machines = rig.parts.machines_with(|config| config.docker_max_jobs = 2);
+    let runner = docker_runner(&mut rig).await;
+    let started = docker_run(&rig, &runner, RUN).await;
+    assert_eq!(started["ok"], json!(true), "{started}");
+
+    runner.look_at_docker();
+    let check = rig.parts.vms.started().last().expect("the check").job.clone();
+    assert_ne!(check, job_name("tr-dddddddddddddddddddddddddd"));
+    pass(&rig.machines, 1);
+    rig.parts.vms.end(&check, End::Failed);
+    pass(&rig.machines, 1);
+    assert!(rig.machines.docker_check().is_some_and(|check| !check.ok));
+
+    let again = docker_run(&rig, &runner, RUN).await;
+    assert_eq!(again["ok"], json!(true), "{again}");
+    assert_eq!(again["message"], json!("started tr-dddddddddddddddddddddddddd"));
+}
+
 /// No check boots while the host is paused: the budget gives it no slot. It boots once the pause is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_docker_check_boots_on_a_paused_host() {

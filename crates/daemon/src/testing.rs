@@ -484,14 +484,27 @@ impl TestParts {
         machines
     }
 
+    /// [`TestParts::machines`] with their configuration changed by `tweak`.
+    pub fn machines_with(&self, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
+        let machines = self.restored_with(FakeHost::new(TEST_MAC), tweak);
+        pass(&machines, 61);
+        machines
+    }
+
     /// Machines as a daemon that just started has them, before its first look at the Mac.
     pub fn restored(&self, host: FakeHost) -> Arc<TestMachines> {
+        self.restored_with(host, |_| {})
+    }
+
+    fn restored_with(&self, host: FakeHost, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
         let (nudges, bell) = (self.nudges.clone(), self.bell.clone());
+        let mut config = MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600));
+        tweak(&mut config);
         let machines = Machines::restore(MachineParts {
             host,
             vms: self.vms.clone(),
             settings: self.settings.clone(),
-            config: MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600)),
+            config,
             roster: self.roster.clone(),
             store: self.store.clone(),
             clock: self.clock.clone(),

@@ -346,6 +346,9 @@ struct Inner<H> {
     docker: BTreeSet<SlotId>,
     /// What the last Docker check found; none before the first ended.
     docker_check: Option<DockerCheck>,
+    /// When the last check's machine ended without an answer ([`DockerCheck::of_end`] said none), in seconds since
+    /// 1970; none once one answered.
+    docker_unanswered: Option<i64>,
 }
 
 impl<H> Inner<H> {
@@ -455,6 +458,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 making: Making::default(),
                 docker: BTreeSet::new(),
                 docker_check: None,
+                docker_unanswered: None,
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -1120,13 +1124,27 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         job.record.slot = Some(job.life.saved().into());
         job.ended_at = Some(now.elapsed);
         if job.record.probe {
-            let console = self.vms.console_tail(name, docker_check::CONSOLE_TAIL);
-            let check = DockerCheck::of_end(job.last.as_ref(), kind, console.as_deref(), self.wall());
-            match &check.why {
-                None => tracing::info!("Docker starts in this host's job machines"),
-                Some(why) => tracing::warn!(%why, "Docker does not start in this host's job machines"),
+            let at = self.wall();
+            let console = || self.vms.console_tail(name, docker_check::CONSOLE_TAIL);
+            match DockerCheck::of_end(job.last.as_ref(), kind, console, at) {
+                None => {
+                    tracing::info!(
+                        end = kind.name(),
+                        "the Docker check's machine ended without an answer; it boots again later"
+                    );
+                    inner.docker_unanswered = Some(at);
+                }
+                Some(check) => {
+                    match &check.why {
+                        None => tracing::info!("Docker starts in this host's job machines"),
+                        Some(why) => {
+                            tracing::warn!(%why, "Docker does not start in this host's job machines")
+                        }
+                    }
+                    inner.docker_check = Some(check);
+                    inner.docker_unanswered = None;
+                }
             }
-            inner.docker_check = Some(check);
         }
         let Some(job) = inner.jobs.get_mut(name) else {
             return;
@@ -1547,6 +1565,17 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// What the last Docker check found; none before the first ended.
     pub fn docker_check(&self) -> Option<DockerCheck> {
         self.lock().docker_check.clone()
+    }
+
+    /// Whether a Docker check is due at `now` (seconds since 1970): [`DockerCheck::due`], and not within
+    /// [`docker_check::AGAIN_AFTER_NO_ANSWER`] of a check machine that ended without an answer.
+    pub fn docker_check_due(&self, now: i64) -> bool {
+        let inner = self.lock();
+        let again = i64::try_from(docker_check::AGAIN_AFTER_NO_ANSWER.as_secs()).unwrap_or(i64::MAX);
+        DockerCheck::due(inner.docker_check.as_ref(), now)
+            && inner
+                .docker_unanswered
+                .is_none_or(|at| now.saturating_sub(at) >= again)
     }
 
     /// Whether the Docker check's machine stands.

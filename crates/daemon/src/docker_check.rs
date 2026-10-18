@@ -6,7 +6,9 @@
 //! the Runner boots one small machine with Docker, through the budget like any job, whose workload waits for
 //! `docker info` and says whether it answered. Until the first check ends, Docker is unknown and nothing is refused;
 //! a pass holds for as long as the Runner runs (an update starts it again, and with it the check); a failure is
-//! checked again every [`RECHECK_AFTER`].
+//! checked again every [`RECHECK_AFTER`]. A check machine that the host or someone ended before its workload could
+//! answer (the host slept or ran short, it was stopped) says nothing of Docker: the check boots again after
+//! [`AGAIN_AFTER_NO_ANSWER`] and what the last one found stands meanwhile.
 
 use std::time::Duration;
 
@@ -17,6 +19,12 @@ use crate::EndKind;
 
 /// How long after a failed check the next one boots.
 pub const RECHECK_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+/// How long after a check machine that ended without an answer ([`DockerCheck::of_end`] says none) the next one boots.
+pub const AGAIN_AFTER_NO_ANSWER: Duration = Duration::from_secs(10 * 60);
+
+/// The longest `why` the console keeps of a check (it cuts what is longer).
+pub const WHY_MAX: usize = 300;
 
 /// How long the check's machine may stand: the boot, the two minutes the daemon gets, and a margin.
 pub const DEADLINE: Duration = Duration::from_secs(300);
@@ -54,16 +62,31 @@ pub struct DockerCheck {
 }
 
 impl DockerCheck {
-    /// What a check machine's end says: it passed only when its workload ended with 0. `state` is the vm-host's last
-    /// word, `kind` the Runner's end of the machine, `console` the end of its console log.
-    pub fn of_end(state: Option<&JobState>, kind: EndKind, console: Option<&str>, at: i64) -> DockerCheck {
+    /// What a check machine's end says: it passed only when its workload ended with 0, and none when the machine
+    /// ended for something that is no answer of Docker's (the host slept or ran short of memory or disk, the Runner
+    /// or someone stopped it, the host shut down or the Runner started again before it was up). `state` is the
+    /// vm-host's last word, `kind` the Runner's end of the machine, `console` reads the end of its console log, which
+    /// only a failure needs.
+    pub fn of_end(
+        state: Option<&JobState>,
+        kind: EndKind,
+        console: impl FnOnce() -> Option<String>,
+        at: i64,
+    ) -> Option<DockerCheck> {
         let ended = state.and_then(|state| state.end.as_ref());
-        if ended.is_some_and(|ended| ended.end == VmEnd::Ok) {
-            return DockerCheck {
-                ok: true,
-                at,
-                why: None,
-            };
+        match ended.map(|ended| ended.end) {
+            Some(VmEnd::Ok) => {
+                return Some(DockerCheck {
+                    ok: true,
+                    at,
+                    why: None,
+                });
+            }
+            Some(VmEnd::EvictedMemory | VmEnd::EvictedDisk | VmEnd::HostSlept | VmEnd::Cancelled) => {
+                return None;
+            }
+            None if no_answer(kind) => return None,
+            _ => {}
         }
         let how = match ended {
             Some(ended) if ended.end == VmEnd::Failed => {
@@ -83,16 +106,19 @@ impl DockerCheck {
             ),
             None => format!("the check's machine ended: {}", kind.name()),
         };
-        let sandbox = console.and_then(|log| log.lines().rev().find(|line| line.contains(SANDBOX_ENDED)));
+        let console = console();
+        let sandbox = console
+            .as_deref()
+            .and_then(|log| log.lines().rev().find(|line| line.contains(SANDBOX_ENDED)));
         let why = match sandbox {
             Some(line) => format!("{how}; {}", line.trim()),
             None => how,
         };
-        DockerCheck {
+        Some(DockerCheck {
             ok: false,
             at,
             why: Some(why),
-        }
+        })
     }
 
     /// Why Docker is refused on this host: a failed check's words. None while it passed or before any check.
@@ -115,6 +141,19 @@ impl DockerCheck {
             }
         }
     }
+}
+
+/// Whether a machine the vm-host said nothing of ended for something that is no answer of Docker's.
+const fn no_answer(kind: EndKind) -> bool {
+    matches!(
+        kind,
+        EndKind::EvictedMemory
+            | EndKind::EvictedDisk
+            | EndKind::HostSlept
+            | EndKind::HostShutdown
+            | EndKind::DaemonRestart
+            | EndKind::Stopped
+    )
 }
 
 const fn vm_end(end: VmEnd) -> &'static str {

@@ -4,7 +4,7 @@
 mod support;
 
 use cf_budget::Size;
-use cf_daemon::docker_check::{DockerCheck, RECHECK_AFTER};
+use cf_daemon::docker_check::{AGAIN_AFTER_NO_ANSWER, DockerCheck, RECHECK_AFTER};
 use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
 use cf_guest_proto::Workload;
@@ -78,6 +78,68 @@ async fn a_check_whose_daemon_never_answers_fails_with_its_exit_and_the_sandboxs
         !check.ok && check.why.as_deref().is_some_and(|why| why.contains("boot")),
         "{check:?}"
     );
+}
+
+/// Seconds since 1970 on the Runner's wall clock.
+fn wall(w: &World) -> i64 {
+    let now = w
+        .parts
+        .clock
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970");
+    i64::try_from(now.as_secs()).expect("seconds")
+}
+
+#[tokio::test]
+async fn a_check_the_host_or_someone_ends_first_answers_nothing_and_boots_again_after_ten_minutes() {
+    let after = i64::try_from(AGAIN_AFTER_NO_ANSWER.as_secs()).expect("seconds");
+    for end in [
+        End::HostSlept,
+        End::EvictedMemory,
+        End::EvictedDisk,
+        End::Cancelled,
+    ] {
+        let w = World::new(2);
+        assert!(w.m.docker_check_due(wall(&w)));
+        let job = probe(&w);
+        pass(&w.m, 1);
+        // Even with the sandbox's line in its log: the machine did not end by its workload.
+        w.parts.vms.console(&job, &format!("{SANDBOX}\n"));
+        w.parts.vms.end(&job, end);
+        pass(&w.m, 1);
+        assert_eq!(w.m.docker_check(), None, "{end:?} answered");
+        assert!(!w.m.probing());
+        assert_eq!(w.slots(), 0, "{end:?}: the check's slot was kept");
+        let now = wall(&w);
+        assert!(!w.m.docker_check_due(now), "{end:?}: due again at once");
+        assert!(
+            !w.m.docker_check_due(now + after - 1),
+            "{end:?}: due again too soon"
+        );
+        assert!(w.m.docker_check_due(now + after), "{end:?}: never due again");
+    }
+
+    // A failure stands while a later check is ended so.
+    let w = World::new(2);
+    let job = probe(&w);
+    pass(&w.m, 1);
+    w.parts.vms.end(&job, End::Failed);
+    pass(&w.m, 1);
+    let failed = w.m.docker_check().expect("an answer");
+    assert!(!failed.ok);
+    let job = probe(&w);
+    pass(&w.m, 1);
+    w.parts.vms.end(&job, End::HostSlept);
+    pass(&w.m, 1);
+    assert_eq!(
+        w.m.docker_check(),
+        Some(failed.clone()),
+        "a slept check changed the answer"
+    );
+    let recheck = i64::try_from(RECHECK_AFTER.as_secs()).expect("seconds");
+    assert!(!w.m.docker_check_due(failed.at + recheck - 1));
+    assert!(w.m.docker_check_due(failed.at + recheck));
 }
 
 #[tokio::test]

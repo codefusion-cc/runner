@@ -578,7 +578,7 @@ pub struct DockerStatus {
     pub ok: bool,
     /// When the check's machine ended, RFC 3339.
     pub checked_at: String,
-    /// Why it failed, at most 1000 characters; left out when it passed.
+    /// Why it failed, at most 300 characters (the console cuts what is longer); left out when it passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
 }
