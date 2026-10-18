@@ -36,6 +36,7 @@ fn laptop() -> Raw {
         thermal_level: 0,
         power_remaining_secs: -2.0,
         disk_free_bytes: 1_893_123_923_968,
+        disk_important_bytes: None,
     }
 }
 
@@ -59,6 +60,7 @@ fn a_laptop_under_pressure_reads_as_vm_stat_and_sysctl_show_it() {
             thermal: Thermal::Nominal,
             on_battery: false,
             disk_free_bytes: 1_893_123_923_968,
+            disk_reclaimable_bytes: 0,
         }
     );
 }
@@ -363,6 +365,32 @@ fn swap_and_disk_pass_through_as_they_are() {
         (reading.swap_used_bytes, reading.swapouts, reading.disk_free_bytes),
         (u64::MAX, u64::MAX, u64::MAX)
     );
+}
+
+#[test]
+fn what_macos_frees_on_demand_is_its_capacity_for_important_use_beyond_the_free_space() {
+    let reclaimable = |free: u64, important: Option<u64>| {
+        let raw = Raw {
+            disk_free_bytes: free,
+            disk_important_bytes: important,
+            ..laptop()
+        };
+        let reading = read(&raw).unwrap();
+        assert_eq!(
+            reading.disk_free_bytes, free,
+            "the free space stays as statfs read it"
+        );
+        reading.disk_reclaimable_bytes
+    };
+    // The Mac mini with 24 local snapshots: 28.7 GB free, 67.3 GB for important use.
+    assert_eq!(reclaimable(28_700_000_000, Some(67_300_000_000)), 38_600_000_000);
+    assert_eq!(reclaimable(28_700_000_000, Some(28_700_000_000)), 0);
+    // Read a moment apart, the capacity can be below what statfs read: nothing is reclaimable then.
+    assert_eq!(reclaimable(28_700_000_000, Some(28_000_000_000)), 0);
+    // macOS would not say: nothing counts.
+    assert_eq!(reclaimable(28_700_000_000, None), 0);
+    assert_eq!(reclaimable(0, Some(u64::MAX)), u64::MAX);
+    assert_eq!(reclaimable(u64::MAX, Some(u64::MAX)), 0);
 }
 
 /// What `pmset -g batt` prints, with this as the battery's line.

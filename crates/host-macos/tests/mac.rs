@@ -292,6 +292,47 @@ fn the_disk_is_the_one_the_path_names() {
 }
 
 #[test]
+fn the_capacity_for_important_use_is_what_foundation_says_and_never_below_the_free_space_by_much() {
+    let host = MacHost::new(Path::new("/tmp")).unwrap();
+    let raw = host.raw().unwrap();
+    let important = raw
+        .disk_important_bytes
+        .expect("macOS says the capacity of a volume it mounts");
+    // The free space and the capacity are read a moment apart, and the capacity counts the free space.
+    assert!(
+        important + (1 << 30) >= raw.disk_free_bytes,
+        "{important} for important use, {} free",
+        raw.disk_free_bytes
+    );
+    let script = r#"ObjC.import("Foundation"); var r = Ref(); $.NSURL.fileURLWithPath("/tmp").getResourceValueForKeyError(r, $("NSURLVolumeAvailableCapacityForImportantUsageKey"), null); String(ObjC.unwrap(r[0]))"#;
+    let foundation: u64 = output("/usr/bin/osascript", &["-l", "JavaScript", "-e", script])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        important.abs_diff(foundation) < 1 << 30,
+        "read {important}, Foundation {foundation}"
+    );
+}
+
+#[test]
+fn the_capacity_for_important_use_is_asked_for_once_in_thirty_seconds() {
+    // One answer takes about 23 ms and the Runner reads the Mac once a second; the rest of a reading 0.13 ms.
+    let host = MacHost::new(Path::new("/tmp")).unwrap();
+    assert!(host.raw().unwrap().disk_important_bytes.is_some());
+    let started = std::time::Instant::now();
+    for _ in 0..50 {
+        let raw = host.raw().unwrap();
+        assert!(raw.disk_important_bytes.unwrap() >= raw.disk_free_bytes);
+    }
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "50 readings took {took:?}"
+    );
+}
+
+#[test]
 fn a_path_that_is_not_there_is_an_error_and_closes_the_mac() {
     let mut host = MacHost::new(Path::new("/nonexistent/cf-runner-test")).unwrap();
     assert_eq!(

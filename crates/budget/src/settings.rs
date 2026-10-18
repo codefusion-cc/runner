@@ -68,9 +68,11 @@ pub struct Settings {
     pub evict_min_held_bytes: u64,
     /// At most one job is stopped per this span.
     pub evict_every: Millis,
-    /// Under this much free disk no slot opens.
+    /// Under this much free disk, with what the system frees as soon as it is needed
+    /// ([`crate::HostReading::disk_reclaimable_bytes`]), no slot opens.
     pub disk_hold_bytes: u64,
-    /// Under this much free disk the job with the largest scratch disk is stopped.
+    /// Under this much free disk the job with the largest scratch disk is stopped. What the system would free does
+    /// not count: a machine's writes need the space now.
     pub disk_evict_bytes: u64,
     /// How long a reserved slot waits for its job before it is given back.
     pub reservation_ttl: Millis,

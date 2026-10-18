@@ -243,6 +243,7 @@ pub fn reading(at: Now, raw: &Raw) -> Result<HostReading, HostError> {
         thermal: thermal_of(&raw.zones),
         on_battery: on_battery_of(&raw.supplies),
         disk_free_bytes: raw.disk_free_bytes,
+        disk_reclaimable_bytes: 0,
     })
 }
 

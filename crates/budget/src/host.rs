@@ -95,6 +95,9 @@ pub struct HostReading {
     pub on_battery: bool,
     /// Free space on the volume that holds the job disks.
     pub disk_free_bytes: u64,
+    /// What the system frees on that volume as soon as something needs the space, beyond `disk_free_bytes`: on a
+    /// Mac, Time Machine's local snapshots and purgeable caches. 0 where there is none.
+    pub disk_reclaimable_bytes: u64,
 }
 
 /// The host's battery, for the console's page: the budget itself reads only [`HostReading::on_battery`].
