@@ -5253,3 +5253,40 @@ async fn no_docker_check_boots_on_a_paused_host() {
     runner.look_at_docker();
     assert_eq!(rig.parts.vms.started().len(), 1);
 }
+
+/// A failed Docker check holds across a restart: before any new check ends, the Runner that starts again serves no
+/// `cf-docker` set, answers a run with Docker `never:` and reports the failure the one before found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_docker_check_holds_across_a_restart() {
+    let mut rig = Rig::new(3).await;
+    let runner = docker_runner(&mut rig).await;
+    runner.look_at_docker();
+    let check = rig.parts.vms.started().last().expect("the check").job.clone();
+    pass(&rig.machines, 1);
+    rig.parts.vms.console(
+        &check,
+        "cf-supervisor: the Docker sandbox ended: exit status: 70\n",
+    );
+    rig.parts.vms.end(&check, End::Failed);
+    pass(&rig.machines, 1);
+    let before = serde_json::to_value(runner.status()).expect("a report")["status"]["docker"].clone();
+    assert_eq!(before["ok"], json!(false));
+    drop(runner);
+
+    rig.restart().await;
+    let runner = docker_runner(&mut rig).await;
+    let status = serde_json::to_value(runner.status()).expect("a report");
+    assert_eq!(status["status"]["docker"], before, "the failure was forgotten");
+    runner.discover().await;
+    assert!(
+        !serves_docker(&runner),
+        "a cf-docker set before a new check passed"
+    );
+    let refused = docker_run(&rig, &runner, "tr_dddddddddddddddddddddddddd").await;
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("never: Docker does not start")),
+        "{refused}"
+    );
+}

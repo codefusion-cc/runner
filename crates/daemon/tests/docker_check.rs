@@ -202,3 +202,71 @@ fn unknown_and_passed_refuse_nothing_a_failure_refuses_until_it_passes_and_is_ch
     assert!(!DockerCheck::due(Some(&failed), 100 + after - 1));
     assert!(DockerCheck::due(Some(&failed), 100 + after));
 }
+
+/// Fails the check on this host: its machine boots and `docker info` never answers.
+fn fail_check(w: &World) {
+    let job = probe(w);
+    pass(&w.m, 1);
+    w.parts.vms.console(&job, &format!("{SANDBOX}\n"));
+    w.parts.vms.end(&job, End::Failed);
+    pass(&w.m, 1);
+    assert!(w.m.docker_check().is_some_and(|check| !check.ok));
+}
+
+#[tokio::test]
+async fn a_failed_check_holds_across_a_restart_until_a_new_one_passes() {
+    let mut w = World::new(2);
+    fail_check(&w);
+    let failed = w.m.docker_check().expect("an answer");
+    w.restart();
+    // Before any new check ends, the Runner that starts again refuses Docker for what the one before found.
+    assert_eq!(
+        w.m.docker_check(),
+        Some(failed.clone()),
+        "the failure was forgotten"
+    );
+    assert!(DockerCheck::refusal(w.m.docker_check().as_ref()).is_some());
+    // The calm minute a Runner that starts waits for, then the check again.
+    pass(&w.m, 61);
+    let job = probe(&w);
+    pass(&w.m, 1);
+    w.parts.vms.end(&job, End::Ok);
+    pass(&w.m, 1);
+    assert!(w.m.docker_check().is_some_and(|check| check.ok));
+    // A pass is not kept: the next start checks again, and Docker is unknown meanwhile.
+    w.restart();
+    assert_eq!(w.m.docker_check(), None, "a pass was kept across a restart");
+}
+
+#[test]
+fn a_failed_check_is_kept_on_disk_and_an_unreadable_one_is_unknown() {
+    use cf_daemon::{DiskStore, Store};
+    let folder = tempfile::tempdir().expect("folder");
+    let store = DiskStore::new(folder.path()).expect("store");
+    assert_eq!(store.docker_failure(), None);
+    let failed = DockerCheck {
+        ok: false,
+        at: 1_790_000_000,
+        why: Some(format!(
+            "docker info did not answer in 2 minutes (exit 1); {SANDBOX}"
+        )),
+    };
+    store.keep_docker_failure(Some(&failed));
+    let again = DiskStore::new(folder.path()).expect("store");
+    assert_eq!(again.docker_failure(), Some(failed));
+    assert!(again.load().is_empty(), "the check was read as a job's record");
+    again.keep_docker_failure(None);
+    assert_eq!(again.docker_failure(), None);
+    again.keep_docker_failure(None);
+    for corrupt in [&b"{"[..], b"[]", b"{\"ok\": true, \"at\": 1}", &[0xff, 0xfe]] {
+        let path = std::fs::read_dir(folder.path())
+            .expect("folder")
+            .flatten()
+            .map(|entry| entry.path())
+            .next();
+        assert!(path.is_none(), "{path:?} is left");
+        std::fs::write(folder.path().join("docker-check.failed"), corrupt).expect("written");
+        assert_eq!(again.docker_failure(), None, "{corrupt:?} was read as a failure");
+        std::fs::remove_file(folder.path().join("docker-check.failed")).expect("removed");
+    }
+}

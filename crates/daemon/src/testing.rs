@@ -627,6 +627,14 @@ impl Store for CrashingStore {
     fn load(&self) -> Vec<Record> {
         self.records.load()
     }
+
+    fn docker_failure(&self) -> Option<crate::docker_check::DockerCheck> {
+        self.records.docker_failure()
+    }
+
+    fn keep_docker_failure(&self, check: Option<&crate::docker_check::DockerCheck>) {
+        self.write(|| self.records.keep_docker_failure(check));
+    }
 }
 
 /// Collects job reports.

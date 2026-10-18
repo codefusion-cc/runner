@@ -51,7 +51,7 @@ pub fn workload() -> Workload {
 }
 
 /// What the last check found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DockerCheck {
     /// Whether the daemon answered.
     pub ok: bool,

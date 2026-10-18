@@ -5,6 +5,7 @@ use cf_budget::Size;
 use cf_lifecycle::{End, Event, Limits, Phase, Saved, Slot};
 
 use crate::EndKind;
+use crate::docker_check::DockerCheck;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -427,11 +428,20 @@ pub trait Store: Send + Sync {
     fn remove(&self, job: &str);
     /// Every record, in the order the jobs were made.
     fn load(&self) -> Vec<Record>;
+    /// The last Docker check that failed ([`crate::docker_check`]), kept across starts so that nothing Docker comes
+    /// to a host whose machines start no Docker daemon until a check passes; none when there is none or it cannot be
+    /// read.
+    fn docker_failure(&self) -> Option<DockerCheck>;
+    /// Keeps a failed check, or forgets the one kept (`None`, once a check passed).
+    fn keep_docker_failure(&self, check: Option<&DockerCheck>);
 }
 
 /// Records in memory, for tests: what a daemon that "starts again" in a test finds is what the one before wrote.
 #[derive(Debug, Clone, Default)]
-pub struct MemoryStore(Arc<Mutex<BTreeMap<String, Record>>>);
+pub struct MemoryStore(
+    Arc<Mutex<BTreeMap<String, Record>>>,
+    Arc<Mutex<Option<DockerCheck>>>,
+);
 
 impl Store for MemoryStore {
     fn save(&self, record: &Record) {
@@ -450,7 +460,18 @@ impl Store for MemoryStore {
         records.sort_by(|a, b| (a.created_at, &a.job).cmp(&(b.created_at, &b.job)));
         records
     }
+
+    fn docker_failure(&self) -> Option<DockerCheck> {
+        self.1.lock().expect("docker").clone()
+    }
+
+    fn keep_docker_failure(&self, check: Option<&DockerCheck>) {
+        *self.1.lock().expect("docker") = check.cloned();
+    }
 }
+
+/// The file beside the records that keeps a failed Docker check: not `.json`, so no record is read from it.
+const DOCKER_FAILURE: &str = "docker-check.failed";
 
 /// Records as files, `<folder>/<job>.json`, each replaced in one step.
 #[derive(Debug, Clone)]
@@ -508,5 +529,43 @@ impl Store for DiskStore {
             .collect();
         records.sort_by(|a, b| (a.created_at, &a.job).cmp(&(b.created_at, &b.job)));
         records
+    }
+
+    fn docker_failure(&self) -> Option<DockerCheck> {
+        let path = self.0.join(DOCKER_FAILURE);
+        let read = match std::fs::read(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            read => read.map_err(|error| error.to_string()),
+        };
+        // Only a failure is ever written: anything else in the file is no answer.
+        match read.and_then(|bytes| {
+            serde_json::from_slice::<DockerCheck>(&bytes).map_err(|error| error.to_string())
+        }) {
+            Ok(check) if !check.ok => Some(check),
+            Ok(_) => {
+                tracing::warn!(file = %path.display(), "the kept Docker check is no failure; Docker is unknown");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(file = %path.display(), %error, "the kept Docker check cannot be read; Docker is unknown");
+                None
+            }
+        }
+    }
+
+    fn keep_docker_failure(&self, check: Option<&DockerCheck>) {
+        let path = self.0.join(DOCKER_FAILURE);
+        let kept = match check {
+            Some(check) => serde_json::to_vec(check)
+                .map_err(std::io::Error::other)
+                .and_then(|json| replace_private(&path, &json)),
+            None => match std::fs::remove_file(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                removed => removed,
+            },
+        };
+        if let Err(error) = kept {
+            tracing::error!(%error, "could not keep the Docker check's failure");
+        }
     }
 }

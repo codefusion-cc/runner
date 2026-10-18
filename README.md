@@ -180,7 +180,8 @@ info`. Until that check ends Docker is unknown and nothing is refused. A check w
 else (the host slept or ran short, someone stopped it) answers nothing and boots again after ten minutes. A failed
 check is tried again every six hours, and meanwhile the host serves no `cf-docker` label set and answers a `test-run`
 with Docker `never: Docker does not start in this machine's job VMs (<why>)`, which the console hands on to another
-machine; a pass holds until the Runner starts again. The console's report carries the last check in `status.docker`: `{"ok": false, "checkedAt":
+machine. A failure is kept in the records' folder (`docker-check.failed`) and holds across a restart until a check
+passes; a pass is not kept, so the Runner checks again at every start. The console's report carries the last check in `status.docker`: `{"ok": false, "checkedAt":
 "2026-10-18T08:00:00Z", "why": "docker info did not answer in 2 minutes (exit 1); cf-supervisor: the Docker sandbox
 ended: exit status: 70"}`, `{"ok": true, "checkedAt": "…"}` after a pass, and nothing before the first check ended.
 

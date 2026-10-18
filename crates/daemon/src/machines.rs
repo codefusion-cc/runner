@@ -457,7 +457,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 offer: Offer::default(),
                 making: Making::default(),
                 docker: BTreeSet::new(),
-                docker_check: None,
+                // A failure the Runner before found holds until a check passes: nothing Docker comes meanwhile. A
+                // pass is not kept, so Docker is unknown until this start's own check ends.
+                docker_check: store.docker_failure(),
                 docker_unanswered: None,
                 host,
                 budget: Budget::new(settings)?,
@@ -1141,6 +1143,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                             tracing::warn!(%why, "Docker does not start in this host's job machines")
                         }
                     }
+                    self.store
+                        .keep_docker_failure(Some(&check).filter(|check| !check.ok));
                     inner.docker_check = Some(check);
                     inner.docker_unanswered = None;
                 }
