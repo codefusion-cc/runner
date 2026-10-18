@@ -1468,6 +1468,43 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         Ok(())
     }
 
+    /// Starts a machine of the Runner's own ([`Record::local`]) on the slot `ticket` grants: the image CI jobs run in,
+    /// `own`'s workload, and no Actions runner. Its record, which `mark` tells apart (a test run's facts, the Docker
+    /// check's flag), has no registration at GitHub from the start, so the sweep never asks GitHub anything of it.
+    /// After an error no machine stands, no record is left of it, and the slot is still the caller's.
+    fn start_own(
+        &self,
+        inner: &mut Inner<H>,
+        now: Now,
+        ticket: Ticket,
+        grant: &Grant,
+        own: Own<'_>,
+        mark: impl FnOnce(&mut Record),
+    ) -> Result<(), HostError> {
+        let request = JobRequest {
+            job: job_name(own.runner).to_string(),
+            host: self.config.host.clone(),
+            memory_bytes: grant.vm_bytes,
+            cpus: grant.cpus,
+            scratch_bytes: self.config.scratch_bytes,
+            image: self.config.image.clone(),
+            workload: own.workload,
+            env: own.env,
+            deadline_s: own.deadline.as_secs(),
+            docker: own.docker,
+        };
+        let mut record = Record {
+            unregistered: true,
+            ..self.record(own.runner, own.repo, test_run::SET, own.size, grant, &request)
+        };
+        mark(&mut record);
+        self.launch(inner, now, ticket, record, &request)
+            .inspect_err(|_| {
+                // Nothing stands and nothing is registered: no record is left of it.
+                self.store.remove(&request.job);
+            })
+    }
+
     /// Starts a test run's machine on the slot `ticket` grants ([`test_run::admit`]): the image CI jobs run in, the
     /// agent as its workload, the run's address and token in its environment, and no Actions runner. Its record has
     /// no registration at GitHub from the start, so the sweep never asks GitHub anything of it. After an error no
@@ -1489,31 +1526,23 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let Some(grant) = inner.grants.get(&ticket).copied() else {
             return failed(format!("slot {} is not granted", ticket.0));
         };
-        let request = JobRequest {
-            job: name,
-            host: self.config.host.clone(),
-            memory_bytes: grant.vm_bytes,
-            cpus: grant.cpus,
-            scratch_bytes: self.config.scratch_bytes,
-            image: self.config.image.clone(),
+        let own = Own {
+            runner: &runner,
+            repo: &run.repo,
+            size: run.size,
             workload: test_run::workload(),
             env: run.env(self.config.deadline),
-            deadline_s: run.deadline(self.config.deadline).as_secs(),
+            deadline: run.deadline(self.config.deadline),
             docker: run.docker,
         };
-        let record = Record {
-            unregistered: true,
-            test_run: Some(TestRunFacts {
-                label: run.label.clone(),
-                started_at: None,
-            }),
-            ..self.record(&runner, &run.repo, test_run::SET, run.size, &grant, &request)
+        let test_run = TestRunFacts {
+            label: run.label.clone(),
+            started_at: None,
         };
-        if let Err(error) = self.launch(&mut inner, now, ticket, record, &request) {
-            // Nothing stands and nothing is registered: no record is left of it.
-            self.store.remove(&request.job);
-            return Err(StartError::Failed(error));
-        }
+        self.start_own(&mut inner, now, ticket, &grant, own, |record| {
+            record.test_run = Some(test_run);
+        })
+        .map_err(StartError::Failed)?;
         // A Docker run's slot counts against the Mac's Docker jobs since `test_run::admit` took it.
         tracing::info!(%runner, size = run.size.label(), repo = %run.repo, "a test run's machine starts");
         Ok(runner)
@@ -1526,37 +1555,27 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let ticket = self.reserve_for(size, true).map_err(|refusal| refusal.0)?;
         let mut inner = self.lock();
         let now = inner.host.now();
-        let grant = match (inner.budget.confirm(ticket), inner.grants.get(&ticket).copied()) {
-            (Ok(()), Some(grant)) => grant,
-            _ => {
-                drop(inner);
-                self.release(ticket);
-                return Err("its slot ran out".into());
-            }
-        };
         let runner = format!("dk-p{:07x}", rand::random::<u32>() & 0x0fff_ffff);
-        let request = JobRequest {
-            job: job_name(&runner).to_string(),
-            host: self.config.host.clone(),
-            memory_bytes: grant.vm_bytes,
-            cpus: grant.cpus,
-            scratch_bytes: self.config.scratch_bytes,
-            image: self.config.image.clone(),
-            workload: docker_check::workload(),
-            env: Vec::new(),
-            deadline_s: docker_check::DEADLINE.as_secs(),
-            docker: true,
+        let started = match (inner.budget.confirm(ticket), inner.grants.get(&ticket).copied()) {
+            (Ok(()), Some(grant)) => {
+                let own = Own {
+                    runner: &runner,
+                    repo: "",
+                    size,
+                    workload: docker_check::workload(),
+                    env: Vec::new(),
+                    deadline: docker_check::DEADLINE,
+                    docker: true,
+                };
+                self.start_own(&mut inner, now, ticket, &grant, own, |record| record.probe = true)
+                    .map_err(|error| error.to_string())
+            }
+            _ => Err("its slot ran out".to_string()),
         };
-        let record = Record {
-            unregistered: true,
-            probe: true,
-            ..self.record(&runner, "", test_run::SET, size, &grant, &request)
-        };
-        if let Err(error) = self.launch(&mut inner, now, ticket, record, &request) {
-            self.store.remove(&request.job);
-            drop(inner);
+        drop(inner);
+        if let Err(why) = started {
             self.release(ticket);
-            return Err(error.to_string());
+            return Err(why);
         }
         tracing::info!(%runner, size = size.label(), "the Docker check's machine starts");
         Ok(runner)
@@ -1567,15 +1586,19 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         self.lock().docker_check.clone()
     }
 
+    /// Why nothing Docker comes to this host ([`DockerCheck::refusal`]): its last Docker check failed.
+    pub fn docker_refusal(&self) -> Option<String> {
+        DockerCheck::refusal(self.lock().docker_check.as_ref())
+    }
+
     /// Whether a Docker check is due at `now` (seconds since 1970): [`DockerCheck::due`], and not within
     /// [`docker_check::AGAIN_AFTER_NO_ANSWER`] of a check machine that ended without an answer.
     pub fn docker_check_due(&self, now: i64) -> bool {
         let inner = self.lock();
-        let again = i64::try_from(docker_check::AGAIN_AFTER_NO_ANSWER.as_secs()).unwrap_or(i64::MAX);
         DockerCheck::due(inner.docker_check.as_ref(), now)
             && inner
                 .docker_unanswered
-                .is_none_or(|at| now.saturating_sub(at) >= again)
+                .is_none_or(|at| docker_check::waited(at, now, docker_check::AGAIN_AFTER_NO_ANSWER))
     }
 
     /// Whether the Docker check's machine stands.
@@ -1726,6 +1749,17 @@ fn workload_ran(state: &JobState) -> bool {
 /// that starts again read it the same way.
 fn came_up(state: &JobState) -> bool {
     state.boot_ms.is_some() || workload_ran(state)
+}
+
+/// What a machine of the Runner's own ([`Machines::start_own`]) runs, and for whom.
+struct Own<'a> {
+    runner: &'a str,
+    repo: &'a str,
+    size: Size,
+    workload: Workload,
+    env: Vec<(String, cf_guest_proto::Secret<String>)>,
+    deadline: Duration,
+    docker: bool,
 }
 
 /// The job a machine's reports and status name: GitHub's, as its messages told it, or a test run's, which the Runner

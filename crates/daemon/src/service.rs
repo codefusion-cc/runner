@@ -25,7 +25,6 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
-use crate::docker_check::DockerCheck;
 use crate::held::{self, HeldSet, OwnRunners, SetView};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
@@ -2061,7 +2060,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// Why nothing Docker comes to this host: its last Docker check failed. None while it passed, and before the
     /// first one ended: Docker is unknown then, not refused.
     fn docker_refused(&self) -> Option<String> {
-        DockerCheck::refusal(self.shared.machines.docker_check().as_ref())
+        self.shared.machines.docker_refusal()
     }
 
     /// Boots the Docker check's machine when one is due ([`crate::docker_check`]): at the start, once the budget gives

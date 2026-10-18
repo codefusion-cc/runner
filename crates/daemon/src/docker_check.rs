@@ -136,11 +136,14 @@ impl DockerCheck {
         match check {
             None => true,
             Some(check) if check.ok => false,
-            Some(check) => {
-                now.saturating_sub(check.at) >= i64::try_from(RECHECK_AFTER.as_secs()).unwrap_or(i64::MAX)
-            }
+            Some(check) => waited(check.at, now, RECHECK_AFTER),
         }
     }
+}
+
+/// Whether `wait` has passed from `since` to `now`, both in seconds since 1970.
+pub(crate) fn waited(since: i64, now: i64, wait: Duration) -> bool {
+    now.saturating_sub(since) >= i64::try_from(wait.as_secs()).unwrap_or(i64::MAX)
 }
 
 /// Whether a machine the vm-host said nothing of ended for something that is no answer of Docker's.
