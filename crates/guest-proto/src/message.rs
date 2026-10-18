@@ -188,7 +188,10 @@ pub const NAME_CHARS: usize = 64;
 /// The most processes an out-of-memory report names.
 pub const LARGEST_PROCESSES: usize = 5;
 
-fn clip(text: &str, most: usize) -> String {
+/// `text` as a host may show it: at most `most` characters, each control character and each one that steers the
+/// text around it ([`steers`]) a space.
+#[must_use]
+pub fn clip(text: &str, most: usize) -> String {
     text.chars()
         .take(most)
         .map(|c| if c.is_control() || steers(c) { ' ' } else { c })

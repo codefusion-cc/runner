@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -171,9 +171,15 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
         let _ = child.kill();
     }
     let problem = problem.to_string();
+    let log_path = format!("{}/{}", spec.sockets, plan::LOG_NAME);
     std::thread::spawn(move || {
         if let Ok(status) = child.wait() {
             say(&format!("the Docker sandbox ended: {status}"));
+            if !status.success() {
+                for line in plan::last_words(&log_tail(&log_path)) {
+                    say(&format!("  {line}"));
+                }
+            }
             // Read by the start hook, which then stops waiting for the daemon; at the job's end nobody reads it.
             if !std::path::Path::new(&problem).exists() {
                 let _ = fs::write(&problem, format!("its sandbox ended ({status})."));
@@ -185,6 +191,20 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
     } else {
         Err("the sandbox did not build its view in time".into())
     }
+}
+
+/// The last [`plan::LAST_WORDS_BYTES`] of the daemon's log at `path`, or nothing when it cannot be read.
+fn log_tail(path: &str) -> Vec<u8> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let from = length.saturating_sub(plan::LAST_WORDS_BYTES as u64);
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(from)).is_ok() {
+        let _ = file.take(plan::LAST_WORDS_BYTES as u64).read_to_end(&mut tail);
+    }
+    tail
 }
 
 /// The launcher's entry, as the machine's root.

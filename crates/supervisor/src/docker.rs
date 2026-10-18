@@ -202,3 +202,27 @@ pub fn flagless_tcp_rule() -> Vec<String> {
         "DROP",
     ])
 }
+
+/// The most of the daemon's log [`last_words`] reads, from its end.
+pub const LAST_WORDS_BYTES: usize = 16 * 1024;
+/// The most lines [`last_words`] gives.
+pub const LAST_WORDS_LINES: usize = 5;
+/// The most characters of a line [`last_words`] keeps.
+pub const LAST_WORDS_CHARS: usize = 300;
+
+/// What the machine's console shows of the daemon's log, `tail` (its last [`LAST_WORDS_BYTES`]), once the sandbox
+/// ended: its last [`LAST_WORDS_LINES`] lines that say something, each clipped ([`cf_guest_proto::clip`]). The
+/// sandbox's and the launcher's reasons and the daemon's last words are there; the job can write to the log too, so
+/// nothing in it may steer the console.
+pub fn last_words(tail: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(tail);
+    let mut lines: Vec<String> = text
+        .lines()
+        .rev()
+        .map(|line| cf_guest_proto::clip(line, LAST_WORDS_CHARS).trim().to_string())
+        .filter(|line| !line.is_empty())
+        .take(LAST_WORDS_LINES)
+        .collect();
+    lines.reverse();
+    lines
+}

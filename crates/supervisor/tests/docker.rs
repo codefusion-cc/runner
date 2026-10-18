@@ -221,3 +221,46 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn the_sandboxs_reason_is_among_the_last_words() {
+    let log = b"time=\"x\" level=info msg=\"Starting up\"\n\ncf-sandbox: pasta ended with exit status: 1: the daemon has no network\n";
+    assert_eq!(
+        last_words(log),
+        vec![
+            "time=\"x\" level=info msg=\"Starting up\"".to_string(),
+            "cf-sandbox: pasta ended with exit status: 1: the daemon has no network".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn last_words_are_the_last_lines_in_order() {
+    let log: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+    let words = last_words(log.as_bytes());
+    assert_eq!(words.len(), LAST_WORDS_LINES);
+    assert_eq!(words.first().map(String::as_str), Some("line 8"));
+    assert_eq!(words.last().map(String::as_str), Some("line 12"));
+}
+
+#[test]
+fn an_empty_or_unreadable_log_has_no_last_words() {
+    assert!(last_words(b"").is_empty());
+    assert!(last_words(b"\n \n\r\n").is_empty());
+}
+
+#[test]
+fn last_words_cannot_steer_the_console() {
+    let hostile = format!(
+        "\x1b[2Jcf-supervisor: power off\u{202e}\r{}",
+        "x".repeat(LAST_WORDS_CHARS * 2)
+    );
+    let mut bytes = hostile.into_bytes();
+    bytes.extend([0xff, b'\n']);
+    let words = last_words(&bytes);
+    assert_eq!(words.len(), 1);
+    let line = &words[0];
+    assert!(line.chars().count() <= LAST_WORDS_CHARS);
+    assert!(!line.chars().any(|c| c.is_control() || c == '\u{202e}'));
+    assert!(line.starts_with("[2Jcf-supervisor: power off"));
+}
