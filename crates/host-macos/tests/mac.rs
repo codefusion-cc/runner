@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use cf_budget::{Host, HostError};
-use cf_host_macos::{MacHost, Raw, battery, battery_in, model, reading};
+use cf_host_macos::{MacHost, Raw, battery, battery_in, model, performance_cores, reading};
 
 fn output(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output().unwrap();
@@ -39,6 +39,19 @@ fn the_facts_are_what_sysctl_prints() {
     let facts = host.facts().unwrap();
     assert_eq!(facts.total_bytes.to_string(), sysctl("hw.memsize"));
     assert_eq!(facts.cores.to_string(), sysctl("hw.ncpu"));
+}
+
+#[test]
+fn the_performance_cores_are_level_0_of_a_chip_with_two_kinds_and_none_of_one_with_one() {
+    let levels: u32 = sysctl("hw.nperflevels").parse().unwrap();
+    let expected = if levels > 1 {
+        sysctl("hw.perflevel0.logicalcpu").parse().unwrap()
+    } else {
+        0
+    };
+    assert_eq!(performance_cores(), expected);
+    let cores: u32 = sysctl("hw.ncpu").parse().unwrap();
+    assert!(expected < cores, "{expected} performance cores of {cores}");
 }
 
 #[test]

@@ -167,7 +167,8 @@ impl Settings {
     /// - Cap: all memory but a reserve of 25% (at least 3 GB) on a dedicated Mac, 40% (at least 4 GB) on a
     ///   workstation whose person is away, and nothing while the person is there. A 16 GB Mac: 12 GB and 9.6 GB.
     /// - Floor: 2 GB, 3 GB and 4 GB on a 16 GB Mac (dedicated, away, in use).
-    /// - CPUs: all cores but two; half the cores while the person is there. 2 vCPUs for `cf-2g` and 4 for
+    /// - CPUs: all cores but two; half the cores while the person is there. A Mac whose cores differ gives CI only
+    ///   its performance cores ([`Settings::on_fast_cores`]). 2 vCPUs for `cf-2g` and 4 for
     ///   `cf-6g` and `cf-8g`. `cf-4g` gets half of the CPUs CI may use, at most 4 and at least 2, so that another
     ///   machine runs beside it: 4 on a Mac with 10 cores, 3 on one with 8 (what the Go manager gave a job there).
     ///   Where the cap leaves no room beside a `cf-4g` (an 8 GB Mac), it takes up to 4 of them ([`vcpus_for`]).
@@ -227,6 +228,28 @@ impl Settings {
         }
     }
 
+    /// These settings with CI on the fast cores of a host whose cores are not all alike: the performance cores of
+    /// an Apple chip, the big cores of a board. A vCPU that lands on a slow core runs a job's tests at a fraction of
+    /// the speed, and the guest cannot tell, so its timeouts fire. An M1 Mac mini has 4 performance cores of 8;
+    /// all but two gave CI 6 and a cf-4g 3, so two jobs side by side ran on the efficiency cores too.
+    ///
+    /// `fast_cores` counts the fast kind. On a host whose cores are all alike it is all of them, or 0, and the
+    /// settings stay as they are. One fast core holds no machine (a cf-2g has 2 vCPUs), so a host with a single
+    /// prime core counts as one whose cores are alike. While a workstation's person is there CI keeps half the
+    /// cores, and never more than the fast ones.
+    pub fn on_fast_cores(mut self, fast_cores: u32) -> Settings {
+        if !(2..self.cores).contains(&fast_cores) {
+            return self;
+        }
+        self.away.cpus = fast_cores;
+        self.in_use.cpus = match self.mode {
+            Mode::Dedicated => fast_cores,
+            Mode::Workstation => self.in_use.cpus.min(fast_cores),
+        };
+        self.vcpus = vcpus_for(fast_cores, self.away.cap_bytes);
+        self
+    }
+
     /// What a lean Linux host with nobody at it holds for itself: the kernel, systemd, sshd and the Runner. 0.4 GB
     /// measured with nothing to do on an RK3588 board with 7.75 GB (`MemTotal` less `MemAvailable`), Docker installed
     /// and idle; half a gigabyte with a little room.
@@ -240,9 +263,8 @@ impl Settings {
     /// would leave a 7.75 GB board 4.75 GB, one cf-4g and never two cf-2g.
     ///
     /// `fast_cores` is how many cores the machines run on: the fast kind of a board whose cores are not all alike,
-    /// which machines are pinned to, so that a vCPU never moves between two kinds of core. On a host whose cores are
-    /// all alike it is all of them, or 0. One fast core holds no machine (a cf-2g has 2 vCPUs), so a host with a
-    /// single prime core counts as one whose cores are alike.
+    /// which machines are pinned to, so that a vCPU never moves between two kinds of core
+    /// ([`Settings::on_fast_cores`]).
     ///
     /// - Floor: 1 GB and 1/32 of the memory, for the page cache that keeps the image the machines boot from and
     ///   for what the host's programs do between two readings. 1.24 GB on 7.75 GB.
@@ -253,18 +275,14 @@ impl Settings {
     ///   its overhead) or two cf-2g (4.4 GB) at a time; a cf-4g beside a cf-2g (6.4 GB) never, nor a cf-6g (6.2 GB
     ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
     /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
-    ///   two, as on a Mac. 2 vCPUs for cf-2g, half the CPUs for cf-4g (at least 2, at most 4), 4 for the larger
+    ///   two. 2 vCPUs for cf-2g, half the CPUs for cf-4g (at least 2, at most 4), 4 for the larger
     ///   sizes: on 4 fast cores, two machines of 2 vCPUs. A cf-4g with no room beside it under the cap takes up to
     ///   4 ([`vcpus_for`]): on 7.75 GB, the four fast cores, which no other machine could use while it runs.
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
         let total = facts.total_bytes;
-        let mut settings = Settings::for_host(facts, Mode::Dedicated);
-        let cpus = if (2..facts.cores).contains(&fast_cores) {
-            fast_cores
-        } else {
-            settings.away.cpus
-        };
+        let mut settings = Settings::for_host(facts, Mode::Dedicated).on_fast_cores(fast_cores);
+        let cpus = settings.away.cpus;
         let floor = GIB + total / 32;
         let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
         let limits = Profile {
