@@ -115,6 +115,7 @@ pub fn status(machine: &str) -> Status {
         sizes: vec![],
         commands: vec![],
         held_jobs: vec![],
+        docker: None,
         scale_sets: vec![ScaleSetStatus {
             repo: "org/app".into(),
             name: "mac-a--app-1a2b".into(),

@@ -43,6 +43,8 @@ struct VmState {
     frozen: bool,
     next_pid: u32,
     held: Option<Arc<HeldLooks>>,
+    /// What each job's console log says, by job.
+    consoles: BTreeMap<String, String>,
 }
 
 /// Looks at vm-hosts that wait, as a look at a vm-host that does not answer does, until a test lets them go.
@@ -94,6 +96,11 @@ impl FakeVms {
         if let Some(vm) = self.lock().vms.get_mut(job) {
             change(vm);
         }
+    }
+
+    /// The job's console log says this.
+    pub fn console(&self, job: &str, text: &str) {
+        self.lock().consoles.insert(job.to_string(), text.to_string());
     }
 
     /// The next `n` starts fail.
@@ -300,6 +307,15 @@ fn finish(vm: &mut FakeVm, end: End) {
 }
 
 impl Vms for FakeVms {
+    fn console_tail(&self, job: &str, bytes: usize) -> Option<String> {
+        let text = self.lock().consoles.get(job).cloned()?;
+        let mut from = text.len().saturating_sub(bytes);
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
+        Some(text[from..].to_string())
+    }
+
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let mut state = self.lock();
         if state.frozen {
@@ -468,14 +484,27 @@ impl TestParts {
         machines
     }
 
+    /// [`TestParts::machines`] with their configuration changed by `tweak`.
+    pub fn machines_with(&self, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
+        let machines = self.restored_with(FakeHost::new(TEST_MAC), tweak);
+        pass(&machines, 61);
+        machines
+    }
+
     /// Machines as a daemon that just started has them, before its first look at the Mac.
     pub fn restored(&self, host: FakeHost) -> Arc<TestMachines> {
+        self.restored_with(host, |_| {})
+    }
+
+    fn restored_with(&self, host: FakeHost, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
         let (nudges, bell) = (self.nudges.clone(), self.bell.clone());
+        let mut config = MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600));
+        tweak(&mut config);
         let machines = Machines::restore(MachineParts {
             host,
             vms: self.vms.clone(),
             settings: self.settings.clone(),
-            config: MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600)),
+            config,
             roster: self.roster.clone(),
             store: self.store.clone(),
             clock: self.clock.clone(),
@@ -597,6 +626,14 @@ impl Store for CrashingStore {
 
     fn load(&self) -> Vec<Record> {
         self.records.load()
+    }
+
+    fn docker_failure(&self) -> Option<crate::docker_check::DockerCheck> {
+        self.records.docker_failure()
+    }
+
+    fn keep_docker_failure(&self, check: Option<&crate::docker_check::DockerCheck>) {
+        self.write(|| self.records.keep_docker_failure(check));
     }
 }
 

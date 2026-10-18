@@ -293,6 +293,11 @@ pub struct Status {
     /// before it said them; a console from before ignores it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_jobs: Vec<HeldJobs>,
+    /// Whether a Docker daemon starts in this host's job machines, as the Runner's own check found: while it does
+    /// not, the host serves no `cf-docker` label set and answers a test run with Docker `never:`. Left out until the
+    /// first check ended, and by a Runner from before it checked; a console from before ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<DockerStatus>,
     /// Its scale sets, at most 500.
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
@@ -562,6 +567,20 @@ pub struct Command {
     /// What the kind needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
+}
+
+/// The last Docker check of a host ([`Status::docker`]): `{ "ok": true, "checkedAt": "<RFC 3339>" }`, or with
+/// `"ok": false` and `"why"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockerStatus {
+    /// Whether the daemon answered in the check's machine.
+    pub ok: bool,
+    /// When the check's machine ended, RFC 3339.
+    pub checked_at: String,
+    /// Why it failed, at most 300 characters (the console cuts what is longer); left out when it passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// The console's answer to a report.

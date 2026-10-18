@@ -440,6 +440,26 @@ fn service(
     machines: &Arc<TestMachines>,
     token: &Secret<String>,
     battery: &Arc<Mutex<Option<Battery>>>,
+    kept: (
+        &Arc<Outbox>,
+        Option<&Arc<FakeUpdate>>,
+        &Arc<FakeSettings>,
+        &std::path::Path,
+        Duration,
+    ),
+) -> TestService {
+    service_with(github, console, parts, machines, token, battery, kept, |_| {})
+}
+
+/// [`service`] with its configuration changed by `tweak`.
+#[allow(clippy::too_many_arguments)]
+fn service_with(
+    github: &FakeGithub,
+    console: &FakeConsole,
+    parts: &TestParts,
+    machines: &Arc<TestMachines>,
+    token: &Secret<String>,
+    battery: &Arc<Mutex<Option<Battery>>>,
     // What stays across a daemon's starts: the outbox, the update it builds (none for a Runner with nowhere to
     // update from), its settings file, the folder of its files, how long an update waits for the machines that
     // stand.
@@ -450,6 +470,7 @@ fn service(
         &std::path::Path,
         Duration,
     ),
+    tweak: impl FnOnce(&mut ServiceConfig),
 ) -> TestService {
     let battery = battery.clone();
     let mut config = ServiceConfig::new(
@@ -468,6 +489,7 @@ fn service(
         Duration::from_millis(100),
         Duration::from_secs(60),
     );
+    tweak(&mut config);
     Service::new(ServiceParts {
         app: app(github, http(), parts.clock.clone()),
         machines: machines.clone(),
@@ -5040,5 +5062,231 @@ async fn a_waiting_test_run_the_console_no_longer_sends_gives_its_place_back() {
         rig.parts.vms.started().len(),
         1,
         "a machine started for the withdrawn run"
+    );
+}
+
+/// A Runner that gives [`REPO`] Docker, beside the rig's own, whose pump is stopped: the test drives it.
+async fn docker_runner(rig: &mut Rig) -> TestService {
+    rig.stop_pump().await;
+    rig.github.set_workflow(
+        REPO,
+        "docker.yml",
+        "on: push\njobs:\n  image:\n    runs-on: [self-hosted, cf-2g, cf-docker]\n    steps: []\n",
+    );
+    service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |config| config.policy.docker_repos = vec![REPO.into()],
+    )
+}
+
+/// Whether the Runner serves a `cf-docker` label set.
+fn serves_docker(service: &TestService) -> bool {
+    service
+        .sets()
+        .iter()
+        .any(|set| set.labels.iter().any(|label| label == "cf-docker"))
+}
+
+/// The test run the console sends with an image, answered by `service`: its result.
+async fn docker_run(rig: &Rig, service: &TestService, run: &str) -> Value {
+    let mut args = test_run_args(&rig.console, run, 0);
+    args["docker"] = json!(true);
+    let id = rig.console.queue_command("test-run", Some(args));
+    for _ in 0..50 {
+        pass(&rig.machines, 1);
+        service.report().await;
+        if let Some(result) = results_of(&rig.console, &id).pop() {
+            return result;
+        }
+    }
+    panic!("no result for {run}");
+}
+
+/// The Runner checks Docker in one machine: unknown until the check ends, which refuses nothing; a failure drops
+/// the `cf-docker` sets and answers a test run with Docker `never:`, and is checked again after six hours; a pass
+/// serves both again. The console's report says what the last check found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_docker_check_decides_whether_docker_jobs_and_runs_come_here() {
+    let mut rig = Rig::new(3).await;
+    let runner = docker_runner(&mut rig).await;
+    runner.discover().await;
+    assert!(serves_docker(&runner), "unknown Docker refused the cf-docker set");
+    let status = serde_json::to_value(runner.status()).expect("a report");
+    assert!(status["status"].get("docker").is_none(), "{}", status["status"]);
+    let unknown = docker_run(&rig, &runner, "tr_aaaaaaaaaaaaaaaaaaaaaaaaaa").await;
+    assert_eq!(unknown["ok"], json!(true), "{unknown}");
+    // Its machine ends: the host's one Docker job's room is free for the check.
+    rig.parts
+        .vms
+        .end(job_name("tr-aaaaaaaaaaaaaaaaaaaaaaaaaa"), End::Ok);
+    pass(&rig.machines, 1);
+
+    // The check boots, takes its slot and fails: the sandbox ended.
+    let before = rig.parts.vms.started().len();
+    runner.look_at_docker();
+    let started = rig.parts.vms.started();
+    assert_eq!(started.len(), before + 1, "no check machine started");
+    let check = started.last().expect("the check").job.clone();
+    assert!(started.last().is_some_and(|request| request.docker));
+    runner.look_at_docker();
+    assert_eq!(
+        rig.parts.vms.started().len(),
+        before + 1,
+        "a second check while one stands"
+    );
+    pass(&rig.machines, 1);
+    rig.parts.vms.console(
+        &check,
+        "cf-supervisor: the Docker sandbox ended: exit status: 70\n",
+    );
+    rig.parts.vms.end(&check, End::Failed);
+    pass(&rig.machines, 1);
+    runner.look_at_docker();
+    runner.discover().await;
+    assert!(!serves_docker(&runner), "a failed check left the cf-docker set");
+    let status = serde_json::to_value(runner.status()).expect("a report");
+    let docker = &status["status"]["docker"];
+    assert_eq!(docker["ok"], json!(false), "{docker}");
+    assert!(
+        docker["checkedAt"].as_str().is_some_and(|at| at.ends_with('Z')),
+        "{docker}"
+    );
+    assert!(
+        docker["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("exit status: 70")),
+        "{docker}"
+    );
+    let refused = docker_run(&rig, &runner, "tr_bbbbbbbbbbbbbbbbbbbbbbbbbb").await;
+    assert_eq!(refused["ok"], json!(false));
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("never: Docker does not start in this machine's job VMs (")),
+        "{refused}"
+    );
+
+    // Not checked again before six hours, then again; a pass serves Docker again.
+    let started = rig.parts.vms.started().len();
+    rig.later(Duration::from_secs(6 * 3600 - 60));
+    runner.look_at_docker();
+    assert_eq!(rig.parts.vms.started().len(), started, "checked again too soon");
+    rig.later(Duration::from_secs(60));
+    runner.look_at_docker();
+    assert_eq!(
+        rig.parts.vms.started().len(),
+        started + 1,
+        "not checked again after six hours"
+    );
+    let again = rig.parts.vms.started().last().expect("the check").job.clone();
+    pass(&rig.machines, 1);
+    rig.parts.vms.end(&again, End::Ok);
+    pass(&rig.machines, 1);
+    runner.look_at_docker();
+    runner.discover().await;
+    assert!(
+        serves_docker(&runner),
+        "a passed check did not serve the cf-docker set again"
+    );
+    let status = serde_json::to_value(runner.status()).expect("a report");
+    assert_eq!(status["status"]["docker"]["ok"], json!(true));
+    assert!(status["status"]["docker"].get("why").is_none());
+    let allowed = docker_run(&rig, &runner, "tr_cccccccccccccccccccccccccc").await;
+    assert_eq!(allowed["ok"], json!(true), "{allowed}");
+    // A pass is not checked again.
+    rig.later(Duration::from_secs(48 * 3600));
+    let started = rig.parts.vms.started().len();
+    runner.look_at_docker();
+    assert_eq!(rig.parts.vms.started().len(), started);
+}
+
+/// A test run with Docker that started before a check failed is answered `started` when the console sends it again,
+/// as it does until it has the result: its machine stands, and a `never:` would have the console start it elsewhere too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_docker_run_that_started_before_a_failed_check_is_answered_started_again() {
+    const RUN: &str = "tr_dddddddddddddddddddddddddd";
+    let mut rig = Rig::new(3).await;
+    rig.stop_pump().await;
+    // Room for the run and the check's machine side by side.
+    rig.machines = rig.parts.machines_with(|config| config.docker_max_jobs = 2);
+    let runner = docker_runner(&mut rig).await;
+    let started = docker_run(&rig, &runner, RUN).await;
+    assert_eq!(started["ok"], json!(true), "{started}");
+
+    runner.look_at_docker();
+    let check = rig.parts.vms.started().last().expect("the check").job.clone();
+    assert_ne!(check, job_name("tr-dddddddddddddddddddddddddd"));
+    pass(&rig.machines, 1);
+    rig.parts.vms.end(&check, End::Failed);
+    pass(&rig.machines, 1);
+    assert!(rig.machines.docker_check().is_some_and(|check| !check.ok));
+
+    let again = docker_run(&rig, &runner, RUN).await;
+    assert_eq!(again["ok"], json!(true), "{again}");
+    assert_eq!(again["message"], json!("started tr-dddddddddddddddddddddddddd"));
+}
+
+/// No check boots while the host is paused: the budget gives it no slot. It boots once the pause is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_docker_check_boots_on_a_paused_host() {
+    let mut rig = Rig::new(2).await;
+    let runner = docker_runner(&mut rig).await;
+    rig.machines.pause(true);
+    runner.look_at_docker();
+    assert!(
+        rig.parts.vms.started().is_empty(),
+        "a check booted on a paused host"
+    );
+    rig.machines.pause(false);
+    runner.look_at_docker();
+    assert_eq!(rig.parts.vms.started().len(), 1);
+}
+
+/// A failed Docker check holds across a restart: before any new check ends, the Runner that starts again serves no
+/// `cf-docker` set, answers a run with Docker `never:` and reports the failure the one before found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_docker_check_holds_across_a_restart() {
+    let mut rig = Rig::new(3).await;
+    let runner = docker_runner(&mut rig).await;
+    runner.look_at_docker();
+    let check = rig.parts.vms.started().last().expect("the check").job.clone();
+    pass(&rig.machines, 1);
+    rig.parts.vms.console(
+        &check,
+        "cf-supervisor: the Docker sandbox ended: exit status: 70\n",
+    );
+    rig.parts.vms.end(&check, End::Failed);
+    pass(&rig.machines, 1);
+    let before = serde_json::to_value(runner.status()).expect("a report")["status"]["docker"].clone();
+    assert_eq!(before["ok"], json!(false));
+    drop(runner);
+
+    rig.restart().await;
+    let runner = docker_runner(&mut rig).await;
+    let status = serde_json::to_value(runner.status()).expect("a report");
+    assert_eq!(status["status"]["docker"], before, "the failure was forgotten");
+    runner.discover().await;
+    assert!(
+        !serves_docker(&runner),
+        "a cf-docker set before a new check passed"
+    );
+    let refused = docker_run(&rig, &runner, "tr_dddddddddddddddddddddddddd").await;
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("never: Docker does not start")),
+        "{refused}"
     );
 }
