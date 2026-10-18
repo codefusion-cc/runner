@@ -5,7 +5,7 @@
 // - Setup, ten minutes at most: `GET <url>/spec` says the commit, the suite, an image or none, and the git bundles;
 //   each bundle comes in parts (`GET <url>/bundles/<i>/parts/<j>`) and is checked against its sha256 and size. Then
 //   `git init`, each bundle fetched in order into `refs/cf-bundle-<i>/*` (each is a prerequisite of the next), and the
-//   commit checked out.
+//   commit checked out. With an image, the VM's Docker daemon is waited for (two minutes at most) and the image pulled.
 // - The suite: `bash -lc <suite>` in a process group of its own, or in `docker run` when the spec names an image, with
 //   the machine's environment less CF_RUN_* and with CI=true and CF_TEST_REMOTE=1. Its output, standard output and
 //   error as one stream decoded as UTF-8 (U+FFFD for what is not), goes to a file first, so a console that does not answer never holds it up, and from there
@@ -50,6 +50,8 @@ const BACKOFF_MAX_MS = knob('CF_RUN_BACKOFF_MAX_MS', 30_000);
 const POLL_MS = knob('CF_RUN_POLL_MS', 250);
 const REQUEST_MS = knob('CF_RUN_REQUEST_MS', 60_000);
 const KEEP = knob('CF_RUN_KEEP_BYTES', 8 * 1024 * 1024);
+const DOCKER_MS = knob('CF_RUN_DOCKER_MS', 120_000);
+const DOCKER_POLL_MS = knob('CF_RUN_DOCKER_POLL_MS', 1_000);
 /** How many answers in a row that are not the console's own, or 409s that move nothing, end the output. */
 const STRAY_ANSWERS = 10;
 const CHUNK = 256 * 1024;
@@ -357,7 +359,30 @@ async function setup(signal) {
   await run('git', ['-C', WORK, '-c', 'advice.detachedHead=false', 'checkout', '-q', '--detach', spec.commit], {
     signal,
   });
+  if (spec.image) {
+    await dockerReady(signal);
+    // The image's download is the setup's, so the suite's own time is the suite's.
+    await run('docker', ['pull', '--quiet', spec.image], { signal });
+  }
   return spec;
+}
+
+/**
+ * The VM's Docker daemon starts beside the workload and takes a few seconds to answer: a CI job's checkout outlasts
+ * that, a test run's doesn't. Asked every DOCKER_POLL_MS until it answers, for DOCKER_MS at most.
+ */
+async function dockerReady(signal) {
+  const until = Date.now() + DOCKER_MS;
+  for (;;) {
+    try {
+      await run('docker', ['info', '--format', '{{.ServerVersion}}'], { signal });
+      return;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+    if (Date.now() >= until) throw new SetupError(`the VM's Docker daemon did not answer within ${DOCKER_MS / 1000} s`);
+    await sleep(DOCKER_POLL_MS);
+  }
 }
 
 /** The last 64 KiB of the output, from the start of a character. */
