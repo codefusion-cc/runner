@@ -19,6 +19,7 @@ use cf_guest_proto::{StopReason, Workload};
 use cf_lifecycle::{BreakerLimits, Effect, End, Event, Limits, Phase, Slot, StartBreaker};
 use cf_vmhost::{JobRequest, JobState, OutOfMemory, Stage};
 
+use crate::docker_check::{self, DockerCheck};
 use crate::ends::{EndKind, machine_end};
 use crate::making::{Making, Offered, theirs};
 use crate::names::job_name;
@@ -343,6 +344,8 @@ struct Inner<H> {
     making: Making,
     /// The slots of Docker jobs; one given back leaves at the next count.
     docker: BTreeSet<SlotId>,
+    /// What the last Docker check found; none before the first ended.
+    docker_check: Option<DockerCheck>,
 }
 
 impl<H> Inner<H> {
@@ -451,6 +454,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 offer: Offer::default(),
                 making: Making::default(),
                 docker: BTreeSet::new(),
+                docker_check: None,
                 host,
                 budget: Budget::new(settings)?,
                 breaker: StartBreaker::new(BreakerLimits::default()),
@@ -583,9 +587,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             });
             // A registration that is gone takes no job, and its machine no longer counts.
             let done = alive && record.unregistered;
-            if alive && record.test_run.is_some() {
+            if alive && record.local() {
                 // No Actions runner, so nothing for the scalers to count: its slot is the budget's alone.
-                tracing::info!(runner = %record.runner, job = %name, "a test run of the Runner before was adopted");
+                tracing::info!(runner = %record.runner, job = %name, "a machine of the Runner's own before was adopted");
             } else if alive {
                 tracing::info!(runner = %record.runner, job = %name, "a machine of the Runner before was adopted");
                 self.roster.adopt(Runner {
@@ -987,24 +991,26 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         for event in events {
             self.feed(inner, name, now, event);
         }
-        self.test_run_up(inner, name, now);
+        self.local_up(inner, name, now);
     }
 
-    /// A test run's machine is up: its job starts there and then, since no Actions runner waits for one and GitHub
-    /// never says anything of it. Without this the lifecycle would wait for a job, ask GitHub to remove a
-    /// registration that never was, and stop the machine as one without a job.
-    fn test_run_up(&self, inner: &mut Inner<H>, name: &str, now: Now) {
+    /// A machine of the Runner's own ([`Record::local`]: a test run's, the Docker check's) is up: its job starts there
+    /// and then, since no Actions runner waits for one and GitHub never says anything of it. Without this the
+    /// lifecycle would wait for a job, ask GitHub to remove a registration that never was, and stop the machine as one
+    /// without a job.
+    fn local_up(&self, inner: &mut Inner<H>, name: &str, now: Now) {
         let Some(job) = inner.jobs.get_mut(name) else {
             return;
         };
-        let Some(facts) = job.record.test_run.as_mut() else {
-            return;
-        };
-        if job.life.phase() != Phase::Idle {
+        if !job.record.local() || job.life.phase() != Phase::Idle {
             return;
         }
-        let at = *facts.started_at.get_or_insert_with(|| secs(self.clock.now()));
-        tracing::info!(runner = %job.record.runner, job = %name, "a test run's machine is up; its suite starts");
+        let wall = secs(self.clock.now());
+        let at = match job.record.test_run.as_mut() {
+            Some(facts) => *facts.started_at.get_or_insert(wall),
+            None => wall,
+        };
+        tracing::info!(runner = %job.record.runner, job = %name, "a machine of the Runner's own is up; its work starts");
         self.hear(inner, name, now, Event::JobStarted, at, true);
     }
 
@@ -1113,6 +1119,18 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         });
         job.record.slot = Some(job.life.saved().into());
         job.ended_at = Some(now.elapsed);
+        if job.record.probe {
+            let console = self.vms.console_tail(name, docker_check::CONSOLE_TAIL);
+            let check = DockerCheck::of_end(job.last.as_ref(), kind, console.as_deref(), self.wall());
+            match &check.why {
+                None => tracing::info!("Docker starts in this host's job machines"),
+                Some(why) => tracing::warn!(%why, "Docker does not start in this host's job machines"),
+            }
+            inner.docker_check = Some(check);
+        }
+        let Some(job) = inner.jobs.get_mut(name) else {
+            return;
+        };
         let oom = job.record.oom;
         let runner = job.record.runner.clone();
         tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
@@ -1139,16 +1157,17 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         };
         let (kind, at) = (EndKind::from_name(&ending.kind), ending.at);
         let mut opened = false;
-        // A test run has no word of GitHub's to wait for: the Mac knows all there is.
+        // A test run or the Docker check has no word of GitHub's to wait for: the Mac knows all there is.
         let test_run = job.record.test_run.is_some();
+        let local = job.record.local();
         if !job.record.end_reported {
             let waited = job.ended_at.map_or(Millis(u64::MAX), |at| now.elapsed.since(at));
             let result = job.record.github.as_ref().and_then(|g| g.result.clone());
-            if !test_run && result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
+            if !local && result.is_none() && !deaf && duration(waited) < RESULT_WAIT {
                 return false;
             }
             // Whether a job ran is GitHub's to say, by its answer to the removal.
-            if !test_run && job.record.unheard() && !deaf {
+            if !local && job.record.unheard() && !deaf {
                 return false;
             }
             if test_run && !job.record.start_reported {
@@ -1322,7 +1341,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         };
         // Written with the lifecycle's step, which takes the same word as a job that ran.
         let mut changed = changed | job.record.ended.as_mut().is_some_and(Ending::job_ran);
-        if !job.record.start_reported {
+        // The Docker check is no job: the console hears nothing of it.
+        if !job.record.start_reported && !job.record.probe {
             changed = true;
             job.record.start_reported = true;
             // Settled as having had no job, by a path that could not wait for GitHub (an uninstall): no completion
@@ -1387,6 +1407,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             oom: false,
             rules: RULES,
             test_run: None,
+            probe: false,
         }
     }
 
@@ -1478,6 +1499,62 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         // A Docker run's slot counts against the Mac's Docker jobs since `test_run::admit` took it.
         tracing::info!(%runner, size = run.size.label(), repo = %run.repo, "a test run's machine starts");
         Ok(runner)
+    }
+
+    /// Boots the Docker check's machine ([`crate::docker_check`]) in a slot of `size` the budget grants as it would a
+    /// claim, so the check never takes the host's room from what it protects, nor runs while the Mac takes no new
+    /// job (paused, draining, holding for an update, someone at it). Says the machine's name, or why none started.
+    pub fn start_docker_probe(&self, size: Size) -> Result<String, String> {
+        let ticket = self.reserve_for(size, true).map_err(|refusal| refusal.0)?;
+        let mut inner = self.lock();
+        let now = inner.host.now();
+        let grant = match (inner.budget.confirm(ticket), inner.grants.get(&ticket).copied()) {
+            (Ok(()), Some(grant)) => grant,
+            _ => {
+                drop(inner);
+                self.release(ticket);
+                return Err("its slot ran out".into());
+            }
+        };
+        let runner = format!("dk-p{:07x}", rand::random::<u32>() & 0x0fff_ffff);
+        let request = JobRequest {
+            job: job_name(&runner).to_string(),
+            host: self.config.host.clone(),
+            memory_bytes: grant.vm_bytes,
+            cpus: grant.cpus,
+            scratch_bytes: self.config.scratch_bytes,
+            image: self.config.image.clone(),
+            workload: docker_check::workload(),
+            env: Vec::new(),
+            deadline_s: docker_check::DEADLINE.as_secs(),
+            docker: true,
+        };
+        let record = Record {
+            unregistered: true,
+            probe: true,
+            ..self.record(&runner, "", test_run::SET, size, &grant, &request)
+        };
+        if let Err(error) = self.launch(&mut inner, now, ticket, record, &request) {
+            self.store.remove(&request.job);
+            drop(inner);
+            self.release(ticket);
+            return Err(error.to_string());
+        }
+        tracing::info!(%runner, size = size.label(), "the Docker check's machine starts");
+        Ok(runner)
+    }
+
+    /// What the last Docker check found; none before the first ended.
+    pub fn docker_check(&self) -> Option<DockerCheck> {
+        self.lock().docker_check.clone()
+    }
+
+    /// Whether the Docker check's machine stands.
+    pub fn probing(&self) -> bool {
+        self.lock()
+            .jobs
+            .values()
+            .any(|job| job.record.probe && job.record.ended.is_none())
     }
 
     /// The test run on this Mac whose machine stands, by its name; none while there is none.
@@ -1626,6 +1703,9 @@ fn came_up(state: &JobState) -> bool {
 /// tells itself. A test run that ended by itself is a `success` whatever its suite did: the agent tells the console
 /// how the suite went, and the Runner only how the machine did.
 fn reported_job(record: &Record) -> Option<GithubJob> {
+    if record.probe {
+        return None;
+    }
     let Some(facts) = &record.test_run else {
         return record.github.clone();
     };
@@ -1886,6 +1966,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             oom: false,
             rules: RULES,
             test_run: None,
+            probe: false,
         };
         self.store.save(&record);
         self.lock().intents.insert(name.to_string(), (record, false));

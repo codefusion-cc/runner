@@ -43,6 +43,8 @@ struct VmState {
     frozen: bool,
     next_pid: u32,
     held: Option<Arc<HeldLooks>>,
+    /// What each job's console log says, by job.
+    consoles: BTreeMap<String, String>,
 }
 
 /// Looks at vm-hosts that wait, as a look at a vm-host that does not answer does, until a test lets them go.
@@ -94,6 +96,11 @@ impl FakeVms {
         if let Some(vm) = self.lock().vms.get_mut(job) {
             change(vm);
         }
+    }
+
+    /// The job's console log says this.
+    pub fn console(&self, job: &str, text: &str) {
+        self.lock().consoles.insert(job.to_string(), text.to_string());
     }
 
     /// The next `n` starts fail.
@@ -300,6 +307,15 @@ fn finish(vm: &mut FakeVm, end: End) {
 }
 
 impl Vms for FakeVms {
+    fn console_tail(&self, job: &str, bytes: usize) -> Option<String> {
+        let text = self.lock().consoles.get(job).cloned()?;
+        let mut from = text.len().saturating_sub(bytes);
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
+        Some(text[from..].to_string())
+    }
+
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let mut state = self.lock();
         if state.frozen {

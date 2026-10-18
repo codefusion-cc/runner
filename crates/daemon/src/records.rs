@@ -123,6 +123,10 @@ pub struct Record {
     /// `unregistered` from the start and no word of GitHub's ever. None for an Actions runner's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_run: Option<TestRunFacts>,
+    /// The Docker check's machine ([`crate::docker_check`]): no Actions runner, no registration at GitHub, no job
+    /// for the console; its end is the check's answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe: bool,
 }
 
 /// What a test run's record keeps beside an Actions runner's: what its job events name.
@@ -183,6 +187,12 @@ impl Record {
     /// still there. The answer to its removal says it ([`crate::Answer`]).
     pub fn unheard(&self) -> bool {
         self.github.is_none() && !self.unregistered && self.up()
+    }
+
+    /// Whether the machine is the Runner's own, with no Actions runner and nothing at GitHub: a test run's or the
+    /// Docker check's. Its job starts when its guest is up and ends with the machine.
+    pub fn local(&self) -> bool {
+        self.test_run.is_some() || self.probe
     }
 
     /// Whether nothing is left to do for this Actions runner.

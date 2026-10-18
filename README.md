@@ -174,6 +174,15 @@ machine runs the agent embedded in the Runner (`crates/daemon/src/test_run/agent
 console as git bundles, runs the suite and sends its output to the console itself. The console's page and job events
 show it as a job of workflow `test-remote` on a machine named `tr-…`; nothing of it is registered at GitHub.
 
+Before anything Docker comes to a host, the Runner checks that Docker starts in its job machines: at its start, once
+the budget gives a slot, it boots one machine of the smallest size with Docker, which waits two minutes for `docker
+info`. Until that check ends Docker is unknown and nothing is refused. A failed check is tried again every six hours,
+and meanwhile the host serves no `cf-docker` label set and answers a `test-run` with Docker `never: Docker does not
+start in this machine's job VMs (<why>)`, which the console hands on to another machine; a pass holds until the Runner
+starts again. The console's report carries the last check in `status.docker`: `{"ok": false, "checkedAt":
+"2026-10-18T08:00:00Z", "why": "docker info did not answer in 2 minutes (exit 1); cf-supervisor: the Docker sandbox
+ended: exit status: 70"}`, `{"ok": true, "checkedAt": "…"}` after a pass, and nothing before the first check ended.
+
 `uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
 could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
 

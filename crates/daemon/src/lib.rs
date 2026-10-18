@@ -8,6 +8,7 @@
 //! per scale set, removes registrations that have to go and reports to the console.
 
 mod adapters;
+pub mod docker_check;
 mod ends;
 pub mod held;
 mod log;

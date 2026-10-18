@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, HeldJobs, HostStatus, JobKind, JobLimits, MAX_RUNNERS,
-    MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage,
-    ScaleSetStatus, SizeStatus, Status, Update,
+    Activity, Answer, Client, Command, CommandResult, DockerStatus, HeldJobs, HostStatus, JobKind, JobLimits,
+    MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
+    RunnerUsage, ScaleSetStatus, SizeStatus, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -25,6 +25,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
+use crate::docker_check::DockerCheck;
 use crate::held::{self, HeldSet, OwnRunners, SetView};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
@@ -326,6 +327,8 @@ struct Shared<H, V> {
     restarting: Notify,
     /// Set while the Runner ends: the last report says so instead of serving nothing.
     ending: AtomicBool,
+    /// Whether the last look at the Docker check found Docker refused: a change reads the label sets again.
+    docker_refused: Mutex<bool>,
     /// The command of the test run that waits for its turn, which is not done again while it waits, and whether the
     /// console still sends it.
     test_run: Mutex<Option<(String, Arc<AtomicBool>)>>,
@@ -531,6 +534,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 restarting: Notify::new(),
                 ending: AtomicBool::new(false),
                 test_run: Mutex::new(None),
+                docker_refused: Mutex::new(false),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
                 results_file: parts.results,
             }),
@@ -1012,6 +1016,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         settings: &cf_budget::Settings,
     ) -> Result<Size, Option<&'static str>> {
         let policy = &self.shared.config.policy;
+        if set.docker() && self.docker_refused().is_some() {
+            // Not offered to GitHub while the host's own check says its machines start no Docker daemon.
+            return Err(Some(crate::docker_check::REFUSAL));
+        }
         if set.docker() && !policy.serves_docker(repo) {
             // Not offered to GitHub: the job waits for a Mac that gives this repository Docker. A Mac left out on
             // purpose is no problem of discovery.
@@ -1688,6 +1696,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .collect(),
                 commands: self.commands(),
                 held_jobs: self.held_report(),
+                docker: shared.machines.docker_check().map(|check| DockerStatus {
+                    ok: check.ok,
+                    checked_at: iso(check.at),
+                    why: check.why.map(|why| cut(why, STATUS_TEXT_MAX)),
+                }),
                 scale_sets: sets
                     .iter()
                     .take(MAX_SCALE_SETS)
@@ -1974,6 +1987,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             Err(why) => return Some((false, why)),
         };
         let runner = run.runner();
+        if run.docker
+            && let Some(why) = self.docker_refused()
+        {
+            // The console hands the run on to another machine.
+            return Some((false, format!("never: {why}")));
+        }
         // The console sends a command again until it has its result: a Runner that died between the start and the
         // result finds the machine it started.
         if shared.machines.knows(&runner) {
@@ -2032,6 +2051,42 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 });
                 None
             }
+        }
+    }
+
+    /// Why nothing Docker comes to this host: its last Docker check failed. None while it passed, and before the
+    /// first one ended: Docker is unknown then, not refused.
+    fn docker_refused(&self) -> Option<String> {
+        DockerCheck::refusal(self.shared.machines.docker_check().as_ref())
+    }
+
+    /// Boots the Docker check's machine when one is due ([`crate::docker_check`]): at the start, once the budget gives
+    /// it a slot, and every six hours while it fails. Not while one stands, nor while an update or new settings wait
+    /// to start the Runner again; the budget refuses its slot while the host is paused or draining. When the check's
+    /// answer changes what the host serves, the label sets are read again.
+    pub fn look_at_docker(&self) {
+        let shared = &self.shared;
+        let machines = &shared.machines;
+        let refused = self.docker_refused().is_some();
+        let before = std::mem::replace(&mut *shared.docker_refused.lock().expect("docker"), refused);
+        if before != refused {
+            let service = self.handle();
+            tokio::spawn(async move { service.discover().await });
+        }
+        if machines.probing()
+            || self.restart_requested()
+            || self.update_under_way()
+            || shared.applying.lock().expect("applying").under_way
+            || !DockerCheck::due(machines.docker_check().as_ref(), secs(shared.clock.now()))
+        {
+            return;
+        }
+        let settings = machines.settings();
+        let Some(size) = Size::ALL.into_iter().find(|&size| settings.can_run(size).is_ok()) else {
+            return;
+        };
+        if let Err(why) = machines.start_docker_probe(size) {
+            tracing::debug!(%why, "the Docker check waits for a slot");
         }
     }
 
@@ -2356,6 +2411,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // A job that was queued, started or ended is on the console's page within a moment, not with
                 // the next report in its turn.
                 _ = news.tick() => {
+                    self.look_at_docker();
                     self.watch_stall(&self.sets(), &self.shared.machines.snapshot());
                     if self.has_news() {
                         let next = self.report().await;
