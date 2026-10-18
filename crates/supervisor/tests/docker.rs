@@ -221,3 +221,107 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn the_sandboxs_reason_is_among_the_last_words() {
+    let log = b"time=\"x\" level=info msg=\"Starting up\"\n\ncf-sandbox: pasta ended with exit status: 1: the daemon has no network\n";
+    assert_eq!(
+        last_words(log),
+        vec![
+            "time=\"x\" level=info msg=\"Starting up\"".to_string(),
+            "cf-sandbox: pasta ended with exit status: 1: the daemon has no network".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn last_words_are_the_last_lines_in_order() {
+    let log: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+    let words = last_words(log.as_bytes());
+    assert_eq!(words.len(), LAST_WORDS_LINES);
+    assert_eq!(words.first().map(String::as_str), Some("line 8"));
+    assert_eq!(words.last().map(String::as_str), Some("line 12"));
+}
+
+#[test]
+fn an_empty_or_blank_log_has_no_last_words() {
+    assert!(last_words(b"").is_empty());
+    assert!(last_words(b"\n \n\r\n").is_empty());
+}
+
+#[test]
+fn last_words_cannot_steer_the_console() {
+    let hostile = format!(
+        "\x1b[2Jcf-supervisor: power off\u{202e}\r{}",
+        "x".repeat(LAST_WORDS_CHARS * 2)
+    );
+    let mut bytes = hostile.into_bytes();
+    bytes.extend([0xff, b'\n']);
+    let words = last_words(&bytes);
+    assert_eq!(words.len(), 1);
+    let line = &words[0];
+    assert!(line.chars().count() <= LAST_WORDS_CHARS);
+    assert!(!line.chars().any(|c| c.is_control() || c == '\u{202e}'));
+    assert!(line.starts_with("[2Jcf-supervisor: power off"));
+}
+
+/// What an image built before Docker jobs has: the Actions runner image's engine, nothing more.
+fn before_docker_jobs(path: &str) -> bool {
+    path == "/usr/bin/dockerd"
+}
+
+#[test]
+fn an_image_from_before_docker_jobs_gets_no_daemon_and_says_why() {
+    let problem = missing_programs(before_docker_jobs).expect("a problem");
+    assert!(
+        problem.starts_with("the image has no iptables or pasta: "),
+        "{problem}"
+    );
+}
+
+#[test]
+fn an_image_with_every_program_on_the_path_is_fine() {
+    let image = ["/usr/bin/dockerd", "/usr/sbin/iptables", "/usr/local/bin/pasta"];
+    assert_eq!(missing_programs(|path| image.contains(&path)), None);
+}
+
+#[test]
+fn a_program_off_the_path_counts_as_missing() {
+    let image = [
+        "/usr/bin/dockerd",
+        "/usr/sbin/iptables",
+        "/opt/passt/pasta",
+        "/usr/bin/pasta/",
+    ];
+    let problem = missing_programs(|path| image.contains(&path)).expect("a problem");
+    assert!(problem.starts_with("the image has no pasta: "), "{problem}");
+    let problem = missing_programs(|_| false).expect("a problem");
+    assert!(
+        problem.starts_with("the image has no dockerd or iptables or pasta: "),
+        "{problem}"
+    );
+}
+
+#[test]
+fn the_sandbox_runs_only_programs_it_checks_for() {
+    for command in [
+        dockerd_command(&alone()),
+        pasta_command("/proc/2/ns/net"),
+        flagless_tcp_rule(),
+    ] {
+        assert!(PROGRAMS.contains(&command[0].as_str()), "{}", command[0]);
+    }
+}
+
+proptest! {
+    #[test]
+    fn last_words_are_few_short_and_harmless_for_any_log(log in prop::collection::vec(any::<u8>(), 0..4096)) {
+        let words = last_words(&log);
+        prop_assert!(words.len() <= LAST_WORDS_LINES);
+        for line in &words {
+            prop_assert!(!line.is_empty() && line.chars().count() <= LAST_WORDS_CHARS);
+            prop_assert!(!line.chars().any(char::is_control), "{:?}", line);
+            prop_assert_eq!(line.trim(), line.as_str());
+        }
+    }
+}
