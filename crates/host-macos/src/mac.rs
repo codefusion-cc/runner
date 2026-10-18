@@ -191,6 +191,19 @@ pub fn model() -> Option<String> {
     )
 }
 
+/// How many performance cores the chip has (`hw.perflevel0.logicalcpu`, level 0 being the fastest), for
+/// [`cf_budget::Settings::on_fast_cores`]; 0 when its cores are all of one kind (`hw.nperflevels` is 1) or macOS
+/// will not say.
+pub fn performance_cores() -> u32 {
+    match sysctl::<i32>(c"hw.nperflevels") {
+        Ok(2..) => sysctl::<i32>(c"hw.perflevel0.logicalcpu")
+            .ok()
+            .and_then(|cores| u32::try_from(cores).ok())
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// How long `pmset` may take to answer. It needs about 10 ms.
 const PMSET_ANSWER: Duration = Duration::from_secs(1);
 

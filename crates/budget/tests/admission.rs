@@ -417,6 +417,44 @@ fn what_fits_each_of_the_two_macs() {
 }
 
 #[test]
+fn a_mac_whose_cores_differ_gives_ci_its_performance_cores_alone() {
+    use Size::{G2, G4};
+    let mac = |cores: u32, performance: u32, mode: Mode| {
+        let facts = HostFacts {
+            total_bytes: 16 * GIB,
+            cores,
+        };
+        Settings::for_host(facts, mode).on_fast_cores(performance)
+    };
+    // An M1 Mac mini: 4 performance cores of 8. All but two gave CI 6 and a cf-4g 3, and two jobs side by side ran
+    // on the efficiency cores too.
+    let mini = mac(8, 4, Mode::Dedicated);
+    assert_eq!(mini.check(), Ok(()));
+    assert_eq!((mini.away.cpus, mini.in_use.cpus), (4, 4));
+    assert_eq!(mini.vcpus, [2, 2, 4, 4]);
+    let mut budget = Budget::new(mini).unwrap();
+    watch(&mut budget, 0, 60, |r| r.available_bytes = 16 * GIB);
+    assert_eq!(budget.claim(secs(60), G4).map(|grant| grant.cpus), Ok(2));
+    assert_eq!(budget.claim(secs(60), G4).map(|grant| grant.cpus), Ok(2));
+    assert_eq!(
+        budget.claim(secs(60), G2).map(|_| ()),
+        Err(Refusal::Cpus { cap: 4, committed: 4 }),
+        "a third machine would run on an efficiency core"
+    );
+    // An M1 Pro workstation, 8 of 10: CI may use 8 while its person is away and half the cores while they work.
+    let pro = mac(10, 8, Mode::Workstation);
+    assert_eq!((pro.away.cpus, pro.in_use.cpus, pro.vcpus_of(G4)), (8, 5, 4));
+    // An M5 with 4 performance cores of 10: 4 for CI, so a cf-4g gets 2 where it had 4.
+    let m5 = mac(10, 4, Mode::Dedicated);
+    assert_eq!((m5.away.cpus, m5.vcpus_of(G4)), (4, 2));
+    // Cores all alike, no word of which are fast, one prime core or more than there are: as before.
+    for performance in [0, 1, 8, 9] {
+        assert_eq!(mac(8, performance, Mode::Dedicated), mac(8, 0, Mode::Dedicated));
+        assert_eq!(mac(8, performance, Mode::Dedicated).away.cpus, 6);
+    }
+}
+
+#[test]
 fn the_floor_holds_to_the_byte() {
     // Three VMs of 4 GB with their overhead and the 2 GB floor: exactly that much available fits the third,
     // one byte less does not.

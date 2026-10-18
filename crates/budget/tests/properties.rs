@@ -164,8 +164,9 @@ fn settings() -> impl Strategy<Value = Settings> {
         any::<bool>(),
         any::<bool>(),
         prop::option::of(0..9u32),
+        0..9u32,
     )
-        .prop_map(|(gb, cores, own, one_cpu, while_in_use, headless)| {
+        .prop_map(|(gb, cores, own, one_cpu, while_in_use, headless, performance)| {
             let facts = HostFacts {
                 total_bytes: gb * GIB,
                 cores,
@@ -173,7 +174,9 @@ fn settings() -> impl Strategy<Value = Settings> {
             let mut settings = match headless {
                 // A Linux host nobody works at, with so many fast cores (0: all alike).
                 Some(fast) => Settings::for_headless(facts, fast),
-                None => Settings::for_host(facts, if own { Mode::Workstation } else { Mode::Dedicated }),
+                // A Mac with so many performance cores (0: all alike).
+                None => Settings::for_host(facts, if own { Mode::Workstation } else { Mode::Dedicated })
+                    .on_fast_cores(performance),
             };
             if one_cpu {
                 settings.vcpus = [1; 4];

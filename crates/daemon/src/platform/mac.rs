@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use cf_budget::{HostError, HostFacts, Mode, Settings};
 use cf_host_macos::{
-    MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, program_of,
+    MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, performance_cores,
+    program_of,
 };
 
 use super::{Platform, Process};
@@ -33,7 +34,7 @@ impl Platform for Mac {
     }
 
     fn settings(facts: HostFacts, mode: Mode) -> Settings {
-        Settings::for_host(facts, mode)
+        Settings::for_host(facts, mode).on_fast_cores(performance_cores())
     }
 
     fn boot_session() -> Option<String> {
