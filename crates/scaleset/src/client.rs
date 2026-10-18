@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cf_ghapp::{Error as ApiError, GitHubApp, Response};
+use cf_ghapp::{DEFAULT_RUNNER_GROUP as RUNNER_GROUP, Error as ApiError, GitHubApp, Response};
 use cf_secret::Secret;
 use reqwest::header::AUTHORIZATION;
 use reqwest::{Method, Url};
@@ -16,7 +16,6 @@ use crate::session::MessageSession;
 use crate::types::{JitConfig, JitResponse, Label, RunnerRef, ScaleSet, SessionInfo};
 
 pub(crate) const API_VERSION: &str = "6.0-preview";
-const RUNNER_GROUP: i64 = 1;
 /// The Actions service's token is replaced this long before it expires.
 const ADMIN_MARGIN_SECS: i64 = 120;
 /// How long a token is trusted when its expiry cannot be read.
@@ -403,7 +402,7 @@ impl ScaleSetClient {
         work_folder: &str,
     ) -> Result<JitConfig, Error> {
         let body = json!({"name": name, "workFolder": work_folder});
-        let response = match self
+        let answer = match self
             .admin_call(
                 Method::POST,
                 &format!("runtime/runnerscalesets/{scale_set_id}/generatejitconfig"),
@@ -411,7 +410,47 @@ impl ScaleSetClient {
             )
             .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                let parsed: JitResponse = decode("Actions runner configuration", &response)?;
+                Ok((parsed.runner, Secret::new(parsed.encoded_jit_config)))
+            }
+            Err(e) => Err(e),
+        };
+        self.registered(name, answer).await
+    }
+
+    /// Registers an Actions runner that takes one job with the repository, outside any scale set, carrying exactly
+    /// `labels` (`docs/github-protocol.md`, probe M): GitHub may hand it a queued job whose labels it has, and looks
+    /// at its queue when it comes online (probe N). Its registration is removed as a scale set's is
+    /// ([`ScaleSetClient::remove_runner`]). A failure that may have left a registration behind removes it, as
+    /// [`ScaleSetClient::generate_jit_config`] does. Give this only names made for this call.
+    pub async fn generate_plain_jit_config(&self, name: &str, labels: &[String]) -> Result<JitConfig, Error> {
+        let answer = self
+            .inner
+            .app
+            .generate_jit_config(self.inner.installation, &self.inner.repo, name, labels)
+            .await
+            .map(|jit| {
+                let runner = RunnerRef {
+                    id: jit.id,
+                    name: name.to_string(),
+                };
+                (Some(runner), jit.encoded)
+            })
+            .map_err(Error::from);
+        self.registered(name, answer).await
+    }
+
+    /// The configuration of a registration the service answered, or the error. One that may have been registered
+    /// although the answer never arrived or was refused as taken is removed before the error comes back, and so is
+    /// one whose ID is unknown, which could never be removed again, or that has no configuration and never starts.
+    async fn registered(
+        &self,
+        name: &str,
+        answer: Result<(Option<RunnerRef>, Secret<String>), Error>,
+    ) -> Result<JitConfig, Error> {
+        let (runner, encoded) = match answer {
+            Ok(answer) => answer,
             Err(e) => {
                 if e.status() == Some(409) || e.is_transient() {
                     self.remove_leftover(name).await;
@@ -419,16 +458,8 @@ impl ScaleSetClient {
                 return Err(e);
             }
         };
-        let parsed: JitResponse = decode("Actions runner configuration", &response)?;
-        // A registration whose ID is unknown could never be removed again, and one without a configuration never
-        // starts: neither is kept.
-        let why = match parsed.runner.filter(|runner| runner.id > 0) {
-            Some(runner) if !parsed.encoded_jit_config.is_empty() => {
-                return Ok(JitConfig {
-                    runner,
-                    encoded: Secret::new(parsed.encoded_jit_config),
-                });
-            }
+        let why = match runner.filter(|runner| runner.id > 0) {
+            Some(runner) if !encoded.expose().is_empty() => return Ok(JitConfig { runner, encoded }),
             Some(_) => "the service sent no configuration",
             None => "the service did not say which Actions runner it registered",
         };

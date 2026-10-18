@@ -10,7 +10,10 @@ mod error;
 mod http;
 mod jwt;
 
-pub use client::{API, GitHubApp, Installation, Repo, WorkflowRun};
+pub use client::{
+    API, DEFAULT_RUNNER_GROUP, GitHubApp, Installation, JOBS_PAGE, MAX_RUN_SETS, PlainJit, Repo,
+    WAITING_RUNS, Waiting, WaitingJob, WorkflowRun,
+};
 pub use credentials::{AppCredentials, AppKey, KeyError};
 pub use error::{Error, StatusError};
 pub use http::{

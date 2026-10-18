@@ -47,7 +47,7 @@ job ran.
 
 `Asking` is a phase of the lifecycle, so the removals come from one place: the sweep (`Service::sweep`) removes the
 registration of every slot that asks, and of every machine that ended while the registration stands (once the wait
-for GitHub's word, `RESULT_WAIT`, is over for one nobody heard of a job on). Two ways lead into `Asking`:
+for GitHub's word, `RESULT_WAIT`, is over for one nobody heard of a job on). Three ways lead into `Asking`:
 
 - **The idle limit.** A machine idle past `limits.idle` is not stopped on that belief, since its start may have gone
   with a session: it asks. With no answer for `limits.job` (GitHub away, no client for the repository), it is stopped
@@ -55,6 +55,11 @@ for GitHub's word, `RESULT_WAIT`, is over for one nobody heard of a job on). Two
 - **Surplus.** The scaler retires idle Actions runners past `IDLE_GRACE` (`Hosts::retire`, the event `Retire`). Those
   of the scale set already asking count toward the surplus. Only an idle machine asks; one still booting is retired
   at a later pass, once up, and one running is never retired.
+
+- **An Actions runner of its own.** One started for a job GitHub holds (`held.rs`) belongs to no scale set: no
+  session message ever names its job. It is retired (`Hosts::retire`) at the first look at the queue that finds no
+  job of its set it could take, or five minutes after it started. A 422 then says it took the job, and the 404 after
+  the job says it is over, as for any machine whose messages went with a session.
 
 A start heard while asking runs the job; a stop or an eviction ends the ask.
 
@@ -128,6 +133,6 @@ generated schedules.
   heard: its `unregistered` cannot be told from one it wrote on a 404. Telling the two apart needs a second source,
   such as the guest saying whether `Runner.Worker` ever ran.
 - A machine that ran a job, and whose start and end both went with a session, is reported without GitHub's result.
-  The result can be read only with the App permission `actions: read`.
+  The App's `actions: read` permission lets the Runner read it from the job's REST view; it does not yet.
 - GitHub removing an ephemeral registration that never ran a job, within the minutes of the wait, would read as a
   job. GitHub keeps offline registrations for far longer.

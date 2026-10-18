@@ -206,6 +206,7 @@ fn held_back(why: Option<Refusal>) -> bool {
             Refusal::Memory { .. }
                 | Refusal::Full { .. }
                 | Refusal::Cpus { .. }
+                | Refusal::Machines { .. }
                 | Refusal::AssignedFirst { .. }
         )
     )

@@ -34,7 +34,7 @@ fn request(job: &str) -> JobRequest {
         workload: Workload::ActionsRunner {
             jit_config: Secret::new(TOKEN.to_string()),
         },
-        env: vec![("CI".into(), "true".into())],
+        env: vec![("CI".into(), String::from("true").into())],
         deadline_s: 3600,
         docker: false,
         docker_cache: None,
@@ -227,7 +227,10 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
         ),
         ((4 << 30) - (256 << 20), 4096, 1 << 30, 4)
     );
-    assert_eq!(task.env, [("CI".to_string(), "true".to_string())]);
+    assert_eq!(
+        task.env,
+        [("CI".to_string(), cf_guest_proto::Secret::new("true".to_string()))]
+    );
     // The guest is told the networks this machine is in, to keep the job from them.
     assert_eq!(task.blocked, cf_vmhost::host_networks());
     assert!(matches!(&task.workload, Workload::ActionsRunner { jit_config } if jit_config.expose() == TOKEN));

@@ -1,7 +1,7 @@
 //! How the Runner updates itself on a host that built it: from the git checkout it was built from, with the toolchain
-//! it was built with (`build.rs` writes both into the program). The console's `update` reaches it through
-//! [`cf_daemon::Service`], which decides when to build and when to install; this module does the two, and the guard
-//! at the start of `daemon` that counts the starts of a new program and puts the one before back.
+//! it was built with (`build.rs` writes both into the program). The console's `update` and `update-to` reach it
+//! through [`cf_daemon::Service`], which decides when to build and when to install; this module does the two, and the
+//! guard at the start of `daemon` that counts the starts of a new program and puts the one before back.
 
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _};
@@ -11,7 +11,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use cf_daemon::update::{AtStart, Pending, SelfUpdate, UpdateFile, at_start, spoken};
+use cf_daemon::update::{AtStart, Pending, SelfUpdate, UpdateFile, at_start, is_commit, spoken};
 
 use crate::commands::VERSION;
 
@@ -22,6 +22,8 @@ const BRANCH: &str = "main";
 const BUILD_LIMIT: Duration = Duration::from_secs(45 * 60);
 /// How long one git call may take.
 const GIT_LIMIT: Duration = Duration::from_secs(120);
+/// How many objects whose names start as a commit `update-to` names are looked at: more is a name too short.
+const MAX_NAMESAKES: usize = 16;
 /// The name the kept program has beside the installed one.
 const PREVIOUS: &str = "prev";
 /// The name the program built and checked has beside the installed one until it is installed.
@@ -199,6 +201,49 @@ impl CheckoutUpdate {
         Ok(())
     }
 
+    /// The full name of the one commit whose name starts with `prefix`, looked up among the objects alone: a branch
+    /// or tag named so, which git would take first for a short name, never stands for it. `None` when no commit is
+    /// named so; refused when several are.
+    fn commit_named(&self, prefix: &str) -> Result<Option<String>, String> {
+        let objects = self.git(&["rev-parse", &format!("--disambiguate={prefix}")])?;
+        let objects: Vec<&str> = objects.lines().collect();
+        let several = || format!("{prefix} is short for more than one commit here: send more of it");
+        if objects.len() > MAX_NAMESAKES {
+            return Err(several());
+        }
+        let mut commits = objects.into_iter().filter(|object| {
+            self.git(&["cat-file", "-t", object])
+                .is_ok_and(|kind| kind == "commit")
+        });
+        match (commits.next(), commits.next()) {
+            (None, _) => Ok(None),
+            (Some(one), None) => Ok(Some(one.to_string())),
+            (Some(_), Some(_)) => Err(several()),
+        }
+    }
+
+    /// The full name of `commit` once it names one commit of the branch's history as fetched, up to `head`; a
+    /// commit of another branch or of a pull request is refused, and so is a name of no commit or of several.
+    fn on_main(&self, commit: &str, head: &str) -> Result<String, String> {
+        let not = "nothing was built";
+        let full = self
+            .commit_named(commit)
+            .map_err(|why| format!("{why}; {not}"))?
+            .ok_or_else(|| format!("{commit} is no commit of {BRANCH} this checkout knows; {not}"))?;
+        if !self.is_ancestor(&full, head) {
+            return Err(format!(
+                "{commit} is not on {BRANCH} (at {}); {not}",
+                &head[..12.min(head.len())]
+            ));
+        }
+        Ok(full)
+    }
+
+    /// Whether `ancestor` is in the history of `of`, itself included; a git that fails says no.
+    fn is_ancestor(&self, ancestor: &str, of: &str) -> bool {
+        self.git(&["merge-base", "--is-ancestor", ancestor, of]).is_ok()
+    }
+
     /// Ends the build that runs, with what it started. A Runner that ends does not wait for it: its process
     /// group is its own, so it would go on after the Runner, and the Runner's runtime waits for the thread that
     /// waits for it.
@@ -258,32 +303,55 @@ impl SelfUpdate for CheckoutUpdate {
         self.source.clone()
     }
 
-    fn build(&self) -> Result<String, String> {
+    fn build(&self, commit: Option<&str>) -> Result<String, String> {
         let running = commit_of(&self.running)
-            .filter(|commit| commit.len() == 12 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter(|running| running.len() == 12 && running.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| {
                 format!(
                     "{} names no commit it was built at; update it by hand",
                     self.running
                 )
             })?;
+        if let Some(name) = commit.filter(|name| !is_commit(name)) {
+            return Err(format!(
+                "`{}` is no commit's name; nothing was fetched or built",
+                cut(name, 40)
+            ));
+        }
         self.own()?;
-        self.git(&["fetch", "-q", "origin", BRANCH])?;
-        let target = self.git(&["rev-parse", "--verify", "-q", "FETCH_HEAD^{commit}"])?;
+        // The branch by its whole name: git fetches a tag before a branch of the same short name.
+        self.git(&["fetch", "-q", "origin", &format!("refs/heads/{BRANCH}")])?;
+        let head = self.git(&["rev-parse", "--verify", "-q", "FETCH_HEAD^{commit}"])?;
+        let target = match commit {
+            Some(commit) => self.on_main(commit, &head)?,
+            None => head,
+        };
         let short = &target[..12.min(target.len())];
         if short == running {
             return Ok(self.running.clone());
         }
-        // Main moves on; a Runner that is not on it is not taken back to what main says.
-        if self
-            .git(&["merge-base", "--is-ancestor", running, &target])
-            .is_err()
+        // Main moves on; a Runner that is not on it is not taken back to what main says, nor to a commit before it.
+        // The running commit is looked up as the one asked for is: a branch or tag named like it does not stand for it.
+        let running_full = self.commit_named(running).ok().flatten();
+        if !running_full
+            .as_deref()
+            .is_some_and(|running| self.is_ancestor(running, &target))
         {
-            return Err(format!(
-                "{BRANCH} at {short} does not have {running}, which runs; update it by hand"
-            ));
+            return Err(match (commit, running_full) {
+                (None, _) => {
+                    format!("{BRANCH} at {short} does not have {running}, which runs; update it by hand")
+                }
+                (Some(_), Some(full)) if self.is_ancestor(&target, &full) => format!(
+                    "{short} is not newer than {running}, which runs: a Runner is not taken back; nothing was built"
+                ),
+                (Some(_), _) => format!(
+                    "{short} does not have {running}, which runs and is not on {BRANCH}; update it by hand; nothing \
+                     was built"
+                ),
+            });
         }
-        self.git(&["checkout", "-q", "--detach", &target])?;
+        // Peeled, the name is the commit's alone: `git checkout` takes a branch named as a whole commit before it.
+        self.git(&["checkout", "-q", "--detach", &format!("{target}^{{commit}}")])?;
         self.cargo_build()?;
         let built = self.built();
         let printed = run_at_most(Command::new(&built).arg("version"), GIT_LIMIT)
@@ -610,7 +678,8 @@ chmod +x target/release/codefusion-runner"#;
         let root = folder.path().canonicalize().expect("folder");
         let (origin, checkout) = (root.join("origin"), root.join("checkout"));
         std::fs::create_dir_all(&origin).expect("folder");
-        run(&origin, &["init", "-q", "-b", "main"]);
+        // SHA-1 whatever git's default: a test names objects by their hashes.
+        run(&origin, &["init", "-q", "--object-format=sha1", "-b", "main"]);
         std::fs::write(origin.join("Cargo.toml"), "one").expect("file");
         run(&origin, &["add", "."]);
         run(&origin, &["commit", "-q", "-m", "one"]);
@@ -690,6 +759,60 @@ chmod +x target/release/codefusion-runner"#;
                 failed: None,
             }
         }
+
+        /// Main on the remote moves on by a commit, which the checkout has not fetched; answers it.
+        fn main_moves_on(&self) -> String {
+            let origin = self.root.join("origin");
+            std::fs::write(origin.join("Cargo.toml"), "three").expect("file");
+            run(&origin, &["commit", "-q", "-am", "three"]);
+            run(&origin, &["rev-parse", "HEAD"])
+        }
+
+        /// A commit on a branch of the remote beside main, as a pull request has, fetched into the checkout;
+        /// answers it.
+        fn pull_request(&self) -> String {
+            let origin = self.root.join("origin");
+            run(&origin, &["checkout", "-q", "-b", "pr"]);
+            std::fs::write(origin.join("Cargo.toml"), "someone's").expect("file");
+            run(&origin, &["commit", "-q", "-am", "pr"]);
+            let commit = run(&origin, &["rev-parse", "HEAD"]);
+            run(&origin, &["checkout", "-q", "main"]);
+            run(&self.update.checkout, &["fetch", "-q", "origin", "pr"]);
+            commit
+        }
+
+        /// Writes an object of `kind` into the checkout; answers its name.
+        fn object(&self, kind: &str, content: &str) -> String {
+            let mut git = Command::new("/usr/bin/git")
+                .arg("-C")
+                .arg(&self.update.checkout)
+                .args(["hash-object", "-t", kind, "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("git runs");
+            std::io::Write::write_all(&mut git.stdin.take().expect("stdin"), content.as_bytes())
+                .expect("written");
+            let output = git.wait_with_output().expect("git ends");
+            assert!(output.status.success(), "git hash-object {kind}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        /// A commit of nothing, on no branch, named by `n`: the same object, and so the same name, on every host.
+        fn root_commit(&self, n: u32) -> String {
+            self.object(
+                "commit",
+                &format!(
+                    "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor t <t@example.invalid> 1700000000 +0000\n\
+                     committer t <t@example.invalid> 1700000000 +0000\n\ntwin {n}\n"
+                ),
+            )
+        }
+
+        /// The version a program built at `commit` says.
+        fn version_of(commit: &str) -> String {
+            format!("0.1.0+{}", &commit[..12])
+        }
     }
 
     #[test]
@@ -699,7 +822,7 @@ chmod +x target/release/codefusion-runner"#;
             bench.update.source(),
             format!("{} main", bench.root.join("origin").display())
         );
-        assert_eq!(bench.update.build(), Ok(format!("0.1.0+{}", &bench.second[..12])));
+        assert_eq!(bench.update.build(None), Ok(Bench::version_of(&bench.second)));
         assert_eq!(bench.head(), bench.second);
         assert_eq!(bench.builds(), 1);
     }
@@ -708,7 +831,7 @@ chmod +x target/release/codefusion-runner"#;
     fn main_at_the_running_commit_builds_nothing() {
         let mut bench = bench(BUILDS);
         bench.update.running = format!("0.1.0+{}", &bench.second[..12]);
-        assert_eq!(bench.update.build(), Ok(bench.update.running.clone()));
+        assert_eq!(bench.update.build(None), Ok(bench.update.running.clone()));
         assert_eq!(bench.builds(), 0);
         assert_eq!(bench.head(), bench.first, "nothing is checked out");
     }
@@ -739,7 +862,7 @@ chmod +x target/release/codefusion-runner"#;
         };
         let bench = bench(BUILDS);
         std::fs::write(bench.update.checkout.join("Cargo.toml"), "mine").expect("file");
-        let said = bench.update.build().expect_err("refused");
+        let said = bench.update.build(None).expect_err("refused");
         assert_eq!(said, refused(&bench));
         untouched(&bench, &said);
         assert_eq!(
@@ -750,7 +873,7 @@ chmod +x target/release/codefusion-runner"#;
         // A new file cargo would build by itself, though git does not know it.
         let bench = self::bench(BUILDS);
         std::fs::write(bench.update.checkout.join("build.rs"), "fn main() {}").expect("file");
-        let said = bench.update.build().expect_err("refused");
+        let said = bench.update.build(None).expect_err("refused");
         assert_eq!(said, refused(&bench));
         untouched(&bench, &said);
     }
@@ -760,7 +883,7 @@ chmod +x target/release/codefusion-runner"#;
         let bench = bench(BUILDS);
         for branch in ["main", "feat/mine"] {
             run(&bench.update.checkout, &["checkout", "-q", "-B", branch]);
-            let said = bench.update.build().expect_err(branch);
+            let said = bench.update.build(None).expect_err(branch);
             assert_eq!(
                 said,
                 format!(
@@ -777,7 +900,7 @@ chmod +x target/release/codefusion-runner"#;
     fn a_checkout_the_config_does_not_name_as_the_build_folder_is_not_touched() {
         let mut bench = bench(BUILDS);
         bench.update.build_folder = None;
-        let said = bench.update.build().expect_err("no folder named");
+        let said = bench.update.build(None).expect_err("no folder named");
         assert_eq!(
             said,
             format!(
@@ -791,7 +914,7 @@ chmod +x target/release/codefusion-runner"#;
         // A folder named that is another, or none at all.
         for named in [bench.root.join("origin"), bench.root.join("gone")] {
             bench.update.build_folder = Some(named.clone());
-            let said = bench.update.build().expect_err("another folder");
+            let said = bench.update.build(None).expect_err("another folder");
             assert_eq!(
                 said,
                 format!(
@@ -810,7 +933,7 @@ chmod +x target/release/codefusion-runner"#;
             let external = bench.root.join("external");
             std::os::unix::fs::symlink("/Volumes", &external).expect("link");
             bench.update.build_folder = Some(external.clone());
-            let said = bench.update.build().expect_err("external");
+            let said = bench.update.build(None).expect_err("external");
             assert_eq!(
                 said,
                 format!(
@@ -824,7 +947,7 @@ chmod +x target/release/codefusion-runner"#;
 
         // The same folder by another way to it is the same.
         bench.update.build_folder = Some(bench.root.join("checkout/../checkout"));
-        assert!(bench.update.build().is_ok());
+        assert!(bench.update.build(None).is_ok());
     }
 
     #[test]
@@ -838,7 +961,7 @@ chmod +x target/release/codefusion-runner"#;
         run(side, &["checkout", "-q", "--detach"]);
         let running = run(side, &["rev-parse", "--short=12", "HEAD"]);
         bench.update.running = format!("0.1.0+{running}");
-        let said = bench.update.build().expect_err("refused");
+        let said = bench.update.build(None).expect_err("refused");
         assert_eq!(
             said,
             format!(
@@ -847,6 +970,271 @@ chmod +x target/release/codefusion-runner"#;
             )
         );
         assert_eq!(bench.builds(), 0);
+        // A commit of main newer than where the side branch left it is not called older than the running one.
+        let said = bench.update.build(Some(&bench.second)).expect_err("refused");
+        assert_eq!(
+            said,
+            format!(
+                "{} does not have {running}, which runs and is not on main; update it by hand; nothing was built",
+                &bench.second[..12]
+            )
+        );
+        assert_eq!(bench.builds(), 0);
+    }
+
+    #[test]
+    fn a_commit_on_main_behind_its_head_is_built_and_installed_and_not_the_head() {
+        let bench = bench(BUILDS);
+        bench.main_moves_on();
+        assert_eq!(
+            bench.update.build(Some(&bench.second)),
+            Ok(Bench::version_of(&bench.second))
+        );
+        assert_eq!(bench.head(), bench.second);
+        assert_eq!(bench.builds(), 1);
+        bench.update.install(&bench.pending()).expect("installed");
+        let says = run_at_most(&mut Command::new(&bench.update.installed), GIT_LIMIT).expect("it runs");
+        assert_eq!(
+            says,
+            format!("codefusion-runner {}", Bench::version_of(&bench.second))
+        );
+    }
+
+    #[test]
+    fn a_commit_in_full_or_in_twelve_characters_is_built() {
+        for asked in [40, 12] {
+            let bench = bench(BUILDS);
+            bench.main_moves_on();
+            assert_eq!(
+                bench.update.build(Some(&bench.second[..asked])),
+                Ok(Bench::version_of(&bench.second)),
+                "{asked} characters"
+            );
+            assert_eq!(bench.head(), bench.second, "{asked} characters");
+        }
+    }
+
+    #[test]
+    fn a_commit_main_does_not_have_is_refused_and_nothing_is_built() {
+        let bench = bench(BUILDS);
+        let pr = bench.pull_request();
+        let said = bench.update.build(Some(&pr)).expect_err("refused");
+        assert_eq!(
+            said,
+            format!(
+                "{pr} is not on main (at {}); nothing was built",
+                &bench.second[..12]
+            )
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+    }
+
+    #[test]
+    fn a_commit_older_than_the_running_one_is_refused_and_nothing_is_built() {
+        let mut bench = bench(BUILDS);
+        bench.main_moves_on();
+        bench.update.running = Bench::version_of(&bench.second);
+        let said = bench.update.build(Some(&bench.first[..7])).expect_err("refused");
+        assert_eq!(
+            said,
+            format!(
+                "{} is not newer than {}, which runs: a Runner is not taken back; nothing was built",
+                &bench.first[..12],
+                &bench.second[..12]
+            )
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+    }
+
+    #[test]
+    fn the_running_commit_asked_for_builds_nothing() {
+        let bench = bench(BUILDS);
+        bench.main_moves_on();
+        assert_eq!(
+            bench.update.build(Some(&bench.first[..7])),
+            Ok(bench.update.running.clone())
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+    }
+
+    #[test]
+    fn a_commit_the_checkout_does_not_know_is_refused_and_nothing_is_built() {
+        let bench = bench(BUILDS);
+        let said = bench.update.build(Some("0000000")).expect_err("refused");
+        assert_eq!(
+            said,
+            "0000000 is no commit of main this checkout knows; nothing was built"
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+    }
+
+    #[test]
+    fn a_commit_too_short_to_name_one_is_refused_and_nothing_is_built() {
+        let bench = bench(BUILDS);
+        // Two commits whose names share their first seven characters, as two commits of a large history may.
+        let twins = [bench.root_commit(5518), bench.root_commit(15091)];
+        assert_eq!(
+            (&twins[0][..7], &twins[1][..7]),
+            ("7c61a9f", "7c61a9f"),
+            "{twins:?}"
+        );
+        let said = bench.update.build(Some("7c61a9f")).expect_err("refused");
+        assert_eq!(
+            said,
+            "7c61a9f is short for more than one commit here: send more of it; nothing was built"
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+        // Long enough, it names one, which is not on main.
+        let said = bench.update.build(Some(&twins[0][..8])).expect_err("refused");
+        assert!(said.contains("is not on main"), "{said}");
+    }
+
+    #[test]
+    fn a_name_a_commit_shares_with_a_file_names_the_commit() {
+        let bench = bench(BUILDS);
+        let commit = bench.root_commit(56017);
+        let file = bench.object("blob", "blob 12288\n");
+        assert_eq!((&commit[..7], &file[..7]), ("fca5cee", "fca5cee"));
+        let said = bench.update.build(Some("fca5cee")).expect_err("refused");
+        assert_eq!(
+            said,
+            format!(
+                "fca5cee is not on main (at {}); nothing was built",
+                &bench.second[..12]
+            )
+        );
+    }
+
+    #[test]
+    fn a_branch_or_tag_named_like_a_commit_is_not_taken_for_one() {
+        let bench = bench(BUILDS);
+        bench.main_moves_on();
+        run(&bench.update.checkout, &["fetch", "-q", "origin", "main"]);
+        // Git takes a branch or tag before a commit of the same short name.
+        run(&bench.update.checkout, &["tag", "cafe123", &bench.second]);
+        let said = bench.update.build(Some("cafe123")).expect_err("refused");
+        assert_eq!(
+            said,
+            "cafe123 is no commit of main this checkout knows; nothing was built"
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+        // Named like the commit asked for, they do not hide it.
+        let tree = run(
+            &bench.update.checkout,
+            &["rev-parse", &format!("{}^{{tree}}", bench.second)],
+        );
+        run(&bench.update.checkout, &["tag", &bench.second[..7], &tree]);
+        run(
+            &bench.update.checkout,
+            &["branch", &bench.second[..8], &bench.first],
+        );
+        for asked in [7, 8] {
+            assert_eq!(
+                bench.update.build(Some(&bench.second[..asked])),
+                Ok(Bench::version_of(&bench.second)),
+                "{asked} characters"
+            );
+        }
+        assert_eq!(bench.head(), bench.second);
+    }
+
+    #[test]
+    fn a_tag_named_main_on_the_remote_is_not_taken_for_main() {
+        let bench = bench(BUILDS);
+        // Someone who may push a tag but not to main: git fetches a tag before a branch of the same name.
+        let pr = bench.pull_request();
+        run(&bench.root.join("origin"), &["tag", "main", &pr]);
+        let said = bench.update.build(Some(&pr)).expect_err("refused");
+        assert_eq!(
+            said,
+            format!(
+                "{pr} is not on main (at {}); nothing was built",
+                &bench.second[..12]
+            )
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+        assert_eq!(bench.update.build(None), Ok(Bench::version_of(&bench.second)));
+        assert_eq!(bench.head(), bench.second);
+    }
+
+    #[test]
+    fn a_branch_or_tag_named_like_the_running_commit_does_not_stand_for_it() {
+        let mut bench = bench(BUILDS);
+        bench.main_moves_on();
+        bench.update.running = Bench::version_of(&bench.second);
+        let checkout = bench.update.checkout.clone();
+        run(&checkout, &["tag", &bench.second[..12], &bench.first]);
+        let said = bench.update.build(Some(&bench.first[..7])).expect_err("refused");
+        assert_eq!(
+            said,
+            format!(
+                "{} is not newer than {}, which runs: a Runner is not taken back; nothing was built",
+                &bench.first[..12],
+                &bench.second[..12]
+            )
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+
+        // A Runner main does not have, with a branch named like it at a commit of main.
+        bench.update.running = "0.1.0+0123456789ab".into();
+        run(&checkout, &["branch", "0123456789ab", &bench.first]);
+        let said = bench.update.build(None).expect_err("refused");
+        assert!(
+            said.ends_with("does not have 0123456789ab, which runs; update it by hand"),
+            "{said}"
+        );
+        let said = bench.update.build(Some(&bench.second)).expect_err("refused");
+        assert!(
+            said.contains("does not have 0123456789ab, which runs and is not on main"),
+            "{said}"
+        );
+        assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()));
+    }
+
+    #[test]
+    fn a_branch_named_as_the_whole_commit_is_not_checked_out_for_it() {
+        let bench = bench(BUILDS);
+        bench.main_moves_on();
+        run(&bench.update.checkout, &["fetch", "-q", "origin", "main"]);
+        // `git checkout` takes a branch of that name before the commit, though git warns no such branch should be.
+        run(&bench.update.checkout, &["branch", &bench.second, &bench.first]);
+        assert_eq!(
+            bench.update.build(Some(&bench.second)),
+            Ok(Bench::version_of(&bench.second))
+        );
+        assert_eq!((bench.builds(), bench.head()), (1, bench.second.clone()));
+    }
+
+    #[test]
+    fn a_name_that_is_no_commit_reaches_no_git() {
+        let long = "a".repeat(41);
+        for name in [
+            "--upload-pack=touch x",
+            "main",
+            "HEAD",
+            "FETCH_HEAD",
+            "abcdef",
+            "ABCDEF0",
+            "abcdef0~1",
+            "abcdef0 ",
+            "",
+            &long,
+        ] {
+            let bench = bench(BUILDS);
+            let said = bench.update.build(Some(name)).expect_err(name);
+            assert!(
+                said.ends_with("is no commit's name; nothing was fetched or built"),
+                "{name}: {said}"
+            );
+            assert_eq!((bench.builds(), bench.head()), (0, bench.first.clone()), "{name}");
+            let fetched = Command::new("/usr/bin/git")
+                .arg("-C")
+                .arg(&bench.update.checkout)
+                .args(["cat-file", "-e", &bench.second])
+                .status()
+                .expect("git runs");
+            assert!(!fetched.success(), "{name}: main's new commit was fetched");
+        }
     }
 
     #[test]
@@ -854,7 +1242,7 @@ chmod +x target/release/codefusion-runner"#;
         for running in ["0.1.0+unknown", "0.1.0", "0.1.0+446125c0a1b2-dirty", "0.1.0+"] {
             let mut bench = bench(BUILDS);
             bench.update.running = running.into();
-            let said = bench.update.build().expect_err(running);
+            let said = bench.update.build(None).expect_err(running);
             assert!(said.contains("names no commit"), "{running}: {said}");
             assert_eq!(bench.builds(), 0);
         }
@@ -865,7 +1253,7 @@ chmod +x target/release/codefusion-runner"#;
         let bench = bench(
             "echo '   Compiling cf-daemon'\necho 'error[E0425]: cannot find value `x`' >&2\necho 'error: could not compile' >&2\nexit 101",
         );
-        let said = bench.update.build().expect_err("failed");
+        let said = bench.update.build(None).expect_err("failed");
         assert!(said.starts_with("the build failed (exit status: 101)"), "{said}");
         assert!(said.ends_with(": error: could not compile"), "{said}");
         let log = std::fs::read_to_string(&bench.update.log).expect("the log");
@@ -878,7 +1266,7 @@ chmod +x target/release/codefusion-runner"#;
         // Long enough for the niced build to write its child down on a busy host.
         bench.update.build_limit = Duration::from_secs(3);
         let began = Instant::now();
-        let said = bench.update.build().expect_err("ended");
+        let said = bench.update.build(None).expect_err("ended");
         assert!(began.elapsed() < Duration::from_secs(12), "{:?}", began.elapsed());
         assert_eq!(said, "the build took longer than 3 seconds and was ended");
         let child: libc::pid_t = std::fs::read_to_string(bench.root.join("marks/child"))
@@ -904,7 +1292,7 @@ chmod +x target/release/codefusion-runner"#;
         let marks = bench.root.join("marks/child");
         let began = Instant::now();
         std::thread::scope(|scope| {
-            let build = scope.spawn(|| bench.update.build());
+            let build = scope.spawn(|| bench.update.build(None));
             while !std::fs::read_to_string(&marks).is_ok_and(|pid| pid.ends_with('\n')) {
                 assert!(began.elapsed() < Duration::from_secs(10), "the build started");
                 std::thread::sleep(Duration::from_millis(20));
@@ -922,19 +1310,19 @@ chmod +x target/release/codefusion-runner"#;
         let bench = bench(
             "mkdir -p target/release\nprintf '#!/bin/sh\\necho codefusion-runner 0.1.0+aaaaaaaaaaaa-dirty\\n' > target/release/codefusion-runner\nchmod +x target/release/codefusion-runner",
         );
-        let said = bench.update.build().expect_err("refused");
+        let said = bench.update.build(None).expect_err("refused");
         assert!(said.contains("0.1.0+aaaaaaaaaaaa-dirty"), "{said}");
 
         let mut bench = self::bench(BUILDS);
         bench.update.fit = unsigned;
-        let said = bench.update.build().expect_err("refused");
+        let said = bench.update.build(None).expect_err("refused");
         assert!(said.ends_with("is not signed"), "{said}");
     }
 
     #[test]
     fn an_install_keeps_the_running_program_writes_the_update_down_and_places_the_new_one() {
         let bench = bench(BUILDS);
-        bench.update.build().expect("built");
+        bench.update.build(None).expect("built");
         bench.update.install(&bench.pending()).expect("installed");
         let read = |path: &Path| std::fs::read_to_string(path).expect("a file");
         assert_eq!(read(&bench.update.previous()), "the one that runs");
@@ -957,7 +1345,7 @@ chmod +x target/release/codefusion-runner"#;
     #[test]
     fn an_install_places_the_program_the_build_checked_not_what_the_checkout_has_since() {
         let bench = bench(BUILDS);
-        bench.update.build().expect("built");
+        bench.update.build(None).expect("built");
         let checked = std::fs::read_to_string(bench.update.built()).expect("the program");
         std::fs::write(bench.update.built(), "a build of another branch").expect("program");
         bench.update.install(&bench.pending()).expect("installed");
@@ -970,7 +1358,7 @@ chmod +x target/release/codefusion-runner"#;
     #[test]
     fn an_install_is_refused_while_a_machine_has_a_record_and_changes_nothing() {
         let bench = bench(BUILDS);
-        bench.update.build().expect("built");
+        bench.update.build(None).expect("built");
         std::fs::create_dir_all(&bench.update.records).expect("folder");
         std::fs::write(bench.update.records.join("job.json"), "{}").expect("record");
         assert_eq!(
@@ -988,7 +1376,7 @@ chmod +x target/release/codefusion-runner"#;
     #[test]
     fn an_install_whose_program_cannot_be_placed_leaves_no_update_written_down() {
         let mut bench = bench(BUILDS);
-        bench.update.build().expect("built");
+        bench.update.build(None).expect("built");
         bench.update.fit = unsigned;
         assert!(bench.update.install(&bench.pending()).is_err());
         assert_eq!(

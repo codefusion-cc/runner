@@ -16,6 +16,10 @@ pub struct Turn {
     /// The repository, `owner/name`. Of the jobs of one kind, those of the repository that started a job least
     /// recently go first, so one busy repository does not keep another waiting.
     pub repo: String,
+    /// Not GitHub's job but one the Mac may turn away (a test run): it gets room only as a claim does, while the Mac
+    /// takes jobs and under the limits in force (the in-use ones while the person is there), never as a job that is
+    /// already the Mac's. Waiting, it is passed over while it does not fit so, and those behind it go on.
+    pub refusable: bool,
 }
 
 /// One assigned job that waits for room.
@@ -94,6 +98,8 @@ pub enum Refusal {
     Full { cap_bytes: u64, committed_bytes: u64 },
     /// The vCPUs of the VMs would add up to more than the CPU cap.
     Cpus { cap: u32, committed: u32 },
+    /// As many VMs run as the owner allows at once ([`Settings::max_machines`]).
+    Machines { cap: u32 },
     /// The Mac could not keep its floor if every VM grew to its full size.
     Memory { short_bytes: u64 },
     /// Jobs that GitHub assigned without asking wait for room, and they go first: so many of them.
@@ -113,6 +119,7 @@ impl Refusal {
             Refusal::PersonThere => "person-there",
             Refusal::Full { .. } => "full",
             Refusal::Cpus { .. } => "cpus",
+            Refusal::Machines { .. } => "max-jobs",
             Refusal::Memory { .. } => "memory",
             Refusal::AssignedFirst { .. } => "assigned-first",
             Refusal::MakingRoom { .. } => "making-room",
@@ -284,7 +291,8 @@ pub struct Charge {
 
 /// Whether one more VM of `size` fits: the arithmetic of admission, with no memory of its own.
 ///
-/// It fits when the sizes stay within `limits.cap_bytes`, the vCPUs within `limits.cpus`, and
+/// It fits when the VMs stay within [`Settings::max_machines`], the sizes within `limits.cap_bytes`, the vCPUs
+/// within `limits.cpus`, and
 /// `available_bytes` covers what the VMs in `charges` may still grow by, the new VM in full with its overhead,
 /// and the floor. More available memory, fewer charges or looser limits never turn a yes into a no.
 pub fn admit(
@@ -297,6 +305,11 @@ pub fn admit(
     let mut committed_bytes = 0u64;
     let mut committed_cpus = 0u32;
     let mut to_come = 0u64;
+    if let Some(cap) = settings.max_machines
+        && charges.len() >= cap as usize
+    {
+        return Err(Refusal::Machines { cap });
+    }
     for charge in charges {
         committed_bytes = committed_bytes.saturating_add(charge.vm_bytes);
         committed_cpus = committed_cpus.saturating_add(charge.cpus);
@@ -491,7 +504,12 @@ impl Budget {
                 continue;
             };
             let size = self.waiting[index].size;
-            if self.assigned_fits(now, size).is_err() {
+            if self.waiter_fits(now, size, &self.waiting[index].turn).is_err() {
+                // A job that may be turned away holds up nobody behind it while it is: each behind it asks for
+                // itself.
+                if self.waiting[index].turn.refusable {
+                    continue;
+                }
                 break;
             }
             let Some(waiter) = self.waiting.remove(index) else {
@@ -542,7 +560,9 @@ impl Budget {
             return Assigned::Never(never);
         }
         let slot = self.next_id();
-        let fits = self.in_turn(size).and_then(|()| self.assigned_fits(now, size));
+        let fits = self
+            .in_turn(size)
+            .and_then(|()| self.waiter_fits(now, size, &turn));
         match fits {
             Ok(()) => {
                 self.started(&turn);
@@ -822,6 +842,17 @@ impl Budget {
         self.admits(reading, &limits, size)
     }
 
+    /// Whether a job of this turn may start now: an assigned one as [`Budget::assigned_fits`] says, one that may be
+    /// turned away ([`Turn::refusable`]) as a claim would be, under the limits in force.
+    fn waiter_fits(&self, now: Now, size: Size, turn: &Turn) -> Result<(), Refusal> {
+        if !turn.refusable {
+            return self.assigned_fits(now, size);
+        }
+        let reading = self.takes_jobs(now)?;
+        self.made_for(size)?;
+        self.admits(reading, profile_for(&self.settings, Some(reading)), size)
+    }
+
     /// The arithmetic for one more slot of `size` under `limits`, on what `reading` shows.
     fn admits(&self, reading: &HostReading, limits: &Profile, size: Size) -> Result<(), Refusal> {
         admit(
@@ -887,11 +918,13 @@ impl Budget {
                     .unwrap_or(waiter),
                 Err(_) => waiter,
             })
-            .map(|&Waiter { slot, size, .. }| {
+            .map(|Waiter { slot, size, turn, .. }| {
+                let (slot, size) = (*slot, *size);
                 let ruled_out = self.settings.can_run(size).err();
                 let why = match ruled_out {
                     Some(limit) => Some(limit),
-                    None if ahead == 0 => self.assigned_fits(now, size).err(),
+                    // What keeps the first one out is what `observe` asks of it: a test run fits as a claim would.
+                    None if ahead == 0 => self.waiter_fits(now, size, turn).err(),
                     None => Some(Refusal::AssignedFirst { waiting: ahead }),
                 };
                 ahead += usize::from(ruled_out.is_none());

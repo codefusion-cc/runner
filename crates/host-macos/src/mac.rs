@@ -271,7 +271,7 @@ pub fn cpu_percent(before: [u32; 4], now: [u32; 4]) -> Option<f64> {
 /// Whether an answer of `words` 32-bit words reaches past the last field read here. An older macOS knows fewer
 /// fields and writes fewer.
 fn has_every_field_read(words: u32) -> bool {
-    let needed = offset_of!(libc::vm_statistics64, internal_page_count) + size_of::<libc::natural_t>();
+    let needed = offset_of!(libc::vm_statistics64, total_uncompressed_pages_in_compressor) + size_of::<u64>();
     (words as usize) * size_of::<libc::integer_t>() >= needed
 }
 
@@ -312,6 +312,9 @@ impl MacHost {
         let memory = self.memory()?;
         let swap: libc::xsw_usage = sysctl(c"vm.swapusage")?;
         let pressure_level: i32 = sysctl(c"kern.memorystatus_vm_pressure_level")?;
+        let memorystatus_level = sysctl::<i32>(c"kern.memorystatus_level")
+            .ok()
+            .map(|level| u32::try_from(level).unwrap_or(u32::MAX));
         // SAFETY: no arguments; it answers with the page size or -1.
         let page_bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_bytes = u64::try_from(page_bytes).map_err(|_| HostError::Call {
@@ -329,8 +332,10 @@ impl MacHost {
             wired_pages: memory.wire_count.into(),
             anonymous_pages: memory.internal_page_count.into(),
             compressor_pages: memory.compressor_page_count.into(),
+            compressed_pages: memory.total_uncompressed_pages_in_compressor,
             swapouts: memory.swapouts,
             pressure_level,
+            memorystatus_level,
             swap_used_bytes: swap.xsu_used,
             swap_total_bytes: swap.xsu_total,
             idle_nanos: idle_nanos(),
@@ -524,11 +529,12 @@ mod tests {
 
     #[test]
     fn an_answer_that_ends_before_the_last_field_read_is_told_apart() {
-        // <mach/vm_statistics.h>: `internal_page_count` is the 36th 32-bit word of `vm_statistics64`, and macOS
-        // writes 38 today.
+        // <mach/vm_statistics.h>: `total_uncompressed_pages_in_compressor`, a 64-bit count, is the 37th and 38th
+        // 32-bit words of `vm_statistics64`, and macOS writes 38 today.
         assert!(!has_every_field_read(0));
-        assert!(!has_every_field_read(35));
-        assert!(has_every_field_read(36));
+        assert!(!has_every_field_read(36));
+        assert!(!has_every_field_read(37));
+        assert!(has_every_field_read(38));
         assert!(has_every_field_read(libc::HOST_VM_INFO64_COUNT));
     }
 }

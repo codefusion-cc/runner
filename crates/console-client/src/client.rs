@@ -38,7 +38,7 @@ pub fn is_machine_name(name: &str) -> bool {
 }
 
 /// The number of UTF-16 units, which is how the console counts a text's length.
-pub(crate) fn units(text: &str) -> usize {
+pub fn units(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
@@ -198,6 +198,12 @@ impl Client {
             token,
             http,
         }
+    }
+
+    /// The console's address this client talks to, as it was given: what a command may name of the console is
+    /// checked against it.
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     async fn post(&self, call: &str, body: Vec<u8>) -> Result<Response, Error> {

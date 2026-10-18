@@ -50,6 +50,8 @@ pub struct Settings {
     pub guest_overhead_bytes: u64,
     /// vCPUs of a VM of each size, in the order of [`Size::ALL`].
     pub vcpus: [u32; 4],
+    /// The most VMs at once, whatever the caps leave room for; `None` for as many as they do.
+    pub max_machines: Option<u32>,
     /// Once the Mac was under its floor, it must be this far above it before that counts as over.
     pub recover_margin_bytes: u64,
     /// How long nothing may be wrong before slots open again.
@@ -74,6 +76,17 @@ pub struct Settings {
     pub reservation_ttl: Millis,
     /// A reading older than this, or two readings further apart, close the Mac.
     pub stale_after: Millis,
+}
+
+/// What the host's owner set on top of the defaults ([`Settings::limited`]); `None` keeps the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// The most VMs at once: [`Settings::max_machines`].
+    pub max_machines: Option<u32>,
+    /// How long the keyboard and the mouse must rest before the person counts as away: [`Settings::idle_after`].
+    pub idle_after: Option<Millis>,
+    /// The floor in percent of the installed memory, whole: what the host keeps available for itself.
+    pub floor_percent: Option<u32>,
 }
 
 /// A setting the budget refuses, with what is wrong. Settings come from a file, the tray and the console, so a bad
@@ -110,6 +123,12 @@ pub enum SettingsError {
     /// An overhead as large as the smallest VM leaves a job nothing.
     #[error("the guest or host overhead leaves the smallest VM nothing")]
     OverheadTooLarge,
+    /// A limit of no VM at all.
+    #[error("the most machines at once is zero")]
+    NoMachines,
+    /// A floor that is no share of the memory, or all of it.
+    #[error("a floor of {percent}% is not between 1% and 90% of the memory")]
+    FloorPercent { percent: u32 },
     /// A duration of zero where the budget waits or measures.
     #[error("{what} is zero")]
     ZeroDuration { what: &'static str },
@@ -149,8 +168,9 @@ impl Settings {
     ///   workstation whose person is away, and nothing while the person is there. A 16 GB Mac: 12 GB and 9.6 GB.
     /// - Floor: 2 GB, 3 GB and 4 GB on a 16 GB Mac (dedicated, away, in use).
     /// - CPUs: all cores but two; half the cores while the person is there. 2 vCPUs for `cf-2g` and 4 for
-    ///   `cf-6g` and `cf-8g`. `cf-4g` gets half of the CPUs CI may use, at most 4 and at least 2, so that two of
-    ///   them run side by side: 4 on a Mac with 10 cores, 3 on one with 8 (what the Go manager gave a job there).
+    ///   `cf-6g` and `cf-8g`. `cf-4g` gets half of the CPUs CI may use, at most 4 and at least 2, so that another
+    ///   machine runs beside it: 4 on a Mac with 10 cores, 3 on one with 8 (what the Go manager gave a job there).
+    ///   Where the cap leaves no room beside a `cf-4g` (an 8 GB Mac), it takes up to 4 of them ([`vcpus_for`]).
     /// - 15 minutes without the person, a 2 minute reservation, 60 s of calm, 30 s after a swap-out, and a job
     ///   stopped after 10 s of critical pressure on a workstation, 30 s on a dedicated Mac.
     pub fn for_host(facts: HostFacts, mode: Mode) -> Settings {
@@ -187,7 +207,8 @@ impl Settings {
             idle_after: Millis::mins(15),
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
-            vcpus: vcpus_for(all_but_two),
+            vcpus: vcpus_for(all_but_two, away.cap_bytes),
+            max_machines: None,
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),
@@ -233,7 +254,8 @@ impl Settings {
     ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
     /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
     ///   two, as on a Mac. 2 vCPUs for cf-2g, half the CPUs for cf-4g (at least 2, at most 4), 4 for the larger
-    ///   sizes: on 4 fast cores, two machines of 2 vCPUs.
+    ///   sizes: on 4 fast cores, two machines of 2 vCPUs. A cf-4g with no room beside it under the cap takes up to
+    ///   4 ([`vcpus_for`]): on 7.75 GB, the four fast cores, which no other machine could use while it runs.
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
         let total = facts.total_bytes;
@@ -243,7 +265,6 @@ impl Settings {
         } else {
             settings.away.cpus
         };
-        settings.vcpus = vcpus_for(cpus);
         let floor = GIB + total / 32;
         let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
         let limits = Profile {
@@ -254,9 +275,50 @@ impl Settings {
             floor_bytes: floor,
             cpus,
         };
+        settings.vcpus = vcpus_for(cpus, limits.cap_bytes);
         settings.away = limits;
         settings.in_use = limits;
         settings
+    }
+
+    /// The floor an owner may set, in percent of the memory ([`Limits::floor_percent`]).
+    pub const FLOOR_PERCENT: std::ops::RangeInclusive<u32> = 1..=90;
+
+    /// These settings with what the owner set on top of them, checked.
+    ///
+    /// - The most machines at once, when set.
+    /// - The time without the person, which only a workstation waits for.
+    /// - The floor as a share of the memory, 1% to 90%, and never under [`Settings::LEAST_FLOOR`]. It is the floor
+    ///   on a dedicated host and on a workstation whose person is away; while a workstation's person is there the
+    ///   floor stays the higher of the two. A cap that would leave the host less than its floor is lowered to what is left.
+    pub fn limited(mut self, limits: &Limits) -> Result<Settings, SettingsError> {
+        self.max_machines = limits.max_machines.or(self.max_machines);
+        if let Some(idle_after) = limits.idle_after {
+            self.idle_after = idle_after;
+        }
+        if let Some(percent) = limits.floor_percent {
+            if !Self::FLOOR_PERCENT.contains(&percent) {
+                return Err(SettingsError::FloorPercent { percent });
+            }
+            let floor = crate::percent_of(self.total_bytes, percent);
+            self.away.floor_bytes = floor;
+            self.in_use.floor_bytes = self.in_use.floor_bytes.max(floor);
+            let away_cap = self.away.cap_bytes.min(self.total_bytes.saturating_sub(floor));
+            if away_cap != self.away.cap_bytes {
+                self.away.cap_bytes = away_cap;
+                self.vcpus = vcpus_for(self.away.cpus, away_cap);
+            }
+            self.in_use.cap_bytes = self
+                .in_use
+                .cap_bytes
+                .min(self.total_bytes.saturating_sub(self.in_use.floor_bytes));
+            // Nobody is ever there on a dedicated host: one set of limits.
+            if self.mode == Mode::Dedicated {
+                self.in_use = self.away;
+            }
+        }
+        self.check()?;
+        Ok(self)
     }
 
     /// The cap "Also while I work" gives a workstation: all memory but 60% (at least 5.5 GB). A 16 GB Mac: 6.4 GB.
@@ -324,6 +386,9 @@ impl Settings {
                 return Err(SettingsError::ZeroDuration { what });
             }
         }
+        if self.max_machines == Some(0) {
+            return Err(SettingsError::NoMachines);
+        }
         if self.disk_evict_bytes > self.disk_hold_bytes {
             return Err(SettingsError::DiskLimitsCrossed);
         }
@@ -340,7 +405,9 @@ impl Settings {
     /// the Mac has the memory for each is decided when it is asked for.
     pub fn side_by_side(&self, limits: &Profile, size: Size) -> u32 {
         let by_cap = u32::try_from(limits.cap_bytes / size.vm_bytes().max(1)).unwrap_or(u32::MAX);
-        by_cap.min(limits.cpus / self.vcpus_of(size).max(1))
+        by_cap
+            .min(limits.cpus / self.vcpus_of(size).max(1))
+            .min(self.max_machines.unwrap_or(u32::MAX))
     }
 
     /// vCPUs of a VM of this size.
@@ -359,8 +426,13 @@ impl Settings {
     }
 }
 
-/// The vCPUs of each size where CI may use `cpus`: 2 for cf-2g, half of them for cf-4g (at least 2, at most 4), so
-/// that two run side by side, and 4 for the larger sizes.
-fn vcpus_for(cpus: u32) -> [u32; 4] {
-    [2, (cpus / 2).clamp(2, 4), 4, 4]
+/// The vCPUs of each size where CI may use `cpus` and the sizes of all machines may add up to `cap_bytes`: 2 for
+/// cf-2g, 4 for the larger sizes, and for cf-4g half of the CPUs (at least 2, at most 4), so that another machine
+/// runs beside it. Where the cap has no room for even a cf-2g beside a cf-4g, the cf-4g runs alone and takes all of
+/// them, at most 4: half would leave the rest idle for as long as it runs. Measured on an RK3588 board with 4 fast
+/// cores, a Vitest suite took 210 s on 2 of them and 95 s on all 4.
+fn vcpus_for(cpus: u32, cap_bytes: u64) -> [u32; 4] {
+    let alone = cap_bytes < Size::G4.vm_bytes() + Size::G2.vm_bytes();
+    let g4 = if alone { cpus } else { cpus / 2 };
+    [2, g4.clamp(2, 4), 4, 4]
 }

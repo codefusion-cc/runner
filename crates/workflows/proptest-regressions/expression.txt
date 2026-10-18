@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c355351ff4e57b6d690716f70405b28a8e1e70e7f8fc312e0907bf5c35cef0c3 # shrinks to x = "", y = ""
+cc b3b1dcf5bac7abaef4dd2a3836dbe285acb04ecd88932c23b7e9e3a18efd2ffe # shrinks to x = ""
+cc ccea88fc7dcd66bb5eaf1cbef42803ca9a10058a67b2361444c9667b9e346014 # shrinks to a = "''", depth = 1
+cc 2103995df0a2b2d80dbbee3a224720f7e7242916d7f3b9417ce579f802329969 # shrinks to a = "''", b = "''"
+cc 3e86f54263a53d6307bec24856caf6510050a6a166dfa6f13bc1e7567b56b8d4 # shrinks to a = "fromJSON(true)", depth = 1
+cc a5a4ded1ac9bea00e8201287efaee9cdd368383e92f19536be035a9121b46cd4 # shrinks to a = "''", b = "format('{1}-{{{0}}}', '', fromJSON(true))"

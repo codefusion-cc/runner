@@ -20,6 +20,12 @@ pub const DOCKER_LABEL: &str = "cf-docker";
 /// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
 
+/// The most labels one set may name. A `runs-on` names a handful; a stranger's pull request could name thousands.
+pub const MAX_SET_LABELS: usize = 16;
+
+/// The longest label of a set that is served.
+pub const MAX_LABEL_BYTES: usize = 64;
+
 /// Labels that name a platform these Actions runners are not: a job asking for one of them is left to other Actions
 /// runners.
 const FOREIGN: [&str; 6] = ["macos", "osx", "windows", "x64", "x86", "arm"];
@@ -44,6 +50,40 @@ impl LabelSet {
         LabelSet(sorted.into_iter().collect())
     }
 
+    /// The set these Actions runners serve for a job that asks for `labels`: a `runs-on` whose expressions are
+    /// read, or a job's labels as GitHub's jobs API names them. Lowercased and without repeats, at most
+    /// [`MAX_SET_LABELS`] labels, each of letters, digits (in any script), `-`, `_` and `.` and at most
+    /// [`MAX_LABEL_BYTES`] long; none empty, none of another platform, and one of them ours: [`POOL_LABEL`], [`DOCKER_LABEL`] or a
+    /// size. `None` for any other: such a job is left to other Actions runners.
+    pub fn served<I, S>(labels: I) -> Option<LabelSet>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut set = BTreeSet::new();
+        for label in labels {
+            let label = label.as_ref().trim();
+            if label.is_empty() || label.len() > MAX_LABEL_BYTES {
+                return None;
+            }
+            // No comma, space or other sign: a set's key joins its labels with commas, so one label must never
+            // read as two.
+            let label = label.to_lowercase();
+            let plain = label
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if !plain || label.len() > MAX_LABEL_BYTES || FOREIGN.contains(&label.as_str()) {
+                return None;
+            }
+            set.insert(label);
+            if set.len() > MAX_SET_LABELS {
+                return None;
+            }
+        }
+        let set = LabelSet(set.into_iter().collect());
+        set.0.iter().any(|label| is_ours(label)).then_some(set)
+    }
+
     /// The labels, sorted.
     pub fn labels(&self) -> &[String] {
         &self.0
@@ -63,6 +103,39 @@ impl LabelSet {
     pub fn docker(&self) -> bool {
         self.contains(DOCKER_LABEL)
     }
+
+    /// The host labels the set asks for ([`is_host_label`]): only a host that has every one of them serves it.
+    pub fn host_labels(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .iter()
+            .map(String::as_str)
+            .filter(|label| is_host_label(label))
+    }
+}
+
+/// What [`is_host_label`] takes, for a person who wrote another label.
+pub const HOST_LABEL_RULE: &str = "`cf-` and a name of lowercase letters, digits and single dashes that starts with a \
+     letter, 40 characters at most, and no label jobs ask for by itself, such as a size or cf-docker";
+
+/// Whether a (lowercase) label names hosts rather than a machine: `cf-` and a name of lowercase letters, digits and
+/// single dashes that starts with a letter, 40 characters in all at most, and no label these Actions runners serve
+/// (a size, [`DOCKER_LABEL`]): `cf-macos`, `cf-linux`. A host serves a set with host labels only when its config
+/// lists every one of them, so a job asks for a kind of host with `[cf-8g, cf-macos]`. A host label alone names no
+/// size.
+pub fn is_host_label(label: &str) -> bool {
+    // HOST_LABEL_RULE says this in words.
+    let Some(name) = label.strip_prefix("cf-") else {
+        return false;
+    };
+    label.len() <= 40
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        // Never a label these Actions runners serve themselves (a size, cf-docker), whatever is added to those.
+        && !is_ours(label)
 }
 
 /// [`self_hosted_with`] without repository variables: every expression over variables stands for [`POOL_LABEL`].
@@ -110,20 +183,28 @@ pub fn self_hosted_with(files: &BTreeMap<String, Vec<u8>>, vars: &BTreeMap<Strin
                 .and_then(Node::as_str);
             if let (true, Some(input)) = (uses, input)
                 && is_pool_expression(input)
+                && let Some(set) = LabelSet::served(resolve(input, vars))
             {
-                seen.insert(LabelSet::new([resolve(input, vars)]));
+                seen.insert(set);
             }
         }
     }
     seen.into_iter().collect()
 }
 
-/// What a pool expression stands for: the label of these Actions runners it evaluates to, else [`POOL_LABEL`].
-fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> String {
+/// What a pool expression stands for: the labels it evaluates to when one of them is a label of these Actions
+/// runners, else [`POOL_LABEL`].
+fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> Vec<String> {
     evaluate(expression, vars)
-        .map(|v| v.trim().to_lowercase())
-        .filter(|v| is_ours(v))
-        .unwrap_or_else(|| POOL_LABEL.to_string())
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|label| label.trim().to_lowercase())
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|labels| labels.iter().any(|label| is_ours(label)))
+        .unwrap_or_else(|| vec![POOL_LABEL.to_string()])
 }
 
 /// A node of a workflow file, as far as labels go: a scalar keeps the text YAML gives it, and a mapping's keys are
@@ -256,19 +337,13 @@ fn label_set(node: &Node, vars: &BTreeMap<String, String>) -> Option<LabelSet> {
 
     let mut set = Vec::with_capacity(labels.len());
     for label in labels {
-        let label = if is_pool_expression(&label) {
-            resolve(&label, vars)
+        if is_pool_expression(&label) {
+            set.extend(resolve(&label, vars));
         } else {
-            label
-        };
-        let label = label.trim().to_lowercase();
-        if label.is_empty() || label.contains("${{") || FOREIGN.contains(&label.as_str()) {
-            return None;
+            set.push(label);
         }
-        set.push(label);
     }
-    let set = LabelSet::new(set);
-    set.labels().iter().any(|l| is_ours(l)).then_some(set)
+    LabelSet::served(set)
 }
 
 /// Whether a (lowercase) label is one these Actions runners serve: [`POOL_LABEL`], [`DOCKER_LABEL`] or a size.

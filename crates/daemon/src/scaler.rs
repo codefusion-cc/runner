@@ -264,9 +264,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         match message.statistics {
             Some(stats) => {
                 // A start or an end GitHub's word did not tie to its assignment leaves no job behind for long.
-                let running = usize::try_from(stats.total_running_jobs).unwrap_or(0);
-                let unstarted = stats.assigned().saturating_sub(running);
-                let gone = self.pending.len().saturating_sub(unstarted);
+                let gone = self.pending.len().saturating_sub(stats.unstarted());
                 self.pending.drain(..gone);
                 self.wanted = Some(stats.assigned());
                 *self.last.lock().expect("statistics") = Some(stats);
@@ -330,12 +328,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let first = self.promised.len();
         let mut refusal = None;
         for _ in 0..ids.len() {
-            let reserved = if self.config.docker {
-                self.slots.reserve_docker(self.config.size)
-            } else {
-                self.slots.reserve(self.config.size)
-            };
-            match reserved {
+            match self.slots.reserve_for(self.config.size, self.config.docker) {
                 Ok(ticket) => self.promised.push(Promise {
                     ticket,
                     since: self.clock.now(),
@@ -463,82 +456,22 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     async fn start(&mut self, ticket: Ticket) -> Result<(), Error> {
-        let mut tries = 0;
-        let (name, jit) = loop {
-            tries += 1;
-            // Never the name of an Actions runner this machine has: its record is kept under the name.
-            let name = loop {
-                let name = runner_name(&self.config.machine, rand::random::<u32>());
-                if self.roster.get(&name).is_none() {
-                    break name;
-                }
-            };
-            self.hosts
-                .registering(&name, &self.config.repo, self.config.scale_set_id);
-            match self.registry.generate_jit(&name).await {
-                Ok(jit) => break (name, jit),
-                Err(e) => {
-                    // A refusal leaves nothing at GitHub; anything else may have registered the name before it
-                    // failed. A taken name is no refusal: only this machine makes names that begin with its own,
-                    // so the name is taken by a try of this call whose answer was lost on the way.
-                    let refused = e
-                        .status()
-                        .is_some_and(|status| (400..500).contains(&status) && status != 409);
-                    if refused {
-                        self.hosts.not_registered(&name);
-                    } else {
-                        self.hosts.registration_unsure(&name);
-                    }
-                    // The name is taken: names are random, another try uses another.
-                    if e.status() == Some(409) && tries < NAME_TRIES {
-                        continue;
-                    }
-                    tracing::warn!(runner = %name, error = %e, "could not register an Actions runner");
-                    return Err(e);
-                }
-            }
-        };
-        let runner_id = jit.runner.id;
-        let spec = RunnerSpec {
-            name: name.clone(),
-            repo: self.config.repo.clone(),
+        let at = Start {
+            machine: &self.config.machine,
+            repo: &self.config.repo,
             scale_set_id: self.config.scale_set_id,
-            runner_id,
             size: self.config.size,
-            default_branch: self.config.default_branch.clone(),
+            default_branch: self.config.default_branch.as_deref(),
+        };
+        start_runner(
+            &self.registry,
+            &self.hosts,
+            &self.roster,
+            &*self.clock,
+            at,
             ticket,
-            jit_config: jit.encoded,
-        };
-        let handle = match self.hosts.start(spec).await {
-            Ok(handle) => handle,
-            Err(e) => {
-                match self.registry.remove_runner(runner_id).await {
-                    Ok(()) => self.hosts.not_registered(&name),
-                    Err(remove) if remove.is_not_found() => self.hosts.not_registered(&name),
-                    // The host keeps the name as a registration to remove.
-                    Err(remove) => {
-                        tracing::warn!(runner = %name, error = %remove, "could not unregister an Actions runner that failed to start");
-                    }
-                }
-                return Err(Error::Scaler(format!(
-                    "start the machine of Actions runner {name}: {e}"
-                )));
-            }
-        };
-        self.roster.add(Runner {
-            name: name.clone(),
-            handle,
-            runner_id,
-            repo: self.config.repo.clone(),
-            scale_set_id: self.config.scale_set_id,
-            ticket: Some(ticket),
-            started: self.clock.now(),
-            busy: false,
-            adopted: false,
-            done: None,
-            job: None,
-        });
-        tracing::info!(runner = %name, "Actions runner started");
+        )
+        .await?;
         Ok(())
     }
 
@@ -587,7 +520,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         self.roster
             .runners(repo, id)
             .iter()
-            .filter(|runner| !runner.busy && runner.done.is_none())
+            .filter(|runner| runner.waits())
             .count()
     }
 
@@ -629,6 +562,110 @@ impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
         self.expire_promises();
         Ok(self.capacity())
     }
+}
+
+/// Where an Actions runner is registered and what machine it gets.
+#[derive(Debug, Clone, Copy)]
+pub struct Start<'a> {
+    /// This machine's name, the start of every Actions runner's name.
+    pub machine: &'a str,
+    /// The repository, `owner/name`.
+    pub repo: &'a str,
+    /// The scale set, or [`crate::held::OWN`] for an Actions runner of its own.
+    pub scale_set_id: i64,
+    /// The machine's size.
+    pub size: Size,
+    /// The repository's default branch, when GitHub named it: only a run there writes a cache.
+    pub default_branch: Option<&'a str>,
+}
+
+/// Registers an Actions runner with `registry` and starts its machine in the slot `ticket`, which is the machine's
+/// from then on. Says the Actions runner's name. After an error the slot is still the caller's, and nothing is left
+/// at GitHub that the host does not know to remove.
+pub async fn start_runner<R: Registry, H: Hosts>(
+    registry: &R,
+    hosts: &H,
+    roster: &Roster,
+    clock: &dyn Clock,
+    at: Start<'_>,
+    ticket: Ticket,
+) -> Result<String, Error> {
+    let mut tries = 0;
+    let (name, jit) = loop {
+        tries += 1;
+        // Never the name of an Actions runner this machine has: its record is kept under the name.
+        let name = loop {
+            let name = runner_name(at.machine, rand::random::<u32>());
+            if roster.get(&name).is_none() {
+                break name;
+            }
+        };
+        hosts.registering(&name, at.repo, at.scale_set_id);
+        match registry.generate_jit(&name).await {
+            Ok(jit) => break (name, jit),
+            Err(e) => {
+                // A refusal leaves nothing at GitHub; anything else may have registered the name before it
+                // failed. A taken name is no refusal: only this machine makes names that begin with its own,
+                // so the name is taken by a try of this call whose answer was lost on the way.
+                let refused = e
+                    .status()
+                    .is_some_and(|status| (400..500).contains(&status) && status != 409);
+                if refused {
+                    hosts.not_registered(&name);
+                } else {
+                    hosts.registration_unsure(&name);
+                }
+                // The name is taken: names are random, another try uses another.
+                if e.status() == Some(409) && tries < NAME_TRIES {
+                    continue;
+                }
+                tracing::warn!(runner = %name, error = %e, "could not register an Actions runner");
+                return Err(e);
+            }
+        }
+    };
+    let runner_id = jit.runner.id;
+    let spec = RunnerSpec {
+        name: name.clone(),
+        repo: at.repo.to_string(),
+        scale_set_id: at.scale_set_id,
+        runner_id,
+        size: at.size,
+        default_branch: at.default_branch.map(str::to_string),
+        ticket,
+        jit_config: jit.encoded,
+    };
+    let handle = match hosts.start(spec).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            match registry.remove_runner(runner_id).await {
+                Ok(()) => hosts.not_registered(&name),
+                Err(remove) if remove.is_not_found() => hosts.not_registered(&name),
+                // The host keeps the name as a registration to remove.
+                Err(remove) => {
+                    tracing::warn!(runner = %name, error = %remove, "could not unregister an Actions runner that failed to start");
+                }
+            }
+            return Err(Error::Scaler(format!(
+                "start the machine of Actions runner {name}: {e}"
+            )));
+        }
+    };
+    roster.add(Runner {
+        name: name.clone(),
+        handle,
+        runner_id,
+        repo: at.repo.to_string(),
+        scale_set_id: at.scale_set_id,
+        ticket: Some(ticket),
+        started: clock.now(),
+        busy: false,
+        adopted: false,
+        done: None,
+        job: None,
+    });
+    tracing::info!(runner = %name, "Actions runner started");
+    Ok(name)
 }
 
 /// Whether two messages speak of the same job: by its request ID when both carry one, else by its run and name. The

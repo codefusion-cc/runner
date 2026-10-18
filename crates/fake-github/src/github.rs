@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,8 +33,9 @@ pub struct Options {
     /// - It looks at no other time unless a test says so ([`FakeGithub::github_looks`]). Seen: GitHub also looks by
     ///   itself, sometimes within 30 s of room (probes J1, I2), sometimes after 2.5 minutes (A, G), sometimes not in
     ///   3 minutes (J2, J3), and not for 13 minutes on the mini (18:39 to 18:52). Nothing the Runner does makes it
-    ///   look: not a session opened (probes E, F), not a scale set updated (I1), not an Actions runner registered
-    ///   (J1 to J3).
+    ///   look: not a session opened (probes E, F), not a scale set updated (I1, L), not an Actions runner registered
+    ///   (J1 to J3, L), but for one registered outside any scale set that comes online (N,
+    ///   [`FakeGithub::runner_online`]).
     /// - It gives each scale set with a session as many jobs as the smaller room of its last two polls' `x-scalesetmaxcapacity`
     ///   leaves. Seen: probe E assigned against the poll before the newest, probe J1 against the newest alone; the
     ///   smaller is no kinder than either. Inferred: which poll GitHub reads.
@@ -78,6 +79,10 @@ struct Job {
     request_id: i64,
     repo: String,
     labels: Vec<String>,
+    /// The labels as the job's `runs-on` wrote them, which the REST view of its run shows.
+    written: Vec<String>,
+    /// When it was queued, on GitHub's clock.
+    created_at: i64,
     display_name: String,
     /// The ref its workflow runs at, `refs/heads/main` or `refs/pull/<n>/merge`.
     git_ref: String,
@@ -127,8 +132,15 @@ struct ScaleSet {
 struct Runner {
     id: i64,
     name: String,
+    /// Its scale set; [`PLAIN`] for one registered outside any.
     scale_set: i64,
+    repo: String,
+    /// What one registered outside a scale set carries: it takes a queued job of its repository whose labels it has.
+    labels: Vec<String>,
 }
+
+/// The scale set of an Actions runner registered outside any, with the REST API's `generate-jitconfig`.
+const PLAIN: i64 = 0;
 
 #[derive(Debug, Clone)]
 struct Repo {
@@ -150,6 +162,8 @@ type Hook = Box<dyn FnOnce(&FakeGithub) + Send>;
 pub struct Logged {
     /// `METHOD path`.
     pub line: String,
+    /// The query's pairs.
+    pub query: Vec<(String, String)>,
     /// The Authorization header, as sent.
     pub authorization: Option<String>,
     /// The request body.
@@ -229,6 +243,10 @@ struct State {
     down: bool,
     /// How often a job was handed to a scale set, the same job again after a take-back included.
     assignments: usize,
+    /// How many conditional requests were answered 304 Not Modified.
+    not_modified: usize,
+    /// The runs of a pull request from a fork.
+    forks: BTreeSet<i64>,
 }
 
 struct Inner {
@@ -302,6 +320,17 @@ impl State {
 
     fn scale_set(&mut self, id: i64) -> Option<&mut ScaleSet> {
         self.scale_sets.iter_mut().find(|s| s.id == id && !s.deleted)
+    }
+
+    fn offers_room(&self, repo: &str) -> bool {
+        self.scale_sets.iter().any(|s| {
+            s.repo == repo
+                && !s.deleted
+                && s.session.is_some()
+                && s.capacity
+                    .zip(s.previous_capacity)
+                    .is_some_and(|(newest, before)| newest.min(before) > self.stats(s.id).assigned)
+        })
     }
 
     fn stats(&self, id: i64) -> Stats {
@@ -384,6 +413,46 @@ impl State {
         v
     }
 
+    /// A run's status as its REST view says it: `queued` while every job waits, `completed` once all ended,
+    /// `in_progress` between.
+    /// When a run last changed, as its REST view says: a time that moves whenever the status of one of its jobs
+    /// does. (GitHub's moves with more; what counts is that it moves with that.)
+    fn run_updated(&self, run_id: i64, created: i64) -> i64 {
+        let digest = sha_of(&self.run_states(run_id).join(","));
+        created + 1 + i64::from_str_radix(&digest[..5], 16).unwrap_or(0)
+    }
+
+    /// The REST status of each job of a run.
+    fn run_states(&self, run_id: i64) -> Vec<&'static str> {
+        self.jobs
+            .iter()
+            .filter(|j| j.run_id == run_id)
+            .map(|j| job_status(&j.state))
+            .collect()
+    }
+
+    fn run_status(&self, run_id: i64) -> &'static str {
+        let states = self.run_states(run_id);
+        if states.iter().all(|s| *s == "queued") {
+            "queued"
+        } else if states.iter().all(|s| *s == "completed") {
+            "completed"
+        } else {
+            "in_progress"
+        }
+    }
+
+    /// A JSON answer with its ETag, or 304 with no body when the request named that ETag already.
+    fn conditional(&mut self, req: &Request, body: &Value) -> Reply {
+        let text = serde_json::to_string(body).expect("json");
+        let etag = format!("W/\"{}\"", sha_of(&text));
+        if req.header("if-none-match") == Some(etag.as_str()) {
+            self.not_modified += 1;
+            return Reply::empty(304).with_header("etag", &etag);
+        }
+        Reply::json(body).with_header("etag", &etag)
+    }
+
     fn eligible_sets(&self, job: &Job) -> Vec<i64> {
         self.scale_sets
             .iter()
@@ -391,6 +460,23 @@ impl State {
             .map(|s| s.id)
             .collect()
     }
+}
+
+/// A job's status as the REST view of its run says it.
+fn job_status(state: &JobState) -> &'static str {
+    match state {
+        JobState::Available | JobState::Acquired(_) => "queued",
+        JobState::Running(_) | JobState::TakenElsewhere => "in_progress",
+        JobState::Completed(_) => "completed",
+    }
+}
+
+/// A listing's `per_page`: GitHub's 30 when it names none, 100 at most.
+fn page_size(req: &Request) -> usize {
+    req.query("per_page")
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(30)
+        .clamp(1, 100)
 }
 
 /// A scale set takes a job when it carries every label the job asks for.
@@ -430,6 +516,8 @@ impl FakeGithub {
                 run_heads: HashMap::new(),
                 down: false,
                 assignments: 0,
+                not_modified: 0,
+                forks: BTreeSet::new(),
             }),
             notify: Notify::new(),
         });
@@ -619,43 +707,84 @@ impl FakeGithub {
     /// [`FakeGithub::queue_job`] for a job whose workflow runs at `git_ref`: a `refs/pull/...` ref is a pull request's
     /// (event `pull_request`), any other a push's.
     pub fn queue_job_at(&self, repo: &str, labels: &[&str], display_name: &str, git_ref: &str) -> i64 {
+        self.queue_run(repo, &[(labels, display_name)], git_ref)[0]
+    }
+
+    /// Queues the jobs of one workflow run at `git_ref`, each with its labels and name, as [`FakeGithub::queue_job`]
+    /// does. Returns their request IDs, which are also the IDs the REST view of the run gives its jobs.
+    pub fn queue_run(&self, repo: &str, jobs: &[(&[&str], &str)], git_ref: &str) -> Vec<i64> {
         let mut st = self.lock();
-        st.next_job += 1;
-        let job = Job {
-            request_id: st.next_job,
-            repo: repo.to_string(),
-            labels: labels.iter().map(|l| l.to_lowercase()).collect(),
-            display_name: display_name.to_string(),
-            git_ref: git_ref.to_string(),
-            run_id: 7000 + st.next_job,
-            state: JobState::Available,
-            assigned_at: 0,
-        };
-        let id = job.request_id;
-        let sets = if st.opts.auto_assign {
-            vec![]
-        } else {
-            st.eligible_sets(&job)
-        };
-        for set in sets {
-            let msg = st.job_message(
-                "JobAvailable",
-                &job,
-                json!({"acquireJobUrl": "https://unused.invalid"}),
-            );
-            st.push(set, vec![msg]);
+        let run_id = 7000 + st.next_job + 1;
+        let mut ids = Vec::new();
+        for (labels, display_name) in jobs {
+            st.next_job += 1;
+            let job = Job {
+                request_id: st.next_job,
+                repo: repo.to_string(),
+                labels: labels.iter().map(|l| l.to_lowercase()).collect(),
+                written: labels.iter().map(|l| l.to_string()).collect(),
+                created_at: st.now(),
+                display_name: display_name.to_string(),
+                git_ref: git_ref.to_string(),
+                run_id,
+                state: JobState::Available,
+                assigned_at: 0,
+            };
+            ids.push(job.request_id);
+            let sets = if st.opts.auto_assign {
+                vec![]
+            } else {
+                st.eligible_sets(&job)
+            };
+            for set in sets {
+                let msg = st.job_message(
+                    "JobAvailable",
+                    &job,
+                    json!({"acquireJobUrl": "https://unused.invalid"}),
+                );
+                st.push(set, vec![msg]);
+            }
+            st.jobs.push(job);
         }
-        st.jobs.push(job);
         look_at_the_queue(&mut st);
         drop(st);
         self.inner.notify.notify_waiters();
-        id
+        ids
+    }
+
+    /// Ends a job as its run shows it, whoever ran it: an Actions runner elsewhere, or a cancel before any took it.
+    pub fn end_job(&self, request_id: i64, result: &str) {
+        let mut st = self.lock();
+        if let Some(job) = st.jobs.iter_mut().find(|j| j.request_id == request_id) {
+            job.state = JobState::Completed(result.to_string());
+        }
+        look_at_the_queue(&mut st);
+        drop(st);
+        self.inner.notify.notify_waiters();
     }
 
     /// GitHub looks at its queue by itself, as it does at times nobody can predict: every scale set with a session
     /// gets the queued jobs its polls have room for.
     pub fn github_looks(&self) {
         let mut st = self.lock();
+        take_back(&mut st);
+        look_at_the_queue(&mut st);
+        drop(st);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// The Actions runner of this name, registered outside any scale set, comes online: GitHub looks at its queue,
+    /// as it did within seconds in probe N, and may hand a job to a scale set rather than to it. An Actions runner
+    /// of a scale set, or one not registered, changes nothing (probes J1 to J3, L).
+    pub fn runner_online(&self, runner_name: &str) {
+        let mut st = self.lock();
+        if !st
+            .runners
+            .iter()
+            .any(|r| r.name == runner_name && r.scale_set == PLAIN)
+        {
+            return;
+        }
         take_back(&mut st);
         look_at_the_queue(&mut st);
         drop(st);
@@ -673,7 +802,9 @@ impl FakeGithub {
         self.inner.notify.notify_waiters();
     }
 
-    /// The Actions runner with this name takes its job and starts it.
+    /// The Actions runner with this name takes its job and starts it: one of a scale set a job assigned to the scale
+    /// set, one registered outside any the oldest queued job of its repository whose labels it has. Nothing happens
+    /// when there is none.
     pub fn start_job(&self, runner_name: &str) {
         let mut st = self.lock();
         if take_back(&mut st) {
@@ -682,21 +813,28 @@ impl FakeGithub {
         let Some(runner) = st.runners.iter().find(|r| r.name == runner_name).cloned() else {
             return;
         };
-        let Some(i) = st
-            .jobs
-            .iter()
-            .position(|j| j.state == JobState::Acquired(runner.scale_set))
-        else {
+        let Some(i) = st.jobs.iter().position(|j| {
+            if runner.scale_set == PLAIN {
+                j.state == JobState::Available && j.repo == runner.repo && matches(&runner.labels, &j.labels)
+            } else {
+                j.state == JobState::Acquired(runner.scale_set)
+            }
+        }) else {
             return;
         };
         st.jobs[i].state = JobState::Running(runner.name.clone());
         let job = st.jobs[i].clone();
-        let msg = st.job_message(
-            "JobStarted",
-            &job,
-            json!({"runnerId": runner.id, "runnerName": runner.name}),
-        );
-        st.push(runner.scale_set, vec![msg]);
+        if runner.scale_set == PLAIN {
+            // A job taken from the queue, as by an Actions runner elsewhere.
+            look_at_the_queue(&mut st);
+        } else {
+            let msg = st.job_message(
+                "JobStarted",
+                &job,
+                json!({"runnerId": runner.id, "runnerName": runner.name}),
+            );
+            st.push(runner.scale_set, vec![msg]);
+        }
         drop(st);
         self.inner.notify.notify_waiters();
     }
@@ -774,6 +912,16 @@ impl FakeGithub {
         self.lock().runners.iter().map(|r| r.name.clone()).collect()
     }
 
+    /// The Actions runners currently registered outside any scale set, each with its repository and labels.
+    pub fn plain_runners(&self) -> Vec<(String, String, Vec<String>)> {
+        self.lock()
+            .runners
+            .iter()
+            .filter(|r| r.scale_set == PLAIN)
+            .map(|r| (r.name.clone(), r.repo.clone(), r.labels.clone()))
+            .collect()
+    }
+
     /// The Actions runners whose registration a DELETE removed (answered 204), not their own end after a job.
     pub fn removed_at_request(&self) -> Vec<String> {
         self.lock().removed_at_request.clone()
@@ -782,15 +930,17 @@ impl FakeGithub {
     /// Whether a scale set of `repo` with a session offered room beyond the jobs it holds in both of its last two
     /// polls: a job of that repository queued now goes to it at once. Another repository's room is no room for it.
     pub fn offers_room(&self, repo: &str) -> bool {
+        self.lock().offers_room(repo)
+    }
+
+    /// Whether this job waits in the queue while a scale set of its repository offers room
+    /// ([`FakeGithub::offers_room`]): GitHub's next look hands it out.
+    pub fn offers_room_for(&self, request_id: i64) -> bool {
         let st = self.lock();
-        st.scale_sets.iter().any(|s| {
-            s.repo == repo
-                && !s.deleted
-                && s.session.is_some()
-                && s.capacity
-                    .zip(s.previous_capacity)
-                    .is_some_and(|(newest, before)| newest.min(before) > st.stats(s.id).assigned)
-        })
+        st.jobs
+            .iter()
+            .find(|j| j.request_id == request_id)
+            .is_some_and(|j| j.state == JobState::Available && st.offers_room(&j.repo))
     }
 
     /// How often a job was handed to a scale set: once per job, and once more for each take-back that was handed out
@@ -806,6 +956,24 @@ impl FakeGithub {
             .iter()
             .find(|j| j.request_id == request_id)
             .map(|j| j.state.clone())
+    }
+
+    /// The run of this job is a pull request's from a fork: its head repository is another one.
+    pub fn from_fork(&self, request_id: i64) {
+        let mut st = self.lock();
+        if let Some(run) = st
+            .jobs
+            .iter()
+            .find(|j| j.request_id == request_id)
+            .map(|j| j.run_id)
+        {
+            st.forks.insert(run);
+        }
+    }
+
+    /// How many conditional requests were answered 304 Not Modified so far.
+    pub fn not_modified(&self) -> usize {
+        self.lock().not_modified
     }
 
     /// Every request seen so far.
@@ -829,6 +997,7 @@ impl FakeGithub {
             let mut st = self.lock();
             st.log.push(Logged {
                 line: line.clone(),
+                query: req.query.clone(),
                 authorization: req.header("authorization").map(String::from),
                 body: String::from_utf8_lossy(&req.body).to_string(),
                 max_capacity: req.header("x-scalesetmaxcapacity").map(String::from),
@@ -949,6 +1118,62 @@ impl FakeGithub {
             ("GET", ["repos", _, _, "actions", "organization-variables"]) => {
                 self.with_installation(&req, |_| Reply::json(&json!({"total_count": 0, "variables": []})))
             }
+            // The REST view of workflow runs and their jobs, newest first, one page; each answer carries an ETag, and a
+            // request that names it in If-None-Match is answered 304 with no body, as GitHub does.
+            ("GET", ["repos", owner, repo, "actions", "runs"]) => {
+                let name = format!("{owner}/{repo}");
+                let status = req.query("status").map(String::from);
+                let per_page = page_size(&req);
+                self.with_installation(&req, |st| {
+                    if !st.repos.contains_key(&name) {
+                        return Reply::status_json(404, &json!({"message": "Not Found"}));
+                    }
+                    let mut runs: Vec<(i64, &'static str, i64, i64)> = Vec::new();
+                    for job in st.jobs.iter().filter(|j| j.repo == name) {
+                        if runs.iter().all(|(id, ..)| *id != job.run_id) {
+                            let updated = st.run_updated(job.run_id, job.created_at);
+                            runs.push((job.run_id, st.run_status(job.run_id), job.created_at, updated));
+                        }
+                    }
+                    runs.retain(|(_, s, ..)| status.as_deref().is_none_or(|wanted| wanted == *s));
+                    runs.sort_by_key(|run| std::cmp::Reverse(run.0));
+                    let total = runs.len();
+                    let page: Vec<Value> = runs
+                        .into_iter()
+                        .take(per_page)
+                        .map(|(id, status, created, updated)| {
+                            let head = if st.forks.contains(&id) { "stranger/fork".to_string() } else { name.clone() };
+                            json!({"id": id, "status": status, "created_at": rfc3339(created),
+                                   "updated_at": rfc3339(updated), "name": "CI",
+                                   "head_repository": {"full_name": head}})
+                        })
+                        .collect();
+                    st.conditional(&req, &json!({"total_count": total, "workflow_runs": page}))
+                })
+            }
+            ("GET", ["repos", owner, repo, "actions", "runs", run, "jobs"]) => {
+                let name = format!("{owner}/{repo}");
+                let run: i64 = run.parse().unwrap_or(0);
+                let per_page = page_size(&req);
+                self.with_installation(&req, |st| {
+                    let jobs: Vec<Value> = st
+                        .jobs
+                        .iter()
+                        .filter(|j| j.repo == name && j.run_id == run)
+                        .map(|j| {
+                            json!({"id": j.request_id, "run_id": j.run_id, "name": j.display_name,
+                                   "status": job_status(&j.state), "labels": j.written,
+                                   "created_at": rfc3339(j.created_at)})
+                        })
+                        .collect();
+                    if jobs.is_empty() {
+                        return Reply::status_json(404, &json!({"message": "Not Found"}));
+                    }
+                    let total = jobs.len();
+                    let page: Vec<Value> = jobs.into_iter().take(per_page).collect();
+                    st.conditional(&req, &json!({"total_count": total, "jobs": page}))
+                })
+            }
             ("POST", ["repos", owner, repo, "actions", "runners", "registration-token"]) => {
                 let name = format!("{owner}/{repo}");
                 self.with_installation(&req, |st| {
@@ -997,11 +1222,7 @@ impl FakeGithub {
                 let name = format!("{owner}/{repo}");
                 let id: i64 = id.parse().unwrap_or(0);
                 self.with_installation(&req, |st| {
-                    let Some(runner) = st
-                        .registered
-                        .get(&id)
-                        .filter(|r| st.scale_sets.iter().any(|s| s.id == r.scale_set && s.repo == name))
-                        .cloned()
+                    let Some(runner) = st.registered.get(&id).filter(|r| r.repo == name).cloned()
                     else {
                         return Reply::status_json(404, &json!({"message": "Not Found"}));
                     };
@@ -1018,6 +1239,12 @@ impl FakeGithub {
                         None => Reply::status_json(404, &json!({"message": "Not Found"})),
                     }
                 })
+            }
+            // Probe M, 2026-10-17: an Actions runner for one job outside any scale set, with exactly the labels asked
+            // for, in the repository's default runner group; a name taken is refused.
+            ("POST", ["repos", owner, repo, "actions", "runners", "generate-jitconfig"]) => {
+                let name = format!("{owner}/{repo}");
+                self.with_installation(&req, |st| generate_plain_jit(st, &name, &req))
             }
             ("POST", ["actions", "runner-registration"]) => self.runner_registration(&req),
             (_, ["svc", rest @ ..]) => self.actions_service(&req, rest).await,
@@ -1573,27 +1800,78 @@ fn acquire_jobs(st: &mut State, id: i64, req: &Request) -> Reply {
     Reply::json(&json!({"count": got.len(), "value": got}))
 }
 
+fn generate_plain_jit(st: &mut State, repo: &str, req: &Request) -> Reply {
+    if !st.repos.contains_key(repo) {
+        return Reply::status_json(404, &json!({"message": "Not Found"}));
+    }
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+    let name = body["name"].as_str().unwrap_or_default().to_string();
+    let labels: Vec<String> = body["labels"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    if name.is_empty() || labels.is_empty() || body["runner_group_id"].as_i64().is_none() {
+        return Reply::status_json(
+            422,
+            &json!({"message": "Invalid request: name, runner_group_id and labels are required"}),
+        );
+    }
+    let Some(rid) = register(st, &name, PLAIN, repo.to_string(), labels.clone()) else {
+        return Reply::status_json(
+            409,
+            &json!({"message": "Already exists - A runner with this name already exists."}),
+        );
+    };
+    let labels: Vec<Value> = labels
+        .iter()
+        .map(|l| json!({"name": l, "type": "custom"}))
+        .collect();
+    Reply::status_json(
+        201,
+        &json!({
+            "runner": {"id": rid, "name": name, "os": "unknown", "status": "offline", "busy": false, "labels": labels},
+            "encoded_jit_config": b64url(format!("jit-config-for-{name}").as_bytes()),
+        }),
+    )
+}
+
+/// Registers an Actions runner and says its ID; none when the name is taken.
+fn register(st: &mut State, name: &str, scale_set: i64, repo: String, labels: Vec<String>) -> Option<i64> {
+    if st.runners.iter().any(|r| r.name == name) {
+        return None;
+    }
+    st.next_runner += 1;
+    let rid = st.next_runner;
+    let runner = Runner {
+        id: rid,
+        name: name.to_string(),
+        scale_set,
+        repo,
+        labels,
+    };
+    st.registered.insert(rid, runner.clone());
+    st.runners.push(runner);
+    Some(rid)
+}
+
 fn generate_jit(st: &mut State, id: i64, req: &Request) -> Reply {
     let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
     let name = body["name"].as_str().unwrap_or_default().to_string();
     if name.is_empty() {
         return json_error(400, "InvalidRunnerException", "name required");
     }
-    if st.scale_set(id).is_none() {
+    let Some(repo) = st.scale_set(id).map(|set| set.repo.clone()) else {
         return json_error(404, "RunnerScaleSetNotFoundException", "scale set not found");
-    }
-    if st.runners.iter().any(|r| r.name == name) {
-        return json_error(409, "AgentExistsException", "a runner with this name exists");
-    }
-    st.next_runner += 1;
-    let rid = st.next_runner;
-    let runner = Runner {
-        id: rid,
-        name: name.clone(),
-        scale_set: id,
     };
-    st.registered.insert(rid, runner.clone());
-    st.runners.push(runner);
+    let Some(rid) = register(st, &name, id, repo, Vec::new()) else {
+        return json_error(409, "AgentExistsException", "a runner with this name exists");
+    };
     Reply::json(&json!({
         "runner": {"id": rid, "name": name, "runnerScaleSetId": id},
         "encodedJITConfig": b64url(format!("jit-config-for-{name}").as_bytes()),

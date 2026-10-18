@@ -458,13 +458,17 @@ fn ask(server: Ipv4Addr) -> String {
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.set_read_timeout(Some(WAIT)).unwrap();
     let mut found = "dropped";
-    for _ in 0..ASKS {
+    for asked in 1..=ASKS {
         socket.send_to(&question, (server, 53)).unwrap();
         let mut answer = [0u8; 512];
         match socket.recv(&mut answer) {
-            // A server failure (SERVFAIL): the host's resolver gave up upstream, and a resolver asks again.
+            // A server failure (SERVFAIL): the host's resolver gave up upstream, and a resolver asks again, [`WAIT`]
+            // later, so upstream has the time to recover that a question without an answer gets.
             Ok(read) if read > 12 && answer[..2] == [0x12, 0x34] && answer[3] & 0x0f == 2 => {
                 found = "no-answer";
+                if asked < ASKS {
+                    std::thread::sleep(WAIT);
+                }
             }
             Ok(read) if read > 12 && answer[..2] == [0x12, 0x34] => {
                 return if u16::from_be_bytes([answer[6], answer[7]]) > 0 {

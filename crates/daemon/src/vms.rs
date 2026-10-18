@@ -59,6 +59,11 @@ pub trait Vms: Send + Sync {
     /// Removes what a job whose vm-host is gone left: its state, its socket, its machine's folder with its disk,
     /// the note of its process. The console log stays.
     fn clean(&self, job: &str);
+
+    /// The last `bytes` of the job's console log, the guest's own lines, when there is one to read.
+    fn console_tail(&self, _job: &str, _bytes: usize) -> Option<String> {
+        None
+    }
 }
 
 /// How long a vm-host has to answer on its socket. It answers one client at a time within a second.
@@ -440,6 +445,19 @@ impl Vms for VmHosts {
         let _ = std::fs::remove_file(self.layout.state(job));
         let _ = std::fs::remove_file(self.spawned(job));
         self.exited.lock().expect("exited").remove(job);
+    }
+
+    fn console_tail(&self, job: &str, bytes: usize) -> Option<String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut file = std::fs::File::open(self.layout.console(job)).ok()?;
+        let size = file.metadata().ok()?.len();
+        let from = size.saturating_sub(u64::try_from(bytes).unwrap_or(u64::MAX));
+        file.seek(SeekFrom::Start(from)).ok()?;
+        let mut tail = Vec::new();
+        file.take(u64::try_from(bytes).unwrap_or(u64::MAX))
+            .read_to_end(&mut tail)
+            .ok()?;
+        Some(String::from_utf8_lossy(&tail).into_owned())
     }
 }
 

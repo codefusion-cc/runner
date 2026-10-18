@@ -61,6 +61,12 @@ impl Statistics {
     pub fn assigned(&self) -> usize {
         usize::try_from(self.total_assigned_jobs).unwrap_or(0)
     }
+
+    /// The assigned jobs no Actions runner of the scale set runs yet.
+    pub fn unstarted(&self) -> usize {
+        self.assigned()
+            .saturating_sub(usize::try_from(self.total_running_jobs).unwrap_or(0))
+    }
 }
 
 /// What the service sends when a message session opens, and what a refresh returns.

@@ -85,6 +85,9 @@ pub struct ServePolicy {
     pub docker_max_jobs: usize,
     /// How many bytes Docker jobs' caches may hold together; 0 keeps none.
     pub docker_cache_bytes: u64,
+    /// The host labels this host has ([`cf_workflows::is_host_label`]): a set that asks for others is left to
+    /// the hosts that have them.
+    pub host_labels: Vec<String>,
 }
 
 impl Default for ServePolicy {
@@ -95,6 +98,7 @@ impl Default for ServePolicy {
             docker_repos: Vec::new(),
             docker_max_jobs: 1,
             docker_cache_bytes: 0,
+            host_labels: Vec::new(),
         }
     }
 }
@@ -117,6 +121,14 @@ impl ServePolicy {
     /// there, and a Docker job is the most a job can do on a machine.
     pub fn serves_docker(&self, repo: &Repo) -> bool {
         repo.private && self.serves(repo) && listed(&self.docker_repos, repo)
+    }
+
+    /// Whether this host serves a label set: it has every host label the set asks for.
+    pub fn serves_labels(&self, set: &LabelSet) -> bool {
+        set.host_labels().all(|wanted| {
+            // Both lowercase: a LabelSet's and the config's own, which takes no other.
+            self.host_labels.iter().any(|label| label == wanted)
+        })
     }
 }
 
@@ -273,5 +285,34 @@ mod tests {
             "no list, no Docker"
         );
         assert_eq!(ServePolicy::default().docker_max_jobs, 1);
+    }
+
+    #[test]
+    fn a_set_with_host_labels_is_served_only_by_a_host_that_has_them_all() {
+        let mac = ServePolicy {
+            host_labels: vec!["cf-macos".into(), "cf-studio".into()],
+            ..ServePolicy::default()
+        };
+        let set = |labels: &[&str]| LabelSet::new(labels);
+        for labels in [
+            &["cf-8g"][..],
+            &["cf-8g", "cf-macos"],
+            &["CF-8G", "CF-MACOS"],
+            &["self-hosted", "cf-macos", "cf-studio"],
+            &["cf-8g", "heyhubs"],
+            &["cf-docker", "cf-macos"],
+        ] {
+            assert!(mac.serves_labels(&set(labels)), "{labels:?}");
+        }
+        for labels in [
+            &["cf-8g", "cf-linux"][..],
+            &["cf-8g", "cf-macos", "cf-linux"],
+            &["cf-8g", "cf-mini"],
+        ] {
+            assert!(!mac.serves_labels(&set(labels)), "{labels:?}");
+        }
+        // A host with no labels serves only the sets that ask for none.
+        assert!(ServePolicy::default().serves_labels(&set(&["cf-8g"])));
+        assert!(!ServePolicy::default().serves_labels(&set(&["cf-8g", "cf-macos"])));
     }
 }

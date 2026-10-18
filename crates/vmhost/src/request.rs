@@ -25,9 +25,9 @@ pub struct JobRequest {
     pub image: String,
     /// What runs: GitHub's Actions runner with its registration, or a command.
     pub workload: Workload,
-    /// Variables for the workload on top of the image's own.
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
+    /// Variables for the workload on top of the image's own. A value may be a credential: no debug print shows it.
+    #[serde(default, with = "cf_guest_proto::secret_env")]
+    pub env: Vec<(String, cf_guest_proto::Secret<String>)>,
     /// The longest the job may run, in seconds.
     pub deadline_s: u64,
     /// Whether the job gets a Docker daemon of its own beside its container (`cf-docker`).

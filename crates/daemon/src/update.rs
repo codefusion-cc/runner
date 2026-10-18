@@ -1,4 +1,5 @@
-//! The Runner's updates of itself, which the console asks for with `update`.
+//! The Runner's updates of itself, which the console asks for with `update` (the head of the branch) or `update-to`
+//! (one commit of it).
 //!
 //! The service decides when ([`crate::Service`]): it builds while jobs run, holds new jobs until no machine
 //! stands, then installs and ends, and the service manager starts the new program. How a build and an install go
@@ -28,13 +29,152 @@ pub trait SelfUpdate: Send + Sync {
     /// Where updates come from, for the console: the checkout and the branch.
     fn source(&self) -> String;
 
-    /// Fetches the source and builds it. Answers the version of the program built and ready to install, or the
-    /// running version when the source has nothing newer, in which case nothing was built.
-    fn build(&self) -> Result<String, String>;
+    /// Fetches the source and builds the head of its branch, or `commit` when one is named: a commit of the branch
+    /// ([`is_commit`] says which names are taken), never one older than the running program. Answers the version of
+    /// the program built and ready to install, or the running version when that is what it would build, in which
+    /// case nothing was built.
+    fn build(&self, commit: Option<&str>) -> Result<String, String>;
 
     /// Puts the program built last in place of the running one, keeping the running one to go back to, with
     /// `pending` written down first. Refused while a machine has a record.
     fn install(&self, pending: &Pending) -> Result<(), String>;
+}
+
+/// How many characters a commit's name has: at least what git shortens one to, at most all of it.
+pub const COMMIT_CHARS: std::ops::RangeInclusive<usize> = 7..=40;
+
+/// Whether `name` names a commit as git writes one: [`COMMIT_CHARS`] lowercase hex characters. A commit the console
+/// asks for reaches git only so, never as an option, a branch or anything git would look up.
+pub fn is_commit(name: &str) -> bool {
+    COMMIT_CHARS.contains(&name.len()) && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The commit the console's `update-to` asks for, or why it asks for none: an object whose one key, `commit`, is a
+/// commit's name ([`is_commit`]).
+pub fn commit_from_args(args: Option<&serde_json::Value>) -> Result<String, String> {
+    let Some(serde_json::Value::Object(args)) = args else {
+        return Err("the command names no commit".into());
+    };
+    if let Some(other) = args.keys().find(|key| *key != "commit") {
+        return Err(format!("`{}` is no argument of update-to", key_said(other)));
+    }
+    match args.get("commit") {
+        None => Err("the command names no commit".into()),
+        Some(serde_json::Value::String(commit)) if is_commit(commit) => Ok(commit.clone()),
+        Some(_) => Err("the commit is no commit's name: 7 to 40 lowercase hex characters".into()),
+    }
+}
+
+/// The Runner's settings file, which it reads when it starts: new settings take effect when it starts again.
+pub trait SettingsFile: Send + Sync {
+    /// What the file says now, against what the Runner started with. Reads the file; quick, but not async.
+    fn look(&self) -> SettingsLook;
+
+    /// Writes `change` into the file, when a Runner could start on what it makes of it, and says whether that
+    /// changed the file; else changes nothing and says why. Quick, but not async.
+    fn change(&self, change: &SettingsChange) -> Result<bool, String>;
+}
+
+/// What the console's `settings` command changes in the settings file. Each field is `None` when the command leaves
+/// it as it is, and `Some(None)` when it puts it back to the default. Whether a value is one a Runner starts on is
+/// the file's to say ([`SettingsFile::change`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SettingsChange {
+    /// The most jobs at once (`maxJobs`).
+    pub max_jobs: Option<Option<u32>>,
+    /// Minutes without the person before a workstation takes jobs (`idleMinutes`).
+    pub idle_minutes: Option<Option<u32>>,
+    /// The memory the host keeps for itself, in percent (`minFreeMemoryPercent`).
+    pub min_free_memory_percent: Option<Option<u32>>,
+    /// The longest a job may run, in minutes (`maxJobHours`, in hours).
+    pub deadline_minutes: Option<Option<u64>>,
+}
+
+impl SettingsChange {
+    /// The change the console's command asks for, or why it is none: an object of the console's keys, each a
+    /// number or `null`. The cf-runners manager's settings that mean nothing here are refused by name.
+    pub fn from_args(args: Option<&serde_json::Value>) -> Result<SettingsChange, String> {
+        let Some(serde_json::Value::Object(args)) = args else {
+            return Err("the command names no settings".into());
+        };
+        if args.is_empty() {
+            return Err("the command changes no setting".into());
+        }
+        let mut change = SettingsChange::default();
+        for (key, value) in args {
+            match key.as_str() {
+                "maxJobs" => change.max_jobs = Some(whole(value, "jobs at once: a whole number")?),
+                "idleMinutes" => change.idle_minutes = Some(whole(value, "idle minutes: a whole number")?),
+                "minFreeMemoryPercent" => {
+                    change.min_free_memory_percent =
+                        Some(whole(value, "the memory kept free: a whole number")?);
+                }
+                "maxJobHours" => {
+                    change.deadline_minutes =
+                        Some(scaled(value, 60.0, "the longest job: hours in whole minutes")?.map(u64::from));
+                }
+                "jobMemoryGb" => {
+                    return Err(
+                        "memory per job: each job gets the memory its label names, cf-2g to cf-8g".into(),
+                    );
+                }
+                "jobCpus" => {
+                    return Err("CPUs per job: each job gets the CPUs of its machine's size".into());
+                }
+                "maxLoadPerCpu" => {
+                    return Err(
+                        "load per CPU: the Runner starts jobs by the memory and CPUs they get, not by load"
+                            .into(),
+                    );
+                }
+                other => return Err(format!("`{}` is no setting of the Runner", key_said(other))),
+            }
+        }
+        Ok(change)
+    }
+}
+
+/// A key of the console's arguments that is not known here, cut to fit in what the Runner says of it.
+fn key_said(key: &str) -> String {
+    key.chars().take(40).collect()
+}
+
+/// A whole number of a setting, or `None` for `null`; else `wrong`.
+fn whole(value: &serde_json::Value, wrong: &str) -> Result<Option<u32>, String> {
+    scaled(value, 1.0, wrong)
+}
+
+/// A number of a setting times `scale`, which must come out whole (within what a float of the console's carries),
+/// or `None` for `null`; else `wrong`.
+fn scaled(value: &serde_json::Value, scale: f64, wrong: &str) -> Result<Option<u32>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .map(|number| number * scale)
+        .filter(|number| {
+            (0.0..=f64::from(u32::MAX)).contains(number) && (number - number.round()).abs() < 1e-6
+        })
+        .map(|number| Some(number.round() as u32))
+        .ok_or_else(|| wrong.to_string())
+}
+
+/// What a settings file says now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettingsLook {
+    /// What the Runner started with.
+    Same,
+    /// Other settings, which a Runner could start on. `id` names this version of the file.
+    Changed {
+        /// This version of the file.
+        id: String,
+    },
+    /// Other settings no Runner could start on, and why.
+    Unusable {
+        /// What a Runner starting on them would say.
+        why: String,
+    },
 }
 
 /// An update whose program was put in place and has not yet stayed up.
@@ -217,6 +357,69 @@ mod tests {
                 failed: None,
             }))
         );
+    }
+
+    #[test]
+    fn update_to_takes_a_commit_and_nothing_else() {
+        use serde_json::json;
+        let commit = |args: serde_json::Value| commit_from_args(Some(&args));
+        assert_eq!(commit(json!({"commit": "5c0ffee"})), Ok("5c0ffee".into()));
+        let full = "5c0ffee0a1b25c0ffee0a1b25c0ffee0a1b2abcd";
+        assert_eq!(commit(json!({ "commit": full })), Ok(full.into()));
+        let no_commit = Err("the command names no commit".to_string());
+        let not_a_name = Err("the commit is no commit's name: 7 to 40 lowercase hex characters".to_string());
+        assert_eq!(commit_from_args(None), no_commit);
+        for args in [json!(null), json!("5c0ffee"), json!(["5c0ffee"]), json!({})] {
+            assert_eq!(commit(args.clone()), no_commit, "{args}");
+        }
+        for value in [
+            json!(null),
+            json!(5),
+            json!(["5c0ffee"]),
+            json!({"sha": "5c0ffee"}),
+            json!("5c0ffe"),
+            json!(format!("{full}a")),
+            json!("5C0FFEE"),
+            json!("5c0ffeg"),
+            json!("--upload-pack=x"),
+            json!("main"),
+            json!("5c0ffee~1"),
+            json!("5c0ffee^{tree}"),
+            json!(" 5c0ffee"),
+            json!("5c0ffee\n"),
+            json!("５c0ffee"),
+            json!(""),
+        ] {
+            assert_eq!(commit(json!({ "commit": value })), not_a_name, "{value}");
+        }
+        assert_eq!(
+            commit(json!({"commit": "5c0ffee", "branch": "pr"})),
+            Err("`branch` is no argument of update-to".into())
+        );
+        let said = commit(json!({"commit": "5c0ffee", "x".repeat(1000): 1})).expect_err("refused");
+        assert_eq!(said, format!("`{}` is no argument of update-to", "x".repeat(40)));
+    }
+
+    proptest! {
+        /// A commit's name is taken as it is, whatever its length within the bounds.
+        #[test]
+        fn every_lowercase_hex_name_of_7_to_40_characters_is_taken(name in "[0-9a-f]{7,40}") {
+            prop_assert_eq!(commit_from_args(Some(&serde_json::json!({"commit": name.clone()}))), Ok(name));
+        }
+
+        /// Text is taken only when it is 7 to 40 of the sixteen lowercase hex characters, and never beside another
+        /// key.
+        #[test]
+        fn any_other_text_or_key_is_refused(name in "\\PC{0,48}|[0-9a-fA-F]{0,48}|[0-9a-f]{0,48}", key in "\\PC{1,12}") {
+            let hex = name.chars().all(|c| "0123456789abcdef".contains(c));
+            let taken = commit_from_args(Some(&serde_json::json!({"commit": name.clone()})));
+            prop_assert_eq!(taken.is_ok(), hex && (7..=40).contains(&name.chars().count()), "{:?}", taken);
+            prop_assume!(key != "commit");
+            let mut args = serde_json::Map::new();
+            args.insert("commit".into(), serde_json::json!("5c0ffee"));
+            args.insert(key, serde_json::json!(name));
+            prop_assert!(commit_from_args(Some(&serde_json::Value::Object(args))).is_err());
+        }
     }
 
     proptest! {

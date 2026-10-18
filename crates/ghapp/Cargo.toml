@@ -10,6 +10,7 @@ publish.workspace = true
 base64.workspace = true
 bytes = "1"
 cf-secret = { path = "../secret" }
+cf-workflows = { path = "../workflows" }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 ring = "0.17"
 serde.workspace = true

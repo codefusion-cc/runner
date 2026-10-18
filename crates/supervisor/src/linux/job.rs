@@ -9,6 +9,7 @@ use cf_guest_proto::{
     CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason,
     Summary, Usage, Workload,
 };
+use cf_supervisor::disks::overlay_options;
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::oom::{self, Kill};
 use cf_supervisor::outcome::{REPORT_BYTES, workload_end};
@@ -254,7 +255,7 @@ pub fn run(
         ROOT,
         "overlay",
         libc::MS_NODEV,
-        &format!("lowerdir={IMAGE},upperdir={SCRATCH}/upper,workdir={SCRATCH}/work"),
+        &overlay_options(IMAGE, &format!("{SCRATCH}/upper"), &format!("{SCRATCH}/work")),
     )
     .map_err(disks)?;
 
@@ -340,6 +341,7 @@ pub fn run(
                 Some(_) => format!("{}/docker", docker::CACHE),
                 None => format!("{SCRATCH}/docker"),
             },
+            &network.beside,
         )
         .and_then(|spec| {
             docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM))?;
@@ -366,7 +368,14 @@ pub fn run(
         shared: SHARED.into(),
         cgroup: format!("{CGROUP}/run"),
         argv,
-        env: workload_environment(&home, USER, &job.env),
+        env: workload_environment(
+            &home,
+            USER,
+            &job.env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.expose().clone()))
+                .collect::<Vec<_>>(),
+        ),
         uid,
         gid,
         groups,

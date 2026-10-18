@@ -82,6 +82,15 @@ pub trait Slots: Send + Sync {
         self.reserve(size)
     }
 
+    /// [`Slots::reserve_docker`] for a Docker job, [`Slots::reserve`] for any other.
+    fn reserve_for(&self, size: Size, docker: bool) -> Result<Ticket, Refusal> {
+        if docker {
+            self.reserve_docker(size)
+        } else {
+            self.reserve(size)
+        }
+    }
+
     /// Counts a slot as a Docker job's until it is given back: its machine gets a Docker daemon, and the cap counts
     /// it. For a job GitHub assigned without a promise, which runs even past the cap, as any assigned job does.
     fn mark_docker(&self, _ticket: Ticket) {}

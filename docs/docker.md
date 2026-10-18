@@ -36,6 +36,13 @@ the machine's and pass the guest's firewall like any other the job opens. Ports 
 from the machine's side, so a step reaches them at `localhost`. `--no-map-gw` keeps the gateway the gateway: without
 it pasta would hand the gateway's address to the machine's loopback.
 
+The daemon's own networks, its bridge and the pools Compose and `docker network create` take from, are /16 blocks of
+private ranges that share no address with anything next to the machine: its network, its gateway and the networks
+the host is in (`cf_supervisor::docker::networks`). Docker's own default, 172.17.0.0/16, is taken only when it is
+clear. A host with Docker of its own is on 172.17.0.0/16 itself; with that as the daemon's bridge, the host's address
+would be the bridge's, inside the machine, and a packet to it would never reach the firewall. When no block is
+clear, the job runs without Docker and is told why.
+
 The daemon's network gets one rule before the daemon starts: TCP segments with no flag at all are dropped on the way
 in. Ubuntu 24.04's pasta sends window updates without the ACK flag ([passt bug 84](https://bugs.passt.top/show_bug.cgi?id=84),
 fixed upstream in 2024-03). A receiver ignores such a segment, but the daemon's NAT takes it for invalid and does not
@@ -98,7 +105,11 @@ folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, 
 
 - The daemon does not start (the image lacks a tool, a module is missing): the job runs without Docker, and its
   start hook writes an error on the run, "Docker did not start", with the end of the daemon's log, as soon as the
-  sandbox ended or after 60 seconds without an answer.
+  sandbox ended or after 60 seconds without an answer. The machine's console log (`logs/<job>.console.log`) shows
+  the same end of the log, clipped, under "the Docker sandbox ended".
+- An image built before Docker jobs (before 2026-10-14) has the daemon but not iptables or pasta: the supervisor
+  checks for them before it makes the sandbox, and the job is told "the image has no iptables or pasta". The cure
+  is a newer image on that machine (`codefusion-runner image install`).
 - The daemon stops during a job: the steps that use it fail; the log is at `/run/cf-docker/dockerd.log`.
 
 ## Tests
@@ -106,7 +117,9 @@ folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, 
 - `crates/supervisor/tests/decisions.rs`: a container stopped at its own limit is not the job's out of memory
   (`oom::OwnLimit`).
 - `crates/supervisor/tests/docker.rs`: the sandbox's ids (every id once, none the machine's root, no overlap, the
-  job's ids kept) and the commands of the daemon, pasta and the rule.
+  job's ids kept), the daemon's networks (clear of a host on Docker's own bridge, of a host in all of
+  172.16.0.0/12, none when nothing is clear, and a property: never an address of what is next to the machine), and
+  the commands of the daemon, pasta and the rule.
 - `crates/daemon/tests/docker.rs`: the daemon flag reaches the machine's request and record, the cap with a promise,
   a running machine, one assigned past the cap and a restart, and a Docker scale set that acquires one job only.
 - `crates/workflows/tests/labels.rs`, `crates/daemon/src/names.rs`, `crates/runner/src/config.rs`: the label, the
@@ -130,5 +143,7 @@ folder cannot share blocks between files (APFS can; on Linux btrfs and XFS can, 
   a port the test opens on the host itself: through pasta a closed port and a dropped packet look alike. The
   scenario goes red with the guest's firewall emptied (the open port is reached through the gateway and the LAN
   address), with `--no-map-gw` taken out (names through the gateway fail), and with the sandbox's root unshifted (a
-  privileged container writes the machine's `core_pattern` and triggers sysrq). `cargo xtask it --only docker-oom`:
+  privileged container writes the machine's `core_pattern` and triggers sysrq). It also fails when an address it
+  probes is in one of the daemon's own networks, where a probe would never leave the machine; it goes red with the
+  bridge put on the host's LAN. `cargo xtask it --only docker-oom`:
   a container that takes all of the job's memory ends the job `oom`.

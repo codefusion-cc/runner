@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
@@ -52,6 +52,8 @@ pub struct Spec {
     pub gid_map: String,
     /// The size of the sandbox's `/dev/shm`.
     pub shm_bytes: u64,
+    /// The daemon's networks, clear of every network next to the machine.
+    pub networks: plan::Networks,
 }
 
 fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
@@ -61,6 +63,7 @@ fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
 /// The modules, the sandbox's control group and folders, and the socket's folder in the job's root. `root` is the
 /// job's root, `scratch` the job's disk, `cgroup` the job's control group; the job user's ids come with the image's
 /// `/etc/group`. `data` is where the daemon keeps its data: on the job's disk, or on a cache ([`mount_cache`]).
+/// `beside` is what is next to the machine, which the daemon's networks stay clear of ([`plan::networks`]).
 /// An error says what the job is missing; the job runs without Docker and is told why.
 pub fn prepare(
     root: &str,
@@ -70,7 +73,16 @@ pub fn prepare(
     host_name: &str,
     shm_bytes: u64,
     data: &str,
+    beside: &[(plan::Ip, u8)],
 ) -> Result<Spec, String> {
+    // Before anything is changed for the daemon: an image from before Docker jobs lacks its programs.
+    if let Some(problem) =
+        plan::missing_programs(|path| fs::symlink_metadata(format!("{root}{path}")).is_ok())
+    {
+        return Err(problem);
+    }
+    let networks = plan::networks(beside)
+        .ok_or("every private range the daemon's networks could have is one the machine or the host is in")?;
     load_modules(MODULE_LIST, MODULE_DIR)?;
     let _ = fs::remove_dir_all(MODULE_DIR);
     let docker_gid = cf_supervisor::environment::find_group(group, plan::GROUP)
@@ -121,6 +133,7 @@ pub fn prepare(
         uid_map,
         gid_map,
         shm_bytes,
+        networks,
     })
 }
 
@@ -139,10 +152,14 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
         "the daemon's log",
         fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .mode(0o644)
             .open(format!("{}/{}", spec.sockets, plan::LOG_NAME)),
     )?;
+    // The tail is read from this handle, not the path: the sandbox owns the log's folder and could put a link or a
+    // pipe there, which the machine's root would then follow.
+    let tail_of = context("the daemon's log", log.try_clone())?;
     let (view_read, view_write) = context("pipe", sys::pipe())?;
     let mut child = spawn_self(
         "docker",
@@ -171,6 +188,11 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
     std::thread::spawn(move || {
         if let Ok(status) = child.wait() {
             say(&format!("the Docker sandbox ended: {status}"));
+            if !status.success() {
+                for line in plan::last_words(&log_tail(&tail_of)) {
+                    say(&format!("  {line}"));
+                }
+            }
             // Read by the start hook, which then stops waiting for the daemon; at the job's end nobody reads it.
             if !std::path::Path::new(&problem).exists() {
                 let _ = fs::write(&problem, format!("its sandbox ended ({status})."));
@@ -182,6 +204,24 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
     } else {
         Err("the sandbox did not build its view in time".into())
     }
+}
+
+/// The last [`plan::LAST_WORDS_BYTES`] of the daemon's log, from its first whole line, or nothing when it cannot be
+/// read. Its writers append, so where this leaves the shared offset does not matter.
+fn log_tail(mut log: &File) -> Vec<u8> {
+    let length = log.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let from = length.saturating_sub(plan::LAST_WORDS_BYTES as u64);
+    let mut tail = Vec::new();
+    if log.seek(SeekFrom::Start(from)).is_ok() {
+        let _ = log.take(plan::LAST_WORDS_BYTES as u64).read_to_end(&mut tail);
+    }
+    // A tail that starts inside a line would show that line's middle.
+    if from > 0
+        && let Some(end) = tail.iter().position(|&byte| byte == b'\n')
+    {
+        tail.drain(..=end);
+    }
+    tail
 }
 
 /// The launcher's entry, as the machine's root.
@@ -274,23 +314,21 @@ fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Re
         .iter()
         .map(|(name, value)| sys::cstr(&format!("{name}={value}")))
         .collect();
+    let networks = serde_json::to_string(&spec.networks).unwrap_or_default();
     let error = sys::exec(
         &sys::cstr(SANDBOX_SELF),
-        &[sys::cstr(SANDBOX_SELF), sys::cstr("docker-sandbox")],
+        &[
+            sys::cstr(SANDBOX_SELF),
+            sys::cstr("docker-sandbox"),
+            sys::cstr(&networks),
+        ],
         &environment,
     );
     Err(format!("{SANDBOX_SELF}: {error}"))
 }
 
 /// The whole environment of the sandbox's programs.
-const SANDBOX_ENV: [(&str, &str); 3] = [
-    (
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    ),
-    ("HOME", "/tmp"),
-    ("LANG", "C.UTF-8"),
-];
+const SANDBOX_ENV: [(&str, &str); 3] = [("PATH", plan::PATH), ("HOME", "/tmp"), ("LANG", "C.UTF-8")];
 
 /// One of the sandbox's programs, `argv`, with the sandbox's environment and nothing on its input.
 fn sandbox_command(argv: &[String]) -> Command {
@@ -365,9 +403,10 @@ fn view(spec: &Spec) -> Result<(), String> {
 
 /// The sandbox's first program, as its root and PID 1 of its process namespace, in the machine's network: makes the
 /// daemon's network namespace, joins it to the machine's with pasta, starts the daemon in it, and reaps until the
-/// daemon ends. Its output is the daemon's log.
-pub fn sandbox() -> ! {
-    match run_sandbox() {
+/// daemon ends. Its output is the daemon's log. `networks` is the daemon's [`plan::Networks`], as JSON.
+pub fn sandbox(networks: &str) -> ! {
+    let networks = serde_json::from_str(networks).map_err(|error| format!("the daemon's networks: {error}"));
+    match networks.and_then(run_sandbox) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("cf-sandbox: {error}");
@@ -376,13 +415,13 @@ pub fn sandbox() -> ! {
     }
 }
 
-fn run_sandbox() -> Result<i32, String> {
+fn run_sandbox(networks: plan::Networks) -> Result<i32, String> {
     let (ready_read, ready_write) = context("pipe", sys::pipe())?;
     let (go_read, go_write) = context("pipe", sys::pipe())?;
     let daemon = fork()?;
     if daemon == 0 {
         drop((ready_read, go_write));
-        let Err(error) = daemon_process(ready_write, go_read);
+        let Err(error) = daemon_process(ready_write, go_read, &networks);
         eprintln!("cf-sandbox: the daemon did not start: {error}");
         std::process::exit(70);
     }
@@ -415,7 +454,7 @@ fn run_sandbox() -> Result<i32, String> {
 /// The daemon's process: a network namespace of the sandbox's, its loopback up and its one rule
 /// ([`plan::flagless_tcp_rule`]), then the daemon once pasta has joined the namespace to the machine's network.
 /// Returns only when that failed.
-fn daemon_process(ready: OwnedFd, go: OwnedFd) -> Result<Infallible, String> {
+fn daemon_process(ready: OwnedFd, go: OwnedFd, networks: &plan::Networks) -> Result<Infallible, String> {
     unshare(libc::CLONE_NEWNET)?;
     net::loopback_up()?;
     let rule = plan::flagless_tcp_rule();
@@ -431,7 +470,7 @@ fn daemon_process(ready: OwnedFd, go: OwnedFd) -> Result<Infallible, String> {
     if File::from(go).read(&mut byte).unwrap_or(0) != 1 {
         return Err("the daemon's network was not joined".into());
     }
-    let command = plan::dockerd_command();
+    let command = plan::dockerd_command(networks);
     let error = sandbox_command(&command).exec();
     Err(format!("{}: {error}", command[0]))
 }

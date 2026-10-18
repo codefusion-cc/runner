@@ -20,7 +20,8 @@ its first jobs from the real GitHub on a MacBook Air: one that passed, one that 
 ran, each in a machine that was gone when the job ended. What is there:
 
 - the service (`codefusion-runner daemon`, kept running by launchd on a Mac and by systemd on Linux): it reads which repositories and `runs-on`
-  labels to serve, keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
+  labels to serve, from the workflows on each default branch and from the jobs GitHub has queued (a pull request's
+  new workflow or labels; `docs/github-protocol.md`), keeps a scale set and a session at GitHub for each, and for every job GitHub assigns asks the
   budget for memory, starts a machine and registers an Actions runner for that one job. When the job ends, however
   it ends, the machine is destroyed, the registration removed, the memory given back, and the console told once,
 - sizes from the label: `cf-2g`, `cf-4g`, `cf-6g`, `cf-8g`; `self-hosted` alone is 4 GB. A machine is counted as
@@ -50,6 +51,12 @@ ran, each in a machine that was gone when the job ended. What is there:
   nothing more, and are root of the sandbox, not of the machine. One Docker job at a time per Mac
   (`docker_max_jobs`), and a cache per repository that only its default branch writes; `docs/docker.md` says how and
   why,
+- host labels, for a job that must run on a kind of host: `runs-on: [cf-8g, cf-macos]` runs only on a host whose
+  `labels` has `cf-macos`. A host label is `cf-` and a name that is no label jobs ask for by itself (a size,
+  `cf-docker`); alone it names no size, so it goes beside a size or `self-hosted`. Each host has its system's by default (`cf-macos`, `cf-linux`).
+  A repository variable read with `fromJSON` may hold the list: `runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY ||
+  '"ubuntu-latest"') }}` with `CI_RUNNER_HEAVY` set to `["cf-8g","cf-macos"]`. Without `fromJSON` GitHub reads the
+  variable as one label, so the Runner does too,
 - the guest: Alpine's `linux-virt` kernel and an initramfs whose PID 1 is the supervisor, built reproducibly by
   `cargo xtask guest` and embedded in the binary,
 - images: an Ed25519 signature over `SHA256SUMS`, every hash and size checked, the root filesystem in parts below
@@ -87,10 +94,18 @@ A configuration file says what the Mac is:
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`
-  jobs get Docker), `docker_max_jobs` (1) and `docker_cache_gb` (30; 0 for no cache). Without `console` the Mac reports to none.
+  jobs get Docker), `docker_max_jobs` (1), `docker_cache_gb` (30; 0 for no cache) and `labels` (the host labels this
+  host has, 8 at most; `["cf-macos"]` on a Mac, `["cf-linux"]` on Linux). Without `console` the Mac reports to none.
 - The file names where the App's key and the console's token go, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
+- A running Runner takes up a changed file by itself, as an update does: it looks every 30 seconds, and when a
+  Runner could start on the new file (it is read as above and its `image` is installed), it takes no new job until
+  no machine stands, then starts again on it. The console's page says what it waits for. A file no Runner could start
+  on (one that names a console before `enroll`, an image not installed, another `state_dir` or `machine`, which only
+  `install` changes) changes nothing; a wait that outlasts the update's limit (50 minutes) gives up on that version
+  of the file, and the Runner takes jobs again. Both stay on the console's page (`settingsError`) until the file
+  changes. So `image install` the image first, then name it here; `scripts/docker-rollout-mac.sh` does both.
 
 The Mac needs Rust to build the Runner (below) and nothing else. Images are public, so a Mac without `gh` fetches a
 release with `curl -fLO https://github.com/codefusion-cc/runner/releases/download/<v>/<file>` for `Image`,
@@ -145,11 +160,31 @@ never cut off by an update. A Runner installed so updates itself when the consol
 own. The config's `build_folder` names that checkout, an absolute path not on an external volume, and the Runner must
 have been built there. The checkout stays at a commit (`git checkout --detach`), not on a branch, and has no changes of
 its own. Otherwise `update` touches nothing and says why: a person's checkout is never fetched into or moved. The
-update fetches `main`, checks it out at its commit and builds it while jobs run. It takes no new job until no machine
-stands and no slot promised to GitHub is left, then installs and starts again. A new program that does not stay up for
-a minute three times is replaced by the one before, and the console hears why; a start that ends as asked (a signal,
-`restart`) does not count. `restart` ends the Runner at once and launchd (systemd on Linux) starts it again; machines
-that run go on and are adopted.
+update fetches `main`, checks it out at its commit and builds it while jobs run. `update-to` (`{"commit": "<hex>"}`, 7 to
+40 lowercase hex characters) builds that commit instead, only when it is on the `main` just fetched and has the commit
+that runs; a commit of a branch or a pull request, one older than the running one, or a short name of more than one
+object is refused. Both take no new job until no machine stands and no slot promised to GitHub is left, then
+install and start again. A new program that does not stay up for a minute three times is replaced by the one before,
+and the console hears why; a start that ends as asked (a signal, `restart`) does not count. `restart` ends the Runner
+at once and launchd (systemd on Linux) starts it again; machines that run go on and are adopted.
+
+`test-run` runs a developer's test suite in one machine of the image CI jobs get, instead of on their laptop. The Runner
+takes it like a main-branch job GitHub assigned: before the CI jobs that wait, never stopping one that runs, waiting for
+room as long as the command's `waitS` allows, and `busy: …` while the Mac takes no new job or has a test run on it. The
+machine runs the agent embedded in the Runner (`crates/daemon/src/test_run/agent.mjs`), which fetches the commit from the
+console as git bundles, runs the suite and sends its output to the console itself. The console's page and job events
+show it as a job of workflow `test-remote` on a machine named `tr-…`; nothing of it is registered at GitHub.
+
+Before anything Docker comes to a host, the Runner checks that Docker starts in its job machines: at its start, once
+the budget gives a slot, it boots one machine of the smallest size with Docker, which waits two minutes for `docker
+info`. Until that check ends Docker is unknown and nothing is refused. A check whose machine ended for something
+else (the host slept or ran short, someone stopped it) answers nothing and boots again after ten minutes. A failed
+check is tried again every six hours, and meanwhile the host serves no `cf-docker` label set and answers a `test-run`
+with Docker `never: Docker does not start in this machine's job VMs (<why>)`, which the console hands on to another
+machine. A failure is kept in the records' folder (`docker-check.failed`) and holds across a restart until a check
+passes; a pass is not kept, so the Runner checks again at every start. The console's report carries the last check in `status.docker`: `{"ok": false, "checkedAt":
+"2026-10-18T08:00:00Z", "why": "docker info did not answer in 2 minutes (exit 1); cf-supervisor: the Docker sandbox
+ended: exit status: 70"}`, `{"ok": true, "checkedAt": "…"}` after a pass, and nothing before the first check ended.
 
 `uninstall` stops the agent and every machine, removes every scale set and registration at GitHub and says what it
 could not remove; `--leave` also tells the console the Mac is gone, `--purge` deletes the state folder with its images.
@@ -192,6 +227,19 @@ target/release/codefusion-runner image install <folder> --version <v> --state-di
 target/release/codefusion-runner check --config <file> --github
 target/release/codefusion-runner enroll --config <file>
 target/release/codefusion-runner install --config <file>
+```
+
+The Runner takes the first `pasta` on its `PATH`. Prefer one from 2025 or newer; where the distribution's is older
+(Debian 12 ships 2023-03), build it from upstream as the Runner's user, at a tagged release whose name ends in the
+commit it was made from, and put it first on the unit's `PATH` with a drop-in that `install` leaves alone:
+
+```sh
+git clone --depth 1 --branch <tag> https://passt.top/passt ~/src/passt && cd ~/src/passt && make
+install -D -m 0755 -T passt ~/.local/bin/pasta
+mkdir -p ~/.config/systemd/user/codefusion-runner.service.d
+printf '[Service]\nEnvironment=PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin\n' "$HOME" \
+  > ~/.config/systemd/user/codefusion-runner.service.d/pasta.conf
+systemctl --user daemon-reload && systemctl --user restart codefusion-runner
 ```
 
 `check` lists what Linux needs and the command that brings what is missing: `/dev/kvm` open to the user, lingering,

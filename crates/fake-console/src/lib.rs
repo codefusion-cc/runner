@@ -68,6 +68,8 @@ struct State {
     events: Vec<Value>,
     left: Vec<String>,
     commands: Vec<Pending>,
+    /// Commands the console stopped sending (a test run that ended or was cancelled), by id.
+    withdrawn: HashSet<String>,
     calls: usize,
     paused: bool,
     watched: bool,
@@ -261,7 +263,11 @@ impl State {
         let commands: Vec<Value> = self
             .commands
             .iter()
-            .filter(|c| c.machine.as_deref().is_none_or(|m| m == name) && !c.done_by.contains(&machine))
+            .filter(|c| {
+                c.machine.as_deref().is_none_or(|m| m == name)
+                    && !c.done_by.contains(&machine)
+                    && !self.withdrawn.contains(&c.id)
+            })
             .map(|c| match &c.args {
                 Some(args) => json!({ "id": c.id, "kind": c.kind, "args": args }),
                 None => json!({ "id": c.id, "kind": c.kind }),
@@ -408,6 +414,11 @@ impl FakeConsole {
             machine: None,
             done_by: HashSet::new(),
         });
+    }
+
+    /// Stops sending a command, as the console does with a test run that ended or was cancelled before any result.
+    pub fn withdraw_command(&self, id: &str) {
+        self.lock().withdrawn.insert(id.to_string());
     }
 
     fn queue(&self, machine: Option<String>, kind: &str, args: Option<Value>) -> String {

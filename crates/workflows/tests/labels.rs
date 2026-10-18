@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use cf_workflows::{DOCKER_LABEL, LabelSet, POOL_LABEL, SizeError, self_hosted, self_hosted_with, size_gb};
+use cf_workflows::{
+    DOCKER_LABEL, LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS, POOL_LABEL, SizeError, is_host_label,
+    self_hosted, self_hosted_with, size_gb,
+};
 use proptest::prelude::*;
 
 fn files(list: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
@@ -491,7 +494,7 @@ fn a_reusable_workflow_input_and_a_list_item_read_variables_too() {
 fn an_expression_the_evaluator_cannot_read_still_stands_for_the_pool_label() {
     let wf = files(&[(
         "ci.yml",
-        "jobs:\n  a:\n    runs-on: ${{ format('{0}', vars.CI_RUNNER) }}\n  b:\n    runs-on: ${{ vars.A && vars.B }}\n",
+        "jobs:\n  a:\n    runs-on: ${{ vars.A && vars.B }}\n  b:\n    runs-on: ${{ format('{1}', vars.CI_RUNNER) }}\n",
     )]);
     assert_eq!(
         keys(&self_hosted_with(
@@ -499,6 +502,34 @@ fn an_expression_the_evaluator_cannot_read_still_stands_for_the_pool_label() {
             &vars(&[("CI_RUNNER", "cf-8g"), ("A", "x"), ("B", "cf-8g")])
         )),
         [POOL_LABEL]
+    );
+}
+
+// added: parentheses and format, as a job that takes its labels from one of two variables writes them; before, such
+// a job stood for the pool's label whatever the variables said.
+#[test]
+fn a_label_made_by_format_inside_parentheses_is_read() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  heavy:\n    runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY || format('\"{0}\"', vars.CI_RUNNER || 'ubuntu-latest')) }}\n  plain:\n    runs-on: ${{ (vars.CI_RUNNER_DOCKER) || format('{0}', 'ubuntu-latest') }}\n",
+    )]);
+    let with = |list: &[(&str, &str)]| keys(&self_hosted_with(&wf, &vars(list)));
+    assert_eq!(with(&[("CI_RUNNER", "cf-2g")]), ["cf-2g", POOL_LABEL]);
+    assert_eq!(
+        with(&[
+            ("CI_RUNNER_HEAVY", r#"["cf-8g","cf-macos"]"#),
+            ("CI_RUNNER", "cf-2g")
+        ]),
+        ["cf-8g,cf-macos", POOL_LABEL]
+    );
+    assert_eq!(
+        with(&[("CI_RUNNER_DOCKER", "cf-docker")]),
+        ["cf-docker", POOL_LABEL]
+    );
+    assert_eq!(
+        with(&[]),
+        [POOL_LABEL],
+        "nothing set: the pool's label, as before"
     );
 }
 
@@ -664,5 +695,242 @@ fn a_variable_naming_the_docker_label_decides_the_scale_set() {
             [POOL_LABEL],
             "{value:?}"
         );
+    }
+}
+
+// added: host labels, which only the hosts that list them in their config serve
+#[test]
+fn a_host_label_is_a_cf_label_of_a_name_that_is_no_size_and_not_docker() {
+    for label in ["cf-macos", "cf-linux", "cf-mac-studio", "cf-m4", "cf-a"] {
+        assert!(is_host_label(label), "{label}");
+    }
+    let longest = format!("cf-{}", "a".repeat(37));
+    assert!(is_host_label(&longest), "40 characters");
+    for label in [
+        "cf-8g",
+        "cf-2g",
+        "cf-docker",
+        "cf-3g",
+        "cf-4gb",
+        "cf-",
+        "cf--macos",
+        "cf-macos-",
+        "cf-mac--os",
+        "cf-mac_os",
+        "cf-mac os",
+        "cf-macOS",
+        "cf-mäc",
+        "macos",
+        "self-hosted",
+        "xcf-macos",
+        "",
+    ] {
+        assert!(!is_host_label(label), "{label:?}");
+    }
+    assert!(!is_host_label(&format!("{longest}a")), "41 characters");
+}
+
+#[test]
+fn a_set_names_its_host_labels() {
+    let set = LabelSet::new(["CF-8G", "cf-macos", "heyhubs", "cf-docker", "cf-linux"]);
+    assert_eq!(set.host_labels().collect::<Vec<_>>(), ["cf-linux", "cf-macos"]);
+    assert_eq!(LabelSet::new(["cf-8g", "self-hosted"]).host_labels().count(), 0);
+}
+
+#[test]
+fn a_variable_read_through_from_json_may_hold_a_list_of_labels() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  heavy:\n    runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY || '\"ubuntu-latest\"') }}\n",
+    )]);
+    let with = |value: &str| keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_HEAVY", value)])));
+    assert_eq!(
+        keys(&self_hosted_with(&wf, &vars(&[]))),
+        [POOL_LABEL],
+        "no variable: the pool's label"
+    );
+    assert_eq!(with(r#"["cf-8g","cf-macos"]"#), ["cf-8g,cf-macos"]);
+    assert_eq!(
+        with(r#" [ "CF-8G" , "cf-macos", "cf-8g" ] "#),
+        ["cf-8g,cf-macos"],
+        "spaced, cased, repeated"
+    );
+    assert_eq!(with(r#"["self-hosted","cf-macos"]"#), ["cf-macos,self-hosted"]);
+    assert_eq!(with(r#"["cf-6g"]"#), ["cf-6g"], "a list of one");
+    assert_eq!(
+        with(r#""cf-8g""#),
+        ["cf-8g"],
+        "a JSON string is one label, as before"
+    );
+    assert_eq!(with("cf-8g"), ["cf-8g"]);
+    // A list must name a label of these Actions runners besides the host's, else it is the pool's label, as any
+    // value that names none.
+    for value in [
+        r#"["cf-macos"]"#,
+        r#"["ubuntu-latest","cf-8g-ish"]"#,
+        "[]",
+        "[1,2]",
+        r#"["cf-8g",2]"#,
+        r#"["cf-8g""#,
+        r#"{"labels":["cf-8g"]}"#,
+        r#"[["cf-8g"]]"#,
+        "ubuntu-latest",
+    ] {
+        assert_eq!(with(value), [POOL_LABEL], "{value:?}");
+    }
+    // A list that also names another platform asks for that platform: these Actions runners leave it.
+    assert_eq!(with(r#"["cf-8g","macos"]"#), Vec::<String>::new());
+    assert_eq!(with(r#"["cf-8g",""]"#), ["cf-8g"], "an empty label is dropped");
+}
+
+#[test]
+fn only_from_json_turns_a_list_into_labels_as_github_does() {
+    // GitHub takes a variable's text as one label unless fromJSON parses it: such a job waits for a runner with a
+    // label that looks like a list, which none has; it stands for the pool's label, as before.
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}\n  b:\n    runs-on: ${{ toJSON(vars.CI_RUNNER) }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER", r#"["cf-8g","cf-macos"]"#)])
+        )),
+        [POOL_LABEL]
+    );
+    // fromJSON inside toJSON is a string again, and so is toJSON inside fromJSON: it parses back the string toJSON
+    // made.
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  a:\n    runs-on: ${{ toJSON(fromJSON(vars.CI_RUNNER)) }}\n  b:\n    runs-on: ${{ fromJSON(toJSON(vars.CI_RUNNER)) }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER", r#"["cf-8g","cf-macos"]"#)])
+        )),
+        [POOL_LABEL]
+    );
+}
+
+#[test]
+fn a_list_from_a_variable_joins_the_labels_beside_it_and_a_reusable_workflows_input() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  list:\n    runs-on: [\"${{ fromJSON(vars.CI_RUNNER_HEAVY) }}\", heyhubs]\n  call:\n    uses: o/r/.github/workflows/x.yml@main\n    with:\n      runs-on: ${{ fromJSON(vars.CI_RUNNER_HEAVY || '\"ubuntu-latest\"') }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER_HEAVY", r#"["cf-8g","cf-macos"]"#)])
+        )),
+        ["cf-8g,cf-macos", "cf-8g,cf-macos,heyhubs"]
+    );
+}
+
+// added: the labels a job asks for, as GitHub's jobs API names them, under the same rules as a workflow's `runs-on`.
+#[test]
+fn a_jobs_labels_are_served_under_the_rules_of_a_workflow() {
+    let served = |labels: &[&str]| LabelSet::served(labels.iter().copied()).map(|set| set.key());
+    assert_eq!(
+        served(&["self-hosted", "cf-2g"]).as_deref(),
+        Some("cf-2g,self-hosted")
+    );
+    assert_eq!(
+        served(&["CF-8G", " cf-macos "]).as_deref(),
+        Some("cf-8g,cf-macos"),
+        "cased and spaced"
+    );
+    assert_eq!(served(&["cf-docker"]).as_deref(), Some("cf-docker"));
+    assert_eq!(
+        served(&["self-hosted", "linux", "arm64", "heyhubs", "ubuntu-24.04", "a_b"]).as_deref(),
+        Some("a_b,arm64,heyhubs,linux,self-hosted,ubuntu-24.04")
+    );
+    // None of ours, another platform, an expression GitHub left unread, an empty label: not served.
+    for labels in [
+        &["ubuntu-latest"][..],
+        &["cf-macos"],
+        &["cf-8g-ish"],
+        &[],
+        &["self-hosted", "macos"],
+        &["self-hosted", "Windows"],
+        &["cf-2g", "x64"],
+        &["self-hosted", "${{ matrix.os }}"],
+        &["self-hosted", ""],
+    ] {
+        assert_eq!(served(labels), None, "{labels:?}");
+    }
+}
+
+// added: what a stranger's pull request can put in `runs-on` is bounded: the number of labels, their length and
+// their characters (letters and digits of any script, as the Go manager kept them, and `-`, `_`, `.`). A comma would let one label read as two in a set's key.
+#[test]
+fn a_set_of_too_many_too_long_or_odd_labels_is_not_served() {
+    let served = |labels: Vec<String>| LabelSet::served(labels).map(|set| set.key());
+    let numbered = |n: usize| -> Vec<String> {
+        std::iter::once("self-hosted".to_string())
+            .chain((1..n).map(|i| format!("l{i}")))
+            .collect()
+    };
+    assert!(
+        served(numbered(MAX_SET_LABELS)).is_some(),
+        "{MAX_SET_LABELS} labels"
+    );
+    assert_eq!(served(numbered(MAX_SET_LABELS + 1)), None);
+    assert_eq!(served(numbered(100_000)), None);
+    let long = |n: usize| vec!["self-hosted".to_string(), "x".repeat(n)];
+    assert!(served(long(MAX_LABEL_BYTES)).is_some());
+    assert_eq!(served(long(MAX_LABEL_BYTES + 1)), None);
+    assert_eq!(served(long(1 << 20)), None);
+    assert_eq!(
+        served(vec!["cf-2g".into(), "Za\u{17c}\u{f3}\u{142}\u{107}".into()]).as_deref(),
+        Some("cf-2g,za\u{17c}\u{f3}\u{142}\u{107}"),
+        "letters of any script"
+    );
+    for odd in [
+        "self-hosted,cf-docker",
+        "a b",
+        "\u{1F600}",
+        "a\u{200b}b",
+        "\u{202e}cf-2g",
+        "tab\there",
+        "nul\u{0}",
+        "new\nline",
+        "a/b",
+    ] {
+        assert_eq!(served(vec!["cf-2g".into(), odd.into()]), None, "{odd:?}");
+    }
+    // Repeats and case count once, before the bound: GitHub compares labels without regard to case.
+    let repeated: Vec<String> = std::iter::repeat_n("SELF-HOSTED".to_string(), 1000).collect();
+    assert_eq!(served(repeated).as_deref(), Some("self-hosted"));
+}
+
+// added: the bounds hold for a workflow on the default branch too, through the same rule.
+#[test]
+fn a_workflows_set_of_odd_labels_is_not_served_either() {
+    let wf = files(&[(
+        "ci.yml",
+        &format!(
+            "jobs:\n  a:\n    runs-on: [self-hosted, \"{}\"]\n  b:\n    runs-on: [self-hosted, \"a,b\"]\n  c:\n    runs-on: [cf-2g]\n",
+            "x".repeat(MAX_LABEL_BYTES + 1)
+        ),
+    )]);
+    assert_eq!(keys(&self_hosted(&wf)), ["cf-2g"]);
+}
+
+proptest! {
+    // added: whatever a job's labels are, a set that is served is one a workflow could have asked for: a label of
+    // ours, no other platform, within the bounds.
+    #[test]
+    fn whatever_a_job_names_a_served_set_keeps_the_rules(labels in prop::collection::vec("\\PC{0,20}|self-hosted|cf-[0-9]g|cf-docker|macos|cf-macos", 0..24)) {
+        if let Some(set) = LabelSet::served(labels.iter()) {
+            prop_assert!(set.labels().len() <= MAX_SET_LABELS);
+            prop_assert!(set.labels().iter().any(|l| l == "self-hosted" || l == "cf-docker" || ["cf-2g", "cf-4g", "cf-6g", "cf-8g"].contains(&l.as_str())));
+            for label in set.labels() {
+                prop_assert!(label.len() <= MAX_LABEL_BYTES && !label.is_empty());
+                prop_assert!(label.chars().all(|c| c.is_alphanumeric() || "-_.".contains(c)), "{}", label);
+                prop_assert!(!["macos", "osx", "windows", "x64", "x86", "arm"].contains(&label.as_str()));
+            }
+        }
     }
 }

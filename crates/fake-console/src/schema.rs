@@ -327,6 +327,7 @@ fn runner(v: &Value, path: &str) -> Check {
         field(u, p, "cpuPercent", Required, |v, p| number(v, p, -1.0, 1e5))?;
         field(u, p, "memoryBytes", Required, bytes)
     })
+    // `size` and `countedBytes` end in `.catch(undefined)`: a value the console cannot read is dropped, never refused.
 }
 
 fn scale_set(v: &Value, path: &str) -> Check {
@@ -359,6 +360,7 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "open", Required, boolean)?;
     field(o, path, "reason", Nullish, text(300))?;
     field(o, path, "maxJobs", Required, count)?;
+    // `memoryForJobsBytes` ends in `.catch(undefined)`: a value the console cannot read is dropped, never refused.
     field(o, path, "paused", Default, boolean)?;
     field(o, path, "host", Nullish, host)?;
     field(o, path, "hostError", Nullish, text(300))?;
@@ -367,6 +369,11 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "notServing", Nullish, text(300))?;
     field(o, path, "scaleSets", Nullish, list(500, scale_set))?;
     field(o, path, "runners", Nullish, list(64, runner))
+    // `commands`, the console's commands this Runner does, is read with `.catch`: one the console cannot read is
+    // dropped and the console assumes the commands of a Runner before it, so no value refuses a report.
+    // `heldJobs`, the jobs GitHub holds back from scale sets with room, is not read: the schema drops keys it does not
+    // know, so a console from before it takes the report as one without it. So is `docker`, the Runner's last Docker
+    // check (`{ ok, checkedAt, why? }`), for a console from before it.
 }
 
 fn settings(v: &Value, path: &str) -> Check {
@@ -445,6 +452,7 @@ pub(crate) fn report(v: &Value) -> Check {
     field(o, "", "hostname", Default, text(255))?;
     field(o, "", "model", Default, text(200))?;
     field(o, "", "settings", Nullish, settings)?;
+    // `limits`, what the `settings` command changes, is read with `.catch` as `commands` is: never a refusal.
     field(o, "", "image", Nullish, |v, p| {
         let i = object(v, p)?;
         field(i, p, "commit", Default, text(64))?;

@@ -106,6 +106,30 @@ fn the_person_being_there_does_not_keep_it_waiting() {
 }
 
 #[test]
+fn a_job_the_mac_may_turn_away_waits_for_the_person_and_its_status_says_so() {
+    let mut budget = open(workstation());
+    watch(&mut budget, 61, 61, |r| r.idle = Millis::ZERO);
+    let turn = cf_budget::Turn {
+        urgent: true,
+        repo: "test-run".into(),
+        refusable: true,
+    };
+    let (slot, why) = waits(budget.assign_in_turn(secs(61), Size::G4, turn));
+    assert_eq!(why, Refusal::PersonThere);
+    // What keeps it waiting is what `observe` asks of it, not what an assigned job would be asked.
+    assert_eq!(
+        budget.status(secs(61)).waiting,
+        [Waiting {
+            slot,
+            size: Size::G4,
+            why: Some(Refusal::PersonThere),
+            never: false,
+        }]
+    );
+    assert_eq!(watch(&mut budget, 62, 70, |r| r.idle = Millis::ZERO), []);
+}
+
+#[test]
 fn a_job_that_started_while_the_person_was_there_says_so() {
     // 4 GB committed under a cap of zero must not be a riddle: the grant and the status name the reason.
     let mut budget = open(workstation());

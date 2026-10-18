@@ -48,9 +48,10 @@ pub struct Job {
     pub workload: Workload,
     /// The job's limits.
     pub limits: Limits,
-    /// Environment variables added to the workload's (later entries win over the supervisor's defaults).
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
+    /// Environment variables added to the workload's (later entries win over the supervisor's defaults). Their values
+    /// may be credentials (a test run's token): no debug print shows them; on the wire they are plain pairs.
+    #[serde(default, with = "secret_env")]
+    pub env: Vec<(String, Secret<String>)>,
     /// How long a step gets to fail by itself after the kernel stopped one of its processes for memory, before the
     /// supervisor stops the rest of the step's processes.
     pub oom_grace_ms: u64,
@@ -190,7 +191,10 @@ pub const NAME_CHARS: usize = 64;
 /// The most processes an out-of-memory report names.
 pub const LARGEST_PROCESSES: usize = 5;
 
-fn clip(text: &str, most: usize) -> String {
+/// `text` as a host may show it: at most `most` characters, each control character and each one that steers the
+/// text around it ([`steers`]) a space.
+#[must_use]
+pub fn clip(text: &str, most: usize) -> String {
     text.chars()
         .take(most)
         .map(|c| if c.is_control() || steers(c) { ' ' } else { c })
@@ -314,6 +318,28 @@ pub enum GuestEnd {
     Exited,
     /// The host asked for the end.
     Stopped(StopReason),
+}
+
+/// Environment variables whose values are [`Secret`]s, written as the `[name, value]` pairs they always were.
+pub mod secret_env {
+    use cf_secret::Secret;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Writes the pairs with their values.
+    pub fn serialize<S: Serializer>(env: &[(String, Secret<String>)], to: S) -> Result<S::Ok, S::Error> {
+        to.collect_seq(env.iter().map(|(name, value)| (name, value.expose())))
+    }
+
+    /// Reads the pairs, each value a secret.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        from: D,
+    ) -> Result<Vec<(String, Secret<String>)>, D::Error> {
+        Vec::<(String, String)>::deserialize(from).map(|env| {
+            env.into_iter()
+                .map(|(name, value)| (name, Secret::new(value)))
+                .collect()
+        })
+    }
 }
 
 /// A secret as a plain string in a message: the one place a [`Secret`] is written out, to the end that needs it.

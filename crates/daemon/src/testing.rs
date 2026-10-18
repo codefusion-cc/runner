@@ -48,6 +48,8 @@ struct VmState {
     /// What the guests of machines started from now on say of their cache disk; a fresh one let go cleanly unless a
     /// test says otherwise.
     cache_end: Option<CacheEnd>,
+    /// What each job's console log says, by job.
+    consoles: BTreeMap<String, String>,
 }
 
 /// Looks at vm-hosts that wait, as a look at a vm-host that does not answer does, until a test lets them go.
@@ -99,6 +101,11 @@ impl FakeVms {
         if let Some(vm) = self.lock().vms.get_mut(job) {
             change(vm);
         }
+    }
+
+    /// The job's console log says this.
+    pub fn console(&self, job: &str, text: &str) {
+        self.lock().consoles.insert(job.to_string(), text.to_string());
     }
 
     /// The next `n` starts fail.
@@ -311,6 +318,15 @@ fn finish(vm: &mut FakeVm, end: End) {
 }
 
 impl Vms for FakeVms {
+    fn console_tail(&self, job: &str, bytes: usize) -> Option<String> {
+        let text = self.lock().consoles.get(job).cloned()?;
+        let mut from = text.len().saturating_sub(bytes);
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
+        Some(text[from..].to_string())
+    }
+
     fn start(&self, request: &JobRequest) -> Result<(), VmError> {
         let mut state = self.lock();
         if state.frozen {
@@ -488,17 +504,30 @@ impl TestParts {
         machines
     }
 
+    /// [`TestParts::machines`] with their configuration changed by `tweak`.
+    pub fn machines_with(&self, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
+        let machines = self.restored_with(FakeHost::new(TEST_MAC), tweak);
+        pass(&machines, 61);
+        machines
+    }
+
     /// Machines as a daemon that just started has them, before its first look at the Mac.
     pub fn restored(&self, host: FakeHost) -> Arc<TestMachines> {
+        self.restored_with(host, |_| {})
+    }
+
+    fn restored_with(&self, host: FakeHost, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
         let (nudges, bell) = (self.nudges.clone(), self.bell.clone());
+        let mut config = MachineConfig {
+            docker_cache: self.docker_cache.clone(),
+            ..MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600))
+        };
+        tweak(&mut config);
         let machines = Machines::restore(MachineParts {
             host,
             vms: self.vms.clone(),
             settings: self.settings.clone(),
-            config: MachineConfig {
-                docker_cache: self.docker_cache.clone(),
-                ..MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600))
-            },
+            config,
             roster: self.roster.clone(),
             store: self.store.clone(),
             clock: self.clock.clone(),
@@ -621,6 +650,14 @@ impl Store for CrashingStore {
     fn load(&self) -> Vec<Record> {
         self.records.load()
     }
+
+    fn docker_failure(&self) -> Option<crate::docker_check::DockerCheck> {
+        self.records.docker_failure()
+    }
+
+    fn keep_docker_failure(&self, check: Option<&crate::docker_check::DockerCheck>) {
+        self.write(|| self.records.keep_docker_failure(check));
+    }
 }
 
 /// Collects job reports.
@@ -692,17 +729,87 @@ impl Events for EventLog {
     }
 }
 
+/// A settings file a test changes: what it says now, how often it was looked at, the changes written into it, and
+/// why the next change is refused, when it is.
+#[derive(Debug)]
+pub struct FakeSettings(Mutex<FakeFile>);
+
+#[derive(Debug)]
+struct FakeFile {
+    look: crate::update::SettingsLook,
+    looks: usize,
+    changes: Vec<crate::update::SettingsChange>,
+    refuse: Option<String>,
+}
+
+impl Default for FakeSettings {
+    fn default() -> FakeSettings {
+        FakeSettings(Mutex::new(FakeFile {
+            look: crate::update::SettingsLook::Same,
+            looks: 0,
+            changes: Vec::new(),
+            refuse: None,
+        }))
+    }
+}
+
+impl FakeSettings {
+    /// From now on the file says `look`.
+    pub fn says(&self, look: crate::update::SettingsLook) {
+        self.0.lock().expect("settings").look = look;
+    }
+
+    /// How often the file was looked at.
+    pub fn looks(&self) -> usize {
+        self.0.lock().expect("settings").looks
+    }
+
+    /// The changes written into the file, in order.
+    pub fn changes(&self) -> Vec<crate::update::SettingsChange> {
+        self.0.lock().expect("settings").changes.clone()
+    }
+
+    /// The next change is refused for `why`, and nothing is written.
+    pub fn refuse_next(&self, why: &str) {
+        self.0.lock().expect("settings").refuse = Some(why.to_string());
+    }
+}
+
+impl crate::update::SettingsFile for FakeSettings {
+    fn look(&self) -> crate::update::SettingsLook {
+        let mut file = self.0.lock().expect("settings");
+        file.looks += 1;
+        file.look.clone()
+    }
+
+    /// A change written makes the file say other settings, named by how many were written.
+    fn change(&self, change: &crate::update::SettingsChange) -> Result<bool, String> {
+        let mut file = self.0.lock().expect("settings");
+        if let Some(why) = file.refuse.take() {
+            return Err(why);
+        }
+        file.changes.push(change.clone());
+        file.look = crate::update::SettingsLook::Changed {
+            id: format!("change-{}", file.changes.len()),
+        };
+        Ok(true)
+    }
+}
+
 /// An update a test scripts: what each build and each install answers, how long a build takes, and what was
 /// installed.
 #[derive(Debug, Default)]
-pub struct FakeUpdate(Mutex<UpdateScript>);
+pub struct FakeUpdate(Mutex<UpdateScript>, Condvar);
 
 #[derive(Debug, Default)]
 struct UpdateScript {
     builds: std::collections::VecDeque<Result<String, String>>,
     installs: std::collections::VecDeque<Result<(), String>>,
     build_takes: Duration,
-    built: usize,
+    /// Builds wait while this is set.
+    held: bool,
+    /// What each build was asked for: `None` for the head of the branch.
+    asked: Vec<Option<String>>,
     installed: Vec<crate::update::Pending>,
 }
 
@@ -724,9 +831,25 @@ impl FakeUpdate {
         self.0.lock().expect("update").build_takes = time;
     }
 
-    /// How many builds ran.
+    /// Builds started from now on wait until [`FakeUpdate::release_builds`].
+    pub fn hold_builds(&self) {
+        self.0.lock().expect("update").held = true;
+    }
+
+    /// Lets the builds that wait go on.
+    pub fn release_builds(&self) {
+        self.0.lock().expect("update").held = false;
+        self.1.notify_all();
+    }
+
+    /// How many builds started.
     pub fn built(&self) -> usize {
-        self.0.lock().expect("update").built
+        self.0.lock().expect("update").asked.len()
+    }
+
+    /// What each build that started was asked for, in order: `None` for the head of the branch, else a commit.
+    pub fn asked(&self) -> Vec<Option<String>> {
+        self.0.lock().expect("update").asked.clone()
     }
 
     /// What was installed, in order.
@@ -740,10 +863,11 @@ impl crate::update::SelfUpdate for FakeUpdate {
         "/src/runner main".into()
     }
 
-    fn build(&self) -> Result<String, String> {
+    fn build(&self, commit: Option<&str>) -> Result<String, String> {
         let (takes, answer) = {
             let mut script = self.0.lock().expect("update");
-            script.built += 1;
+            script.asked.push(commit.map(str::to_string));
+            let mut script = self.1.wait_while(script, |script| script.held).expect("update");
             let answer = script
                 .builds
                 .pop_front()
