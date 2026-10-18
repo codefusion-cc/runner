@@ -244,7 +244,7 @@ fn last_words_are_the_last_lines_in_order() {
 }
 
 #[test]
-fn an_empty_or_unreadable_log_has_no_last_words() {
+fn an_empty_or_blank_log_has_no_last_words() {
     assert!(last_words(b"").is_empty());
     assert!(last_words(b"\n \n\r\n").is_empty());
 }
@@ -263,4 +263,65 @@ fn last_words_cannot_steer_the_console() {
     assert!(line.chars().count() <= LAST_WORDS_CHARS);
     assert!(!line.chars().any(|c| c.is_control() || c == '\u{202e}'));
     assert!(line.starts_with("[2Jcf-supervisor: power off"));
+}
+
+/// What an image built before Docker jobs has: the Actions runner image's engine, nothing more.
+fn before_docker_jobs(path: &str) -> bool {
+    path == "/usr/bin/dockerd"
+}
+
+#[test]
+fn an_image_from_before_docker_jobs_gets_no_daemon_and_says_why() {
+    let problem = missing_programs(before_docker_jobs).expect("a problem");
+    assert!(
+        problem.starts_with("the image has no iptables or pasta: "),
+        "{problem}"
+    );
+}
+
+#[test]
+fn an_image_with_every_program_on_the_path_is_fine() {
+    let image = ["/usr/bin/dockerd", "/usr/sbin/iptables", "/usr/local/bin/pasta"];
+    assert_eq!(missing_programs(|path| image.contains(&path)), None);
+}
+
+#[test]
+fn a_program_off_the_path_counts_as_missing() {
+    let image = [
+        "/usr/bin/dockerd",
+        "/usr/sbin/iptables",
+        "/opt/passt/pasta",
+        "/usr/bin/pasta/",
+    ];
+    let problem = missing_programs(|path| image.contains(&path)).expect("a problem");
+    assert!(problem.starts_with("the image has no pasta: "), "{problem}");
+    let problem = missing_programs(|_| false).expect("a problem");
+    assert!(
+        problem.starts_with("the image has no dockerd or iptables or pasta: "),
+        "{problem}"
+    );
+}
+
+#[test]
+fn the_sandbox_runs_only_programs_it_checks_for() {
+    for command in [
+        dockerd_command(&alone()),
+        pasta_command("/proc/2/ns/net"),
+        flagless_tcp_rule(),
+    ] {
+        assert!(PROGRAMS.contains(&command[0].as_str()), "{}", command[0]);
+    }
+}
+
+proptest! {
+    #[test]
+    fn last_words_are_few_short_and_harmless_for_any_log(log in prop::collection::vec(any::<u8>(), 0..4096)) {
+        let words = last_words(&log);
+        prop_assert!(words.len() <= LAST_WORDS_LINES);
+        for line in &words {
+            prop_assert!(!line.is_empty() && line.chars().count() <= LAST_WORDS_CHARS);
+            prop_assert!(!line.chars().any(char::is_control), "{:?}", line);
+            prop_assert_eq!(line.trim(), line.as_str());
+        }
+    }
 }

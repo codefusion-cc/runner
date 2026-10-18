@@ -75,7 +75,11 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
 
 - The daemon does not start (the image lacks a tool, a module is missing): the job runs without Docker, and its
   start hook writes an error on the run, "Docker did not start", with the end of the daemon's log, as soon as the
-  sandbox ended or after 60 seconds without an answer.
+  sandbox ended or after 60 seconds without an answer. The machine's console log (`logs/<job>.console.log`) shows
+  the same end of the log, clipped, under "the Docker sandbox ended".
+- An image built before Docker jobs (before 2026-10-14) has the daemon but not iptables or pasta: the supervisor
+  checks for them before it makes the sandbox, and the job is told "the image has no iptables or pasta". The cure
+  is a newer image on that machine (`codefusion-runner image install`).
 - The daemon stops during a job: the steps that use it fail; the log is at `/run/cf-docker/dockerd.log`.
 
 ## Tests

@@ -40,6 +40,27 @@ pub const PROBLEM: &str = "docker-problem.txt";
 /// The group the socket belongs to, which the image gives the job's user.
 pub const GROUP: &str = "docker";
 
+/// Where the sandbox's programs are looked for, its `PATH`.
+pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// The programs the sandbox runs from the image: the daemon, iptables for its network rule and pasta. Images built
+/// before Docker jobs (2026-10-14) have the daemon but neither of the others.
+pub const PROGRAMS: [&str; 3] = ["dockerd", "iptables", "pasta"];
+
+/// Why a job gets no daemon when its image lacks some of [`PROGRAMS`], where `exists` says whether a path in the
+/// image is there, or `None` when it has them all.
+pub fn missing_programs(exists: impl Fn(&str) -> bool) -> Option<String> {
+    let missing: Vec<&str> = PROGRAMS
+        .into_iter()
+        .filter(|name| !PATH.split(':').any(|folder| exists(&format!("{folder}/{name}"))))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "the image has no {}: it was built before Docker jobs; the Runner needs a newer image",
+            missing.join(" or ")
+        )
+    })
+}
+
 /// One line of a `uid_map` or `gid_map`: the first id inside, the first outside, how many.
 pub type Extent = (u32, u32, u32);
 

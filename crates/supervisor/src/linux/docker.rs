@@ -70,6 +70,12 @@ pub fn prepare(
     shm_bytes: u64,
     beside: &[(plan::Ip, u8)],
 ) -> Result<Spec, String> {
+    // Before anything is changed for the daemon: an image from before Docker jobs lacks its programs.
+    if let Some(problem) =
+        plan::missing_programs(|path| fs::symlink_metadata(format!("{root}{path}")).is_ok())
+    {
+        return Err(problem);
+    }
     let networks = plan::networks(beside)
         .ok_or("every private range the daemon's networks could have is one the machine or the host is in")?;
     load_modules(MODULE_LIST, MODULE_DIR)?;
@@ -142,10 +148,14 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
         "the daemon's log",
         fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .mode(0o644)
             .open(format!("{}/{}", spec.sockets, plan::LOG_NAME)),
     )?;
+    // The tail is read from this handle, not the path: the sandbox owns the log's folder and could put a link or a
+    // pipe there, which the machine's root would then follow.
+    let tail_of = context("the daemon's log", log.try_clone())?;
     let (view_read, view_write) = context("pipe", sys::pipe())?;
     let mut child = spawn_self(
         "docker",
@@ -171,12 +181,11 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
         let _ = child.kill();
     }
     let problem = problem.to_string();
-    let log_path = format!("{}/{}", spec.sockets, plan::LOG_NAME);
     std::thread::spawn(move || {
         if let Ok(status) = child.wait() {
             say(&format!("the Docker sandbox ended: {status}"));
             if !status.success() {
-                for line in plan::last_words(&log_tail(&log_path)) {
+                for line in plan::last_words(&log_tail(&tail_of)) {
                     say(&format!("  {line}"));
                 }
             }
@@ -193,16 +202,20 @@ pub fn start(spec: &Spec, problem: &str) -> Result<(), String> {
     }
 }
 
-/// The last [`plan::LAST_WORDS_BYTES`] of the daemon's log at `path`, or nothing when it cannot be read.
-fn log_tail(path: &str) -> Vec<u8> {
-    let Ok(mut file) = File::open(path) else {
-        return Vec::new();
-    };
-    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+/// The last [`plan::LAST_WORDS_BYTES`] of the daemon's log, from its first whole line, or nothing when it cannot be
+/// read. Its writers append, so where this leaves the shared offset does not matter.
+fn log_tail(mut log: &File) -> Vec<u8> {
+    let length = log.metadata().map(|meta| meta.len()).unwrap_or(0);
     let from = length.saturating_sub(plan::LAST_WORDS_BYTES as u64);
     let mut tail = Vec::new();
-    if file.seek(SeekFrom::Start(from)).is_ok() {
-        let _ = file.take(plan::LAST_WORDS_BYTES as u64).read_to_end(&mut tail);
+    if log.seek(SeekFrom::Start(from)).is_ok() {
+        let _ = log.take(plan::LAST_WORDS_BYTES as u64).read_to_end(&mut tail);
+    }
+    // A tail that starts inside a line would show that line's middle.
+    if from > 0
+        && let Some(end) = tail.iter().position(|&byte| byte == b'\n')
+    {
+        tail.drain(..=end);
     }
     tail
 }
@@ -311,14 +324,7 @@ fn first_process(spec: &Spec, built: OwnedFd, ask: OwnedFd, done: OwnedFd) -> Re
 }
 
 /// The whole environment of the sandbox's programs.
-const SANDBOX_ENV: [(&str, &str); 3] = [
-    (
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    ),
-    ("HOME", "/tmp"),
-    ("LANG", "C.UTF-8"),
-];
+const SANDBOX_ENV: [(&str, &str); 3] = [("PATH", plan::PATH), ("HOME", "/tmp"), ("LANG", "C.UTF-8")];
 
 /// One of the sandbox's programs, `argv`, with the sandbox's environment and nothing on its input.
 fn sandbox_command(argv: &[String]) -> Command {
