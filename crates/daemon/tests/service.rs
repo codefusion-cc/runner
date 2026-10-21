@@ -2292,7 +2292,9 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// Every job that ran here reaches the console, its start and its end, each once.
+/// Every job that ran here reaches the console, its start and its end, each once. A start the Runner reported on
+/// its own (GitHub's answer implied the job, or the registration went before a crash) has its end only once the
+/// machine is gone and the wait for GitHub's word is over: that end is waited for too.
 async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -> Result<(), TestCaseError> {
     let heard_from = std::time::Instant::now();
     loop {
@@ -2300,12 +2302,22 @@ async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -
             .iter()
             .filter(|runner| heard(rig, runner) != (true, true))
             .collect();
-        if unheard.is_empty() {
+        let events = rig.events();
+        let unended: Vec<&str> = events
+            .iter()
+            .filter_map(|(id, _)| id.strip_suffix("/started"))
+            .filter(|runner| {
+                !events
+                    .iter()
+                    .any(|(id, end)| *id == format!("{runner}/completed") && !end.is_null())
+            })
+            .collect();
+        if unheard.is_empty() && unended.is_empty() {
             break;
         }
         prop_assert!(
             heard_from.elapsed() < HEARD_WITHIN,
-            "jobs that ran here and never reached the console: {unheard:?}"
+            "jobs that ran here and never reached the console: {unheard:?}; started and never ended: {unended:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
