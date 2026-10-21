@@ -203,7 +203,11 @@ impl Watch {
         if reading.on_battery {
             self.troubles.insert(Trouble::Battery);
         }
-        if reading.disk_free_bytes < settings.disk_hold_bytes {
+        if reading
+            .disk_free_bytes
+            .saturating_add(reading.disk_reclaimable_bytes)
+            < settings.disk_hold_bytes
+        {
             self.troubles.insert(Trouble::DiskLow);
         }
     }

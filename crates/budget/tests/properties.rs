@@ -61,6 +61,7 @@ struct Shape {
     thermal: Thermal,
     on_battery: bool,
     disk_gib: u64,
+    disk_reclaimable_gib: u64,
     late_ms: u64,
 }
 
@@ -74,6 +75,7 @@ fn fine() -> Shape {
         thermal: Thermal::Nominal,
         on_battery: false,
         disk_gib: 100,
+        disk_reclaimable_gib: 0,
         late_ms: 0,
     }
 }
@@ -97,6 +99,7 @@ fn shape() -> impl Strategy<Value = Shape> {
         prop::bool::weighted(0.1),
         prop_oneof![5 => Just(100u64), 1 => 0..30u64],
         prop_oneof![9 => Just(0u64), 1 => 0..8000u64],
+        prop_oneof![4 => Just(0u64), 1 => 0..60u64],
     )
         .prop_map(
             |(
@@ -109,6 +112,7 @@ fn shape() -> impl Strategy<Value = Shape> {
                 on_battery,
                 disk_gib,
                 late_ms,
+                disk_reclaimable_gib,
             )| {
                 Shape {
                     available_mib,
@@ -119,6 +123,7 @@ fn shape() -> impl Strategy<Value = Shape> {
                     thermal,
                     on_battery,
                     disk_gib,
+                    disk_reclaimable_gib,
                     late_ms,
                 }
             },
@@ -254,7 +259,7 @@ impl World {
             && reading.pressure == Pressure::Normal
             && reading.thermal < Thermal::Serious
             && !reading.on_battery
-            && reading.disk_free_bytes >= self.settings.disk_hold_bytes
+            && reading.disk_free_bytes + reading.disk_reclaimable_bytes >= self.settings.disk_hold_bytes
             && reading.available_bytes >= self.limits(reading).floor_bytes
     }
 
@@ -385,6 +390,7 @@ impl World {
                     thermal: reading.thermal,
                     on_battery: reading.on_battery,
                     disk_free_bytes: reading.disk_gib * GIB,
+                    disk_reclaimable_bytes: reading.disk_reclaimable_gib * GIB,
                 };
                 self.observe(Some(handed))?;
             }
@@ -805,6 +811,7 @@ proptest! {
             thermal: shape.thermal,
             on_battery: shape.on_battery,
             disk_free_bytes: shape.disk_gib * GIB,
+            disk_reclaimable_bytes: shape.disk_reclaimable_gib * GIB,
         };
         let mut bad = base.clone();
         bad.available_mib = bad.available_mib.saturating_sub(less_mib);

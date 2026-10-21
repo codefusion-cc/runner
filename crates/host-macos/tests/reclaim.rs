@@ -40,6 +40,7 @@ fn idle_mini() -> Raw {
         thermal_level: 0,
         power_remaining_secs: -2.0,
         disk_free_bytes: 75 * GIB,
+        disk_important_bytes: None,
     }
 }
 

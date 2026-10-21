@@ -54,6 +54,7 @@ pub fn calm(at: Now) -> HostReading {
         thermal: Thermal::Nominal,
         on_battery: false,
         disk_free_bytes: 100 * GIB,
+        disk_reclaimable_bytes: 0,
     }
 }
 

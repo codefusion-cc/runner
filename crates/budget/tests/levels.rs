@@ -248,6 +248,52 @@ fn a_signal_that_flips_every_second_keeps_the_mac_closed() {
 }
 
 #[test]
+fn space_the_system_frees_on_demand_counts_for_the_hold_and_not_for_a_stop() {
+    // A Mac mini running CI with 24 hourly local snapshots: 24.5 GB free, 38.6 GB more that macOS frees as soon as
+    // something needs it. It took no job for hours with 25.4 GB free.
+    let mut budget = open(dedicated());
+    let snapshots = |r: &mut HostReading| {
+        r.disk_free_bytes = 24 * GIB + GIB / 2;
+        r.disk_reclaimable_bytes = 38 * GIB + 6 * GIB / 10;
+    };
+    assert_eq!(after(&mut budget, 61, snapshots), None);
+    assert_eq!(budget.level(secs(61)), Level::Open);
+    // The hold counts both, to the byte.
+    let mut budget = open(dedicated());
+    let short = |r: &mut HostReading| {
+        r.disk_free_bytes = 20 * GIB;
+        r.disk_reclaimable_bytes = 5 * GIB - 1;
+    };
+    assert_eq!(
+        after(&mut budget, 61, short),
+        Some(Refusal::Trouble(Trouble::DiskLow))
+    );
+    let mut budget = open(dedicated());
+    let enough = |r: &mut HostReading| {
+        r.disk_free_bytes = 20 * GIB;
+        r.disk_reclaimable_bytes = 5 * GIB;
+    };
+    assert_eq!(after(&mut budget, 61, enough), None);
+    // Nothing that would be freed keeps a job whose writes have no room now: under 5 GB free, one is stopped.
+    let (mut budget, older, _) = two_jobs();
+    let scratch = Usage {
+        resident_bytes: 0,
+        scratch_bytes: GIB,
+    };
+    budget.usage(secs(61), older, scratch).unwrap();
+    let mut reading = calm(secs(61));
+    reading.disk_free_bytes = 5 * GIB - 1;
+    reading.disk_reclaimable_bytes = 200 * GIB;
+    assert_eq!(
+        budget.observe(secs(61), Some(reading)).evict,
+        Some(Eviction {
+            slot: older,
+            cause: EvictionCause::Disk
+        })
+    );
+}
+
+#[test]
 fn heat_battery_and_a_full_disk_hold() {
     let cases: [(Change, Trouble); 4] = [
         (|r| r.thermal = Thermal::Serious, Trouble::Hot),
