@@ -28,6 +28,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older run; runs on main, tags and schedules never cancel one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   kernel:
     name: Our copy of the pinned kernel package answers
