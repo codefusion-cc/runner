@@ -1253,6 +1253,17 @@ async fn a_plain_actions_runner_is_registered_with_exactly_its_labels() {
         .unwrap_err();
     assert_eq!(again.status(), Some(409));
     assert_eq!(h.fake.plain_runners().len(), 1);
+    // Sent once: GitHub may have registered it although its answer failed, and a second try would meet the name.
+    let path = "POST /repos/org/app/actions/runners/generate-jitconfig";
+    let sent = h.fake.count(path);
+    h.fake.fail(path, Reply::text(502, "bad gateway"), 1);
+    let failed = h
+        .app
+        .generate_jit_config(1, "org/app", "mac-b-3", &labels)
+        .await
+        .unwrap_err();
+    assert_eq!(failed.status(), Some(502));
+    assert_eq!(h.fake.count(path), sent + 1);
     let unknown = h
         .app
         .generate_jit_config(1, "org/none", "mac-b-2", &labels)

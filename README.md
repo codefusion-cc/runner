@@ -90,6 +90,9 @@ A configuration file says what the Mac is:
   Runner may have the same name.
 - `state_dir` holds everything the Runner keeps and is on the Mac's own disk. `app_dir` holds the GitHub App's
   `app.json` and `app.pem` (0600); `scripts/runner-app.ts` in `codefusion-cc/codefusion` makes the App and writes them.
+  Without `app_dir`, the Mac gets its GitHub tokens from the console it is enrolled with, which holds the Runners
+  App's key: read tokens renewed at half their life, and a registration token or a one-job runner when it needs one.
+  With both, the console's tokens serve once the owner turns them on on the machine's page, and the key until then.
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`

@@ -210,6 +210,8 @@ struct State {
     repos: BTreeMap<String, Repo>,
     /// token -> expires_at (epoch seconds)
     installation_tokens: HashMap<String, i64>,
+    /// The installation tokens that only read, as the console's are: GitHub refuses them a write.
+    read_only: BTreeSet<String>,
     /// token -> (expires_at, repository)
     registration_tokens: HashMap<String, (i64, String)>,
     admin_tokens: HashMap<String, (i64, String)>,
@@ -314,6 +316,18 @@ impl State {
     fn token(&mut self, prefix: &str) -> String {
         self.next += 1;
         format!("{prefix}_{:04}", self.next)
+    }
+
+    /// A token that registers Actions runners with `repo`, and when it expires; none for a repository the App lacks.
+    fn registration_token(&mut self, repo: &str) -> Option<(String, i64)> {
+        if !self.repos.contains_key(repo) {
+            return None;
+        }
+        let token = self.token("AREG");
+        let exp = self.now() + 3600;
+        self.registration_tokens
+            .insert(token.clone(), (exp, repo.to_string()));
+        Some((token, exp))
     }
 
     fn scale_set(&mut self, id: i64) -> Option<&mut ScaleSet> {
@@ -492,6 +506,7 @@ impl FakeGithub {
                 next: 0,
                 repos: BTreeMap::new(),
                 installation_tokens: HashMap::new(),
+                read_only: BTreeSet::new(),
                 registration_tokens: HashMap::new(),
                 admin_tokens: HashMap::new(),
                 scale_sets: vec![],
@@ -604,6 +619,78 @@ impl FakeGithub {
     /// died. Up again with `false`.
     pub fn set_down(&self, down: bool) {
         self.lock().down = down;
+    }
+
+    // ---- what the console does with the App's key ----
+
+    /// The App's installations, each with its account, as `GET /app/installations` lists them.
+    pub fn installations(&self) -> Vec<(i64, String)> {
+        vec![(1, "org".to_string())]
+    }
+
+    /// GitHub's time by the fake's clock, in seconds since 1970: what the tokens it makes expire by.
+    pub fn now_epoch(&self) -> i64 {
+        self.lock().now()
+    }
+
+    /// An installation token that only reads, made as the console makes one with its own App's key (no request
+    /// reaches the fake): it reads every repository the fake has, and GitHub refuses it every write. With when it
+    /// expires.
+    pub fn mint_read_token(&self) -> (String, i64) {
+        let mut st = self.lock();
+        let token = st.token("ghs");
+        let exp = st.now() + st.opts.installation_token_ttl.as_secs() as i64;
+        st.installation_tokens.insert(token.clone(), exp);
+        st.read_only.insert(token.clone());
+        (token, exp)
+    }
+
+    /// A token that registers Actions runners with `repo`, made as the console makes one, with when it expires; none
+    /// for a repository the App lacks.
+    pub fn mint_registration_token(&self, repo: &str) -> Option<(String, i64)> {
+        self.lock().registration_token(repo)
+    }
+
+    /// An Actions runner for one job of `repo`, registered as the console registers one: its ID and configuration,
+    /// or GitHub's status (404 for a repository the App lacks, 409 for a name taken, 422 for no labels).
+    pub fn mint_plain_jit(&self, repo: &str, name: &str, labels: &[String]) -> Result<(i64, String), u16> {
+        let mut st = self.lock();
+        let body = json!({"name": name, "runner_group_id": 1, "labels": labels, "work_folder": "_work"});
+        match plain_jit(&mut st, repo, &body) {
+            Ok(_) => {
+                let id = st
+                    .runners
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map(|r| r.id)
+                    .unwrap_or(0);
+                Ok((id, jit_config_of(name)))
+            }
+            Err(Reply::Response { status, .. }) => Err(status),
+            Err(_) => Err(500),
+        }
+    }
+
+    /// This installation token stops working (`DELETE /installation/token`): GitHub answers 401 to it.
+    pub fn revoke_token(&self, token: &str) {
+        let mut st = self.lock();
+        st.installation_tokens.remove(token);
+        st.read_only.remove(token);
+    }
+
+    /// Whether GitHub still takes this installation token: made here, not revoked and not expired.
+    pub fn token_works(&self, token: &str) -> bool {
+        let st = self.lock();
+        st.installation_tokens
+            .get(token)
+            .is_some_and(|exp| *exp > st.now())
+    }
+
+    /// Every installation token stops working: GitHub answers 401 to each.
+    pub fn revoke_installation_tokens(&self) {
+        let mut st = self.lock();
+        st.installation_tokens.clear();
+        st.read_only.clear();
     }
 
     // ---- faults and hooks ----
@@ -1149,14 +1236,17 @@ impl FakeGithub {
             }
             ("POST", ["repos", owner, repo, "actions", "runners", "registration-token"]) => {
                 let name = format!("{owner}/{repo}");
+                let writes = writes(&req);
                 self.with_installation(&req, |st| {
-                    if !st.repos.contains_key(&name) {
-                        return Reply::status_json(404, &json!({"message": "Not Found"}));
+                    if st.read_only.contains(&writes) {
+                        return not_accessible();
                     }
-                    let token = st.token("AREG");
-                    let exp = st.now() + 3600;
-                    st.registration_tokens.insert(token.clone(), (exp, name.clone()));
-                    Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
+                    match st.registration_token(&name) {
+                        Some((token, exp)) => {
+                            Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
+                        }
+                        None => Reply::status_json(404, &json!({"message": "Not Found"})),
+                    }
                 })
             }
             // Probe H, 2026-10-12: `busy` and `status` for an Actions runner registered for a scale set, by the ID its
@@ -1187,7 +1277,16 @@ impl FakeGithub {
             // for, in the repository's default runner group; a name taken is refused.
             ("POST", ["repos", owner, repo, "actions", "runners", "generate-jitconfig"]) => {
                 let name = format!("{owner}/{repo}");
-                self.with_installation(&req, |st| generate_plain_jit(st, &name, &req))
+                let writes = writes(&req);
+                self.with_installation(&req, |st| {
+                    if st.read_only.contains(&writes) {
+                        return not_accessible();
+                    }
+                    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                    match plain_jit(st, &name, &body) {
+                        Ok(reply) | Err(reply) => reply,
+                    }
+                })
             }
             ("POST", ["actions", "runner-registration"]) => self.runner_registration(&req),
             (_, ["svc", rest @ ..]) => self.actions_service(&req, rest).await,
@@ -1743,11 +1842,24 @@ fn acquire_jobs(st: &mut State, id: i64, req: &Request) -> Reply {
     Reply::json(&json!({"count": got.len(), "value": got}))
 }
 
-fn generate_plain_jit(st: &mut State, repo: &str, req: &Request) -> Reply {
+/// The bearer token of a request, for the check that it may write.
+fn writes(req: &Request) -> String {
+    req.header("authorization")
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// GitHub's answer to a write with a token that may not make it.
+fn not_accessible() -> Reply {
+    Reply::status_json(403, &json!({"message": "Resource not accessible by integration"}))
+}
+
+/// `generate-jitconfig` with the request's JSON body: the 201, or GitHub's refusal.
+fn plain_jit(st: &mut State, repo: &str, body: &Value) -> Result<Reply, Reply> {
     if !st.repos.contains_key(repo) {
-        return Reply::status_json(404, &json!({"message": "Not Found"}));
+        return Err(Reply::status_json(404, &json!({"message": "Not Found"})));
     }
-    let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
     let name = body["name"].as_str().unwrap_or_default().to_string();
     let labels: Vec<String> = body["labels"]
         .as_array()
@@ -1760,28 +1872,33 @@ fn generate_plain_jit(st: &mut State, repo: &str, req: &Request) -> Reply {
         })
         .unwrap_or_default();
     if name.is_empty() || labels.is_empty() || body["runner_group_id"].as_i64().is_none() {
-        return Reply::status_json(
+        return Err(Reply::status_json(
             422,
             &json!({"message": "Invalid request: name, runner_group_id and labels are required"}),
-        );
+        ));
     }
     let Some(rid) = register(st, &name, PLAIN, repo.to_string(), labels.clone()) else {
-        return Reply::status_json(
+        return Err(Reply::status_json(
             409,
             &json!({"message": "Already exists - A runner with this name already exists."}),
-        );
+        ));
     };
     let labels: Vec<Value> = labels
         .iter()
         .map(|l| json!({"name": l, "type": "custom"}))
         .collect();
-    Reply::status_json(
+    Ok(Reply::status_json(
         201,
         &json!({
             "runner": {"id": rid, "name": name, "os": "unknown", "status": "offline", "busy": false, "labels": labels},
-            "encoded_jit_config": b64url(format!("jit-config-for-{name}").as_bytes()),
+            "encoded_jit_config": jit_config_of(&name),
         }),
-    )
+    ))
+}
+
+/// The configuration the fake gives an Actions runner registered outside any scale set.
+fn jit_config_of(name: &str) -> String {
+    b64url(format!("jit-config-for-{name}").as_bytes())
 }
 
 /// Registers an Actions runner and says its ID; none when the name is taken.

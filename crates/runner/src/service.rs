@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cf_budget::{Budget, Host as _, HostFacts, HostReading, Settings, Size, admit};
+use cf_console_client::ConsoleTokens;
 use cf_daemon::names::ServePolicy;
 use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, UpdateFile};
 use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
-use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
+use cf_ghapp::{
+    AppCredentials, Clock, GitHubApp, Http, KeyTokens, RetryPolicy, SystemClock, SystemMonotonic, TokenSource,
+};
 use cf_secret::Secret;
 
 use crate::commands::VERSION;
@@ -62,16 +65,47 @@ fn runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
         .map_err(|error| format!("no runtime: {error}"))
 }
 
+/// The App's credentials in `app_dir`, when the configuration names the folder.
+fn credentials(config: &Config) -> Result<Option<AppCredentials>, String> {
+    config
+        .app_dir
+        .as_ref()
+        .map(|dir| {
+            AppCredentials::load(dir).map_err(|error| format!("the GitHub App in {}: {error}", dir.display()))
+        })
+        .transpose()
+}
+
+/// The GitHub App client, with its tokens from the console when the host is enrolled with one (the App's key here,
+/// when there is one, serves while the console's tokens are off for the host), else signed for with the key here.
 fn app(config: &Config) -> Result<GitHubApp, String> {
-    let credentials = AppCredentials::load(&config.app_dir)
-        .map_err(|error| format!("the GitHub App in {}: {error}", config.app_dir.display()))?;
-    Ok(GitHubApp::new(
-        &credentials.client_id,
-        credentials.key,
-        &config.github_api,
-        Http::new(ANSWER, RetryPolicy::default()),
-        Arc::new(SystemClock),
-    ))
+    let http = Http::new(ANSWER, RetryPolicy::default());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let key = credentials(config)?;
+    match (console(config)?, key) {
+        (Some((address, token)), key) => {
+            let key = key.map(|credentials| {
+                Arc::new(KeyTokens::from_credentials(
+                    credentials,
+                    &config.github_api,
+                    http.clone(),
+                    clock.clone(),
+                )) as Arc<dyn TokenSource>
+            });
+            let client = cf_console_client::Client::new(&address, token, http.clone());
+            let tokens = ConsoleTokens::new(client, &config.machine, key, clock, Arc::new(SystemMonotonic));
+            Ok(GitHubApp::with_source(Arc::new(tokens), &config.github_api, http))
+        }
+        (None, Some(credentials)) => Ok(GitHubApp::from_credentials(
+            credentials,
+            &config.github_api,
+            http,
+            clock,
+        )),
+        (None, None) => {
+            Err("no GitHub tokens: no App key (app_dir) and no console to get them from (console)".into())
+        }
+    }
 }
 
 /// This host's token for the console, when the configuration names one.
@@ -218,6 +252,7 @@ fn installed_image(config: &Config) -> Result<PathBuf, String> {
 
 fn service(
     config: &Config,
+    app: GitHubApp,
     program: &Path,
     updates: Option<Arc<dyn SelfUpdate>>,
     settings: Option<Arc<dyn SettingsFile>>,
@@ -227,7 +262,7 @@ fn service(
         version: VERSION.into(),
         state_dir: config.state_dir.clone(),
         program: program.to_path_buf(),
-        app: app(config)?,
+        app,
         image: config.image.clone(),
         deadline: config.deadline(),
         mode: config.mode(),
@@ -270,9 +305,29 @@ fn only_runner(config: &Config) -> Result<std::fs::File, String> {
     }
 }
 
-/// The configuration an uninstall works with: a host without a token it can use (it never enrolled, or its
-/// enrolment was cut off) has nobody to tell, and must still be able to go.
-fn for_uninstall(mut config: Config) -> Config {
+/// The GitHub App client a check looks with: the Runner's own, but with the key here when the host has not enrolled
+/// with its console yet, as `check` comes before `enroll`.
+fn github_for_check(config: &Config) -> Result<GitHubApp, String> {
+    match config.app_dir {
+        Some(_) => app(&as_enrolled(config.clone())),
+        None => app(config),
+    }
+}
+
+/// The GitHub App client an uninstall removes this host's runners with (`config` as [`as_enrolled`] made it): none for
+/// a host with no way to GitHub at all, no App key here and no console token it can use (lost, or taken by an
+/// earlier `uninstall --leave`). It can remove nothing there, and must still be able to go; the console's Remove
+/// takes its runners off GitHub.
+fn github_for_uninstall(config: &Config) -> Result<Option<GitHubApp>, String> {
+    if config.app_dir.is_none() && config.console.is_none() {
+        return Ok(None);
+    }
+    app(config).map(Some)
+}
+
+/// The configuration with its console only when the host holds a token it can use: one that never enrolled, or whose
+/// enrolment was cut off, has nobody to tell when it goes and no tokens to get from it when it is checked.
+fn as_enrolled(mut config: Config) -> Config {
     if console(&config).is_err() {
         config.console = None;
     }
@@ -360,7 +415,13 @@ fn run_daemon(config: &Path) -> Result<(), String> {
     let runtime = runtime(2)?;
     let ran = runtime.block_on(async {
         let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
-        let (_machines, service) = service(&config, &program, updates, Some(Arc::new(settings)))?;
+        let (_machines, service) = service(
+            &config,
+            app(&config)?,
+            &program,
+            updates,
+            Some(Arc::new(settings)),
+        )?;
         let (trigger, stop) = cf_scaleset::shutdown();
         watch_signals();
         tokio::spawn(async move {
@@ -626,9 +687,10 @@ fn needs(config: &Config, home: &Path, hostname: &str, program: &Path) -> Vec<Re
 /// What an install needs on every system.
 fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> {
     vec![
-        AppCredentials::load(&config.app_dir)
-            .map(|_| format!("the GitHub App's key in {}", config.app_dir.display()))
-            .map_err(|error| format!("the GitHub App in {}: {error}", config.app_dir.display())),
+        credentials(config).map(|key| match (key, &config.app_dir) {
+            (Some(_), Some(dir)) => format!("the GitHub App's key in {}", dir.display()),
+            _ => "GitHub tokens from the console, which holds the App's key".to_string(),
+        }),
         installed_image(config).map(|_| format!("image {}", config.image)),
         console(config).map(|console| match console {
             Some((address, _)) => format!("a token for the console at {address}"),
@@ -660,13 +722,14 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
         // The service is built on a folder of its own that is removed after: building it takes up what a Runner
         // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
         let scratch = crate::vm::Scratch::new("check")?;
+        let github = github_for_check(&config)?;
         let probe = Config {
             state_dir: scratch.path().to_path_buf(),
             console: None,
             ..config.clone()
         };
         let (served, problems) = runtime(1)?.block_on(async {
-            let (_machines, service) = service(&probe, &program, None, None)?;
+            let (_machines, service) = service(&probe, github, &program, None, None)?;
             Ok::<_, String>(service.survey().await)
         })?;
         for line in &served {
@@ -769,7 +832,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 /// the program's copy. `leave` also takes the host off the console; `purge` removes the state folder with the images
 /// and the logs. What could not be removed is said, and is an error.
 pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> {
-    let config = for_uninstall(Config::load(config)?);
+    let config = as_enrolled(Config::load(config)?);
     let home = home()?;
     let manager = manager(&home);
     manager.stop()?;
@@ -782,24 +845,35 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
     } else {
         own_program()?
     };
-    let left = runtime(2)?.block_on(async {
-        let (machines, service) = service(&config, &program, None, None).map_err(|error| {
-            format!(
-                "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its \
-                 deadline"
-            )
-        })?;
-        let ticks = tokio::spawn(async move {
-            loop {
-                let machines = machines.clone();
-                let _ = tokio::task::spawn_blocking(move || machines.tick()).await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-        let left = service.retire(RETIRE_WAIT, leave).await;
-        ticks.abort();
-        Ok::<_, String>(left)
-    })?;
+    let nothing_removed = |error: String| {
+        format!(
+            "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its deadline"
+        )
+    };
+    let github = github_for_uninstall(&config).map_err(nothing_removed)?;
+    let left = match github {
+        None => {
+            println!(
+                "{}",
+                nothing_removed("no GitHub tokens here: no App key (app_dir) and no console token".into())
+            );
+            Vec::new()
+        }
+        Some(github) => runtime(2)?.block_on(async {
+            let (machines, service) =
+                service(&config, github, &program, None, None).map_err(nothing_removed)?;
+            let ticks = tokio::spawn(async move {
+                loop {
+                    let machines = machines.clone();
+                    let _ = tokio::task::spawn_blocking(move || machines.tick()).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+            let left = service.retire(RETIRE_WAIT, leave).await;
+            ticks.abort();
+            Ok::<_, String>(left)
+        })?,
+    };
     manager.remove()?;
     for line in &left {
         println!("LEFT: {line}");
@@ -1282,6 +1356,97 @@ mod tests {
     }
 
     #[test]
+    fn github_tokens_come_from_the_console_when_enrolled_and_from_the_key_otherwise() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        std::fs::create_dir_all(&state).expect("the state folder");
+        std::fs::create_dir_all(&key).expect("the App's folder");
+        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o600))
+            .expect("a mode");
+
+        let signs = app(&config(&state, &key, false)).expect("the key alone");
+        assert!(signs.jwt().is_ok(), "signs with the key here");
+
+        let mut console_only = config(&state, &key, true);
+        console_only.app_dir = None;
+        let error = app(&console_only).expect_err("not enrolled");
+        assert!(error.ends_with("run `enroll` first"), "{error}");
+        std::fs::write(console_only.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        let brokered = app(&console_only).expect("the console");
+        assert!(brokered.jwt().is_err(), "no key here: the console holds it");
+        assert!(
+            app(&config(&state, &key, true)).expect("both").jwt().is_err(),
+            "the console first"
+        );
+        assert_eq!(
+            common_needs(&console_only, Path::new("/nonexistent"))[0],
+            Ok("GitHub tokens from the console, which holds the App's key".to_string())
+        );
+
+        let mut neither = console_only.clone();
+        neither.console = None;
+        assert!(app(&neither).expect_err("nothing").contains("no GitHub tokens"));
+    }
+
+    #[test]
+    fn an_uninstall_with_no_way_to_github_still_goes_and_one_with_a_broken_key_stops() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        std::fs::create_dir_all(&state).expect("the state folder");
+        // Console only, its token gone: nothing here reaches GitHub, and nothing stops the uninstall.
+        let mut console_only = config(&state, &key, true);
+        console_only.app_dir = None;
+        assert!(
+            github_for_uninstall(&as_enrolled(console_only.clone()))
+                .expect("goes")
+                .is_none()
+        );
+        // With its token, the console's tokens remove the runners.
+        std::fs::write(console_only.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        assert!(
+            github_for_uninstall(&as_enrolled(console_only))
+                .expect("the console")
+                .is_some()
+        );
+        // A key named but not usable is an error, said before anything is removed.
+        std::fs::create_dir_all(&key).expect("the App's folder");
+        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o644))
+            .expect("a mode");
+        assert!(github_for_uninstall(&as_enrolled(config(&state, &key, false))).is_err());
+    }
+
+    #[test]
+    fn a_check_before_enroll_looks_at_github_with_the_key_here() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        std::fs::create_dir_all(&key).expect("the App's folder");
+        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o600))
+            .expect("a mode");
+        let both = config(&state, &key, true);
+        let looks = github_for_check(&both).expect("not enrolled yet, with a key");
+        assert!(looks.jwt().is_ok(), "the key here");
+        let mut console_only = both.clone();
+        console_only.app_dir = None;
+        let error = github_for_check(&console_only).expect_err("not enrolled, no key");
+        assert!(error.ends_with("run `enroll` first"), "{error}");
+        std::fs::create_dir_all(&state).expect("the state folder");
+        std::fs::write(both.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        assert!(
+            github_for_check(&both).expect("enrolled").jwt().is_err(),
+            "the console's, as the Runner's"
+        );
+    }
+
+    #[test]
     fn a_token_file_that_is_empty_is_no_token() {
         let folder = tempfile::tempdir().expect("folder");
         let with = config(folder.path(), folder.path(), true);
@@ -1300,13 +1465,13 @@ mod tests {
     fn a_host_without_a_token_it_can_use_is_uninstalled_without_the_console() {
         let folder = tempfile::tempdir().expect("folder");
         let with = || config(folder.path(), folder.path(), true);
-        assert_eq!(for_uninstall(with()).console, None, "it never enrolled");
+        assert_eq!(as_enrolled(with()).console, None, "it never enrolled");
         // An enrolment that was cut off, or a token removed by hand.
         std::fs::write(with().console_token(), "\n").expect("a file");
-        assert_eq!(for_uninstall(with()).console, None, "an empty file is no token");
+        assert_eq!(as_enrolled(with()).console, None, "an empty file is no token");
         std::fs::write(with().console_token(), "the-token\n").expect("a file");
         assert_eq!(
-            for_uninstall(with()).console.as_deref(),
+            as_enrolled(with()).console.as_deref(),
             Some("https://console.example"),
             "an enrolled host tells the console"
         );
