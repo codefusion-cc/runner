@@ -54,7 +54,7 @@ fn endpoint(base: &str, call: &str) -> Result<reqwest::Url, Error> {
 }
 
 /// The request body: the message with the protocol version in it.
-fn body_of<T: Serialize>(message: &T) -> Result<Vec<u8>, Error> {
+pub(crate) fn body_of<T: Serialize>(message: &T) -> Result<Vec<u8>, Error> {
     let mut value = serde_json::to_value(message)
         .map_err(|_| Error::Protocol("the message cannot be written as JSON".into()))?;
     match value.as_object_mut() {
@@ -65,7 +65,7 @@ fn body_of<T: Serialize>(message: &T) -> Result<Vec<u8>, Error> {
 }
 
 /// An answer read as `T`. The error says where the answer is wrong and quotes none of it.
-fn read<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error> {
+pub(crate) fn read<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error> {
     serde_json::from_slice(&response.body).map_err(|error| Error::from(HttpError::not_the_json(what, &error)))
 }
 
@@ -196,14 +196,23 @@ impl Client {
         &self.base
     }
 
-    async fn post(&self, call: &str, body: Vec<u8>) -> Result<Response, Error> {
+    pub(crate) async fn post(&self, call: &str, body: Vec<u8>) -> Result<Response, Error> {
+        self.post_with(&self.http, call, body).await
+    }
+
+    /// The HTTP client the calls go through.
+    pub(crate) fn http(&self) -> &Http {
+        &self.http
+    }
+
+    /// A call through `http`, which may try it again differently from the client's own.
+    pub(crate) async fn post_with(&self, http: &Http, call: &str, body: Vec<u8>) -> Result<Response, Error> {
         // A token of another shape is not the console's: it would be refused, and may not even be a header.
         if !is_token(self.token.expose()) {
             return Err(Error::Unauthorized);
         }
         let url = endpoint(&self.base, call)?;
-        Ok(self
-            .http
+        Ok(http
             .send(|client| {
                 client
                     .post(url.clone())

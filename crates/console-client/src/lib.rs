@@ -1,7 +1,8 @@
 //! The client of the CodeFusion Console's runner protocol (protocol 1): a Mac enrols with a one-time code, reports what
 //! it does and which jobs started and ended, hears of commands and pauses in the answer, and leaves when uninstalled.
 //!
-//! [`enroll`] trades the code for a token; [`Client`] makes the other calls with it. Job events wait in an [`Outbox`]
+//! [`enroll`] trades the code for a token; [`Client`] makes the other calls with it, GitHub's tokens through the
+//! console among them, which [`ConsoleTokens`] keeps and renews for the App client. Job events wait in an [`Outbox`]
 //! until a report that carries them is answered, so a console that is away for a while, a lost answer and a restart of
 //! the Runner lose none of them and send none twice that the console took.
 //!
@@ -10,7 +11,9 @@
 
 mod client;
 mod error;
+mod github;
 mod outbox;
+mod tokens;
 mod wire;
 
 pub use client::{
@@ -18,5 +21,12 @@ pub use client::{
     RESULT_ID_MAX, RUNNER_NAME_MAX, enroll, is_machine_name, units,
 };
 pub use error::Error;
+pub use github::{
+    InstallationToken, JIT_LABELS_MAX, JIT_NAME_MAX, JitRunner, LABEL_MAX, MAX_TOKEN_LIFE, MIN_TOKEN_LIFE,
+    READ_INSTALLATIONS_MAX, REPO_MAX, RegistrationToken, TOKEN_MAX, is_label, is_repo_name, is_runner_of,
+};
 pub use outbox::{EVENT_ID_MAX, OUTBOX_CAPACITY, Outbox, REPORT_BATCH, SENT_MEMORY};
+pub use tokens::{
+    ConsoleTokens, EMPTY_LIFE, END_MARGIN, FAILED_WAIT, FAILED_WAIT_MAX, GATE_RECHECK, GATE_RECHECK_ALONE,
+};
 pub use wire::*;

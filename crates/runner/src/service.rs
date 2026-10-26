@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cf_budget::{Budget, Host as _, HostFacts, HostReading, Settings, Size, admit};
+use cf_console_client::ConsoleTokens;
 use cf_daemon::names::ServePolicy;
 use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, UpdateFile};
 use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
-use cf_ghapp::{AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
+use cf_ghapp::{
+    AppCredentials, Clock, GitHubApp, Http, KeyTokens, RetryPolicy, SystemClock, SystemMonotonic, TokenSource,
+};
 use cf_secret::Secret;
 
 use crate::commands::VERSION;
@@ -62,16 +65,47 @@ fn runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
         .map_err(|error| format!("no runtime: {error}"))
 }
 
+/// The App's credentials in `app_dir`, when the configuration names the folder.
+fn credentials(config: &Config) -> Result<Option<AppCredentials>, String> {
+    config
+        .app_dir
+        .as_ref()
+        .map(|dir| {
+            AppCredentials::load(dir).map_err(|error| format!("the GitHub App in {}: {error}", dir.display()))
+        })
+        .transpose()
+}
+
+/// The GitHub App client, with its tokens from the console when the host is enrolled with one (the App's key here,
+/// when there is one, serves while the console's tokens are off for the host), else signed for with the key here.
 fn app(config: &Config) -> Result<GitHubApp, String> {
-    let credentials = AppCredentials::load(&config.app_dir)
-        .map_err(|error| format!("the GitHub App in {}: {error}", config.app_dir.display()))?;
-    Ok(GitHubApp::new(
-        &credentials.client_id,
-        credentials.key,
-        &config.github_api,
-        Http::new(ANSWER, RetryPolicy::default()),
-        Arc::new(SystemClock),
-    ))
+    let http = Http::new(ANSWER, RetryPolicy::default());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let key = credentials(config)?;
+    match (console(config)?, key) {
+        (Some((address, token)), key) => {
+            let key = key.map(|credentials| {
+                Arc::new(KeyTokens::from_credentials(
+                    credentials,
+                    &config.github_api,
+                    http.clone(),
+                    clock.clone(),
+                )) as Arc<dyn TokenSource>
+            });
+            let client = cf_console_client::Client::new(&address, token, http.clone());
+            let tokens = ConsoleTokens::new(client, &config.machine, key, clock, Arc::new(SystemMonotonic));
+            Ok(GitHubApp::with_source(Arc::new(tokens), &config.github_api, http))
+        }
+        (None, Some(credentials)) => Ok(GitHubApp::from_credentials(
+            credentials,
+            &config.github_api,
+            http,
+            clock,
+        )),
+        (None, None) => {
+            Err("no GitHub tokens: no App key (app_dir) and no console to get them from (console)".into())
+        }
+    }
 }
 
 /// This host's token for the console, when the configuration names one.
@@ -218,6 +252,7 @@ fn installed_image(config: &Config) -> Result<PathBuf, String> {
 
 fn service(
     config: &Config,
+    app: GitHubApp,
     program: &Path,
     updates: Option<Arc<dyn SelfUpdate>>,
     settings: Option<Arc<dyn SettingsFile>>,
@@ -227,7 +262,7 @@ fn service(
         version: VERSION.into(),
         state_dir: config.state_dir.clone(),
         program: program.to_path_buf(),
-        app: app(config)?,
+        app,
         image: config.image.clone(),
         deadline: config.deadline(),
         mode: config.mode(),
@@ -360,7 +395,13 @@ fn run_daemon(config: &Path) -> Result<(), String> {
     let runtime = runtime(2)?;
     let ran = runtime.block_on(async {
         let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
-        let (_machines, service) = service(&config, &program, updates, Some(Arc::new(settings)))?;
+        let (_machines, service) = service(
+            &config,
+            app(&config)?,
+            &program,
+            updates,
+            Some(Arc::new(settings)),
+        )?;
         let (trigger, stop) = cf_scaleset::shutdown();
         watch_signals();
         tokio::spawn(async move {
@@ -626,9 +667,10 @@ fn needs(config: &Config, home: &Path, hostname: &str, program: &Path) -> Vec<Re
 /// What an install needs on every system.
 fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> {
     vec![
-        AppCredentials::load(&config.app_dir)
-            .map(|_| format!("the GitHub App's key in {}", config.app_dir.display()))
-            .map_err(|error| format!("the GitHub App in {}: {error}", config.app_dir.display())),
+        credentials(config).map(|key| match (key, &config.app_dir) {
+            (Some(_), Some(dir)) => format!("the GitHub App's key in {}", dir.display()),
+            _ => "GitHub tokens from the console, which holds the App's key".to_string(),
+        }),
         installed_image(config).map(|_| format!("image {}", config.image)),
         console(config).map(|console| match console {
             Some((address, _)) => format!("a token for the console at {address}"),
@@ -660,13 +702,15 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
         // The service is built on a folder of its own that is removed after: building it takes up what a Runner
         // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
         let scratch = crate::vm::Scratch::new("check")?;
+        // Its GitHub tokens come from where the Runner's would, the console among them: only the reports stay home.
+        let github = app(&config)?;
         let probe = Config {
             state_dir: scratch.path().to_path_buf(),
             console: None,
             ..config.clone()
         };
         let (served, problems) = runtime(1)?.block_on(async {
-            let (_machines, service) = service(&probe, &program, None, None)?;
+            let (_machines, service) = service(&probe, github, &program, None, None)?;
             Ok::<_, String>(service.survey().await)
         })?;
         for line in &served {
@@ -783,7 +827,9 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
         own_program()?
     };
     let left = runtime(2)?.block_on(async {
-        let (machines, service) = service(&config, &program, None, None).map_err(|error| {
+        let (machines, service) = app(&config)
+            .and_then(|github| service(&config, github, &program, None, None))
+            .map_err(|error| {
             format!(
                 "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its \
                  deadline"
@@ -1279,6 +1325,42 @@ mod tests {
             "no cf-runners manager in this home"
         );
         assert!(!state.exists() && !app.exists(), "a check makes no folder");
+    }
+
+    #[test]
+    fn github_tokens_come_from_the_console_when_enrolled_and_from_the_key_otherwise() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        std::fs::create_dir_all(&state).expect("the state folder");
+        std::fs::create_dir_all(&key).expect("the App's folder");
+        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o600))
+            .expect("a mode");
+
+        let signs = app(&config(&state, &key, false)).expect("the key alone");
+        assert!(signs.jwt().is_ok(), "signs with the key here");
+
+        let mut console_only = config(&state, &key, true);
+        console_only.app_dir = None;
+        let error = app(&console_only).expect_err("not enrolled");
+        assert!(error.ends_with("run `enroll` first"), "{error}");
+        std::fs::write(console_only.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        let brokered = app(&console_only).expect("the console");
+        assert!(brokered.jwt().is_err(), "no key here: the console holds it");
+        assert!(
+            app(&config(&state, &key, true)).expect("both").jwt().is_err(),
+            "the console first"
+        );
+        assert_eq!(
+            common_needs(&console_only, Path::new("/nonexistent"))[0],
+            Ok("GitHub tokens from the console, which holds the App's key".to_string())
+        );
+
+        let mut neither = console_only.clone();
+        neither.console = None;
+        assert!(app(&neither).expect_err("nothing").contains("no GitHub tokens"));
     }
 
     #[test]

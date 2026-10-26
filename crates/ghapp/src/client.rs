@@ -6,27 +6,21 @@ use base64::engine::general_purpose::STANDARD;
 use cf_secret::Secret;
 use cf_workflows::LabelSet;
 use reqwest::Method;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LINK};
+use reqwest::header::ETAG;
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::credentials::{AppCredentials, AppKey};
 use crate::error::Error;
 use crate::http::{Http, Response};
-use crate::jwt::{Clock, Signer};
+use crate::jwt::Clock;
+use crate::key::KeyTokens;
+use crate::rest::{Installed, MAX_PAGES, Rest, decode};
+use crate::source::TokenSource;
 
 /// GitHub's REST API.
 pub const API: &str = "https://api.github.com";
-
-const API_VERSION: &str = "2022-11-28";
-
-/// An installation token is replaced this long before it expires.
-const TOKEN_MARGIN_SECS: i64 = 300;
-
-/// How many pages of one listing are read: 10 000 entries at GitHub's hundred a page.
-const MAX_PAGES: usize = 100;
 
 /// One account the App is installed on.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -239,22 +233,6 @@ fn etag_of(response: &Response) -> String {
         .to_string()
 }
 
-fn decode<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error> {
-    serde_json::from_slice(&response.body).map_err(|e| Error::not_the_json(what, &e))
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    token: String,
-    #[serde(with = "time::serde::rfc3339")]
-    expires_at: OffsetDateTime,
-}
-
-struct CachedToken {
-    value: Secret<String>,
-    expires: i64,
-}
-
 /// A repository's workflow file contents by blob hash.
 type Blobs = HashMap<String, Arc<Vec<u8>>>;
 
@@ -276,21 +254,20 @@ struct RunJobs {
     read: Arc<RunRead>,
 }
 
-type TokenSlot = Arc<tokio::sync::Mutex<Option<CachedToken>>>;
-
 struct Inner {
-    signer: Signer,
-    http: Http,
-    api: String,
-    tokens: Mutex<HashMap<i64, TokenSlot>>,
+    rest: Rest,
+    source: Arc<dyn TokenSource>,
+    /// The local key, when the tokens come from it: what [`GitHubApp::jwt`] signs with.
+    key: Option<Arc<KeyTokens>>,
     /// Each repository's current workflow files by blob hash.
     blobs: Mutex<HashMap<String, Blobs>>,
     /// What each repository's queue last read as.
     queue: Mutex<HashMap<String, QueueCache>>,
 }
 
-/// A GitHub App's REST client. Cheap to clone; safe to share. It keeps installation tokens until shortly before
-/// they expire and workflow files by their blob hash, so polling repositories costs little.
+/// A GitHub App's REST client. Cheap to clone; safe to share. Its tokens come from a [`TokenSource`]: the App's key
+/// on this machine, or the CodeFusion Console. It keeps workflow files by their blob hash, so polling repositories
+/// costs little.
 #[derive(Clone)]
 pub struct GitHubApp {
     inner: Arc<Inner>,
@@ -299,24 +276,16 @@ pub struct GitHubApp {
 impl std::fmt::Debug for GitHubApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitHubApp")
-            .field("api", &self.inner.api)
+            .field("api", &self.inner.rest.api)
             .finish_non_exhaustive()
     }
 }
 
 impl GitHubApp {
-    /// A client for the App with this client ID and key. `api` is the REST API root.
+    /// A client for the App with this client ID and key, which signs for its own tokens. `api` is the REST API root.
     pub fn new(client_id: &str, key: AppKey, api: &str, http: Http, clock: Arc<dyn Clock>) -> GitHubApp {
-        GitHubApp {
-            inner: Arc::new(Inner {
-                signer: Signer::new(client_id.to_string(), key, clock),
-                http,
-                api: api.trim_end_matches('/').to_string(),
-                tokens: Mutex::new(HashMap::new()),
-                blobs: Mutex::new(HashMap::new()),
-                queue: Mutex::new(HashMap::new()),
-            }),
-        }
+        let key = Arc::new(KeyTokens::new(client_id, key, api, http.clone(), clock));
+        GitHubApp::build(key.clone(), Some(key), api, http)
     }
 
     /// A client for the App in loaded credentials.
@@ -329,220 +298,131 @@ impl GitHubApp {
         GitHubApp::new(&credentials.client_id, credentials.key, api, http, clock)
     }
 
+    /// A client whose tokens come from `source` (the console's, say). `api` is the REST API root the tokens are for.
+    pub fn with_source(source: Arc<dyn TokenSource>, api: &str, http: Http) -> GitHubApp {
+        GitHubApp::build(source, None, api, http)
+    }
+
+    fn build(source: Arc<dyn TokenSource>, key: Option<Arc<KeyTokens>>, api: &str, http: Http) -> GitHubApp {
+        GitHubApp {
+            inner: Arc::new(Inner {
+                rest: Rest::new(api, http),
+                source,
+                key,
+                blobs: Mutex::new(HashMap::new()),
+                queue: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
     /// The REST API root.
     pub fn api(&self) -> &str {
-        &self.inner.api
+        &self.inner.rest.api
     }
 
     /// The HTTP client the calls go through.
     pub fn http(&self) -> &Http {
-        &self.inner.http
+        &self.inner.rest.http
     }
 
     /// GitHub's clock minus this machine's, in seconds, as learned from its responses (0 until it was refused for
-    /// the time).
+    /// the time, and always with tokens from the console).
     pub fn clock_skew_secs(&self) -> i64 {
-        self.inner.signer.skew()
+        self.inner.source.clock_skew_secs()
     }
 
     /// GitHub's time as this machine knows it, in seconds since the epoch: its own clock plus that offset. What
     /// the expiry of a token GitHub issued is compared with.
     pub fn now_epoch(&self) -> i64 {
-        self.inner.signer.now_epoch()
+        self.inner.source.now_epoch()
     }
 
-    /// The App's own signed token, valid nine minutes and issued a minute in the past.
+    /// The App's own signed token, valid nine minutes and issued a minute in the past. An [`Error::Key`] for a
+    /// client whose tokens come from elsewhere: it holds no key.
     pub fn jwt(&self) -> Result<Secret<String>, Error> {
-        self.inner.signer.token()
-    }
-
-    fn url(&self, path: &str) -> String {
-        if path.starts_with("http") {
-            path.to_string()
-        } else {
-            format!("{}{path}", self.inner.api)
+        match &self.inner.key {
+            Some(key) => key.jwt(),
+            None => Err(Error::Key(
+                "no App key here: the tokens come from the console".into(),
+            )),
         }
     }
 
-    /// One call; with `etag`, GitHub answers 304 (an [`Error::Status`]) when what it would send has that tag.
-    async fn request(
-        &self,
-        method: Method,
-        url: &str,
-        auth: &Secret<String>,
-        etag: Option<&str>,
-        body: Option<&serde_json::Value>,
-    ) -> Result<Response, Error> {
-        let url = url.to_string();
-        let bearer = format!("Bearer {}", auth.expose());
-        let body = body.map(|body| body.to_string());
-        self.inner
-            .http
-            .send(|c| {
-                let mut request = c
-                    .request(method.clone(), &url)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", API_VERSION)
-                    .header(AUTHORIZATION, &bearer);
-                if let Some(tag) = etag {
-                    request = request.header(IF_NONE_MATCH, tag);
-                }
-                if let Some(body) = &body {
-                    request = request
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(body.clone());
-                }
-                request
-            })
-            .await
-    }
-
-    /// A call authenticated as the App. A 401 whose `Date` header shows the machine's clock is off is tried once
-    /// more with a token signed by GitHub's time.
-    async fn as_app(&self, method: Method, path: &str) -> Result<Response, Error> {
-        let url = self.url(path);
-        let mut learned = false;
-        loop {
-            let jwt = self.jwt()?;
-            match self.request(method.clone(), &url, &jwt, None, None).await {
-                Err(Error::Status(s)) if s.status == 401 && !learned => {
-                    learned = true;
-                    match s.server_time {
-                        Some(t) if self.inner.signer.learn_server_time(t) => continue,
-                        _ => return Err(Error::Status(s)),
-                    }
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// A call authenticated with an installation token; a 401 drops the cached token and tries once with a new one.
+    /// A call authenticated with an installation token; a 401 drops the token and tries once with a new one.
     async fn as_installation(
         &self,
         installation: i64,
+        repo: Option<&str>,
         method: Method,
         path: &str,
     ) -> Result<Response, Error> {
-        self.as_installation_with(installation, method, path, None, None)
+        self.as_installation_with(installation, repo, method, path, None)
             .await
     }
 
-    /// [`Self::as_installation`] with `If-None-Match`, a JSON body, or both.
+    /// [`Self::as_installation`] with `If-None-Match`.
     async fn as_installation_with(
         &self,
         installation: i64,
+        repo: Option<&str>,
         method: Method,
         path: &str,
         etag: Option<&str>,
-        body: Option<&serde_json::Value>,
     ) -> Result<Response, Error> {
-        let url = self.url(path);
-        let mut retried = false;
-        loop {
-            let token = self.installation_token(installation).await?;
-            match self.request(method.clone(), &url, &token, etag, body).await {
-                Err(Error::Status(s)) if s.status == 401 && !retried => {
-                    retried = true;
-                    self.forget_token(installation, &token).await;
-                }
-                other => return other,
-            }
-        }
+        self.inner
+            .rest
+            .as_installation(
+                Installed {
+                    source: &*self.inner.source,
+                    installation,
+                    repo,
+                },
+                method,
+                path,
+                etag,
+                None,
+            )
+            .await
     }
 
-    /// The token in an answer; one without a token is no answer.
-    fn token_from(&self, what: &str, response: &Response) -> Result<TokenResponse, Error> {
-        let parsed: TokenResponse = decode(what, response)?;
-        if parsed.token.is_empty() {
-            return Err(Error::Decode {
-                what: what.into(),
-                why: "GitHub returned an empty token".into(),
-            });
-        }
-        Ok(parsed)
-    }
-
-    /// Every page of a listing from `first` on, as the App itself or as an installation. A listing of more than
-    /// [`MAX_PAGES`] pages is [`Error::Refused`]: one that names a next page for ever is not read for ever.
-    async fn pages(&self, installation: Option<i64>, first: &str) -> Result<Vec<Response>, Error> {
+    /// Every page of an installation's listing from `first` on. A listing of more than [`MAX_PAGES`] pages is
+    /// [`Error::Refused`]: one that names a next page for ever is not read for ever.
+    async fn pages(
+        &self,
+        installation: i64,
+        repo: Option<&str>,
+        first: &str,
+    ) -> Result<Vec<Response>, Error> {
         let mut pages = vec![];
         let mut next = Some(first.to_string());
         while let Some(page) = next {
             if pages.len() == MAX_PAGES {
-                return Err(Error::Refused(format!(
-                    "{first}: a listing of more than {MAX_PAGES} pages"
-                )));
+                return Err(Rest::too_many_pages(first));
             }
-            let response = match installation {
-                Some(installation) => self.as_installation(installation, Method::GET, &page).await?,
-                None => self.as_app(Method::GET, &page).await?,
-            };
-            next = self.next_page(&response);
+            let response = self
+                .as_installation(installation, repo, Method::GET, &page)
+                .await?;
+            next = self.inner.rest.next_page(&response);
             pages.push(response);
         }
         Ok(pages)
     }
 
-    /// Lists every account the App is installed on.
+    /// Lists every account the App is installed on, as the token source has them.
     pub async fn installations(&self) -> Result<Vec<Installation>, Error> {
-        let mut all = vec![];
-        for page in self.pages(None, "/app/installations?per_page=100").await? {
-            all.extend(decode::<Vec<Installation>>("installations", &page)?);
-        }
-        Ok(all)
+        self.inner.source.installations().await
     }
 
-    fn slot(&self, installation: i64) -> TokenSlot {
-        self.inner
-            .tokens
-            .lock()
-            .expect("tokens")
-            .entry(installation)
-            .or_default()
-            .clone()
-    }
-
-    /// Drops the cached token GitHub refused, unless another caller has replaced it already.
-    async fn forget_token(&self, installation: i64, refused: &Secret<String>) {
-        let slot = self.slot(installation);
-        let mut cached = slot.lock().await;
-        if cached.as_ref().is_some_and(|c| c.value == *refused) {
-            *cached = None;
-        }
-    }
-
-    /// An installation token, reused until five minutes before it expires. One call at a time per installation asks
-    /// GitHub for a new one; the others wait for it.
+    /// A token that reads an installation's repositories. From the local key, one with every permission of the App,
+    /// reused until five minutes before it expires, one call at a time per installation asking GitHub for a new one.
     pub async fn installation_token(&self, installation: i64) -> Result<Secret<String>, Error> {
-        let slot = self.slot(installation);
-        let mut cached = slot.lock().await;
-        let now = self.inner.signer.now_epoch();
-        if let Some(c) = cached.as_ref().filter(|c| now < c.expires - TOKEN_MARGIN_SECS) {
-            return Ok(c.value.clone());
-        }
-        let response = self
-            .as_app(
-                Method::POST,
-                &format!("/app/installations/{installation}/access_tokens"),
-            )
-            .await?;
-        let parsed = self.token_from("installation token", &response)?;
-        let value = Secret::new(parsed.token);
-        *cached = Some(CachedToken {
-            value: value.clone(),
-            expires: parsed.expires_at.unix_timestamp(),
-        });
-        Ok(value)
+        self.inner.source.token(installation, None).await
     }
 
     /// A token for registering Actions runners with a repository, which the scale set client trades for the Actions
     /// service's own.
     pub async fn registration_token(&self, installation: i64, repo: &str) -> Result<Secret<String>, Error> {
-        let path = format!("/repos/{repo}/actions/runners/registration-token");
-        let response = self.as_installation(installation, Method::POST, &path).await?;
-        let parsed = self.token_from("Actions runner registration token", &response)?;
-        Ok(Secret::new(parsed.token))
+        self.inner.source.registration_token(installation, repo).await
     }
 
     /// Registers an Actions runner for one job with a repository, outside any scale set, in the repository's default
@@ -555,27 +435,10 @@ impl GitHubApp {
         name: &str,
         labels: &[String],
     ) -> Result<PlainJit, Error> {
-        #[derive(Deserialize)]
-        struct Registered {
-            id: i64,
-        }
-        #[derive(Deserialize)]
-        struct JitAnswer {
-            runner: Registered,
-            encoded_jit_config: String,
-        }
-        let body = serde_json::json!({
-            "name": name, "runner_group_id": DEFAULT_RUNNER_GROUP, "labels": labels, "work_folder": "_work",
-        });
-        let path = format!("/repos/{repo}/actions/runners/generate-jitconfig");
-        let response = self
-            .as_installation_with(installation, Method::POST, &path, None, Some(&body))
-            .await?;
-        let answer: JitAnswer = decode("Actions runner configuration", &response)?;
-        Ok(PlainJit {
-            id: answer.runner.id,
-            encoded: Secret::new(answer.encoded_jit_config),
-        })
+        self.inner
+            .source
+            .generate_jit_config(installation, repo, name, labels)
+            .await
     }
 
     /// Whether a registered Actions runner of a repository has a job, by GitHub's own record. `None` when GitHub no
@@ -591,27 +454,14 @@ impl GitHubApp {
             busy: bool,
         }
         let path = format!("/repos/{repo}/actions/runners/{runner_id}");
-        match self.as_installation(installation, Method::GET, &path).await {
+        match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
             Ok(response) => Ok(Some(decode::<RunnerState>("Actions runner", &response)?.busy)),
             Err(Error::Status(s)) if s.status == 404 => Ok(None),
             Err(e) => Err(e),
         }
-    }
-
-    /// The next page's address from a `Link` header. Only pages on the same API are followed: a header must not
-    /// send the token elsewhere.
-    fn next_page(&self, response: &Response) -> Option<String> {
-        let link = response.headers.get(LINK)?.to_str().ok()?;
-        for part in link.split(',') {
-            let part = part.trim();
-            if !part.ends_with("rel=\"next\"") {
-                continue;
-            }
-            let url = part.strip_prefix('<')?.split('>').next()?;
-            let prefix = format!("{}/", self.inner.api);
-            return url.starts_with(&prefix).then(|| url.to_string());
-        }
-        None
     }
 
     /// Lists the repositories an installation gives the App.
@@ -622,7 +472,7 @@ impl GitHubApp {
         }
         let mut all = vec![];
         for page in self
-            .pages(Some(installation), "/installation/repositories?per_page=100")
+            .pages(installation, None, "/installation/repositories?per_page=100")
             .await?
         {
             all.extend(decode::<Page>("repositories", &page)?.repositories);
@@ -657,6 +507,7 @@ impl GitHubApp {
         let listing = match self
             .as_installation(
                 installation,
+                Some(repo),
                 Method::GET,
                 &format!("/repos/{repo}/contents/.github/workflows"),
             )
@@ -691,6 +542,7 @@ impl GitHubApp {
                     let response = self
                         .as_installation(
                             installation,
+                            Some(repo),
                             Method::GET,
                             &format!("/repos/{repo}/git/blobs/{}", e.sha),
                         )
@@ -746,7 +598,7 @@ impl GitHubApp {
             ),
             (format!("/repos/{repo}/actions/variables?per_page=30"), true),
         ] {
-            let pages = match self.pages(Some(installation), &path).await {
+            let pages = match self.pages(installation, Some(repo), &path).await {
                 Ok(pages) => pages,
                 Err(Error::Status(s)) if !required && (s.status == 403 || s.status == 404) => continue,
                 Err(e) => return Err(e),
@@ -849,7 +701,7 @@ impl GitHubApp {
     ) -> Result<(String, Arc<Listing>), Error> {
         let known = last.listings.get(path);
         match self
-            .get_if(installation, path, known.map(|(tag, _)| tag.as_str()))
+            .get_if(installation, repo, path, known.map(|(tag, _)| tag.as_str()))
             .await?
         {
             Some(response) => Ok((etag_of(&response), Arc::new(read_runs(repo, &response)?))),
@@ -873,7 +725,7 @@ impl GitHubApp {
             .as_ref()
             .map(|k| k.etag.as_str())
             .filter(|tag| !tag.is_empty());
-        let (etag, read) = match self.get_if(installation, &path, etag).await? {
+        let (etag, read) = match self.get_if(installation, repo, &path, etag).await? {
             Some(response) => (etag_of(&response), Arc::new(read_jobs(run, &response)?)),
             None => {
                 let known = known.expect("a 304 answers a known ETag");
@@ -891,11 +743,12 @@ impl GitHubApp {
     async fn get_if(
         &self,
         installation: i64,
+        repo: &str,
         path: &str,
         etag: Option<&str>,
     ) -> Result<Option<Response>, Error> {
         match self
-            .as_installation_with(installation, Method::GET, path, etag, None)
+            .as_installation_with(installation, Some(repo), Method::GET, path, etag)
             .await
         {
             Ok(response) => Ok(Some(response)),
@@ -906,9 +759,6 @@ impl GitHubApp {
 
     /// The App's installation that covers a repository.
     pub async fn repo_installation(&self, repo: &str) -> Result<i64, Error> {
-        let response = self
-            .as_app(Method::GET, &format!("/repos/{repo}/installation"))
-            .await?;
-        Ok(decode::<Installation>("repository installation", &response)?.id)
+        self.inner.source.repo_installation(repo).await
     }
 }
