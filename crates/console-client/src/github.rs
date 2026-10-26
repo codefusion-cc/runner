@@ -1,6 +1,7 @@
 //! GitHub through the console (protocol 1, `/agent/runners/github/{read,registration,jit}`): the console holds the
 //! Runners App's key and hands a machine the tokens it needs, each with how long it lasts. The console answers 403
-//! while the owner has not turned GitHub tokens on for the machine.
+//! with the code `broker_off` ([`Error::GithubOff`]) while the owner has not turned GitHub tokens on for the machine;
+//! any other 403 is a refusal of the call itself ([`Error::Refused`]).
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -23,6 +24,10 @@ pub const JIT_NAME_MAX: usize = 64;
 pub const READ_INSTALLATIONS_MAX: usize = 1000;
 /// The longest token taken from the console.
 pub const TOKEN_MAX: usize = 4096;
+/// The most refused tokens one read names (`githubReadSchema`).
+pub const REFUSED_MAX: usize = 20;
+/// The longest refused token a read names (`githubReadSchema`); a longer one is not the console's to replace.
+pub const REFUSED_TOKEN_MAX: usize = 255;
 /// A token given with less than this left is not taken: it would end before a call made with it does.
 pub const MIN_TOKEN_LIFE: Duration = Duration::from_secs(120);
 /// The longest a token is held for, whatever the console says: GitHub's tokens last an hour.
@@ -132,9 +137,12 @@ fn refuse(why: &str) -> Error {
 
 impl Client {
     /// `github/read`: per installation of the console's Runners App, a token that only reads (runners, Actions runs,
-    /// variables, contents). Tried again on a dropped connection, a 429 or a 5xx, as the client's [`cf_ghapp::Http`]
-    /// says. A 403 ([`Error::Refused`]) is the console's switch for this machine being off.
-    pub async fn github_read(&self) -> Result<Vec<InstallationToken>, Error> {
+    /// variables, contents). `refused` names tokens of the console's that GitHub refused (401): the console hands out
+    /// none of them again, makes a new one in its place and revokes it. At most [`REFUSED_MAX`] are named, the last
+    /// ones of `refused`, and none over [`REFUSED_TOKEN_MAX`], which the console would refuse the whole call for.
+    /// Tried again on a dropped connection, a 429 or a 5xx, as the client's [`cf_ghapp::Http`] says.
+    /// [`Error::GithubOff`] is the console's switch for this machine being off.
+    pub async fn github_read(&self, refused: &[Secret<String>]) -> Result<Vec<InstallationToken>, Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Wire {
@@ -148,7 +156,18 @@ impl Client {
         struct Answer {
             installations: Vec<Wire>,
         }
-        let body = body_of(&serde_json::json!({}))?;
+        let named: Vec<&str> = refused
+            .iter()
+            .map(|t| t.expose().as_str())
+            .filter(|t| (1..=REFUSED_TOKEN_MAX).contains(&t.len()))
+            .collect();
+        let named = &named[named.len().saturating_sub(REFUSED_MAX)..];
+        let message = if named.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "refused": named })
+        };
+        let body = body_of(&message)?;
         let response = self.post("github/read", body).await?;
         let answer: Answer = read("the read tokens' answer", &response)?;
         if answer.installations.len() > READ_INSTALLATIONS_MAX {
@@ -198,7 +217,8 @@ impl Client {
     /// `github/jit`: one Actions runner `name` for one job of `repo`, with exactly `labels`. Sent once and never again
     /// by itself: GitHub may have registered it although the answer failed. What the console would refuse (a name
     /// that is not `<machine>-j` and seven hex digits, no labels or more than 20, a label it does not take) is refused
-    /// here as [`Error::Protocol`], unsent.
+    /// here as [`Error::Protocol`], unsent. Over the console's limits it answers 429 with the wait ([`Error::Busy`]),
+    /// having asked GitHub nothing; a name the console does not make for this machine is a 403 ([`Error::Refused`]).
     pub async fn github_jit(&self, repo: &str, name: &str, labels: &[String]) -> Result<JitRunner, Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]

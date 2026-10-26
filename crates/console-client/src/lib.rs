@@ -20,10 +20,11 @@ pub use client::{
     Client, MACHINE_NAME_MAX, MAX_BODY_BYTES, MAX_JOB_EVENTS, MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS,
     RESULT_ID_MAX, RUNNER_NAME_MAX, enroll, is_machine_name, units,
 };
-pub use error::Error;
+pub use error::{BROKER_OFF, Error, RETRY_AFTER_MAX};
 pub use github::{
     InstallationToken, JIT_LABELS_MAX, JIT_NAME_MAX, JitRunner, LABEL_MAX, MAX_TOKEN_LIFE, MIN_TOKEN_LIFE,
-    READ_INSTALLATIONS_MAX, REPO_MAX, RegistrationToken, TOKEN_MAX, is_label, is_repo_name, is_runner_of,
+    READ_INSTALLATIONS_MAX, REFUSED_MAX, REFUSED_TOKEN_MAX, REPO_MAX, RegistrationToken, TOKEN_MAX, is_label,
+    is_repo_name, is_runner_of,
 };
 pub use outbox::{EVENT_ID_MAX, OUTBOX_CAPACITY, Outbox, REPORT_BATCH, SENT_MEMORY};
 pub use tokens::{

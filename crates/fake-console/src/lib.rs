@@ -92,6 +92,8 @@ struct State {
     github_calls: Vec<GithubCall>,
     /// What the next `github/…` call that passes the token and body checks is answered instead.
     override_next: Option<Reply>,
+    /// A console before `refused` was read: kept read tokens are handed out again whatever a read names.
+    ignore_refused: bool,
 }
 
 /// A running fake console. It stops when dropped.
@@ -102,6 +104,11 @@ pub struct FakeConsole {
 
 fn error(status: u16, message: &str) -> Reply {
     Reply::status_json(status, &json!({ "error": message }))
+}
+
+/// A refusal with the code a Runner tells it apart by (agent.ts `refusal`), such as `broker_off`.
+fn coded(status: u16, message: &str, code: &str) -> Reply {
+    Reply::status_json(status, &json!({ "error": message, "code": code }))
 }
 
 fn take(counter: &mut u32) -> bool {
@@ -439,6 +446,12 @@ impl FakeConsole {
             state.broker_off(id);
         }
         true
+    }
+
+    /// Whether a read's `refused` is ignored, as a console that predates it does: a kept read token GitHub refused is
+    /// handed out again until less than 40 minutes of it are left.
+    pub fn ignore_refused(&self, ignore: bool) {
+        self.lock().ignore_refused = ignore;
     }
 
     /// Every `github/…` call that passed the machine's token and the body checks, in order, with its answer's status.

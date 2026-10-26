@@ -3,14 +3,16 @@
 //! them with that key, so a token from here works against that fake as one from the console works against GitHub.
 //!
 //! Kept as the console keeps them: a read or registration token is handed out again while more than 40 minutes of it
-//! are left; one-job runners are limited to 3 a repository and 20 a machine in five minutes. Time is the fake GitHub's
-//! clock, so a test that moves it moves this too.
+//! are left, but a read token the machine names `refused` is replaced by a new one and revoked at GitHub; one-job
+//! runners are limited to 3 a repository and 20 a machine in five minutes. The switch's 403 carries the code
+//! `broker_off`; a runner name not of the machine's is a 403 without one. Time is the fake GitHub's clock, so a test
+//! that moves it moves this too.
 
 use cf_fake_github::FakeGithub;
 use cf_fake_github::httpd::{Reply, Request};
 use serde_json::{Value, json};
 
-use crate::{State, error, json_body, schema};
+use crate::{State, coded, error, json_body, schema};
 
 /// A kept token is handed out again only while more than this is left of it (`REUSE_MIN_MS`), in seconds.
 pub const REUSE_MIN_S: i64 = 40 * 60;
@@ -52,7 +54,8 @@ pub(crate) struct Attempt {
 
 impl State {
     /// agent.ts `callerOf`, then the route's own checks in github.ts's order: the machine's token (401), the body
-    /// (415, 413, 400), the machine's switch (403), the schema (400), the Runners App (409).
+    /// (415, 413, 400), the machine's switch (403 `broker_off`), the schema (400), for a runner its name (403), the
+    /// Runners App (409).
     pub(crate) fn github(&mut self, route: &str, request: &Request) -> Reply {
         let machine = match self.machine_of(request) {
             Ok(machine) => machine,
@@ -91,11 +94,12 @@ impl State {
     fn github_route(&mut self, route: &str, machine: u64, name: &str, body: &Value) -> Reply {
         let on = self.machines.iter().any(|m| m.id == machine && m.broker);
         if !on {
-            return error(
+            return coded(
                 403,
                 &format!(
                     "GitHub through the console is off for {name}: the owner turns it on on the machine's page in the console"
                 ),
+                "broker_off",
             );
         }
         let checked = match route {
@@ -106,6 +110,13 @@ impl State {
         if let Err(problem) = checked {
             return error(400, &format!("Not a request this console reads: {problem}"));
         }
+        let runner = body["name"].as_str().unwrap_or("");
+        if route == "jit" && schema::runner_machine(runner) != Some(name) {
+            return error(
+                403,
+                &format!("A runner of {name} is named {name}-j and seven hex digits, not {runner}"),
+            );
+        }
         let Some(github) = self.github.clone() else {
             return error(
                 409,
@@ -113,30 +124,48 @@ impl State {
             );
         };
         match route {
-            "read" => self.read(&github, machine),
+            "read" => {
+                let refused: Vec<String> = body["refused"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect();
+                self.read(&github, machine, &refused)
+            }
             "registration" => self.registration(&github, machine, body["repo"].as_str().unwrap_or("")),
-            _ => self.jit(&github, machine, name, body),
+            _ => self.jit(&github, machine, body),
         }
     }
 
-    /// The token kept for `machine` of `kind` and `scope` while more than [`REUSE_MIN_S`] of it is left, else one
-    /// `make` makes, kept in its place.
+    /// The token kept for `machine` of `kind` and `scope` while more than [`REUSE_MIN_S`] of it is left and it is not
+    /// one of `refused`, else one `make` makes, kept in its place. A kept read token named refused is revoked at
+    /// `github` once its replacement is kept.
     fn kept(
         &mut self,
-        now: i64,
+        github: &FakeGithub,
         machine: u64,
         kind: &'static str,
         scope: &str,
+        refused: &[String],
         make: impl FnOnce() -> Option<(String, i64)>,
     ) -> Option<(String, i64)> {
+        let now = github.now_epoch();
         self.kept.retain(|k| k.expires_at > now);
         let found = self.kept.iter().find(|k| {
             k.machine == machine && k.kind == kind && k.scope == scope && k.expires_at - REUSE_MIN_S > now
         });
+        let mut replaced = None;
         if let Some(k) = found {
-            return Some((k.token.clone(), k.expires_at));
+            if !refused.contains(&k.token) {
+                return Some((k.token.clone(), k.expires_at));
+            }
+            replaced = Some(k.token.clone());
         }
         let (token, expires_at) = make()?;
+        if let Some(old) = replaced.filter(|_| kind == "read") {
+            github.revoke_token(&old);
+        }
         self.kept
             .retain(|k| !(k.machine == machine && k.kind == kind && k.scope == scope));
         self.kept.push(Kept {
@@ -149,17 +178,20 @@ impl State {
         Some((token, expires_at))
     }
 
-    fn read(&mut self, github: &FakeGithub, machine: u64) -> Reply {
+    fn read(&mut self, github: &FakeGithub, machine: u64, refused: &[String]) -> Reply {
         let now = github.now_epoch();
+        let refused = if self.ignore_refused { &[][..] } else { refused };
         let mut installations = vec![];
         let listed = self
             .installations
             .clone()
             .unwrap_or_else(|| github.installations());
         for (id, account) in listed {
-            let Some((token, expires_at)) = self.kept(now, machine, "read", &id.to_string(), || {
-                Some(github.mint_read_token())
-            }) else {
+            let Some((token, expires_at)) =
+                self.kept(github, machine, "read", &id.to_string(), refused, || {
+                    Some(github.mint_read_token())
+                })
+            else {
                 continue;
             };
             installations.push(json!({
@@ -172,7 +204,7 @@ impl State {
     fn registration(&mut self, github: &FakeGithub, machine: u64, repo: &str) -> Reply {
         let now = github.now_epoch();
         let scope = repo.to_lowercase();
-        match self.kept(now, machine, "registration", &scope, || {
+        match self.kept(github, machine, "registration", &scope, &[], || {
             github.mint_registration_token(repo)
         }) {
             Some((token, expires_at)) => {
@@ -182,15 +214,9 @@ impl State {
         }
     }
 
-    fn jit(&mut self, github: &FakeGithub, machine: u64, name: &str, body: &Value) -> Reply {
+    fn jit(&mut self, github: &FakeGithub, machine: u64, body: &Value) -> Reply {
         let repo = body["repo"].as_str().unwrap_or("");
         let runner = body["name"].as_str().unwrap_or("");
-        if schema::runner_machine(runner) != Some(name) {
-            return error(
-                403,
-                &format!("A runner of {name} is named {name}-j and seven hex digits, not {runner}"),
-            );
-        }
         let now = github.now_epoch();
         let scope = repo.to_lowercase();
         self.attempts.retain(|a| a.at > now - JIT_WINDOW_S);

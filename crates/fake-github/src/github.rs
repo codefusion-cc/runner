@@ -678,6 +678,14 @@ impl FakeGithub {
         st.read_only.remove(token);
     }
 
+    /// Whether GitHub still takes this installation token: made here, not revoked and not expired.
+    pub fn token_works(&self, token: &str) -> bool {
+        let st = self.lock();
+        st.installation_tokens
+            .get(token)
+            .is_some_and(|exp| *exp > st.now())
+    }
+
     /// Every installation token stops working: GitHub answers 401 to each.
     pub fn revoke_installation_tokens(&self) {
         let mut st = self.lock();

@@ -87,9 +87,12 @@ struct State {
     /// Until when the console is taken at its word that its tokens are off for this machine.
     off_until: Option<Instant>,
     failing: Option<Failing>,
-    /// Tokens of the console GitHub refused (401). The console keeps a token while 40 minutes of it are left and hands
-    /// it out again: one it does is not sent to GitHub, and the console is asked again only after a wait.
+    /// Tokens of the console GitHub refused (401), named in the next read so the console replaces and revokes them.
+    /// One it hands out again all the same (a console that does not read the names) is not sent to GitHub, and the
+    /// console is asked again only after a wait.
     refused: Vec<Secret<String>>,
+    /// Calls the console answered with a wait (`Retry-After`), by route and repository: not sent again until then.
+    waits: HashMap<(&'static str, String), Instant>,
 }
 
 /// The wait after `failures` refreshes in a row went wrong: [`FAILED_WAIT`], doubled each time, at most
@@ -111,9 +114,12 @@ enum Route<'a> {
 /// used until [`END_MARGIN`] before they end, by the monotonic clock; concurrent callers share one request.
 ///
 /// While the console cannot be reached, a token it gave keeps being used until its end, and the console is asked
-/// again after a wait that doubles from [`FAILED_WAIT`]; past the end every call is a clear error and none waits.
-/// While the console answers 403 (the owner has not turned GitHub tokens on for this machine, or turned them off)
-/// the local key, when there is one, serves everything, and the console is asked again after [`GATE_RECHECK`].
+/// again after a wait that doubles from [`FAILED_WAIT`], never sooner than its `Retry-After`; past the end every call
+/// is a clear error and none waits. A registration or a runner the console answered with a wait is not asked for that
+/// repository again until it passes. A token GitHub refuses (401) is named in the next read, and the console hands out
+/// a new one in its place. While the console says its tokens are off for this machine (403 `broker_off`: the owner
+/// has not turned them on, or turned them off) the local key, when there is one, serves everything, and the console
+/// is asked again after [`GATE_RECHECK`]; any other refusal is an error with the console's words.
 pub struct ConsoleTokens {
     client: Client,
     machine: String,
@@ -134,19 +140,22 @@ impl std::fmt::Debug for ConsoleTokens {
     }
 }
 
-/// A console error as the App client's: what can work later stays transient, a refusal keeps its status, and none
-/// carries a token.
+/// An answer of `status` to a call to `path` of the console, as the App client's error.
+fn status_error(path: &str, status: u16, body: String, retry_after: Option<Duration>) -> GitHubError {
+    GitHubError::Status(StatusError {
+        method: "POST".into(),
+        path: path.into(),
+        status,
+        body,
+        retry_after,
+        server_time: None,
+    })
+}
+
+/// A console error as the App client's: what can work later stays transient, a refusal keeps its status, a wait the
+/// console asked for is kept, and none carries a token.
 fn as_github(path: &str, error: Error) -> GitHubError {
-    let status = |status: u16, body: String| {
-        GitHubError::Status(StatusError {
-            method: "POST".into(),
-            path: path.into(),
-            status,
-            body,
-            retry_after: None,
-            server_time: None,
-        })
-    };
+    let status = |status: u16, body: String| status_error(path, status, body, None);
     match error {
         Error::Unauthorized => status(
             401,
@@ -156,6 +165,12 @@ fn as_github(path: &str, error: Error) -> GitHubError {
             status: code,
             message,
         } => status(code, message),
+        Error::GithubOff(message) => status(403, message),
+        Error::Busy {
+            status: code,
+            message,
+            retry_after,
+        } => status_error(path, code, message, Some(retry_after)),
         Error::Unavailable(why) => GitHubError::Transport(format!("the console: {why}")),
         Error::Protocol(why) => GitHubError::Decode {
             what: format!("the console's answer to {path}"),
@@ -164,8 +179,11 @@ fn as_github(path: &str, error: Error) -> GitHubError {
     }
 }
 
+/// Whether the console said its GitHub tokens are off for this machine: only its 403 with the code `broker_off`.
+/// Another 403 refuses the call itself (a runner name the console does not make, something in front of it), and is
+/// an error with the console's words, never a reason to turn to the local key.
 fn gate_off(error: &Error) -> bool {
-    matches!(error, Error::Refused { status: 403, .. })
+    matches!(error, Error::GithubOff(_))
 }
 
 impl ConsoleTokens {
@@ -200,7 +218,7 @@ impl ConsoleTokens {
         self.lock().off_until.is_some_and(|until| now < until)
     }
 
-    /// The console said 403: its tokens are dropped, and it is asked again after a while.
+    /// The console said its tokens are off: they are dropped, and it is asked again after a while.
     fn mark_off(&self, why: &Error) {
         let wait = if self.fallback.is_some() {
             GATE_RECHECK
@@ -258,7 +276,8 @@ impl ConsoleTokens {
     /// Asks the console for read tokens. Holds `refreshing` while it does (the caller took it).
     async fn refresh(&self) -> Result<Arc<Read>, Option<GitHubError>> {
         let sent = self.ticks.now();
-        match self.client.github_read().await {
+        let refused = self.lock().refused.clone();
+        match self.client.github_read(&refused).await {
             Ok(tokens) => {
                 let (refresh_at, ends_at) = match tokens.iter().map(|t| t.expires_in).min() {
                     Some(life) => (sent + life / 2, sent + life.saturating_sub(END_MARGIN)),
@@ -288,7 +307,8 @@ impl ConsoleTokens {
                         tracing::info!("the console gives GitHub tokens again");
                     }
                 } else {
-                    // A token GitHub refused, handed out again: asked for again after a wait, not on every call.
+                    // A token GitHub refused, handed out again although it was named: asked for again after a wait,
+                    // not on every call.
                     let failures = state.failing.as_ref().map_or(0, |f| f.failures) + 1;
                     let retry_at = self.ticks.now() + failed_wait(failures);
                     read.refresh_at = read.refresh_at.min(retry_at);
@@ -316,11 +336,13 @@ impl ConsoleTokens {
                 Err(self.fallback.is_none().then(|| as_github(READ, error)))
             }
             Err(error) => {
+                let asked = error.retry_after();
                 let error = as_github(READ, error);
                 let now = self.ticks.now();
                 let mut state = self.lock();
                 let failures = state.failing.as_ref().map_or(0, |f| f.failures) + 1;
-                let wait = failed_wait(failures);
+                // Never sooner than the console asked.
+                let wait = failed_wait(failures).max(asked.unwrap_or_default());
                 // A token that still works is not left to end while nobody asks.
                 let retry_at = match &state.read {
                     Some(read) if now < read.ends_at => (now + wait).min(read.ends_at),
@@ -466,7 +488,7 @@ impl ConsoleTokens {
                 .as_ref()
                 .is_some_and(|read| read.held.iter().any(|h| h.token == *token));
             if ours {
-                // Asked for again at once, the first time: the console hands out the same token while it keeps it.
+                // Asked for again at once, naming it: the console makes a new one in its place and revokes it.
                 if !state.refused.contains(token) {
                     state.refused.push(token.clone());
                     state.read = None;
@@ -502,16 +524,59 @@ impl ConsoleTokens {
         }
     }
 
+    /// A wait the console asked for on `route` and `repo` that has not passed, as the error of a call not sent.
+    fn waiting(&self, route: &'static str, repo: &str) -> Result<(), GitHubError> {
+        let now = self.ticks.now();
+        let mut state = self.lock();
+        let key = (route, repo.to_ascii_lowercase());
+        match state.waits.get(&key) {
+            Some(until) if now < *until => {
+                let left = until.saturating_duration_since(now);
+                // A 429 whatever the console first answered: this call reached nobody, so nothing was made.
+                Err(status_error(
+                    route,
+                    429,
+                    format!(
+                        "not sent: the console asked to wait {} s more before asking for {repo} again",
+                        left.as_secs().max(1)
+                    ),
+                    Some(left),
+                ))
+            }
+            Some(_) => {
+                state.waits.remove(&key);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Keeps the wait `error` asks for on `route` and `repo`, when it asks for one.
+    fn wait_for(&self, route: &'static str, repo: &str, error: &Error) {
+        if let Some(asked) = error.retry_after() {
+            let now = self.ticks.now();
+            let mut state = self.lock();
+            state.waits.retain(|_, at| now < *at);
+            state
+                .waits
+                .insert((route, repo.to_ascii_lowercase()), now + asked);
+        }
+    }
+
     async fn registration(&self, installation: i64, repo: &str) -> Result<Secret<String>, GitHubError> {
         let mut why = None;
         if !self.is_off(self.ticks.now()) {
+            self.waiting(REGISTRATION, repo)?;
             match self.client.github_registration(repo).await {
                 Ok(token) => return Ok(token.token),
                 Err(error) if gate_off(&error) => {
                     self.mark_off(&error);
                     why = Some(as_github(REGISTRATION, error));
                 }
-                Err(error) => return Err(as_github(REGISTRATION, error)),
+                Err(error) => {
+                    self.wait_for(REGISTRATION, repo, &error);
+                    return Err(as_github(REGISTRATION, error));
+                }
             }
         }
         let key = self.off(why)?;
@@ -534,6 +599,7 @@ impl ConsoleTokens {
                     self.machine
                 )));
             }
+            self.waiting(JIT, repo)?;
             // The console refuses a machine whose switch is off before it asks GitHub anything, so the key may try.
             match self.client.github_jit(repo, name, labels).await {
                 Ok(jit) => {
@@ -546,7 +612,10 @@ impl ConsoleTokens {
                     self.mark_off(&error);
                     why = Some(as_github(JIT, error));
                 }
-                Err(error) => return Err(as_github(JIT, error)),
+                Err(error) => {
+                    self.wait_for(JIT, repo, &error);
+                    return Err(as_github(JIT, error));
+                }
             }
         }
         let key = self.off(why)?;
