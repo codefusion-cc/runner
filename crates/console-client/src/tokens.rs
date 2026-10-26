@@ -34,10 +34,13 @@ const REGISTRATION: &str = "/agent/runners/github/registration";
 const JIT: &str = "/agent/runners/github/jit";
 
 /// One installation's token from the last read.
+#[derive(Clone)]
 struct Held {
     id: i64,
     account: Option<String>,
     token: Secret<String>,
+    /// Made in place of one GitHub refused: GitHub refusing this one too is not asked about again at once.
+    replacement: bool,
 }
 
 /// The console's last read answer, with when it is asked again and when its tokens stop being used, both on the
@@ -49,6 +52,15 @@ struct Read {
 }
 
 impl Read {
+    /// The same tokens, asked for again from `now`.
+    fn due(&self, now: Instant) -> Read {
+        Read {
+            held: self.held.clone(),
+            refresh_at: self.refresh_at.min(now),
+            ends_at: self.ends_at,
+        }
+    }
+
     /// The installation an `installation` from a caller is: itself when it is one of these, else the one on the
     /// account that owns `repo` (a caller that learned its installations from the local key).
     fn find(&self, installation: i64, repo: Option<&str>) -> Option<&Held> {
@@ -91,6 +103,9 @@ struct State {
     /// One it hands out again all the same (a console that does not read the names) is not sent to GitHub, and the
     /// console is asked again only after a wait.
     refused: Vec<Secret<String>>,
+    /// Tokens made in place of refused ones that GitHub refused too, in a row: the wait before the next replacement
+    /// doubles with them, so a GitHub that refuses every new token does not make the console mint one per call.
+    refusals: u32,
     /// Calls the console answered with a wait (`Retry-After`), by route and repository: not sent again until then.
     waits: HashMap<(&'static str, String), Instant>,
 }
@@ -101,6 +116,14 @@ fn failed_wait(failures: u32) -> Duration {
     FAILED_WAIT
         .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
         .min(FAILED_WAIT_MAX)
+}
+
+/// What the console answered a call the local key can make too.
+enum Asked<T> {
+    /// Its answer.
+    Answer(T),
+    /// Its tokens are off for this machine (its refusal): the local key serves.
+    Off(GitHubError),
 }
 
 /// Where a call goes.
@@ -283,26 +306,40 @@ impl ConsoleTokens {
                     Some(life) => (sent + life / 2, sent + life.saturating_sub(END_MARGIN)),
                     None => (sent + EMPTY_LIFE, sent + EMPTY_LIFE),
                 };
+                let mut state = self.lock();
+                let before: Vec<Secret<String>> = state
+                    .read
+                    .as_ref()
+                    .map(|r| r.held.iter().map(|h| h.token.clone()).collect())
+                    .unwrap_or_default();
                 let mut read = Read {
                     held: tokens
                         .into_iter()
                         .map(|t| Held {
                             id: t.id,
                             account: t.account,
+                            replacement: !refused.is_empty() && !before.contains(&t.token),
                             token: t.token,
                         })
                         .collect(),
                     refresh_at,
                     ends_at,
                 };
-                let mut state = self.lock();
                 if state.off_until.take().is_some() {
                     tracing::info!("GitHub tokens come from the console again");
+                }
+                if refused.is_empty() {
+                    state.refusals = 0;
                 }
                 state
                     .refused
                     .retain(|token| read.held.iter().any(|h| h.token == *token));
-                if state.refused.is_empty() {
+                // Refused while this read was on its way, or past what one read names: named in the next one, now.
+                if state.refused.iter().any(|token| !refused.contains(token)) {
+                    read.refresh_at = read.refresh_at.min(self.ticks.now());
+                }
+                let named_again = state.refused.iter().any(|token| refused.contains(token));
+                if !named_again {
                     if state.failing.take().is_some() {
                         tracing::info!("the console gives GitHub tokens again");
                     }
@@ -342,12 +379,13 @@ impl ConsoleTokens {
                 let mut state = self.lock();
                 let failures = state.failing.as_ref().map_or(0, |f| f.failures) + 1;
                 // Never sooner than the console asked.
-                let wait = failed_wait(failures).max(asked.unwrap_or_default());
-                // A token that still works is not left to end while nobody asks.
+                let wait = failed_wait(failures);
+                // A token that still works is not left to end while nobody asks, but the console's own wait stands.
                 let retry_at = match &state.read {
                     Some(read) if now < read.ends_at => (now + wait).min(read.ends_at),
                     _ => now + wait,
-                };
+                }
+                .max(now + asked.unwrap_or_default());
                 state.failing = Some(Failing {
                     retry_at,
                     failures,
@@ -371,13 +409,40 @@ impl ConsoleTokens {
         }
         if let Some(read) = held.filter(|r| now < r.ends_at) {
             // Due, still good: one caller asks, the rest go on with it, and a console that fails changes nothing yet.
-            let waiting = self.lock().failing.as_ref().is_some_and(|f| now < f.retry_at);
+            // A caller whose token GitHub refused waits for the new one instead.
+            let (waiting, refused) = {
+                let state = self.lock();
+                (
+                    state.failing.as_ref().is_some_and(|f| now < f.retry_at),
+                    read.held.iter().any(|h| state.refused.contains(&h.token)),
+                )
+            };
             if waiting {
                 return Ok(Route::Console(read));
             }
-            let Ok(_one) = self.refreshing.try_lock() else {
-                return Ok(Route::Console(read));
+            let _one = if refused {
+                self.refreshing.lock().await
+            } else {
+                match self.refreshing.try_lock() {
+                    Ok(one) => one,
+                    Err(_) => return Ok(Route::Console(read)),
+                }
             };
+            // Another caller may have asked meanwhile, and got new tokens or a wait.
+            let now = self.ticks.now();
+            let (latest, waiting) = {
+                let state = self.lock();
+                (
+                    state.read.clone(),
+                    state.failing.as_ref().is_some_and(|f| now < f.retry_at),
+                )
+            };
+            if let Some(fresh) = latest.as_ref().filter(|r| now < r.refresh_at) {
+                return Ok(Route::Console(fresh.clone()));
+            }
+            if waiting {
+                return Ok(Route::Console(latest.unwrap_or(read)));
+            }
             return match self.refresh().await {
                 Ok(fresh) => Ok(Route::Console(fresh)),
                 Err(_) if self.is_off(self.ticks.now()) => self.off(None).map(Route::Key),
@@ -474,8 +539,8 @@ impl ConsoleTokens {
                 )),
             },
             Route::Key(key) => {
-                let installation = self.key_installation(key, installation, repo).await?;
-                key.token(installation, repo).await
+                let mapped = self.key_installation(key, installation, repo).await?;
+                self.unmap_gone(installation, key.token(mapped, repo).await)
             }
         }
     }
@@ -483,15 +548,36 @@ impl ConsoleTokens {
     async fn forget(&self, installation: i64, token: &Secret<String>) {
         {
             let mut state = self.lock();
-            let ours = state
-                .read
+            let read = state.read.clone();
+            if let Some((read, held)) = read
                 .as_ref()
-                .is_some_and(|read| read.held.iter().any(|h| h.token == *token));
-            if ours {
-                // Asked for again at once, naming it: the console makes a new one in its place and revokes it.
-                if !state.refused.contains(token) {
-                    state.refused.push(token.clone());
-                    state.read = None;
+                .and_then(|read| Some((read, read.held.iter().find(|h| h.token == *token)?)))
+            {
+                if state.refused.contains(token) {
+                    return;
+                }
+                // Asked for again, naming it: the console makes a new one in its place and revokes it. The other
+                // installations' tokens serve meanwhile.
+                state.refused.push(token.clone());
+                let now = self.ticks.now();
+                state.read = Some(Arc::new(read.due(now)));
+                if held.replacement {
+                    // The new one is refused too: asked for again after a wait that doubles, not on every call.
+                    state.refusals += 1;
+                    let failures = state.refusals;
+                    let error = as_github(
+                        READ,
+                        Error::Refused {
+                            status: 401,
+                            message: "GitHub refuses the new tokens the console makes too".into(),
+                        },
+                    );
+                    tracing::warn!(%error, failures, "GitHub refuses the console's new token for an installation");
+                    state.failing = Some(Failing {
+                        retry_at: now + failed_wait(failures),
+                        failures,
+                        error,
+                    });
                 }
                 return;
             }
@@ -563,25 +649,64 @@ impl ConsoleTokens {
         }
     }
 
-    async fn registration(&self, installation: i64, repo: &str) -> Result<Secret<String>, GitHubError> {
-        let mut why = None;
-        if !self.is_off(self.ticks.now()) {
-            self.waiting(REGISTRATION, repo)?;
-            match self.client.github_registration(repo).await {
-                Ok(token) => return Ok(token.token),
-                Err(error) if gate_off(&error) => {
-                    self.mark_off(&error);
-                    why = Some(as_github(REGISTRATION, error));
-                }
-                Err(error) => {
-                    self.wait_for(REGISTRATION, repo, &error);
-                    return Err(as_github(REGISTRATION, error));
-                }
+    /// `call` to the console on `route` for `repo`, unless a wait it asked for there has not passed: its answer, its
+    /// refusal when its tokens are off for this machine (marked so), or the error, with the wait it asks for kept.
+    async fn ask<T>(
+        &self,
+        route: &'static str,
+        repo: &str,
+        call: impl Future<Output = Result<T, Error>>,
+    ) -> Result<Asked<T>, GitHubError> {
+        self.waiting(route, repo)?;
+        match call.await {
+            Ok(answer) => Ok(Asked::Answer(answer)),
+            Err(error) if gate_off(&error) => {
+                self.mark_off(&error);
+                Ok(Asked::Off(as_github(route, error)))
+            }
+            Err(error) => {
+                self.wait_for(route, repo, &error);
+                Err(as_github(route, error))
             }
         }
+    }
+
+    /// The local key and its installation for `installation` and `repo`, while the console's tokens are off (`why`,
+    /// the console's refusal, when there is one).
+    async fn key_for(
+        &self,
+        why: Option<GitHubError>,
+        installation: i64,
+        repo: &str,
+    ) -> Result<(&dyn TokenSource, i64), GitHubError> {
         let key = self.off(why)?;
         let installation = self.key_installation(key, installation, Some(repo)).await?;
-        key.registration_token(installation, repo).await
+        Ok((key, installation))
+    }
+
+    /// `result` of the key's call for the console's `installation`; a 404 drops the key's installation found for it,
+    /// which may be gone (the key's App installed again), so the next call looks it up again.
+    fn unmap_gone<T>(&self, installation: i64, result: Result<T, GitHubError>) -> Result<T, GitHubError> {
+        if matches!(&result, Err(error) if error.status() == Some(404)) {
+            self.lock().mapped.remove(&installation);
+        }
+        result
+    }
+
+    async fn registration(&self, installation: i64, repo: &str) -> Result<Secret<String>, GitHubError> {
+        let why = if self.is_off(self.ticks.now()) {
+            None
+        } else {
+            match self
+                .ask(REGISTRATION, repo, self.client.github_registration(repo))
+                .await?
+            {
+                Asked::Answer(token) => return Ok(token.token),
+                Asked::Off(why) => Some(why),
+            }
+        };
+        let (key, mapped) = self.key_for(why, installation, repo).await?;
+        self.unmap_gone(installation, key.registration_token(mapped, repo).await)
     }
 
     async fn jit(
@@ -591,36 +716,35 @@ impl ConsoleTokens {
         name: &str,
         labels: &[String],
     ) -> Result<PlainJit, GitHubError> {
-        let mut why = None;
-        if !self.is_off(self.ticks.now()) {
+        let why = if self.is_off(self.ticks.now()) {
+            None
+        } else {
             if !is_runner_of(&self.machine, name) {
                 return Err(GitHubError::Refused(format!(
                     "{name}: the console makes only Actions runners named {}-j and seven hex digits",
                     self.machine
                 )));
             }
-            self.waiting(JIT, repo)?;
-            // The console refuses a machine whose switch is off before it asks GitHub anything, so the key may try.
-            match self.client.github_jit(repo, name, labels).await {
-                Ok(jit) => {
+            // Off, the console made nothing, or removed the runner GitHub made meanwhile; one it could not remove
+            // keeps the name, and the key's try meets a 409, which the caller takes as a name to clean up.
+            match self
+                .ask(JIT, repo, self.client.github_jit(repo, name, labels))
+                .await?
+            {
+                Asked::Answer(jit) => {
                     return Ok(PlainJit {
                         id: jit.runner_id,
                         encoded: jit.encoded,
                     });
                 }
-                Err(error) if gate_off(&error) => {
-                    self.mark_off(&error);
-                    why = Some(as_github(JIT, error));
-                }
-                Err(error) => {
-                    self.wait_for(JIT, repo, &error);
-                    return Err(as_github(JIT, error));
-                }
+                Asked::Off(why) => Some(why),
             }
-        }
-        let key = self.off(why)?;
-        let installation = self.key_installation(key, installation, Some(repo)).await?;
-        key.generate_jit_config(installation, repo, name, labels).await
+        };
+        let (key, mapped) = self.key_for(why, installation, repo).await?;
+        self.unmap_gone(
+            installation,
+            key.generate_jit_config(mapped, repo, name, labels).await,
+        )
     }
 }
 

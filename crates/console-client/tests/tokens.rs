@@ -598,6 +598,28 @@ async fn installation_ids_of_the_other_app_are_mapped_by_repository() {
     assert_eq!(status_of(&error), Some(404));
 }
 
+#[tokio::test]
+async fn an_installation_of_the_key_that_is_gone_is_looked_up_again() {
+    let rig = rig(true, true).await;
+    rig.console.set_installations(&[(77, "ORG")]);
+    rig.app.installations().await.expect("the console's");
+    rig.console.set_broker(MACHINE, false);
+    rig.github.revoke_installation_tokens();
+    // The key's App was installed again: the first lookup names an installation GitHub no longer has.
+    rig.github.fail(
+        "GET /repos/org/app/installation",
+        Reply::json(&json!({"id": 9})),
+        1,
+    );
+    let error = rig.app.registration_token(77, REPO).await.expect_err("gone");
+    assert_eq!(status_of(&error), Some(404), "{error}");
+    assert!(
+        rig.app.registration_token(77, REPO).await.is_ok(),
+        "looked up again"
+    );
+    assert_eq!(rig.github.count("/repos/org/app/installation"), 2);
+}
+
 // ---- answers that break the contract ----
 
 #[tokio::test]
@@ -954,6 +976,115 @@ async fn a_refused_token_is_named_again_after_a_read_that_failed() {
         .rfind(|c| c.route == "read")
         .expect("a read");
     assert_eq!(last.body, json!({"protocol": 1, "refused": [first.expose()]}));
+}
+
+#[tokio::test]
+async fn a_token_github_refuses_leaves_the_other_installations_tokens_serving() {
+    let rig = rig_with(true, false, support::no_retry()).await;
+    rig.console.set_installations(&[(1, "org"), (2, "other")]);
+    rig.app.installation_token(1).await.expect("token");
+    let other = rig.app.installation_token(2).await.expect("token");
+    rig.console.down(true);
+    github_refuses_once(&rig);
+    let error = rig
+        .app
+        .repositories(1)
+        .await
+        .expect_err("refused, and no console");
+    assert_eq!(status_of(&error), Some(401), "{error}");
+    // The other installation's token has most of its hour left: it serves while the console is away.
+    assert_eq!(rig.app.installation_token(2).await.expect("still good"), other);
+    assert!(rig.app.repositories(2).await.is_ok());
+}
+
+#[tokio::test]
+async fn new_tokens_github_refuses_too_are_asked_for_at_a_doubling_pace() {
+    let rig = rig(true, false).await;
+    rig.app.installation_token(1).await.expect("token");
+    rig.github.fail(
+        "GET /installation/repositories",
+        Reply::status_json(401, &json!({"message": "Bad credentials"})),
+        1000,
+    );
+    for _ in 0..10 {
+        let error = rig.app.repositories(1).await.expect_err("refused");
+        assert_eq!(status_of(&error), Some(401), "{error}");
+    }
+    assert_eq!(
+        rig.calls("read"),
+        2,
+        "the first token replaced at once, the new one refused too: no read for every call"
+    );
+    rig.advance(FAILED_WAIT);
+    for _ in 0..5 {
+        assert!(rig.app.repositories(1).await.is_err());
+    }
+    assert_eq!(rig.calls("read"), 3, "once after the wait");
+    rig.advance(FAILED_WAIT);
+    assert!(rig.app.repositories(1).await.is_err());
+    assert_eq!(rig.calls("read"), 3, "the wait doubled");
+    rig.advance(FAILED_WAIT);
+    rig.github.recover("GET /installation/repositories");
+    assert!(rig.app.repositories(1).await.is_ok(), "a token that works serves");
+}
+
+#[tokio::test]
+async fn a_token_refused_while_a_read_is_on_its_way_is_named_in_the_next_one() {
+    let rig = rig(true, false).await;
+    rig.console.set_installations(&[(1, "org"), (2, "other")]);
+    let first = rig.app.installation_token(1).await.expect("token");
+    let second = rig.app.installation_token(2).await.expect("token");
+    // A renewal is under way, slowly, and hands out the tokens it keeps: it was sent before GitHub refused one.
+    rig.advance(Duration::from_secs(31 * 60));
+    rig.console.answer_next(Reply::After(
+        Duration::from_millis(400),
+        Box::new(Reply::json(&json!({"installations": [
+            {"id": 1, "account": "org", "token": first.expose(), "expiresInS": 3600},
+            {"id": 2, "account": "other", "token": second.expose(), "expiresInS": 3600},
+        ]}))),
+    ));
+    let renewing = {
+        let app = rig.app.clone();
+        tokio::spawn(async move { app.installation_token(2).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    github_refuses_once(&rig);
+    assert!(
+        rig.app.repositories(1).await.is_ok(),
+        "named in the read after it, and replaced"
+    );
+    renewing.await.expect("task").expect("token");
+    let reads: Vec<_> = rig
+        .console
+        .github_calls()
+        .into_iter()
+        .filter(|c| c.route == "read")
+        .collect();
+    assert_eq!(
+        reads.len(),
+        3,
+        "the first, the slow renewal, and the one that names it"
+    );
+    assert_eq!(reads[1].body, json!({"protocol": 1}));
+    assert_eq!(reads[2].body, json!({"protocol": 1, "refused": [first.expose()]}));
+}
+
+#[tokio::test]
+async fn a_wait_the_console_asks_for_past_the_tokens_end_stands() {
+    let rig = rig(true, false).await;
+    rig.app.installation_token(1).await.expect("token");
+    rig.advance(Duration::from_secs(31 * 60));
+    rig.console.fail_next_waiting(1, 503, 3600);
+    rig.app.installation_token(1).await.expect("the kept one serves");
+    let asked = rig.console.calls();
+    rig.advance(Duration::from_secs(29 * 60));
+    assert!(rig.app.installations().await.is_err(), "the token ended");
+    assert_eq!(rig.console.calls(), asked, "not before its Retry-After");
+    rig.advance(Duration::from_secs(31 * 60));
+    assert!(
+        rig.app.installations().await.is_ok(),
+        "asked once the hour passed"
+    );
 }
 
 #[tokio::test]

@@ -183,6 +183,10 @@ impl Client {
                         "the read tokens' answer: an installation ID that is not one, or twice",
                     ));
                 }
+                // One the console could not be asked to replace, were GitHub to refuse it.
+                if wire.token.len() > REFUSED_TOKEN_MAX {
+                    return Err(refuse("the read tokens' answer: a token over 255 characters"));
+                }
                 Ok(InstallationToken {
                     id: wire.id,
                     account: wire.account,

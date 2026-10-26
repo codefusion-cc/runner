@@ -314,6 +314,17 @@ fn github_for_check(config: &Config) -> Result<GitHubApp, String> {
     }
 }
 
+/// The GitHub App client an uninstall removes this host's runners with (`config` as [`as_enrolled`] made it): none for
+/// a host with no way to GitHub at all, no App key here and no console token it can use (lost, or taken by an
+/// earlier `uninstall --leave`). It can remove nothing there, and must still be able to go; the console's Remove
+/// takes its runners off GitHub.
+fn github_for_uninstall(config: &Config) -> Result<Option<GitHubApp>, String> {
+    if config.app_dir.is_none() && config.console.is_none() {
+        return Ok(None);
+    }
+    app(config).map(Some)
+}
+
 /// The configuration with its console only when the host holds a token it can use: one that never enrolled, or whose
 /// enrolment was cut off, has nobody to tell when it goes and no tokens to get from it when it is checked.
 fn as_enrolled(mut config: Config) -> Config {
@@ -834,26 +845,35 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
     } else {
         own_program()?
     };
-    let left = runtime(2)?.block_on(async {
-        let (machines, service) = app(&config)
-            .and_then(|github| service(&config, github, &program, None, None))
-            .map_err(|error| {
-            format!(
-                "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its \
-                 deadline"
-            )
-        })?;
-        let ticks = tokio::spawn(async move {
-            loop {
-                let machines = machines.clone();
-                let _ = tokio::task::spawn_blocking(move || machines.tick()).await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-        let left = service.retire(RETIRE_WAIT, leave).await;
-        ticks.abort();
-        Ok::<_, String>(left)
-    })?;
+    let nothing_removed = |error: String| {
+        format!(
+            "{error}; nothing was removed at GitHub, and a machine that stands ends with its job or at its deadline"
+        )
+    };
+    let github = github_for_uninstall(&config).map_err(nothing_removed)?;
+    let left = match github {
+        None => {
+            println!(
+                "{}",
+                nothing_removed("no GitHub tokens here: no App key (app_dir) and no console token".into())
+            );
+            Vec::new()
+        }
+        Some(github) => runtime(2)?.block_on(async {
+            let (machines, service) =
+                service(&config, github, &program, None, None).map_err(nothing_removed)?;
+            let ticks = tokio::spawn(async move {
+                loop {
+                    let machines = machines.clone();
+                    let _ = tokio::task::spawn_blocking(move || machines.tick()).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+            let left = service.retire(RETIRE_WAIT, leave).await;
+            ticks.abort();
+            Ok::<_, String>(left)
+        })?,
+    };
     manager.remove()?;
     for line in &left {
         println!("LEFT: {line}");
@@ -1369,6 +1389,36 @@ mod tests {
         let mut neither = console_only.clone();
         neither.console = None;
         assert!(app(&neither).expect_err("nothing").contains("no GitHub tokens"));
+    }
+
+    #[test]
+    fn an_uninstall_with_no_way_to_github_still_goes_and_one_with_a_broken_key_stops() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        std::fs::create_dir_all(&state).expect("the state folder");
+        // Console only, its token gone: nothing here reaches GitHub, and nothing stops the uninstall.
+        let mut console_only = config(&state, &key, true);
+        console_only.app_dir = None;
+        assert!(
+            github_for_uninstall(&as_enrolled(console_only.clone()))
+                .expect("goes")
+                .is_none()
+        );
+        // With its token, the console's tokens remove the runners.
+        std::fs::write(console_only.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        assert!(
+            github_for_uninstall(&as_enrolled(console_only))
+                .expect("the console")
+                .is_some()
+        );
+        // A key named but not usable is an error, said before anything is removed.
+        std::fs::create_dir_all(&key).expect("the App's folder");
+        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o644))
+            .expect("a mode");
+        assert!(github_for_uninstall(&as_enrolled(config(&state, &key, false))).is_err());
     }
 
     #[test]
