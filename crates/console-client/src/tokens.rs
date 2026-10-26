@@ -87,6 +87,17 @@ struct State {
     /// Until when the console is taken at its word that its tokens are off for this machine.
     off_until: Option<Instant>,
     failing: Option<Failing>,
+    /// Tokens of the console GitHub refused (401). The console keeps a token while 40 minutes of it are left and hands
+    /// it out again: one it does is not sent to GitHub, and the console is asked again only after a wait.
+    refused: Vec<Secret<String>>,
+}
+
+/// The wait after `failures` refreshes in a row went wrong: [`FAILED_WAIT`], doubled each time, at most
+/// [`FAILED_WAIT_MAX`].
+fn failed_wait(failures: u32) -> Duration {
+    FAILED_WAIT
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+        .min(FAILED_WAIT_MAX)
 }
 
 /// Where a call goes.
@@ -249,12 +260,11 @@ impl ConsoleTokens {
         let sent = self.ticks.now();
         match self.client.github_read().await {
             Ok(tokens) => {
-                let life = tokens
-                    .iter()
-                    .map(|t| t.expires_in)
-                    .min()
-                    .unwrap_or(EMPTY_LIFE + END_MARGIN);
-                let read = Arc::new(Read {
+                let (refresh_at, ends_at) = match tokens.iter().map(|t| t.expires_in).min() {
+                    Some(life) => (sent + life / 2, sent + life.saturating_sub(END_MARGIN)),
+                    None => (sent + EMPTY_LIFE, sent + EMPTY_LIFE),
+                };
+                let mut read = Read {
                     held: tokens
                         .into_iter()
                         .map(|t| Held {
@@ -263,16 +273,40 @@ impl ConsoleTokens {
                             token: t.token,
                         })
                         .collect(),
-                    refresh_at: sent + life / 2,
-                    ends_at: sent + life.saturating_sub(END_MARGIN),
-                });
+                    refresh_at,
+                    ends_at,
+                };
                 let mut state = self.lock();
                 if state.off_until.take().is_some() {
                     tracing::info!("GitHub tokens come from the console again");
                 }
-                if state.failing.take().is_some() {
-                    tracing::info!("the console gives GitHub tokens again");
+                state
+                    .refused
+                    .retain(|token| read.held.iter().any(|h| h.token == *token));
+                if state.refused.is_empty() {
+                    if state.failing.take().is_some() {
+                        tracing::info!("the console gives GitHub tokens again");
+                    }
+                } else {
+                    // A token GitHub refused, handed out again: asked for again after a wait, not on every call.
+                    let failures = state.failing.as_ref().map_or(0, |f| f.failures) + 1;
+                    let retry_at = self.ticks.now() + failed_wait(failures);
+                    read.refresh_at = read.refresh_at.min(retry_at);
+                    let error = as_github(
+                        READ,
+                        Error::Refused {
+                            status: 401,
+                            message: "GitHub refuses a token the console gives again".into(),
+                        },
+                    );
+                    tracing::warn!(%error, failures, "the console's token for an installation does not work at GitHub");
+                    state.failing = Some(Failing {
+                        retry_at,
+                        failures,
+                        error,
+                    });
                 }
+                let read = Arc::new(read);
                 state.console_ids.extend(read.held.iter().map(|h| h.id));
                 state.read = Some(read.clone());
                 Ok(read)
@@ -286,9 +320,7 @@ impl ConsoleTokens {
                 let now = self.ticks.now();
                 let mut state = self.lock();
                 let failures = state.failing.as_ref().map_or(0, |f| f.failures) + 1;
-                let wait = FAILED_WAIT
-                    .saturating_mul(1u32 << (failures - 1).min(16))
-                    .min(FAILED_WAIT_MAX);
+                let wait = failed_wait(failures);
                 // A token that still works is not left to end while nobody asks.
                 let retry_at = match &state.read {
                     Some(read) if now < read.ends_at => (now + wait).min(read.ends_at),
@@ -396,6 +428,17 @@ impl ConsoleTokens {
     async fn read_token(&self, installation: i64, repo: Option<&str>) -> Result<Secret<String>, GitHubError> {
         match self.route().await? {
             Route::Console(read) => match read.find(installation, repo) {
+                Some(held) if self.lock().refused.contains(&held.token) => Err(as_github(
+                    READ,
+                    Error::Refused {
+                        status: 401,
+                        message: format!(
+                            "GitHub refuses the token the console gives for installation {}; the console is asked \
+                             again after a wait",
+                            held.id
+                        ),
+                    },
+                )),
                 Some(held) => Ok(held.token.clone()),
                 None => Err(as_github(
                     READ,
@@ -423,7 +466,11 @@ impl ConsoleTokens {
                 .as_ref()
                 .is_some_and(|read| read.held.iter().any(|h| h.token == *token));
             if ours {
-                state.read = None;
+                // Asked for again at once, the first time: the console hands out the same token while it keeps it.
+                if !state.refused.contains(token) {
+                    state.refused.push(token.clone());
+                    state.read = None;
+                }
                 return;
             }
         }

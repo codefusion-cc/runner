@@ -325,8 +325,8 @@ impl GitHubApp {
         &self.inner.rest.http
     }
 
-    /// GitHub's clock minus this machine's, in seconds, as learned from its responses (0 until it was refused for
-    /// the time, and always with tokens from the console).
+    /// GitHub's clock minus this machine's, in seconds, as the App's key here learned it from GitHub's responses (0
+    /// until it was refused for the time, and always without a key here).
     pub fn clock_skew_secs(&self) -> i64 {
         self.inner.source.clock_skew_secs()
     }

@@ -684,3 +684,44 @@ async fn a_read_token_from_the_console_cannot_register_a_runner() {
         "GitHub refuses a read token a write"
     );
 }
+
+#[tokio::test]
+async fn an_empty_read_answer_stands_until_its_whole_life_has_passed() {
+    let rig = rig(true, false).await;
+    rig.console
+        .answer_next(Reply::json(&json!({"installations": []})));
+    assert!(rig.app.installations().await.expect("none").is_empty());
+    rig.advance(cf_console_client::EMPTY_LIFE - Duration::from_secs(1));
+    assert!(rig.app.installations().await.expect("still none").is_empty());
+    assert_eq!(rig.calls("read"), 1, "not asked again before its life is over");
+}
+
+#[tokio::test]
+async fn a_token_github_refuses_that_the_console_hands_out_again_does_not_ask_the_console_on_every_call() {
+    let rig = rig(true, false).await;
+    let token = rig.app.installation_token(1).await.expect("token");
+    // GitHub stops taking the token; the console keeps it (40 minutes and more left) and hands it out again.
+    rig.github.revoke_token(token.expose());
+    for _ in 0..20 {
+        let error = rig.app.repositories(1).await.expect_err("refused");
+        assert_eq!(status_of(&error), Some(401), "{error}");
+        assert!(!error.to_string().contains(token.expose().as_str()));
+    }
+    assert!(
+        rig.calls("read") <= 2,
+        "the console is asked once more, not on every call GitHub refuses: {} reads",
+        rig.calls("read")
+    );
+    // After the wait it is asked once more, and still handing out the same token, waited on again.
+    rig.advance(FAILED_WAIT);
+    for _ in 0..5 {
+        assert_eq!(
+            status_of(&rig.app.repositories(1).await.expect_err("refused")),
+            Some(401)
+        );
+    }
+    assert_eq!(rig.calls("read"), 3, "once per wait");
+    // Once the console makes a new one (under 40 minutes left of the kept one), it serves.
+    rig.advance(Duration::from_secs(21 * 60));
+    assert!(rig.app.repositories(1).await.is_ok(), "a new token serves");
+}

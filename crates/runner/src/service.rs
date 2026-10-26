@@ -305,9 +305,18 @@ fn only_runner(config: &Config) -> Result<std::fs::File, String> {
     }
 }
 
-/// The configuration an uninstall works with: a host without a token it can use (it never enrolled, or its
-/// enrolment was cut off) has nobody to tell, and must still be able to go.
-fn for_uninstall(mut config: Config) -> Config {
+/// The GitHub App client a check looks with: the Runner's own, but with the key here when the host has not enrolled
+/// with its console yet, as `check` comes before `enroll`.
+fn github_for_check(config: &Config) -> Result<GitHubApp, String> {
+    match config.app_dir {
+        Some(_) => app(&as_enrolled(config.clone())),
+        None => app(config),
+    }
+}
+
+/// The configuration with its console only when the host holds a token it can use: one that never enrolled, or whose
+/// enrolment was cut off, has nobody to tell when it goes and no tokens to get from it when it is checked.
+fn as_enrolled(mut config: Config) -> Config {
     if console(&config).is_err() {
         config.console = None;
     }
@@ -702,8 +711,7 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
         // The service is built on a folder of its own that is removed after: building it takes up what a Runner
         // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
         let scratch = crate::vm::Scratch::new("check")?;
-        // Its GitHub tokens come from where the Runner's would, the console among them: only the reports stay home.
-        let github = app(&config)?;
+        let github = github_for_check(&config)?;
         let probe = Config {
             state_dir: scratch.path().to_path_buf(),
             console: None,
@@ -813,7 +821,7 @@ pub fn install(config_path: &Path) -> Result<(), String> {
 /// the program's copy. `leave` also takes the host off the console; `purge` removes the state folder with the images
 /// and the logs. What could not be removed is said, and is an error.
 pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> {
-    let config = for_uninstall(Config::load(config)?);
+    let config = as_enrolled(Config::load(config)?);
     let home = home()?;
     let manager = manager(&home);
     manager.stop()?;
@@ -1364,6 +1372,31 @@ mod tests {
     }
 
     #[test]
+    fn a_check_before_enroll_looks_at_github_with_the_key_here() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("folder");
+        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        std::fs::create_dir_all(&key).expect("the App's folder");
+        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
+        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o600))
+            .expect("a mode");
+        let both = config(&state, &key, true);
+        let looks = github_for_check(&both).expect("not enrolled yet, with a key");
+        assert!(looks.jwt().is_ok(), "the key here");
+        let mut console_only = both.clone();
+        console_only.app_dir = None;
+        let error = github_for_check(&console_only).expect_err("not enrolled, no key");
+        assert!(error.ends_with("run `enroll` first"), "{error}");
+        std::fs::create_dir_all(&state).expect("the state folder");
+        std::fs::write(both.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        assert!(
+            github_for_check(&both).expect("enrolled").jwt().is_err(),
+            "the console's, as the Runner's"
+        );
+    }
+
+    #[test]
     fn a_token_file_that_is_empty_is_no_token() {
         let folder = tempfile::tempdir().expect("folder");
         let with = config(folder.path(), folder.path(), true);
@@ -1382,13 +1415,13 @@ mod tests {
     fn a_host_without_a_token_it_can_use_is_uninstalled_without_the_console() {
         let folder = tempfile::tempdir().expect("folder");
         let with = || config(folder.path(), folder.path(), true);
-        assert_eq!(for_uninstall(with()).console, None, "it never enrolled");
+        assert_eq!(as_enrolled(with()).console, None, "it never enrolled");
         // An enrolment that was cut off, or a token removed by hand.
         std::fs::write(with().console_token(), "\n").expect("a file");
-        assert_eq!(for_uninstall(with()).console, None, "an empty file is no token");
+        assert_eq!(as_enrolled(with()).console, None, "an empty file is no token");
         std::fs::write(with().console_token(), "the-token\n").expect("a file");
         assert_eq!(
-            for_uninstall(with()).console.as_deref(),
+            as_enrolled(with()).console.as_deref(),
             Some("https://console.example"),
             "an enrolled host tells the console"
         );
