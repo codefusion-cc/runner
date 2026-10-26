@@ -9,7 +9,7 @@ use std::time::Duration;
 use cf_secret::Secret;
 use serde::Deserialize;
 
-use crate::client::{Client, body_of, read};
+use crate::client::{Client, body_of, is_slug, read};
 use crate::error::Error;
 
 /// The longest repository name the console takes.
@@ -94,10 +94,7 @@ pub fn is_label(label: &str) -> bool {
 /// Whether `name` is an Actions runner of `machine` as the console makes them (`isRunnerOf`): exactly `<machine>-j`
 /// and seven lowercase hex digits, so `mac` never names a runner of `mac-mini`.
 pub fn is_runner_of(machine: &str, name: &str) -> bool {
-    let slug = !machine.is_empty()
-        && machine.split('-').all(|part| {
-            !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        });
+    let slug = is_slug(machine);
     let suffix = name
         .strip_prefix(machine)
         .and_then(|rest| rest.strip_prefix("-j"))

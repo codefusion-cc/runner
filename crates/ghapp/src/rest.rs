@@ -61,6 +61,14 @@ impl Rest {
         }
     }
 
+    /// The same client, sending each call once: for a call GitHub may have acted on although the answer failed.
+    pub(crate) fn without_retries(&self) -> Rest {
+        Rest {
+            http: self.http.without_retries(),
+            api: self.api.clone(),
+        }
+    }
+
     pub(crate) fn url(&self, path: &str) -> String {
         if path.starts_with("http") {
             path.to_string()
@@ -78,13 +86,12 @@ impl Rest {
         etag: Option<&str>,
         body: Option<&serde_json::Value>,
     ) -> Result<Response, Error> {
-        let url = url.to_string();
         let bearer = format!("Bearer {}", auth.expose());
         let body = body.map(|body| body.to_string());
         self.http
             .send(|c| {
                 let mut request = c
-                    .request(method.clone(), &url)
+                    .request(method.clone(), url)
                     .header("Accept", "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", API_VERSION)
                     .header(AUTHORIZATION, &bearer);

@@ -199,10 +199,7 @@ impl KeyTokens {
         });
         let path = format!("/repos/{repo}/actions/runners/generate-jitconfig");
         // Sent once: GitHub may have registered it although the answer failed, and a second try meets the name.
-        let once = Rest {
-            http: self.rest.http.without_retries(),
-            api: self.rest.api.clone(),
-        };
+        let once = self.rest.without_retries();
         let response = once
             .as_installation(
                 self.installed(installation, repo),

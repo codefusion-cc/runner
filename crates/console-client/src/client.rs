@@ -27,10 +27,13 @@ pub const RESULT_ID_MAX: usize = 64;
 /// Whether `name` is a Mac name the console accepts: lower case letters and digits in groups joined by single
 /// hyphens, 1 to 24 characters.
 pub fn is_machine_name(name: &str) -> bool {
-    name.len() <= MACHINE_NAME_MAX
-        && name.split('-').all(|part| {
-            !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        })
+    name.len() <= MACHINE_NAME_MAX && is_slug(name)
+}
+
+/// Whether `name` is lower case letters and digits in groups joined by single hyphens, of any length.
+pub(crate) fn is_slug(name: &str) -> bool {
+    name.split('-')
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
 }
 
 /// The number of UTF-16 units, which is how the console counts a text's length.

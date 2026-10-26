@@ -92,17 +92,19 @@ impl From<HttpError> for Error {
                 403 if code_of(&s.body).as_deref() == Some(BROKER_OFF) => {
                     Error::GithubOff(message_of(&s.body))
                 }
-                429 | 500..=599 if s.retry_after.is_some() => Error::Busy {
-                    status: s.status,
-                    message: message_of(&s.body),
-                    retry_after: s.retry_after.unwrap_or_default().min(RETRY_AFTER_MAX),
+                429 | 500..=599 => match s.retry_after {
+                    Some(wait) => Error::Busy {
+                        status: s.status,
+                        message: message_of(&s.body),
+                        retry_after: wait.min(RETRY_AFTER_MAX),
+                    },
+                    None => Error::Unavailable(format!(
+                        "{} answered {}: {}",
+                        s.path,
+                        s.status,
+                        message_of(&s.body)
+                    )),
                 },
-                429 | 500..=599 => Error::Unavailable(format!(
-                    "{} answered {}: {}",
-                    s.path,
-                    s.status,
-                    message_of(&s.body)
-                )),
                 400..=499 => Error::Refused {
                     status: s.status,
                     message: message_of(&s.body),
