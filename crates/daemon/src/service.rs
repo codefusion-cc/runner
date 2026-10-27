@@ -728,6 +728,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let shared = &self.shared;
         let machine = &shared.config.machine;
 
+        // Listeners first, so a set one made at GitHub before it stopped is listed below and deleted with the rest.
+        let unwanted: Vec<String> = shared
+            .serving
+            .lock()
+            .expect("serving")
+            .iter()
+            .filter(|(name, serving)| {
+                let repo = &serving.state.lock().expect("set").repo;
+                !wanted.contains_key(*name)
+                    && !unread.contains(repo)
+                    && only.is_none_or(|only| only.contains(repo))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in unwanted {
+            self.close(&name).await;
+        }
+
         // Scale sets of this Mac that nothing asks for any more, from this run of the Runner or one before.
         let clients: Vec<(String, ScaleSetClient)> = shared
             .clients
@@ -753,7 +771,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !set.name.starts_with(&prefix) || wanted.contains_key(&set.name) {
                     continue;
                 }
-                self.close(&set.name).await;
                 if shared.roster.active(&repo, set.id) == 0 {
                     match client.delete_scale_set(set.id).await {
                         Ok(()) => {
@@ -772,7 +789,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
-
         for (name, want) in wanted {
             let mut serving = shared.serving.lock().expect("serving");
             if serving.contains_key(&name) {
