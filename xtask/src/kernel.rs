@@ -51,6 +51,13 @@ pub struct Kernel {
     pub sha256: &'static str,
     /// The package's size in bytes. A download that is longer is cut off by curl, one that is shorter is refused.
     pub size: u64,
+    /// The tag of our copy without the version. arm64's has no architecture in it: it was published before there
+    /// was another.
+    pub tag_stem: &'static str,
+    /// The kernel's file name in the bundle and in a release.
+    pub file_name: &'static str,
+    /// Makes the plain kernel the monitors boot from the package's `boot/vmlinuz-virt`.
+    pub unpack: fn(&[u8]) -> Result<Vec<u8>>,
 }
 
 pub const AARCH64: Kernel = Kernel {
@@ -58,6 +65,9 @@ pub const AARCH64: Kernel = Kernel {
     version: "6.18.56-r0",
     sha256: "e3839bfd751ff0a4421484f712b9b29efb514024523736a0ef62521521571b12",
     size: 41_695_630,
+    tag_stem: "kernel-linux-virt-",
+    file_name: "Image",
+    unpack: unpack_zboot,
 };
 
 pub const X86_64: Kernel = Kernel {
@@ -65,6 +75,9 @@ pub const X86_64: Kernel = Kernel {
     version: "6.18.58-r0",
     sha256: "1eec55004cf7167c914c8839f46691d2bc82767e20466bff51eb45d06f8e90cc",
     size: 44_534_524,
+    tag_stem: "kernel-linux-virt-x86_64-",
+    file_name: "vmlinux",
+    unpack: unpack_bzimage,
 };
 
 /// What the build calls the package.
@@ -86,25 +99,14 @@ impl Kernel {
         }
     }
 
-    /// The tag of our copy. arm64's has no architecture in it: it was published before there was another.
+    /// The tag of our copy.
     pub fn tag(&self) -> String {
-        match self.arch {
-            Arch::Aarch64 => format!("kernel-linux-virt-{}", self.version),
-            arch => format!("kernel-linux-virt-{}-{}", arch.name(), self.version),
-        }
+        format!("{}{}", self.tag_stem, self.version)
     }
 
     /// What messages call it.
     pub fn what(&self) -> String {
         format!("{} {WHAT}", self.arch.name())
-    }
-
-    /// The kernel's file name in the bundle and in a release.
-    pub fn file_name(&self) -> &'static str {
-        match self.arch {
-            Arch::Aarch64 => "Image",
-            Arch::X86_64 => "vmlinux",
-        }
     }
 
     /// Where a build reads the pinned package, in order: our copy, then Alpine.
@@ -141,14 +143,6 @@ impl Kernel {
             hosts: &["dl-cdn.alpinelinux.org"],
         }
     }
-
-    /// The plain kernel the monitors boot, from the package's `boot/vmlinuz-virt`.
-    pub fn unpack(&self, vmlinuz: &[u8]) -> Result<Vec<u8>> {
-        match self.arch {
-            Arch::Aarch64 => unpack_zboot(vmlinuz),
-            Arch::X86_64 => unpack_bzimage(vmlinuz),
-        }
-    }
 }
 
 /// `cargo xtask kernel check`: fails only when our copy of a pinned package does not give the pinned bytes, since a
@@ -156,8 +150,7 @@ impl Kernel {
 /// architecture is checked before it fails.
 pub fn check(root: &Path, args: &[String]) -> Result<()> {
     crate::no_options(args)?;
-    let mut failed = Vec::new();
-    for arch in Arch::ALL {
+    pinned::all(Arch::ALL.map(|arch| {
         let kernel = Kernel::of(arch);
         let dir = Scratch::new(root.join("target/kernel-check").join(arch.name()))?;
         let checked = check_sources(
@@ -168,14 +161,8 @@ pub fn check(root: &Path, args: &[String]) -> Result<()> {
             &kernel.alpine_index(),
             dir.path(),
         );
-        if let Err(error) = pinned::conclude(checked, &kernel.what(), "xtask/src/kernel.rs") {
-            failed.push(error.to_string());
-        }
-    }
-    match failed.is_empty() {
-        true => Ok(()),
-        false => Err(failed.join("\n").into()),
-    }
+        pinned::conclude(checked, &kernel.what(), "xtask/src/kernel.rs")
+    }))
 }
 
 fn check_sources(
@@ -262,8 +249,9 @@ pub fn unpack_zboot(image: &[u8]) -> Result<Vec<u8>> {
     if image.len() < 32 || &image[0..2] != b"MZ" || &image[4..8] != b"zimg" {
         return Err("the kernel is not an EFI zboot image".into());
     }
-    let offset = u32::from_le_bytes(image[8..12].try_into()?) as usize;
-    let size = u32::from_le_bytes(image[12..16].try_into()?) as usize;
+    let (offset, size) = le32(image, 8)
+        .zip(le32(image, 12))
+        .ok_or("the zboot header is cut off")?;
     let compression = &image[24..32];
     if !compression.starts_with(b"gzip") {
         return Err(format!(
@@ -276,12 +264,17 @@ pub fn unpack_zboot(image: &[u8]) -> Result<Vec<u8>> {
         .checked_add(size)
         .and_then(|end| image.get(offset..end))
         .ok_or("the zboot payload is cut off")?;
-    let mut kernel = Vec::new();
-    GzDecoder::new(payload).read_to_end(&mut kernel)?;
+    let kernel = gunzip(payload)?;
     if kernel.get(56..60) != Some(ARM64_MAGIC) {
         return Err("the unpacked kernel is not an arm64 Image".into());
     }
     Ok(kernel)
+}
+
+fn gunzip(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut unpacked = Vec::new();
+    GzDecoder::new(payload).read_to_end(&mut unpacked)?;
+    Ok(unpacked)
 }
 
 fn le16(bytes: &[u8], at: usize) -> Option<usize> {
@@ -328,8 +321,7 @@ pub fn unpack_bzimage(image: &[u8]) -> Result<Vec<u8>> {
     if !payload.starts_with(&[0x1f, 0x8b]) {
         return Err("the bzImage payload is not compressed with gzip".into());
     }
-    let mut kernel = Vec::new();
-    GzDecoder::new(payload).read_to_end(&mut kernel)?;
+    let kernel = gunzip(payload)?;
     if !kernel.starts_with(b"\x7fELF\x02\x01") || le16(&kernel, 18) != Some(EM_X86_64) {
         return Err("the unpacked kernel is not a 64-bit x86_64 ELF".into());
     }
@@ -559,7 +551,7 @@ mod tests {
                 X86_64.tag(),
                 format!("kernel-linux-virt-x86_64-{}", X86_64.version)
             );
-            assert_ne!(AARCH64.file_name(), X86_64.file_name());
+            assert_ne!(AARCH64.file_name, X86_64.file_name);
         }
 
         /// An index as Alpine signs it: a gzip stream with the signature, then one with the index, from real tar.
@@ -708,11 +700,11 @@ mod tests {
             );
         }
         assert_eq!(
-            X86_64.unpack(&bzimage(1, 0, &gzip(&vmlinux()))).unwrap(),
+            (X86_64.unpack)(&bzimage(1, 0, &gzip(&vmlinux()))).unwrap(),
             vmlinux()
         );
-        assert!(AARCH64.unpack(&bzimage(1, 0, &gzip(&vmlinux()))).is_err());
-        assert!(X86_64.unpack(&zboot(&kernel(), b"gzip\0\0\0\0")).is_err());
+        assert!((AARCH64.unpack)(&bzimage(1, 0, &gzip(&vmlinux()))).is_err());
+        assert!((X86_64.unpack)(&zboot(&kernel(), b"gzip\0\0\0\0")).is_err());
     }
 
     #[test]

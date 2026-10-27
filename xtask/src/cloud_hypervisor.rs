@@ -101,15 +101,12 @@ fn check(root: &Path, args: &[String]) -> Result<()> {
     crate::no_options(args)?;
     let curl = Curl::https();
     let dir = Scratch::new(root.join("target/cloud-hypervisor-check"))?;
-    let mut failed = Vec::new();
-    for arch in Arch::ALL {
+    let copies = pinned::all(Arch::ALL.map(|arch| {
         let pinned = pinned(arch)?;
         let what = format!("{WHAT} for {}", arch.name());
         let checked = pinned::check_sources(&curl, &sources(pinned), pin_of(pinned), dir.path(), &what);
-        if let Err(error) = pinned::conclude(checked, &what, FIX) {
-            failed.push(error.to_string());
-        }
-    }
+        pinned::conclude(checked, &what, FIX)
+    }));
     let newer = Checked {
         copy: Ok(()),
         notices: newer_release(&curl, &latest_release(), dir.path())
@@ -117,10 +114,7 @@ fn check(root: &Path, args: &[String]) -> Result<()> {
             .collect(),
     };
     pinned::conclude(newer, WHAT, FIX)?;
-    match failed.is_empty() {
-        true => Ok(()),
-        false => Err(failed.join("\n").into()),
-    }
+    copies
 }
 
 /// Where a check that fails says to look.

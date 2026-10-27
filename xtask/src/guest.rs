@@ -79,8 +79,8 @@ pub fn build(root: &Path) -> Result<()> {
     }
 
     let package = fetch_package(pinned, &target.join("cache"))?;
-    let kernel = pinned.unpack(&fs::read(package.join("boot/vmlinuz-virt"))?)?;
-    fs::write(staging.join(pinned.file_name()), &kernel)?;
+    let kernel = (pinned.unpack)(&fs::read(package.join("boot/vmlinuz-virt"))?)?;
+    fs::write(staging.join(pinned.file_name), &kernel)?;
 
     let modules = collect_modules(&package, MODULES, &[])?;
     let docker_modules = collect_modules(&package, DOCKER_MODULES, &modules)?;
@@ -109,7 +109,7 @@ pub fn build(root: &Path) -> Result<()> {
             version: &version,
             built: 0,
             arch: arch.name(),
-            kernel: &staging.join(pinned.file_name()),
+            kernel: &staging.join(pinned.file_name),
             initramfs: &staging.join(INITRAMFS_FILE),
             rootfs: None,
             max_part: MAX_PART,
@@ -168,7 +168,7 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
             version: &version,
             built,
             arch: arch.name(),
-            kernel: &guest.join(Kernel::of(arch).file_name()),
+            kernel: &guest.join(Kernel::of(arch).file_name),
             initramfs: &guest.join(INITRAMFS_FILE),
             rootfs: Some(&rootfs),
             max_part,
