@@ -207,6 +207,8 @@ struct State {
     /// Whether a session's first poll makes the service look at its queue; see
     clock_offset: i64,
     next: u32,
+    /// The length of the read tokens [`FakeGithub::mint_read_token`] makes; 0 for the short ones.
+    read_token_len: usize,
     repos: BTreeMap<String, Repo>,
     /// token -> expires_at (epoch seconds)
     installation_tokens: HashMap<String, i64>,
@@ -506,6 +508,7 @@ impl FakeGithub {
                 opts,
                 clock_offset: 0,
                 next: 0,
+                read_token_len: 0,
                 repos: BTreeMap::new(),
                 installation_tokens: HashMap::new(),
                 read_only: BTreeSet::new(),
@@ -618,6 +621,12 @@ impl FakeGithub {
         self.lock().rest_stale = stale;
     }
 
+    /// Makes each read token [`FakeGithub::mint_read_token`] makes from now on `len` characters long, as GitHub's
+    /// longer installation tokens are; 0 goes back to the short ones.
+    pub fn set_read_token_length(&self, len: usize) {
+        self.lock().read_token_len = len;
+    }
+
     /// Takes the fake down: every request is dropped unanswered and changes nothing, as for a client whose process
     /// died. Up again with `false`.
     pub fn set_down(&self, down: bool) {
@@ -641,7 +650,10 @@ impl FakeGithub {
     /// expires.
     pub fn mint_read_token(&self) -> (String, i64) {
         let mut st = self.lock();
-        let token = st.token("ghs");
+        let mut token = st.token("ghs");
+        while token.len() < st.read_token_len {
+            token.push('x');
+        }
         let exp = st.now() + st.opts.installation_token_ttl.as_secs() as i64;
         st.installation_tokens.insert(token.clone(), exp);
         st.read_only.insert(token.clone());

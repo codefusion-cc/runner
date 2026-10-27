@@ -22,12 +22,11 @@ pub const LABEL_MAX: usize = 100;
 pub const JIT_NAME_MAX: usize = 64;
 /// The most installations one read answer may list; more is not the console's.
 pub const READ_INSTALLATIONS_MAX: usize = 1000;
-/// The longest token taken from the console.
+/// The longest token taken from the console, and the longest refused one a read names (`githubReadSchema`). GitHub
+/// documents no fixed length, and its installation tokens grew past 255 characters.
 pub const TOKEN_MAX: usize = 4096;
 /// The most refused tokens one read names (`githubReadSchema`).
 pub const REFUSED_MAX: usize = 20;
-/// The longest refused token a read names (`githubReadSchema`); a longer one is not the console's to replace.
-pub const REFUSED_TOKEN_MAX: usize = 255;
 /// A token given with less than this left is not taken: it would end before a call made with it does.
 pub const MIN_TOKEN_LIFE: Duration = Duration::from_secs(120);
 /// The longest a token is held for, whatever the console says: GitHub's tokens last an hour.
@@ -136,7 +135,7 @@ impl Client {
     /// `github/read`: per installation of the console's Runners App, a token that only reads (runners, Actions runs,
     /// variables, contents). `refused` names tokens of the console's that GitHub refused (401): the console hands out
     /// none of them again, makes a new one in its place and revokes it. At most [`REFUSED_MAX`] are named, the last
-    /// ones of `refused`, and none over [`REFUSED_TOKEN_MAX`], which the console would refuse the whole call for.
+    /// ones of `refused`, and none over [`TOKEN_MAX`], which the console would refuse the whole call for.
     /// Tried again on a dropped connection, a 429 or a 5xx, as the client's [`cf_ghapp::Http`] says.
     /// [`Error::GithubOff`] is the console's switch for this machine being off.
     pub async fn github_read(&self, refused: &[Secret<String>]) -> Result<Vec<InstallationToken>, Error> {
@@ -156,7 +155,7 @@ impl Client {
         let named: Vec<&str> = refused
             .iter()
             .map(|t| t.expose().as_str())
-            .filter(|t| (1..=REFUSED_TOKEN_MAX).contains(&t.len()))
+            .filter(|t| (1..=TOKEN_MAX).contains(&t.len()))
             .collect();
         let named = &named[named.len().saturating_sub(REFUSED_MAX)..];
         let message = if named.is_empty() {
@@ -179,10 +178,6 @@ impl Client {
                     return Err(refuse(
                         "the read tokens' answer: an installation ID that is not one, or twice",
                     ));
-                }
-                // One the console could not be asked to replace, were GitHub to refuse it.
-                if wire.token.len() > REFUSED_TOKEN_MAX {
-                    return Err(refuse("the read tokens' answer: a token over 255 characters"));
                 }
                 Ok(InstallationToken {
                     id: wire.id,
