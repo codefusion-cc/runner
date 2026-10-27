@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cf_console_client::{
-    Client, ConsoleTokens, END_MARGIN, FAILED_WAIT, GATE_RECHECK, GATE_RECHECK_ALONE, MAX_TOKEN_LIFE, enroll,
+    Client, ConsoleTokens, END_MARGIN, Error, FAILED_WAIT, GATE_RECHECK, GATE_RECHECK_ALONE, MAX_TOKEN_LIFE,
+    enroll,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::harness::{REPO, TestClock, fast, labels};
@@ -1110,13 +1111,41 @@ async fn a_read_names_at_most_twenty_refused_tokens_the_last_ones_and_none_too_l
     client.github_read(&refused).await.expect("the console took it");
     let last: Vec<String> = (5..25).map(|n| format!("ghs_{n:02}")).collect();
     assert_eq!(named(&rig), json!(last));
-    // One of 255 characters is named; one of 256 is not the console's, and would cost the whole read.
-    let edge = format!("ghs_{}", "y".repeat(251));
+    // GitHub's tokens have no fixed length: one of 256 characters and one of 4096 are named; one longer is not
+    // the console's, and would cost the whole read.
+    let long = format!("ghs_{}", "y".repeat(252));
+    let edge = format!("ghs_{}", "w".repeat(4092));
     client
-        .github_read(&[Secret::new(edge.clone()), Secret::new("z".repeat(256))])
+        .github_read(&[
+            Secret::new(long.clone()),
+            Secret::new(edge.clone()),
+            Secret::new("z".repeat(4097)),
+        ])
         .await
         .expect("the console took it");
-    assert_eq!(named(&rig), json!([edge]));
+    assert_eq!(named(&rig), json!([long, edge]));
+}
+
+#[tokio::test]
+async fn a_read_takes_tokens_of_256_and_4096_characters_and_refuses_a_longer_one() {
+    for (len, taken) in [(256, true), (4096, true), (4097, false)] {
+        // Its own console each time: one keeps the token it gave for the hour.
+        let rig = rig(true, false).await;
+        rig.github.set_read_token_length(len);
+        let client = Client::new(
+            &rig.console.url(),
+            rig.machine_token.clone(),
+            Http::new(Duration::from_secs(5), support::no_retry()),
+        );
+        match client.github_read(&[]).await {
+            Ok(tokens) => {
+                assert!(taken, "{len}");
+                assert!(!tokens.is_empty());
+                assert!(tokens.iter().all(|t| t.token.expose().len() == len), "{len}");
+            }
+            Err(error) => assert!(!taken && matches!(error, Error::Protocol(_)), "{len}: {error}"),
+        }
+    }
 }
 
 #[tokio::test]

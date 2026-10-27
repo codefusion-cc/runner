@@ -523,11 +523,11 @@ fn label(v: &Value, path: &str) -> Check {
     }
 }
 
-/// `githubReadSchema`: `refused`, at most 20 tokens of 1 to 255 characters, `[]` when absent.
+/// `githubReadSchema`: `refused`, at most 20 tokens of 1 to 4096 characters, `[]` when absent.
 pub(crate) fn github_read(v: &Value) -> Check {
     let o = object(v, "")?;
     field(o, "", "protocol", Required, literal_protocol)?;
-    field(o, "", "refused", Default, list(20, |v, p| string(v, p, 1, 255)))
+    field(o, "", "refused", Default, list(20, |v, p| string(v, p, 1, 4096)))
 }
 
 /// `githubRegistrationSchema`.
