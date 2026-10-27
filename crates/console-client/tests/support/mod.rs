@@ -108,6 +108,7 @@ pub fn status(machine: &str) -> Status {
         discovery_error: None,
         update: None,
         not_serving: None,
+        starting: false,
         settings_error: None,
         settings_error_at: None,
         idle_with_jobs_waiting_seconds: 0,
