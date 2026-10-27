@@ -218,7 +218,8 @@ echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/60-
 ```
 
 The home is where the images, the job disks and the build go, so it is on a disk with room (20 GB and more), not on
-one mounted `noexec`. Lingering starts the user's systemd with the host and keeps it running without a login.
+one mounted `noexec`, in a file system that opens files for direct I/O (ext4, xfs or btrfs, not tmpfs): a job's disk
+is written past the host's page cache. Lingering starts the user's systemd with the host and keeps it running without a login.
 
 Then as that user (`sudo -iu codefusion-runner`): Rust from rustup, the sources in a checkout of the Runner's own, and
 
