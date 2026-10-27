@@ -347,25 +347,33 @@ fn has_pvh_note(elf: &[u8]) -> bool {
         return false;
     };
     (0..count).any(|index| {
-        let header = table + index * entry;
+        // Offsets past the end read as nothing; saturating keeps a lying header from overflowing.
+        let header = table.saturating_add(index.saturating_mul(entry));
         if le32(elf, header) != Some(4) {
             return false;
         }
-        let (Some(start), Some(size)) = (le64(elf, header + 8), le64(elf, header + 32)) else {
+        let (Some(start), Some(size)) = (
+            le64(elf, header.saturating_add(8)),
+            le64(elf, header.saturating_add(32)),
+        ) else {
             return false;
         };
         let Some(notes) = start.checked_add(size).and_then(|end| elf.get(start..end)) else {
             return false;
         };
         let mut at = 0;
-        while let (Some(name_size), Some(desc_size), Some(kind)) =
-            (le32(notes, at), le32(notes, at + 4), le32(notes, at + 8))
-        {
-            let name = notes.get(at + 12..at + 12 + name_size);
+        while let (Some(name_size), Some(desc_size), Some(kind)) = (
+            le32(notes, at),
+            le32(notes, at.saturating_add(4)),
+            le32(notes, at.saturating_add(8)),
+        ) {
+            let name = notes.get(at + 12..(at + 12).saturating_add(name_size));
             if kind == PVH_NOTE && name == Some(b"Xen\0".as_slice()) {
                 return true;
             }
-            at += 12 + name_size.next_multiple_of(4) + desc_size.next_multiple_of(4);
+            at = (at + 12)
+                .saturating_add(name_size.next_multiple_of(4))
+                .saturating_add(desc_size.next_multiple_of(4));
         }
         false
     })
@@ -743,5 +751,13 @@ mod tests {
         let mut past_the_end = vmlinux();
         past_the_end[96..104].copy_from_slice(&u64::MAX.to_le_bytes());
         refused(bzimage(1, 0, &gzip(&past_the_end)), "no PVH entry note");
+        let mut lying_table = vmlinux();
+        lying_table[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        lying_table[54..56].copy_from_slice(&u16::MAX.to_le_bytes());
+        lying_table[56..58].copy_from_slice(&u16::MAX.to_le_bytes());
+        refused(bzimage(1, 0, &gzip(&lying_table)), "no PVH entry note");
+        let mut lying_note = vmlinux();
+        lying_note[120..124].copy_from_slice(&u32::MAX.to_le_bytes());
+        refused(bzimage(1, 0, &gzip(&lying_note)), "no PVH entry note");
     }
 }

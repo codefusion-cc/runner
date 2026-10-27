@@ -124,10 +124,23 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # One name for both architectures' releases of a run, however late each publish job starts or is run again.
+  version:
+    name: Name this run's releases
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      stem: ${{ steps.stem.outputs.stem }}
+    steps:
+      - id: stem
+        run: echo "stem=$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
   # No checkout, no toolchain, no cache: the job that holds the key runs the two programs `build` made, and `gh`.
   publish:
     name: Sign and publish the ${{ matrix.platform }} image
-    needs: build
+    needs: [build, version]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
@@ -147,7 +160,8 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x tools/xtask tools/codefusion-runner
-          version="${{ matrix.tag }}$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
+          version="${{ matrix.tag }}${{ needs.version.outputs.stem }}"
+          test -n "${{ needs.version.outputs.stem }}"
           echo "VERSION=$version" >> "$GITHUB_ENV"
           # The key goes in through standard input: never a file, an argument or a log line.
           tools/xtask release --version "$version" --out release --arch ${{ matrix.arch }} \

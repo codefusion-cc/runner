@@ -100,43 +100,54 @@ pub fn fetch(root: &Path) -> Result<PathBuf> {
 fn check(root: &Path, args: &[String]) -> Result<()> {
     crate::no_options(args)?;
     let curl = Curl::https();
+    let dir = Scratch::new(root.join("target/cloud-hypervisor-check"))?;
     let mut failed = Vec::new();
-    for (index, arch) in Arch::ALL.into_iter().enumerate() {
+    for arch in Arch::ALL {
         let pinned = pinned(arch)?;
-        let dir = Scratch::new(root.join("target/cloud-hypervisor-check").join(arch.name()))?;
         let what = format!("{WHAT} for {}", arch.name());
-        let checked = match index {
-            0 => check_sources(
-                &curl,
-                &sources(pinned),
-                pin_of(pinned),
-                &latest_release(),
-                dir.path(),
-            ),
-            _ => pinned::check_sources(&curl, &sources(pinned), pin_of(pinned), dir.path(), &what),
-        };
-        if let Err(error) = pinned::conclude(checked, &what, "xtask/src/cloud_hypervisor.rs") {
+        let checked = pinned::check_sources(&curl, &sources(pinned), pin_of(pinned), dir.path(), &what);
+        if let Err(error) = pinned::conclude(checked, &what, FIX) {
             failed.push(error.to_string());
         }
     }
+    let newer = Checked {
+        copy: Ok(()),
+        notices: newer_release(&curl, &latest_release(), dir.path())
+            .into_iter()
+            .collect(),
+    };
+    pinned::conclude(newer, WHAT, FIX)?;
     match failed.is_empty() {
         true => Ok(()),
         false => Err(failed.join("\n").into()),
     }
 }
 
+/// Where a check that fails says to look.
+const FIX: &str = "xtask/src/cloud_hypervisor.rs";
+
+/// What the check says of one build's sources and of the project's newest release.
+#[cfg(test)]
 fn check_sources(curl: &Curl, sources: &[Source], pin: Pin<'_>, latest: &Source, dir: &Path) -> Checked {
     let mut checked = pinned::check_sources(curl, sources, pin, dir, WHAT);
-    match pinned::newest(curl, latest, dir, tag_of) {
-        Ok(newest) if newest == VERSION => println!("cloud-hypervisor has no release newer than {VERSION}"),
-        Ok(newest) => checked.notices.push(format!(
-            "cloud-hypervisor has {newest}, the pin is {VERSION}: move the pin (xtask/src/cloud_hypervisor.rs)"
-        )),
-        Err(error) => checked
-            .notices
-            .push(format!("could not read cloud-hypervisor's latest release: {error}")),
-    }
+    checked.notices.extend(newer_release(curl, latest, dir));
     checked
+}
+
+/// A warning when the project has a release newer than the pin, or cannot say which is newest.
+fn newer_release(curl: &Curl, latest: &Source, dir: &Path) -> Option<String> {
+    match pinned::newest(curl, latest, dir, tag_of) {
+        Ok(newest) if newest == VERSION => {
+            println!("cloud-hypervisor has no release newer than {VERSION}");
+            None
+        }
+        Ok(newest) => Some(format!(
+            "cloud-hypervisor has {newest}, the pin is {VERSION}: move the pin ({FIX})"
+        )),
+        Err(error) => Some(format!(
+            "could not read cloud-hypervisor's latest release: {error}"
+        )),
+    }
 }
 
 /// The tag of a release as GitHub's API describes it.

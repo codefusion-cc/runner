@@ -12,6 +12,7 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - xtask/src/arch.rs
       - xtask/src/pinned.rs
       - xtask/src/kernel.rs
       - xtask/src/cloud_hypervisor.rs
@@ -20,6 +21,7 @@ on:
   push:
     branches: [main]
     paths:
+      - xtask/src/arch.rs
       - xtask/src/pinned.rs
       - xtask/src/kernel.rs
       - xtask/src/cloud_hypervisor.rs
