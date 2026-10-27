@@ -123,6 +123,61 @@ jobs:
       - name: The probe reads this host
         run: cargo run --locked -p cf-host-linux --example linux-probe
 
+  fresh-host:
+    # A fresh Ubuntu host set up the way a cloud VM is (scripts/host-setup.sh as root: a connect code, no App key),
+    # against the fake GitHub and console (`cargo xtask fakes serve`): it passes once the host serves the fake's
+    # repository on GitHub tokens from the console alone. A GitHub-hosted runner: this repository is public, so its
+    # minutes are free, and the setup needs a host nobody set up before.
+    name: A fresh host enrols and serves
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: The fakes
+        run: |
+          cargo build --locked -q -p xtask
+          target/debug/xtask fakes serve --code-file "$RUNNER_TEMP/code" --urls-file "$RUNNER_TEMP/urls" \
+            --timeout-s 3000 > "$RUNNER_TEMP/fakes.log" 2>&1 &
+          echo "FAKES_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 60); do [ -s "$RUNNER_TEMP/urls" ] && break; sleep 1; done
+          cat "$RUNNER_TEMP/urls" >> "$GITHUB_ENV"
+      # The Runner's user cannot read this runner's home, so it clones from a copy of the checkout it can.
+      - name: A copy of the checkout the Runner's user reads
+        run: |
+          git update-ref refs/heads/under-test HEAD
+          git clone -q --bare . /tmp/runner.git
+          chmod -R a+rX /tmp/runner.git
+      - name: The newest image of this architecture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image=$(gh release list -R "$GITHUB_REPOSITORY" --limit 50 --json tagName,isDraft \
+            --jq '[.[] | select(.isDraft | not) | .tagName | select(startswith("amd64-image-"))][0]')
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Set up the host
+        run: |
+          sudo scripts/host-setup.sh --machine ci-fresh --console "$CONSOLE" --code-file "$RUNNER_TEMP/code" \
+            --repo /tmp/runner.git --image "$IMAGE" --github-api "$GITHUB"
+      - name: A run again changes nothing
+        run: sudo scripts/host-setup.sh --machine ci-fresh --console "$CONSOLE" --code-file "$RUNNER_TEMP/none"
+      - name: The host serves
+        timeout-minutes: 15
+        run: |
+          while kill -0 "$FAKES_PID" 2>/dev/null; do sleep 2; done
+          cat "$RUNNER_TEMP/fakes.log"
+          grep -q 'serves org/app' "$RUNNER_TEMP/fakes.log"
+      - name: What the Runner said
+        if: failure()
+        run: |
+          sudo tail -n 100 /home/codefusion-runner/.local/state/codefusion-runner/logs/runner.log || true
+          sudo tail -n 50 /home/codefusion-runner/.local/state/codefusion-runner/logs/systemd.log || true
+          cat "$RUNNER_TEMP/fakes.log" || true
+
   deny:
     name: Dependencies (cargo deny)
     runs-on: ubuntu-latest

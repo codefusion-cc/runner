@@ -14,12 +14,16 @@
 //!   `cf-vmm-ch` embeds it.
 //! - `cloud-hypervisor check`: whether our copy of each architecture's pinned monitor and the project's release
 //!   still give it, and whether the project has a newer one. Fails when our copy of either does not.
+//! - `fakes serve --code-file F --urls-file F [--timeout-s N]`: GitHub and the console as fakes, for a fresh host
+//!   that `scripts/host-setup.sh` sets up: writes a connect code and their addresses, and ends once a host enrolled
+//!   with it serves the fake's repository on GitHub tokens from the console alone (`xtask/src/fakes.rs`).
 //! - `build`: the guest, then the release binary: on macOS ad hoc signed with the entitlement, on Linux with the
 //!   monitor in it.
 
 mod arch;
 mod cloud_hypervisor;
 mod cpio;
+mod fakes;
 mod guest;
 mod it;
 mod kernel;
@@ -50,11 +54,15 @@ fn run(args: &[String]) -> Result<()> {
         Some("release") => guest::release(&root, &args[1..]),
         Some("build") => no_options(&args[1..]).and_then(|()| build(&root)),
         Some("it") => it::run(&root, &args[1..]),
+        Some("fakes") => fakes::run(&args[1..]),
         Some("kernel") if args.get(1).map(String::as_str) == Some("check") => {
             kernel::check(&root, &args[2..])
         }
         Some("cloud-hypervisor") => cloud_hypervisor::run(&root, &args[1..]),
-        _ => Err("tasks: keygen, guest, release, build, it, kernel check, cloud-hypervisor [check]".into()),
+        _ => Err(
+            "tasks: keygen, guest, release, build, it, fakes serve, kernel check, cloud-hypervisor [check]"
+                .into(),
+        ),
     }
 }
 
