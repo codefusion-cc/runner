@@ -790,7 +790,7 @@ async fn the_consoles_runner_limit_is_a_429_whose_wait_is_kept() {
     );
     assert_eq!(rig.console.calls() - before, 1, "not tried again");
     // Until the wait passes, the repository's runners are not asked for: a 429 that says what is left.
-    rig.advance(Duration::from_secs(299));
+    rig.advance(Duration::from_secs(said - 1));
     let error = rig
         .app
         .generate_jit_config(1, REPO, "mac-a-j0000005", &labels(&["self-hosted"]))
