@@ -3702,6 +3702,30 @@ async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
     );
 }
 
+/// Until its first look at GitHub ends, a Runner says it starts, not that it serves nothing; a look that could
+/// not read GitHub ends it too, and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_says_it_starts_until_its_first_look_at_github_ends() {
+    for github_answers in [true, false] {
+        let mut rig = Rig::new(2).await;
+        if !github_answers {
+            rig.github.fail(
+                "GET /app/installations",
+                Reply::status_json(503, &json!({"message": "unavailable"})),
+                usize::MAX,
+            );
+        }
+        rig.stop_pump().await;
+        rig.service.report().await;
+        assert_eq!(last_status(&rig.console)["starting"], json!(true));
+        rig.service.discover().await;
+        rig.service.report().await;
+        let last = last_status(&rig.console);
+        assert!(last.get("starting").is_none(), "{last}");
+        assert_eq!(last["discoveryError"].is_string(), !github_answers, "{last}");
+    }
+}
+
 fn changed(id: &str) -> SettingsLook {
     SettingsLook::Changed { id: id.into() }
 }
