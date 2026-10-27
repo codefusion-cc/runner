@@ -53,6 +53,33 @@ name in lowercase, and its record names the repository, which is checked before 
 - The report's `jobCaches` and `jobCacheEvents` list each host's caches with their size and last write, and what
   last happened to them (`kept`, `discarded` with why, `replaced`, `dropped`, `evicted`).
 
+## A Linux host on ext4
+
+A cloud VM's boot disk is usually ext4, which cannot share blocks, so its host keeps no cache. Give it a second disk
+formatted XFS (reflink is on by default since xfsprogs 5.1), mounted at the state folder's `job-cache` before the
+Runner starts. Copies and caches both live in that folder, so one disk holds them all. On GCP, with the VM paused in
+the console and its jobs ended (`<vm>`, `<project>`, `<zone>`, `<user>` and `<state>` are the host's own):
+
+```bash
+gcloud compute disks create <vm>-job-cache --project <project> --zone <zone> --type pd-balanced --size 40GB
+gcloud compute instances attach-disk <vm> --project <project> --zone <zone> --disk <vm>-job-cache --device-name job-cache
+```
+
+On the VM, as root:
+
+```bash
+mkfs.xfs -L job-cache /dev/disk/by-id/google-job-cache
+mkdir -p <state>/job-cache
+echo 'LABEL=job-cache <state>/job-cache xfs defaults,nofail 0 2' >> /etc/fstab
+systemctl daemon-reload && mount <state>/job-cache
+chown <user>: <state>/job-cache && chmod 700 <state>/job-cache
+```
+
+Then restart the Runner and resume the VM. `nofail` boots the VM without the disk, and the Runner then starts with
+no cache instead of not at all. An attached disk stays through a spot VM's stop and start, and survives the VM's
+deletion (`--auto-delete` is off for an attached disk), so a rebuilt VM attaches the same one, with no `mkfs`. Keep
+`cache_gb` below the disk's size: copies of running jobs need room beside the caches.
+
 ## Tests
 
 - `crates/daemon/tests/caches.rs`: the rule (each condition refusing alone, with and without Docker, and a property:
