@@ -1,8 +1,12 @@
 [alias]
 xtask = "run -q -p xtask --"
 
-# The guest supervisor is a static Linux binary; rust-lld links it on any host, so the Mac builds it with no cross
-# toolchain.
+# The guest supervisor is a static Linux binary of the host's architecture; rust-lld links it on any host, so the Mac
+# builds it with no cross toolchain.
 [target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "link-self-contained=yes"]

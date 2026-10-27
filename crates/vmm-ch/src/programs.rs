@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 
-/// cloud-hypervisor's static aarch64 build as this build carries it, if it carries it.
+/// cloud-hypervisor's static build for this architecture as this build carries it, if it carries it.
 pub fn embedded() -> Option<&'static [u8]> {
     EMBEDDED
 }
@@ -27,7 +27,7 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// What a build without cloud-hypervisor says, and how to make one with it.
 pub const NOT_EMBEDDED: &str = "this build carries no cloud-hypervisor: build it with `cargo xtask build` on Linux for \
-                                arm64, the one architecture it is pinned for";
+                                aarch64 or x86_64, the architectures it is pinned for";
 
 /// Unpacks the embedded cloud-hypervisor into `dir` (made private when it is not there), checked byte for byte,
 /// and says where it is; a file that is there and right stays. A folder or file another user could change is

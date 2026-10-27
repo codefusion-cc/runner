@@ -137,6 +137,7 @@ impl Store {
         }
         let newest = self.newest_accepted()?;
         let manifest = verify(&DirFiles::new(partial), key, version, newest)?.manifest;
+        manifest.for_this_host()?;
         let rootfs = manifest.rootfs.as_ref().ok_or(StoreError::NoRootfs)?;
 
         // Only what was checked stays: a file the signed list does not name was read by nobody.

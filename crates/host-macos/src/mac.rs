@@ -5,6 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use cf_budget::{Host, HostError, HostFacts, HostReading, Now};
@@ -39,6 +40,14 @@ unsafe extern "C" {
     safe fn CFNumberGetTypeID() -> usize;
     fn CFNumberGetValue(number: CfRef, kind: isize, value: *mut c_void) -> u8;
     fn CFRelease(value: CfRef);
+    fn CFURLCreateFromFileSystemRepresentation(
+        allocator: CfRef,
+        path: *const u8,
+        len: isize,
+        is_directory: u8,
+    ) -> CfRef;
+    fn CFURLCopyResourcePropertyForKey(url: CfRef, key: CfRef, value: *mut CfRef, error: *mut CfRef) -> u8;
+    static kCFURLVolumeAvailableCapacityForImportantUsageKey: CfRef;
 }
 
 unsafe extern "C" {
@@ -191,6 +200,19 @@ pub fn model() -> Option<String> {
     )
 }
 
+/// How many performance cores the chip has (`hw.perflevel0.logicalcpu`, level 0 being the fastest), for
+/// [`cf_budget::Settings::on_fast_cores`]; 0 when its cores are all of one kind (`hw.nperflevels` is 1) or macOS
+/// will not say.
+pub fn performance_cores() -> u32 {
+    match sysctl::<i32>(c"hw.nperflevels") {
+        Ok(2..) => sysctl::<i32>(c"hw.perflevel0.logicalcpu")
+            .ok()
+            .and_then(|cores| u32::try_from(cores).ok())
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// How long `pmset` may take to answer. It needs about 10 ms.
 const PMSET_ANSWER: Duration = Duration::from_secs(1);
 
@@ -281,7 +303,14 @@ pub struct MacHost {
     host_port: u32,
     disk: CString,
     thermal_token: c_int,
+    /// When the capacity for important use was last asked for ([`IMPORTANT_EVERY`]), and how far it was above the
+    /// free space then: what macOS would free, which changes slowly, where the free space does not.
+    important: Mutex<Option<(Instant, Option<u64>)>>,
 }
+
+/// How often the capacity for important use is asked for again. One answer takes about 23 ms, where all of a
+/// reading's other calls take 0.13 ms; what it adds, Time Machine's hourly snapshots, changes slowly.
+const IMPORTANT_EVERY: Duration = Duration::from_secs(30);
 
 impl MacHost {
     /// Opens what the readings need. `disk` is a directory on the volume that holds the job disks; it must exist.
@@ -304,6 +333,7 @@ impl MacHost {
             host_port: mach_host_self(),
             disk,
             thermal_token,
+            important: Mutex::new(None),
         })
     }
 
@@ -321,6 +351,7 @@ impl MacHost {
             what: "sysconf(_SC_PAGESIZE)",
             code: errno(),
         })?;
+        let disk_free_bytes = self.disk_free_bytes()?;
         Ok(Raw {
             page_bytes,
             free_pages: memory.free_count.into(),
@@ -341,7 +372,8 @@ impl MacHost {
             idle_nanos: idle_nanos(),
             thermal_level: self.thermal_level()?,
             power_remaining_secs: IOPSGetTimeRemainingEstimate(),
-            disk_free_bytes: self.disk_free_bytes()?,
+            disk_free_bytes,
+            disk_important_bytes: self.disk_important_bytes(disk_free_bytes),
         })
     }
 
@@ -434,6 +466,55 @@ impl MacHost {
     fn disk_free_bytes(&self) -> Result<u64, HostError> {
         let stats = self.statfs()?;
         Ok(stats.f_bavail.saturating_mul(stats.f_bsize.into()))
+    }
+
+    /// The job disks' volume's capacity for important use, which counts what macOS frees on demand. A 16 GB Mac mini
+    /// running CI kept 24 hourly local snapshots: `statfs` read 28.7 GB free and this 67.3 GB.
+    /// Between two answers it is the free space now and what macOS would free at the last answer, so a job that
+    /// fills the disk lowers it at once.
+    fn disk_important_bytes(&self, free: u64) -> Option<u64> {
+        let now = Instant::now();
+        let mut last = self.important.lock().unwrap_or_else(PoisonError::into_inner);
+        let beyond = match *last {
+            Some((at, beyond)) if now.duration_since(at) < IMPORTANT_EVERY => beyond,
+            _ => {
+                let beyond = self
+                    .ask_important_bytes()
+                    .map(|important| important.saturating_sub(free));
+                *last = Some((now, beyond));
+                beyond
+            }
+        };
+        beyond.map(|beyond| free.saturating_add(beyond))
+    }
+
+    fn ask_important_bytes(&self) -> Option<u64> {
+        let path = self.disk.as_bytes();
+        // SAFETY: `path` is `len` readable bytes; the URL is released below. The key is a constant CoreFoundation
+        // keeps. The value is read only when it is a CFNumber, and released.
+        unsafe {
+            let url =
+                CFURLCreateFromFileSystemRepresentation(ptr::null(), path.as_ptr(), path.len() as isize, 1);
+            if url.is_null() {
+                return None;
+            }
+            let mut value: CfRef = ptr::null();
+            let found = CFURLCopyResourcePropertyForKey(
+                url,
+                kCFURLVolumeAvailableCapacityForImportantUsageKey,
+                &mut value,
+                ptr::null_mut(),
+            );
+            CFRelease(url);
+            if found == 0 || value.is_null() {
+                return None;
+            }
+            let mut bytes: i64 = 0;
+            let read = CFGetTypeID(value) == CFNumberGetTypeID()
+                && CFNumberGetValue(value, CF_NUMBER_SINT64, (&raw mut bytes).cast()) != 0;
+            CFRelease(value);
+            read.then(|| u64::try_from(bytes).ok()).flatten()
+        }
     }
 }
 

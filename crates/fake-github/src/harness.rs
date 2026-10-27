@@ -2,9 +2,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use cf_ghapp::{AppKey, Clock, GitHubApp, Http, RetryPolicy};
+use cf_ghapp::{AppKey, Clock, GitHubApp, Http, Monotonic, RetryPolicy};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 
@@ -14,7 +14,8 @@ use crate::{FakeGithub, Options, test_key};
 /// The repository the harness installs the App on.
 pub const REPO: &str = "org/app";
 
-/// The real time plus whatever a test moved it by.
+/// The real time plus whatever a test moved it by, as the wall clock ([`Clock`]) and as the monotonic one
+/// ([`Monotonic`]), so a token's lifetime and GitHub's expiry move together.
 #[derive(Debug, Default)]
 pub struct TestClock(Mutex<Duration>);
 
@@ -28,6 +29,12 @@ impl TestClock {
 impl Clock for TestClock {
     fn now(&self) -> SystemTime {
         SystemTime::now() + *self.0.lock().expect("clock")
+    }
+}
+
+impl Monotonic for TestClock {
+    fn now(&self) -> Instant {
+        Instant::now() + *self.0.lock().expect("clock")
     }
 }
 

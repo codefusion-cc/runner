@@ -32,6 +32,7 @@ impl FakeHost {
                 thermal: Thermal::Nominal,
                 on_battery: false,
                 disk_free_bytes: 1024 * GIB,
+                disk_reclaimable_bytes: 0,
             },
             failure: None,
             reads: 0,

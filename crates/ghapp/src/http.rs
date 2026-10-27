@@ -136,6 +136,17 @@ impl Http {
         self
     }
 
+    /// The same client, sending each request once: for a call that must not reach the other side twice.
+    pub fn without_retries(&self) -> Http {
+        Http {
+            retry: RetryPolicy {
+                retries: 0,
+                ..self.retry
+            },
+            ..self.clone()
+        }
+    }
+
     /// Sends the request `build` makes. A network failure, a 429, a 5xx, and a 403 that carries
     /// `Retry-After` are tried again after a wait with jitter (the header's wait when there is one); a status
     /// outside 2xx that is not retried comes back as [`Error::Status`]. A body that ends early is a

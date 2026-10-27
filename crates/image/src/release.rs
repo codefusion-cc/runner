@@ -19,7 +19,9 @@ pub struct ReleaseInputs<'a> {
     pub version: &'a str,
     /// When the release is built, in seconds since 1970 (UTC); 0 for a bundle that is embedded, not downloaded.
     pub built: u64,
-    /// The uncompressed kernel `Image`.
+    /// The architecture of the kernel, the initramfs and the root filesystem (see [`crate::HOST_ARCH`]).
+    pub arch: &'a str,
+    /// The uncompressed kernel: an `Image` on aarch64, the `vmlinux` ELF on x86_64.
     pub kernel: &'a Path,
     /// The initramfs.
     pub initramfs: &'a Path,
@@ -64,6 +66,7 @@ pub fn write_release(out: &Path, inputs: &ReleaseInputs<'_>, key: &SigningKey) -
         format: FORMAT,
         version: inputs.version.to_string(),
         built: inputs.built,
+        arch: inputs.arch.to_string(),
         kernel,
         initramfs,
         rootfs,

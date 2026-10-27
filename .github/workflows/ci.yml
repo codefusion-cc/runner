@@ -34,10 +34,6 @@ jobs:
       - name: Guest image
         run: cargo xtask guest
       - run: cargo clippy --locked --workspace --all-targets -j3 -- -D warnings
-      # The guest's Linux code for its own target: musl's libc types are not glibc's, so the Linux job below does
-      # not stand in for this.
-      - name: Lint the guest supervisor for its own target
-        run: cargo clippy --locked -p cf-supervisor -p cf-nft --target aarch64-unknown-linux-musl --bins --lib -j3 -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace -j3
         env:
@@ -64,8 +60,18 @@ jobs:
           retention-days: 7
 
   linux:
-    name: Linux (arm64)
-    runs-on: ubuntu-24.04-arm
+    name: Linux (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            guest: aarch64-unknown-linux-musl
+          - platform: x86_64
+            runner: ubuntu-24.04
+            guest: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
       # The crates that build and pass on Linux. Add a crate here once it does.
@@ -92,6 +98,10 @@ jobs:
       - name: pasta and OpenSSL's headers
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends passt pkg-config libssl-dev
       - run: cargo clippy --locked $LINUX_CRATES --all-targets -j4 -- -D warnings
+      # The guest's Linux code for its own target: musl's libc types are not glibc's, so the line above does not stand
+      # in for this.
+      - name: Lint the guest supervisor for its own target
+        run: cargo clippy --locked -p cf-supervisor -p cf-nft --target ${{ matrix.guest }} --bins --lib -j4 -- -D warnings
       # The test run's agent runs in the guest's Linux on the image's Node 24: its tests start real bash suites against
       # a fake console and check that what they stop is gone, process groups and all.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

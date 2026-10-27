@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use cf_budget::{Host, HostError};
-use cf_host_macos::{MacHost, Raw, battery, battery_in, model, reading};
+use cf_host_macos::{MacHost, Raw, battery, battery_in, model, performance_cores, reading};
 
 fn output(program: &str, args: &[&str]) -> String {
     let output = Command::new(program).args(args).output().unwrap();
@@ -39,6 +39,19 @@ fn the_facts_are_what_sysctl_prints() {
     let facts = host.facts().unwrap();
     assert_eq!(facts.total_bytes.to_string(), sysctl("hw.memsize"));
     assert_eq!(facts.cores.to_string(), sysctl("hw.ncpu"));
+}
+
+#[test]
+fn the_performance_cores_are_level_0_of_a_chip_with_two_kinds_and_none_of_one_with_one() {
+    let levels: u32 = sysctl("hw.nperflevels").parse().unwrap();
+    let expected = if levels > 1 {
+        sysctl("hw.perflevel0.logicalcpu").parse().unwrap()
+    } else {
+        0
+    };
+    assert_eq!(performance_cores(), expected);
+    let cores: u32 = sysctl("hw.ncpu").parse().unwrap();
+    assert!(expected < cores, "{expected} performance cores of {cores}");
 }
 
 #[test]
@@ -276,6 +289,47 @@ fn the_disk_is_the_one_the_path_names() {
     let read = host.raw().unwrap().disk_free_bytes;
     let difference = read.abs_diff(available * 1024);
     assert!(difference < 1 << 30, "df {available} KB, read {read} bytes");
+}
+
+#[test]
+fn the_capacity_for_important_use_is_what_foundation_says_and_never_below_the_free_space_by_much() {
+    let host = MacHost::new(Path::new("/tmp")).unwrap();
+    let raw = host.raw().unwrap();
+    let important = raw
+        .disk_important_bytes
+        .expect("macOS says the capacity of a volume it mounts");
+    // The free space and the capacity are read a moment apart, and the capacity counts the free space.
+    assert!(
+        important + (1 << 30) >= raw.disk_free_bytes,
+        "{important} for important use, {} free",
+        raw.disk_free_bytes
+    );
+    let script = r#"ObjC.import("Foundation"); var r = Ref(); $.NSURL.fileURLWithPath("/tmp").getResourceValueForKeyError(r, $("NSURLVolumeAvailableCapacityForImportantUsageKey"), null); String(ObjC.unwrap(r[0]))"#;
+    let foundation: u64 = output("/usr/bin/osascript", &["-l", "JavaScript", "-e", script])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        important.abs_diff(foundation) < 1 << 30,
+        "read {important}, Foundation {foundation}"
+    );
+}
+
+#[test]
+fn the_capacity_for_important_use_is_asked_for_once_in_thirty_seconds() {
+    // One answer takes about 23 ms and the Runner reads the Mac once a second; the rest of a reading 0.13 ms.
+    let host = MacHost::new(Path::new("/tmp")).unwrap();
+    assert!(host.raw().unwrap().disk_important_bytes.is_some());
+    let started = std::time::Instant::now();
+    for _ in 0..50 {
+        let raw = host.raw().unwrap();
+        assert!(raw.disk_important_bytes.unwrap() >= raw.disk_free_bytes);
+    }
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "50 readings took {took:?}"
+    );
 }
 
 #[test]

@@ -413,6 +413,21 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
         lookups
     );
 
+    // Nor does a limit, which refused the call before anything was made.
+    h.fake
+        .fail_until_recovered("generatejitconfig", Reply::text(429, "slow down"));
+    let error = h
+        .client
+        .generate_jit_config(set.id, "mac-a-cf-2g-limit", "_work")
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), Some(429), "{error:?}");
+    h.fake.recover("generatejitconfig");
+    assert_eq!(
+        h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
+        lookups
+    );
+
     // And a name that works is found by its name.
     let jit = h
         .client

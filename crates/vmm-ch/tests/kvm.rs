@@ -42,8 +42,14 @@ mod linux {
             std::process::exit(0);
         };
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        // `cargo xtask guest` names the kernel after its architecture's form: arm64's `Image`, x86_64's `vmlinux`.
+        let kernel_name = if cfg!(target_arch = "x86_64") {
+            "vmlinux"
+        } else {
+            "Image"
+        };
         let (kernel, initramfs, monitor) = (
-            target.join("guest/Image"),
+            target.join("guest").join(kernel_name),
             target.join("guest/initramfs.cpio.gz"),
             target.join("vmm-programs/cloud-hypervisor"),
         );

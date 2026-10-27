@@ -33,8 +33,11 @@ pub struct Config {
     /// The folder with everything the Runner keeps: images, job disks, records, the outbox, logs. On the
     /// internal disk: a launchd agent may not open an external volume.
     pub state_dir: PathBuf,
-    /// The folder with the GitHub App's `app.json` and `app.pem`.
-    pub app_dir: PathBuf,
+    /// The folder with the GitHub App's `app.json` and `app.pem`, when the Mac signs for its GitHub tokens itself.
+    /// Left out, the Mac gets them from the console it is enrolled with (`console`), which holds the App's key. With
+    /// both, the console's serve while the owner has turned them on for the Mac, and the key the rest of the time.
+    #[serde(default)]
+    pub app_dir: Option<PathBuf>,
     /// GitHub's API.
     #[serde(default = "github_api")]
     pub github_api: String,
@@ -152,8 +155,9 @@ impl Config {
             ));
         }
         let build_folder = self.build_folder.iter().map(|folder| ("build_folder", folder));
-        let folders = [("state_dir", &self.state_dir), ("app_dir", &self.app_dir)];
-        for (what, folder) in folders.into_iter().chain(build_folder.clone()) {
+        let app_dir = self.app_dir.iter().map(|folder| ("app_dir", folder));
+        let folders = std::iter::once(("state_dir", &self.state_dir)).chain(app_dir);
+        for (what, folder) in folders.chain(build_folder.clone()) {
             if !folder.is_absolute() {
                 return Err(format!("{what}: `{}` is not an absolute path", folder.display()));
             }
@@ -173,6 +177,13 @@ impl Config {
             return Err(
                 "use: `workstation` means something on macOS only, where a person works at the Mac; say \
                  `dedicated` or leave `use` out"
+                    .into(),
+            );
+        }
+        if self.app_dir.is_none() && self.console.is_none() {
+            return Err(
+                "app_dir: the folder of the GitHub App's key, unless the Mac gets its GitHub tokens from the console \
+                 (`console`)"
                     .into(),
             );
         }
@@ -414,9 +425,41 @@ mod tests {
     }
 
     #[test]
+    fn github_tokens_come_from_the_apps_key_the_console_or_both() {
+        let key = Config::parse(WHOLE).expect("the key");
+        assert_eq!(
+            key.app_dir,
+            Some(PathBuf::from("/Users/someone/.config/codefusion-runners"))
+        );
+        let console = with(|v| {
+            v.as_object_mut().expect("object").remove("app_dir");
+            v["console"] = "https://console.example".into();
+        })
+        .expect("the console alone");
+        assert_eq!(console.app_dir, None);
+        assert!(
+            with(|v| v["console"] = "https://console.example".into()).is_ok(),
+            "both"
+        );
+        assert!(
+            with(|v| v["app_dir"] = serde_json::Value::Null).is_err(),
+            "null is no folder, and no console"
+        );
+        let neither = with(|v| {
+            v.as_object_mut().expect("object").remove("app_dir");
+        })
+        .expect_err("neither");
+        assert!(
+            neither.starts_with("app_dir:") && neither.contains("console"),
+            "{neither}"
+        );
+    }
+
+    #[test]
     fn the_state_folder_is_absolute_and_on_a_mac_on_no_external_volume() {
         assert!(with(|v| v["state_dir"] = "state".into()).is_err());
         assert!(with(|v| v["app_dir"] = "~/.config/x".into()).is_err());
+        assert!(with(|v| v["app_dir"] = "".into()).is_err());
         let external = with(|v| v["state_dir"] = "/Volumes/External/runner".into());
         if cfg!(target_os = "macos") {
             let error = external.expect_err("refused");

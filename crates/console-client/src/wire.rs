@@ -266,6 +266,11 @@ pub struct Status {
     /// Why the host serves no repository, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_serving: Option<String>,
+    /// Whether the Runner's first look at GitHub since it started has not ended yet: its scale sets are not listed
+    /// yet, so serving none says nothing. Left out once it ended, and by a Runner from before it said it; a console
+    /// from before ignores it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub starting: bool,
     /// Why the Runner does not run on its settings file as it is now: the file changed and no Runner could start on
     /// it, or the wait for its machines to end ran out. Said until the file changes again.
     #[serde(default, skip_serializing_if = "Option::is_none")]

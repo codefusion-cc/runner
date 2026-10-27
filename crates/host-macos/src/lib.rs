@@ -35,4 +35,7 @@ pub use backup::{ATTRIBUTE, Attributes, Exclusion, VALUE, exclude_with};
 pub use cf_budget::Battery;
 pub use convert::{CALM_LEVEL, HEAVY_COMPRESSOR_SHARE, Raw, battery_in, model_name, reading};
 #[cfg(target_os = "macos")]
-pub use mac::{MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, program_of};
+pub use mac::{
+    MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, performance_cores,
+    program_of,
+};

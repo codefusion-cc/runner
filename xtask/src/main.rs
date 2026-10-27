@@ -2,18 +2,22 @@
 //!
 //! - `keygen <file>`: makes the image signing key; writes the secret seed to `<file>` (mode 0600) and prints the
 //!   public key to commit as `crates/image/trusted-key.txt`.
-//! - `guest`: builds the kernel and initramfs into `target/guest`, signed with a key made for that build.
-//! - `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--max-part BYTES]`:
-//!   the signed release folder with the root filesystem in parts, as the image workflow publishes it, verified
-//!   before the task ends. `--guest` is where the kernel and initramfs are (default `target/guest`).
-//! - `kernel check`: whether our copy of the pinned kernel package and Alpine still give it, and whether Alpine has
-//!   a newer one. Fails when our copy does not.
-//! - `cloud-hypervisor`: the pinned Linux monitor into `target/vmm-programs`, where `cf-vmm-ch` embeds it.
-//! - `cloud-hypervisor check`: whether our copy of the pinned monitor and the project's release still give it, and
-//!   whether the project has a newer one. Fails when our copy does not.
+//! - `guest`: builds the kernel and initramfs of the host's architecture into `target/guest`, signed with a key made
+//!   for that build.
+//! - `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--arch A]
+//!   [--max-part BYTES]`: the signed release folder with the root filesystem in parts, as the image workflow
+//!   publishes it, verified before the task ends. `--guest` is where the kernel and initramfs are (default
+//!   `target/guest`), `--arch` what they are built for (default the host's).
+//! - `kernel check`: whether our copy of each architecture's pinned kernel package and Alpine still give it, and
+//!   whether Alpine has a newer one. Fails when our copy of either does not.
+//! - `cloud-hypervisor`: the Linux monitor pinned for the host's architecture into `target/vmm-programs`, where
+//!   `cf-vmm-ch` embeds it.
+//! - `cloud-hypervisor check`: whether our copy of each architecture's pinned monitor and the project's release
+//!   still give it, and whether the project has a newer one. Fails when our copy of either does not.
 //! - `build`: the guest, then the release binary: on macOS ad hoc signed with the entitlement, on Linux with the
 //!   monitor in it.
 
+mod arch;
 mod cloud_hypervisor;
 mod cpio;
 mod guest;

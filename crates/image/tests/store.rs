@@ -16,6 +16,17 @@ fn rootfs() -> Vec<u8> {
 
 /// A release folder of this version and build time, its root file system in parts of 4096 bytes.
 fn release(version: &str, built: u64, with_rootfs: bool, signer: &SigningKey) -> tempfile::TempDir {
+    release_for(cf_image::HOST_ARCH, version, built, with_rootfs, signer)
+}
+
+/// The same, built for `arch`.
+fn release_for(
+    arch: &str,
+    version: &str,
+    built: u64,
+    with_rootfs: bool,
+    signer: &SigningKey,
+) -> tempfile::TempDir {
     let src = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     fs::write(src.path().join("Image"), b"kernel").unwrap();
@@ -27,6 +38,7 @@ fn release(version: &str, built: u64, with_rootfs: bool, signer: &SigningKey) ->
         &ReleaseInputs {
             version,
             built,
+            arch,
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs"),
             rootfs: with_rootfs.then_some(rootfs.as_path()),
@@ -385,4 +397,31 @@ fn a_second_install_waits_for_the_one_under_way() {
     heard.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
     assert_eq!(second.join().unwrap().unwrap().version, "v1");
     assert_eq!(names(&state.path().join("images")), ["accepted.json", "v1"]);
+}
+
+#[test]
+fn an_image_of_another_architecture_is_refused_and_nothing_is_installed() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::new(state.path().join("images"));
+    let trusted = key(1).verifying_key();
+    let other = if cf_image::HOST_ARCH == "x86_64" {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    for arch in [other, "", "arm64", "amd64"] {
+        let foreign = release_for(arch, "v1", 1000, true, &key(1));
+        match store.install(foreign.path(), "v1", &trusted) {
+            Err(StoreError::Refused(ImageError::WrongArch { found, host })) => {
+                assert_eq!((found.as_str(), host.as_str()), (arch, cf_image::HOST_ARCH));
+            }
+            other => panic!("{arch}: {other:?}"),
+        }
+    }
+    assert_eq!(names(&state.path().join("images")), Vec::<String>::new());
+    // A refused image moves nothing forward: the host's own installs after it, older or not.
+    assert_eq!((store.rootfs("v1"), store.newest_accepted().unwrap()), (None, 0));
+    let own = release("v1", 900, true, &key(1));
+    store.install(own.path(), "v1", &trusted).unwrap();
+    assert!(store.rootfs("v1").is_some());
 }

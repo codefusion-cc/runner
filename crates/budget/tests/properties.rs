@@ -61,6 +61,7 @@ struct Shape {
     thermal: Thermal,
     on_battery: bool,
     disk_gib: u64,
+    disk_reclaimable_gib: u64,
     late_ms: u64,
 }
 
@@ -74,6 +75,7 @@ fn fine() -> Shape {
         thermal: Thermal::Nominal,
         on_battery: false,
         disk_gib: 100,
+        disk_reclaimable_gib: 0,
         late_ms: 0,
     }
 }
@@ -97,6 +99,7 @@ fn shape() -> impl Strategy<Value = Shape> {
         prop::bool::weighted(0.1),
         prop_oneof![5 => Just(100u64), 1 => 0..30u64],
         prop_oneof![9 => Just(0u64), 1 => 0..8000u64],
+        prop_oneof![4 => Just(0u64), 1 => 0..60u64],
     )
         .prop_map(
             |(
@@ -109,6 +112,7 @@ fn shape() -> impl Strategy<Value = Shape> {
                 on_battery,
                 disk_gib,
                 late_ms,
+                disk_reclaimable_gib,
             )| {
                 Shape {
                     available_mib,
@@ -119,6 +123,7 @@ fn shape() -> impl Strategy<Value = Shape> {
                     thermal,
                     on_battery,
                     disk_gib,
+                    disk_reclaimable_gib,
                     late_ms,
                 }
             },
@@ -164,8 +169,9 @@ fn settings() -> impl Strategy<Value = Settings> {
         any::<bool>(),
         any::<bool>(),
         prop::option::of(0..9u32),
+        0..9u32,
     )
-        .prop_map(|(gb, cores, own, one_cpu, while_in_use, headless)| {
+        .prop_map(|(gb, cores, own, one_cpu, while_in_use, headless, performance)| {
             let facts = HostFacts {
                 total_bytes: gb * GIB,
                 cores,
@@ -173,7 +179,9 @@ fn settings() -> impl Strategy<Value = Settings> {
             let mut settings = match headless {
                 // A Linux host nobody works at, with so many fast cores (0: all alike).
                 Some(fast) => Settings::for_headless(facts, fast),
-                None => Settings::for_host(facts, if own { Mode::Workstation } else { Mode::Dedicated }),
+                // A Mac with so many performance cores (0: all alike).
+                None => Settings::for_host(facts, if own { Mode::Workstation } else { Mode::Dedicated })
+                    .on_fast_cores(performance),
             };
             if one_cpu {
                 settings.vcpus = [1; 4];
@@ -251,7 +259,7 @@ impl World {
             && reading.pressure == Pressure::Normal
             && reading.thermal < Thermal::Serious
             && !reading.on_battery
-            && reading.disk_free_bytes >= self.settings.disk_hold_bytes
+            && reading.disk_free_bytes + reading.disk_reclaimable_bytes >= self.settings.disk_hold_bytes
             && reading.available_bytes >= self.limits(reading).floor_bytes
     }
 
@@ -382,6 +390,7 @@ impl World {
                     thermal: reading.thermal,
                     on_battery: reading.on_battery,
                     disk_free_bytes: reading.disk_gib * GIB,
+                    disk_reclaimable_bytes: reading.disk_reclaimable_gib * GIB,
                 };
                 self.observe(Some(handed))?;
             }
@@ -802,6 +811,7 @@ proptest! {
             thermal: shape.thermal,
             on_battery: shape.on_battery,
             disk_free_bytes: shape.disk_gib * GIB,
+            disk_reclaimable_bytes: shape.disk_reclaimable_gib * GIB,
         };
         let mut bad = base.clone();
         bad.available_mib = bad.available_mib.saturating_sub(less_mib);

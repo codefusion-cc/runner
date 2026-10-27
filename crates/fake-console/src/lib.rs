@@ -1,20 +1,26 @@
-//! A fake CodeFusion Console at the HTTP edge, for tests: the runner protocol's `enroll`, `report` and `leave`, over
-//! real sockets, with the checks of the console's own code (`worker/runners/agent.ts` and `protocol.ts`) in the same
+//! A fake CodeFusion Console at the HTTP edge, for tests: the runner protocol's `enroll`, `report` and `leave`, and
+//! GitHub through the console (`github/read`, `github/registration`, `github/jit`, made by an attached
+//! [`cf_fake_github::FakeGithub`]: [`FakeConsole::serve_github`], [`FakeConsole::set_broker`]), over real sockets, with the checks of the console's own code (`worker/runners/agent.ts` and `protocol.ts`) in the same
 //! order, with the same statuses and bounds.
 //!
 //! Tests drive it ([`FakeConsole::add_code`], [`FakeConsole::pause`], [`FakeConsole::queue_command`]), make it
-//! misbehave ([`FakeConsole::down`], [`FakeConsole::fail_next`], [`FakeConsole::accept_then_drop_next`]) and read
-//! what it saw ([`FakeConsole::reports`], [`FakeConsole::job_events`]). It is written from the console's code and not
+//! misbehave ([`FakeConsole::down`], [`FakeConsole::fail_next`], [`FakeConsole::accept_then_drop_next`],
+//! [`FakeConsole::answer_next`]) and read what it saw ([`FakeConsole::reports`], [`FakeConsole::job_events`],
+//! [`FakeConsole::github_calls`]). It is written from the console's code and not
 //! from the client's types, so the client's wire format is checked against the contract and not against itself.
 //!
 //! What it leaves out: Cloudflare Access in front of the path, the delivery windows of commands (a command comes
 //! with every answer until a result names it), and the console's history, samples and audit log.
 
+mod github;
 mod schema;
+
+pub use github::{GithubCall, JIT_PER_MACHINE, JIT_PER_REPO, JIT_WINDOW_S, REUSE_MIN_S};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use cf_fake_github::FakeGithub;
 use cf_fake_github::httpd::{Handler, Reply, Request, Server};
 use rand::Rng as _;
 use serde_json::{Value, json};
@@ -39,6 +45,8 @@ struct Machine {
     /// The system as the console keeps it: what the last connect request said, then what the last report that named
     /// one said ([`schema::os`]).
     os: Option<&'static str>,
+    /// `runner_machines.broker`: whether the owner turned GitHub through the console on for it. Off at first.
+    broker: bool,
 }
 
 struct Pending {
@@ -52,7 +60,8 @@ struct Pending {
 #[derive(Default)]
 struct Faults {
     down: bool,
-    fail: Option<(u32, u16)>,
+    /// Calls left, the status, and the `Retry-After` it says.
+    fail: Option<(u32, u16, Option<u32>)>,
     drop_before: u32,
     drop_after: u32,
 }
@@ -74,6 +83,17 @@ struct State {
     paused: bool,
     watched: bool,
     faults: Faults,
+    /// The Runners App's installations, as the console reaches them with its key; none until a test attaches one.
+    github: Option<FakeGithub>,
+    /// The Runners App's installations, when a test set them: by default the fake GitHub's.
+    installations: Option<Vec<(i64, String)>>,
+    kept: Vec<github::Kept>,
+    attempts: Vec<github::Attempt>,
+    github_calls: Vec<GithubCall>,
+    /// What the next `github/…` call that passes the token and body checks is answered instead.
+    override_next: Option<Reply>,
+    /// A console before `refused` was read: kept read tokens are handed out again whatever a read names.
+    ignore_refused: bool,
 }
 
 /// A running fake console. It stops when dropped.
@@ -84,6 +104,11 @@ pub struct FakeConsole {
 
 fn error(status: u16, message: &str) -> Reply {
     Reply::status_json(status, &json!({ "error": message }))
+}
+
+/// A refusal with the code a Runner tells it apart by (agent.ts `refusal`), such as `broker_off`.
+fn coded(status: u16, message: &str, code: &str) -> Reply {
+    Reply::status_json(status, &json!({ "error": message, "code": code }))
 }
 
 fn take(counter: &mut u32) -> bool {
@@ -157,6 +182,9 @@ impl State {
             Some("enroll") => self.enroll(request),
             Some("report") => self.report(request),
             Some("leave") => self.leave(request),
+            Some(route @ ("github/read" | "github/registration" | "github/jit")) => {
+                self.github(&route["github/".len()..], request)
+            }
             _ => error(404, "Not found"),
         }
     }
@@ -205,6 +233,7 @@ impl State {
                     name: machine.clone(),
                     token: token.clone(),
                     os: schema::os(&body),
+                    broker: false,
                 });
             }
         }
@@ -322,9 +351,13 @@ impl FakeConsole {
         if take(&mut state.faults.drop_before) {
             return Reply::Drop;
         }
-        if let Some((left, status)) = state.faults.fail {
-            state.faults.fail = (left > 1).then_some((left - 1, status));
-            return error(status, "The console fails on purpose");
+        if let Some((left, status, wait)) = state.faults.fail {
+            state.faults.fail = (left > 1).then_some((left - 1, status, wait));
+            let reply = error(status, "The console fails on purpose");
+            return match wait {
+                Some(s) => reply.with_header("retry-after", &s.to_string()),
+                None => reply,
+            };
         }
         let reply = state.route(request);
         let taken = matches!(&reply, Reply::Response { status: 200, .. });
@@ -369,7 +402,61 @@ impl FakeConsole {
 
     /// The next `n` calls are answered `status` with an `error` text, before anything else is looked at.
     pub fn fail_next(&self, n: u32, status: u16) {
-        self.lock().faults.fail = (n > 0).then_some((n, status));
+        self.lock().faults.fail = (n > 0).then_some((n, status, None));
+    }
+
+    /// As [`FakeConsole::fail_next`], with `Retry-After: retry_after_s`, as the console's 503 while GitHub is busy.
+    pub fn fail_next_waiting(&self, n: u32, status: u16, retry_after_s: u32) {
+        self.lock().faults.fail = (n > 0).then_some((n, status, Some(retry_after_s)));
+    }
+
+    /// The next `github/…` call that passes the machine's token and the body checks is answered `reply` and nothing
+    /// is made: a console that broke its contract, or one in front of a GitHub that answered nonsense.
+    pub fn answer_next(&self, reply: Reply) {
+        self.lock().override_next = Some(reply);
+    }
+
+    /// The Runners App the console holds: its tokens are made by `github`, as the console makes them with the key.
+    pub fn serve_github(&self, github: FakeGithub) {
+        self.lock().github = Some(github);
+    }
+
+    /// The installations of the console's Runners App, each with its account: another App than the one of the key on
+    /// the machine, so other IDs. Their read tokens read every repository of the fake GitHub.
+    pub fn set_installations(&self, installations: &[(i64, &str)]) {
+        self.lock().installations = Some(
+            installations
+                .iter()
+                .map(|(id, account)| (*id, account.to_string()))
+                .collect(),
+        );
+    }
+
+    /// Turns GitHub through the console on or off for the machine named `machine`, as the owner does on its page.
+    /// Turning it off forgets the tokens kept for it and revokes its read tokens at GitHub. Returns whether a machine
+    /// of that name is connected.
+    pub fn set_broker(&self, machine: &str, on: bool) -> bool {
+        let mut state = self.lock();
+        let Some(row) = state.machines.iter_mut().find(|m| m.name == machine) else {
+            return false;
+        };
+        row.broker = on;
+        let id = row.id;
+        if !on {
+            state.broker_off(id);
+        }
+        true
+    }
+
+    /// Whether a read's `refused` is ignored, as a console that predates it does: a kept read token GitHub refused is
+    /// handed out again until less than 40 minutes of it are left.
+    pub fn ignore_refused(&self, ignore: bool) {
+        self.lock().ignore_refused = ignore;
+    }
+
+    /// Every `github/…` call that passed the machine's token and the body checks, in order, with its answer's status.
+    pub fn github_calls(&self) -> Vec<GithubCall> {
+        self.lock().github_calls.clone()
     }
 
     /// The next `n` calls get a closed connection and nothing else, and the console does nothing with them.

@@ -46,6 +46,10 @@ pub struct Raw {
     pub power_remaining_secs: f64,
     /// `statfs` of the volume with the job disks: blocks an unprivileged process may use, in bytes.
     pub disk_free_bytes: u64,
+    /// The volume's capacity for important use (`NSURLVolumeAvailableCapacityForImportantUsageKey`): the free space
+    /// and what macOS frees for it on demand, Time Machine's local snapshots and purgeable caches. `None` when macOS
+    /// will not say.
+    pub disk_important_bytes: Option<u64>,
 }
 
 /// `IOPSGetTimeRemainingEstimate`'s answer for a Mac on the mains (`kIOPSTimeRemainingUnlimited`).
@@ -137,6 +141,9 @@ pub fn reading(facts: HostFacts, at: Now, raw: &Raw) -> Result<HostReading, Host
         thermal,
         on_battery: raw.power_remaining_secs != POWER_UNLIMITED,
         disk_free_bytes: raw.disk_free_bytes,
+        disk_reclaimable_bytes: raw
+            .disk_important_bytes
+            .map_or(0, |important| important.saturating_sub(raw.disk_free_bytes)),
     })
 }
 

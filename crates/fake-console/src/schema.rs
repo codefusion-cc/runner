@@ -373,7 +373,8 @@ fn status(v: &Value, path: &str) -> Check {
     // dropped and the console assumes the commands of a Runner before it, so no value refuses a report.
     // `heldJobs`, the jobs GitHub holds back from scale sets with room, is not read: the schema drops keys it does not
     // know, so a console from before it takes the report as one without it. So is `docker`, the Runner's last Docker
-    // check (`{ ok, checkedAt, why? }`), for a console from before it.
+    // check (`{ ok, checkedAt, why? }`), for a console from before it, and `starting`, true until the Runner's first
+    // look at GitHub ended.
 }
 
 fn settings(v: &Value, path: &str) -> Check {
@@ -460,4 +461,98 @@ pub(crate) fn report(v: &Value) -> Check {
     })?;
     field(o, "", "jobs", Nullish, list(500, job_event))?;
     field(o, "", "results", Nullish, list(50, command_result))
+}
+
+/// `REPO_NAME`, at most 140 characters: an owner of a letter or digit and up to 38 more letters, digits or dashes, a
+/// slash, and a name of 1 to 100 letters, digits, dots, dashes and underscores that is not `.` or `..`.
+fn repo(v: &Value, path: &str) -> Check {
+    string(v, path, 0, 140)?;
+    let s = v.as_str().unwrap_or("");
+    let shaped = s.split_once('/').is_some_and(|(owner, name)| {
+        let owner_ok = (1..=39).contains(&owner.len())
+            && owner.as_bytes()[0].is_ascii_alphanumeric()
+            && owner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let name_ok = (1..=100).contains(&name.len())
+            && name != "."
+            && name != ".."
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+        owner_ok && name_ok
+    });
+    if shaped {
+        Ok(())
+    } else {
+        Err(bad(path, "owner/name"))
+    }
+}
+
+/// `RUNNER_NAME`, at most 64 characters: lowercase words joined by dashes, `-j` and seven lowercase hex digits.
+fn runner_name(v: &Value, path: &str) -> Check {
+    string(v, path, 0, 64)?;
+    if runner_machine(v.as_str().unwrap_or("")).is_some() {
+        Ok(())
+    } else {
+        Err(bad(path, "the machine's name, -j and seven hex digits"))
+    }
+}
+
+/// The machine a runner name is of (`RUNNER_NAME`'s first group), or none for a name not of that shape.
+pub(crate) fn runner_machine(name: &str) -> Option<&str> {
+    let (machine, hex) = name.rsplit_once("-j")?;
+    let hex_ok = hex.len() == 7
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let machine_ok = machine
+        .split('-')
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+    (hex_ok && machine_ok).then_some(machine)
+}
+
+fn label(v: &Value, path: &str) -> Check {
+    let shaped = v.as_str().is_some_and(|s| {
+        (1..=100).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    });
+    if shaped {
+        Ok(())
+    } else {
+        Err(bad(path, "letters, digits, dots, dashes and underscores"))
+    }
+}
+
+/// `githubReadSchema`: `refused`, at most 20 tokens of 1 to 255 characters, `[]` when absent.
+pub(crate) fn github_read(v: &Value) -> Check {
+    let o = object(v, "")?;
+    field(o, "", "protocol", Required, literal_protocol)?;
+    field(o, "", "refused", Default, list(20, |v, p| string(v, p, 1, 255)))
+}
+
+/// `githubRegistrationSchema`.
+pub(crate) fn github_registration(v: &Value) -> Check {
+    let o = object(v, "")?;
+    field(o, "", "protocol", Required, literal_protocol)?;
+    field(o, "", "repo", Required, repo)
+}
+
+/// `githubJitSchema`: labels `z.array(label).min(1).max(20)`.
+pub(crate) fn github_jit(v: &Value) -> Check {
+    let o = object(v, "")?;
+    field(o, "", "protocol", Required, literal_protocol)?;
+    field(o, "", "repo", Required, repo)?;
+    field(o, "", "name", Required, runner_name)?;
+    field(o, "", "labels", Required, |v, p| {
+        let labels = v
+            .as_array()
+            .ok_or_else(|| bad(p, "Invalid input: expected array"))?;
+        if labels.is_empty() || labels.len() > 20 {
+            return Err(bad(p, "1 to 20 labels"));
+        }
+        labels
+            .iter()
+            .enumerate()
+            .try_for_each(|(n, l)| label(l, &join(p, &n.to_string())))
+    })
 }

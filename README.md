@@ -1,6 +1,6 @@
 # CodeFusion Runner
 
-A Rust program for macOS and arm64 Linux that runs GitHub Actions jobs, each in its own small virtual machine that is
+A Rust program for macOS and Linux (arm64 and x86_64) that runs GitHub Actions jobs, each in its own small virtual machine that is
 gone when the job ends. It runs CodeFusion's CI on CodeFusion's own machines.
 
 The idea: a Mac opens a job slot only when it has the memory for it. The job gets a fixed amount of memory and CPU,
@@ -92,6 +92,9 @@ A configuration file says what the Mac is:
   Runner may have the same name.
 - `state_dir` holds everything the Runner keeps and is on the Mac's own disk. `app_dir` holds the GitHub App's
   `app.json` and `app.pem` (0600); `scripts/runner-app.ts` in `codefusion-cc/codefusion` makes the App and writes them.
+  Without `app_dir`, the Mac gets its GitHub tokens from the console it is enrolled with, which holds the Runners
+  App's key: read tokens renewed at half their life, and a registration token or a one-job runner when it needs one.
+  With both, the console's tokens serve once the owner turns them on on the machine's page, and the key until then.
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`
@@ -111,6 +114,9 @@ A configuration file says what the Mac is:
 The Mac needs Rust to build the Runner (below) and nothing else. Images are public, so a Mac without `gh` fetches a
 release with `curl -fLO https://github.com/codefusion-cc/runner/releases/download/<v>/<file>` for `Image`,
 `image.json`, `initramfs.cpio.gz`, `SHA256SUMS`, `SHA256SUMS.sig` and every `rootfs.erofs.NNN`, into an empty folder.
+An x86_64 Linux host takes the amd64 release of the same build instead, `amd64-image-<date>-<run>` beside
+`image-<date>-<run>`, whose kernel is `vmlinux`. Each image names the architecture it is built for, signed, and
+`image install` refuses another's.
 
 ```sh
 codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
@@ -192,11 +198,16 @@ could not remove; `--leave` also tells the console the Mac is gone, `--purge` de
 
 ## Run it on Linux
 
-On Linux (arm64, KVM, systemd, cgroup v2; Debian 12 and Ubuntu 24.04 are known to work) the Runner is a unit of the
+On Linux (arm64 or x86_64, KVM, systemd, cgroup v2; Debian 12 and Ubuntu 24.04 are known to work) the Runner is a unit of the
 user's own systemd, `codefusion-runner.service`, run by a user of its own. Each job's vm-host runs in a systemd scope
 of its own whose cgroup is delegated to it, so machines live through a restart or an update of the Runner and are
 adopted. Nobody sits at such a host: `use` is `dedicated` or left out (`workstation` is refused), and the budget keeps half a
 gigabyte for the host and runs machines on its fast cores.
+
+A host runs guests of its own architecture, and `cargo xtask build` picks the kernel, the guest's supervisor and
+cloud-hypervisor for it. On a cloud VM KVM means nested virtualization: on Google Cloud an Intel N2 or C3 machine
+made with `--enable-nested-virtualization` (AMD and Arm machines there offer none), and `check` says so when
+`/dev/kvm` is missing.
 
 Once, as root (Ubuntu 24.04 also needs the line about user namespaces):
 
@@ -209,7 +220,8 @@ echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/60-
 ```
 
 The home is where the images, the job disks and the build go, so it is on a disk with room (20 GB and more), not on
-one mounted `noexec`. Lingering starts the user's systemd with the host and keeps it running without a login.
+one mounted `noexec`, in a file system that opens files for direct I/O (ext4, xfs and btrfs do, and `check` says when
+it does not): a job's disk is written past the host's page cache. Lingering starts the user's systemd with the host and keeps it running without a login.
 
 Then as that user (`sudo -iu codefusion-runner`): Rust from rustup, the sources in a checkout of the Runner's own, and
 
@@ -279,11 +291,12 @@ cargo fmt --all --check
 cargo xtask guest
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p cf-supervisor --target aarch64-unknown-linux-musl --bins -- -D warnings
+cargo clippy -p cf-supervisor --target x86_64-unknown-linux-musl --bins -- -D warnings
 CF_REQUIRE_EMBEDDED=1 cargo test --workspace
 cargo deny check
 ```
 
-and on an arm64 Linux host with pasta (`apt install passt`), OpenSSL's headers (`apt install pkg-config libssl-dev`)
+and on a Linux host (arm64 or x86_64, as CI runs both) with pasta (`apt install passt`), OpenSSL's headers (`apt install pkg-config libssl-dev`)
 and user namespaces (on Ubuntu 24.04, `sysctl kernel.apparmor_restrict_unprivileged_userns=0`), for the crates CI
 lists in `LINUX_CRATES`, the service's among them:
 
@@ -297,7 +310,7 @@ cargo run -p cf-host-linux --example linux-probe
 systemd, and checks that it claims the scope's cgroup; without a systemd of the user's it says so and passes, unless
 `CF_REQUIRE_USER_MANAGER` is set.
 
-CI cannot boot a machine, so the jobs in real machines run on a Mac of your own, or on an arm64 Linux host with
+CI cannot boot a machine, so the jobs in real machines run on a Mac of your own, or on a Linux host with
 KVM, in a cgroup delegated to you (`systemd-run --user --scope -p Delegate=yes cargo xtask it`):
 
 ```sh

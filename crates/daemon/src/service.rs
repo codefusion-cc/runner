@@ -330,6 +330,8 @@ struct Shared<H, V> {
     restarting: Notify,
     /// Set while the Runner ends: the last report says so instead of serving nothing.
     ending: AtomicBool,
+    /// Set once the first look at GitHub ended, read or not: until then the reports say the Runner starts.
+    looked: AtomicBool,
     /// Whether the last look at the Docker check found Docker refused: a change reads the label sets again.
     docker_refused: AtomicBool,
     /// Rung when the label sets are to be read again before the next discovery in its turn: the looks at GitHub
@@ -539,6 +541,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 restart: AtomicBool::new(false),
                 restarting: Notify::new(),
                 ending: AtomicBool::new(false),
+                looked: AtomicBool::new(false),
                 test_run: Mutex::new(None),
                 docker_refused: AtomicBool::new(false),
                 rediscover: Notify::new(),
@@ -696,6 +699,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // Nothing is known: everything stays as it is.
                 tracing::warn!(%error, "the App's installations could not be read");
                 *shared.discovery_error.lock().expect("discovery") = Some(format!("GitHub: {error}"));
+                shared.looked.store(true, Ordering::SeqCst);
                 return vec!["GitHub could not be asked for this host's scale sets".into()];
             }
         };
@@ -732,6 +736,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let shared = &self.shared;
         let machine = &shared.config.machine;
 
+        // Listeners first, so a set one made at GitHub before it stopped is listed below and deleted with the rest.
+        let unwanted: Vec<String> = shared
+            .serving
+            .lock()
+            .expect("serving")
+            .iter()
+            .filter(|(name, serving)| {
+                let repo = &serving.state.lock().expect("set").repo;
+                !wanted.contains_key(*name)
+                    && !unread.contains(repo)
+                    && only.is_none_or(|only| only.contains(repo))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in unwanted {
+            self.close(&name).await;
+        }
+
         // Scale sets of this Mac that nothing asks for any more, from this run of the Runner or one before.
         let clients: Vec<(String, ScaleSetClient)> = shared
             .clients
@@ -757,7 +779,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !set.name.starts_with(&prefix) || wanted.contains_key(&set.name) {
                     continue;
                 }
-                self.close(&set.name).await;
                 if shared.roster.active(&repo, set.id) == 0 {
                     match client.delete_scale_set(set.id).await {
                         Ok(()) => {
@@ -776,7 +797,6 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
-
         for (name, want) in wanted {
             let mut serving = shared.serving.lock().expect("serving");
             if serving.contains_key(&name) {
@@ -807,6 +827,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// Keeps what a look found wrong for the console, and logs it: `always`, or when it is news.
     fn say(&self, problems: Vec<String>, served: usize, always: bool) -> Vec<String> {
         let shared = &self.shared;
+        shared.looked.store(true, Ordering::SeqCst);
         *shared.not_serving.lock().expect("not serving") = (served == 0 && problems.is_empty())
             .then(|| "the App is installed on no repository this host serves".to_string());
         let said = (!problems.is_empty()).then(|| problems.join("; "));
@@ -1708,6 +1729,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 discovery_error: self.discovery_error().map(|error| cut(error, STATUS_TEXT_MAX)),
                 update,
                 not_serving,
+                starting: !shared.looked.load(Ordering::SeqCst),
                 settings_error: settings_error
                     .as_ref()
                     .map(|(error, _)| cut(error.clone(), STATUS_TEXT_MAX)),

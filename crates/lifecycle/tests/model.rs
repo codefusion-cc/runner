@@ -417,6 +417,7 @@ fn calm(at: Millis) -> HostReading {
         thermal: Thermal::Nominal,
         on_battery: false,
         disk_free_bytes: 500 * GIB,
+        disk_reclaimable_bytes: 0,
     }
 }
 

@@ -1,6 +1,12 @@
 # cargo deny check: advisories, licences, duplicate versions and where crates come from.
 [graph]
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
 
 [advisories]
 version = 2

@@ -798,7 +798,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "401 as the session opens",
             answers(
-                "POST /svc/_apis/runtime/runnerscalesets/1/sessions",
+                "POST /svc/_apis/runtime/runnerscalesets/10/sessions",
                 || Reply::text(401, "bad credentials"),
                 2,
             ),
@@ -806,7 +806,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "409: a session of before is still open",
             answers(
-                "POST /svc/_apis/runtime/runnerscalesets/1/sessions",
+                "POST /svc/_apis/runtime/runnerscalesets/10/sessions",
                 || Reply::status_json(409, &json!({"message": "exists"})),
                 3,
             ),
@@ -814,7 +814,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "429 on the long poll",
             answers(
-                "GET /svc/_apis/runtime/runnerscalesets/1/messages",
+                "GET /svc/_apis/runtime/runnerscalesets/10/messages",
                 || Reply::text(429, "slow down").with_header("retry-after", "0"),
                 3,
             ),
@@ -822,7 +822,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "5xx on the long poll",
             answers(
-                "GET /svc/_apis/runtime/runnerscalesets/1/messages",
+                "GET /svc/_apis/runtime/runnerscalesets/10/messages",
                 || Reply::text(503, "unavailable"),
                 4,
             ),
@@ -834,7 +834,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "5xx as the scale set is made",
             answers(
-                "POST /svc/_apis/runtime/runnerscalesets?",
+                "POST /svc/_apis/runtime/runnerscalesets",
                 || Reply::text(502, "bad gateway"),
                 2,
             ),
@@ -858,7 +858,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         ),
         (
             "the answer to the acquired job's message is lost",
-            Box::new(|github| github.lose_answer("GET /svc/_apis/runtime/runnerscalesets/1/messages", 1)),
+            Box::new(|github| github.lose_answer("GET /svc/_apis/runtime/runnerscalesets/10/messages", 1)),
         ),
     ];
     for (what, fault) in faults {
@@ -871,6 +871,11 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         assert_eq!(rig.events()[1].1, json!("success"), "{what}");
         rig.nothing_left().await;
         assert_eq!(rig.parts.vms.started().len(), 1, "{what}: one job, one machine");
+        assert_eq!(
+            rig.github.unspent_faults(),
+            Vec::<String>::new(),
+            "{what}: GitHub went wrong as often as set"
+        );
     }
 }
 
@@ -2293,7 +2298,9 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// Every job that ran here reaches the console, its start and its end, each once.
+/// Every job that ran here reaches the console, its start and its end, each once. A start the Runner reported on
+/// its own (GitHub's answer implied the job, or the registration went before a crash) has its end only once the
+/// machine is gone and the wait for GitHub's word is over: that end is waited for too.
 async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -> Result<(), TestCaseError> {
     let heard_from = std::time::Instant::now();
     loop {
@@ -2301,12 +2308,22 @@ async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -
             .iter()
             .filter(|runner| heard(rig, runner) != (true, true))
             .collect();
-        if unheard.is_empty() {
+        let events = rig.events();
+        let unended: Vec<&str> = events
+            .iter()
+            .filter_map(|(id, _)| id.strip_suffix("/started"))
+            .filter(|runner| {
+                !events
+                    .iter()
+                    .any(|(id, end)| *id == format!("{runner}/completed") && !end.is_null())
+            })
+            .collect();
+        if unheard.is_empty() && unended.is_empty() {
             break;
         }
         prop_assert!(
             heard_from.elapsed() < HEARD_WITHIN,
-            "jobs that ran here and never reached the console: {unheard:?}"
+            "jobs that ran here and never reached the console: {unheard:?}; started and never ended: {unended:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -2541,38 +2558,52 @@ fn no_session_for_a_while(rig: &Rig, set: i64) {
     );
 }
 
+/// Ends the job of `runner` just before GitHub answers the first `poll` that comes while a session is open.
+fn end_at_first_poll_with_a_session(github: &FakeGithub, poll: String, runner: String) {
+    github.before(&poll.clone(), move |github| {
+        if github.scale_sets().iter().any(|s| s.has_session) {
+            github.complete_job(&runner, "succeeded");
+        } else {
+            end_at_first_poll_with_a_session(github, poll, runner);
+        }
+    });
+}
+
 /// GPT, scaler.rs:525: a session opens with counts that name a running job, and the job ends right after them: at
-/// the Runner's first look at GitHub once the session is open, the REST view or the first poll. The counts are from
-/// before the end: no second machine starts for a job that is over.
+/// the Runner's first poll once the session is open (its start was heard, so the REST view is not asked). The counts
+/// are from before the end: no second machine starts for a job that is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_that_ends_as_a_session_opens_gets_no_second_machine_from_the_opening_counts() {
-    let rig = Rig::new(2).await;
-    rig.service.discover().await;
-    let runner = rig.job_running().await;
-    until("the start at the console", || heard(&rig, &runner).0).await;
-    let set = rig.github.scale_sets()[0].id;
-    for first_look in [
-        "GET /repos/org/app/actions/runners/".to_string(),
-        format!("GET /svc/_apis/runtime/runnerscalesets/{set}/messages"),
-    ] {
-        let runner = runner.clone();
-        rig.github.before(&first_look, move |github| {
-            if github.scale_sets().iter().any(|s| s.has_session) {
-                github.complete_job(&runner, "succeeded");
-            }
-        });
+    // The second time the session is lost as a poll fails: the Runner polls once more before it opens another.
+    for polls_again in [false, true] {
+        let rig = Rig::new(2).await;
+        rig.service.discover().await;
+        let runner = rig.job_running().await;
+        until("the start at the console", || heard(&rig, &runner).0).await;
+        let set = rig.github.scale_sets()[0].id;
+        let poll = format!("GET /svc/_apis/runtime/runnerscalesets/{set}/messages");
+        if polls_again {
+            let failed = poll.clone();
+            rig.github.before(&poll, move |github| {
+                github.lose_session(set);
+                github.fail(&failed, Reply::text(503, "unavailable"), 1);
+            });
+        }
+        end_at_first_poll_with_a_session(&rig.github, poll, runner.clone());
+        if !polls_again {
+            rig.github.lose_session(set);
+        }
+        until("the job over at GitHub", || {
+            !rig.github.runners().contains(&runner)
+        })
+        .await;
+        until("a session again", || {
+            rig.github.scale_sets().iter().any(|s| s.has_session)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(rig.parts.vms.started().len(), 1, "one job, one machine");
     }
-    rig.github.lose_session(set);
-    until("the job over at GitHub", || {
-        !rig.github.runners().contains(&runner)
-    })
-    .await;
-    until("a session again", || {
-        rig.github.scale_sets().iter().any(|s| s.has_session)
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(rig.parts.vms.started().len(), 1, "one job, one machine");
 }
 
 /// GPT, scaler.rs:582: a job is cancelled before its Actions runner took it, the surplus Actions runner is removed
@@ -3686,6 +3717,30 @@ async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
     );
 }
 
+/// Until its first look at GitHub ends, a Runner says it starts, not that it serves nothing; a look that could
+/// not read GitHub ends it too, and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_says_it_starts_until_its_first_look_at_github_ends() {
+    for github_answers in [true, false] {
+        let mut rig = Rig::new(2).await;
+        if !github_answers {
+            rig.github.fail(
+                "GET /app/installations",
+                Reply::status_json(503, &json!({"message": "unavailable"})),
+                usize::MAX,
+            );
+        }
+        rig.stop_pump().await;
+        rig.service.report().await;
+        assert_eq!(last_status(&rig.console)["starting"], json!(true));
+        rig.service.discover().await;
+        rig.service.report().await;
+        let last = last_status(&rig.console);
+        assert!(last.get("starting").is_none(), "{last}");
+        assert_eq!(last["discoveryError"].is_string(), !github_answers, "{last}");
+    }
+}
+
 fn changed(id: &str) -> SettingsLook {
     SettingsLook::Changed { id: id.into() }
 }
@@ -4300,6 +4355,74 @@ async fn a_repository_gets_at_most_8_sets_of_queued_jobs_the_newest_and_the_rest
     }
     let error = rig.service.discovery_error().expect("said");
     assert!(error.contains(REPO) && error.contains("at most 8"), "{error}");
+}
+
+// added: a set the bound pushes out while GitHub is making it goes at GitHub in the same look: its listener ends
+// before the sets are listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_pushed_out_while_github_makes_it_is_deleted_in_the_same_look() {
+    let rig = Rig::new(2).await;
+    // GitHub is slow to make scale sets: the look that pushes the oldest out comes while it is made.
+    rig.github.delay(
+        "POST /svc/_apis/runtime/runnerscalesets",
+        Duration::from_secs(1),
+        9,
+    );
+    let labels: Vec<String> = (1..=9).map(|n| format!("pr-{n}")).collect();
+    for label in &labels[..8] {
+        under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", label]);
+    }
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g"]);
+    rig.service.discover().await;
+
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", &labels[8]]);
+    rig.service.look_at_queue().await;
+    assert_eq!(rig.service.sets().len(), 9);
+    assert_eq!(
+        served_with(&rig, "pr-1"),
+        (false, false),
+        "the oldest goes, at GitHub too"
+    );
+    for label in &labels[1..] {
+        serving(&rig, label).await;
+    }
+}
+
+// added: a set the bound pushes out goes though GitHub has not made it yet: its listener is still trying, and the
+// set must not stay served beside the newest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_pushed_out_before_github_made_it_is_not_served() {
+    let rig = Rig::new(2).await;
+    // No scale set is made at GitHub until it recovers: every listener is still trying.
+    rig.github.fail_until_recovered(
+        "POST /svc/_apis/runtime/runnerscalesets",
+        Reply::text(503, "unavailable"),
+    );
+    let labels: Vec<String> = (1..=9).map(|n| format!("pr-{n}")).collect();
+    for label in &labels[..8] {
+        under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", label]);
+    }
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g"]);
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 9, "8 of queued jobs and main's");
+
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", &labels[8]]);
+    rig.service.look_at_queue().await;
+    assert_eq!(
+        rig.service.sets().len(),
+        9,
+        "the oldest goes though GitHub never had it"
+    );
+    assert!(!served_with(&rig, "pr-1").0, "pr-1 is no longer served");
+    rig.github.recover("POST /svc/_apis/runtime/runnerscalesets");
+    for label in &labels[1..] {
+        serving(&rig, label).await;
+    }
+    assert_eq!(
+        served_with(&rig, "pr-1"),
+        (false, false),
+        "and GitHub does not get it later"
+    );
 }
 
 // added: at most 32 label sets of queued jobs on the host, whatever repositories ask.
