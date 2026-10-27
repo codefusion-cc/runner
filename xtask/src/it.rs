@@ -1,7 +1,7 @@
 //! `cargo xtask it`: the Runner against real virtual machines on this host, one small machine at a time.
 //!
-//! GitHub's hosted runners boot no machines, so this suite runs by hand, on a Mac or on an arm64 Linux host with
-//! KVM. It needs the built binary (`cargo xtask build`) and a signed image release in a folder (`gh release download
+//! GitHub's hosted runners boot no machines, so this suite runs by hand, on a Mac or on a Linux host (arm64 or
+//! x86_64) with KVM, with the image release of the host's architecture. It needs the built binary (`cargo xtask build`) and a signed image release in a folder (`gh release download
 //! <tag> -R <repository> -D target/it/release`), which it installs through the verifying store. Each scenario
 //! starts `codefusion-runner vm` the way the daemon does, with a shell script in place of the Actions runner, and
 //! judges the job's last state and what the job wrote to the machine's console. The numbers go to

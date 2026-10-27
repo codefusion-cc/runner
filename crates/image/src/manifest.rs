@@ -2,6 +2,16 @@ use serde::{Deserialize, Serialize};
 
 /// The manifest format this build reads and writes.
 pub const FORMAT: u32 = 1;
+/// The architecture this build runs guests of, as Rust names it (`aarch64`, `x86_64`): a host boots only an image
+/// built for its own.
+pub const HOST_ARCH: &str = std::env::consts::ARCH;
+/// The architecture of a manifest that names none: every release before there were x86_64 hosts.
+const FIRST_ARCH: &str = "aarch64";
+
+fn first_arch() -> String {
+    FIRST_ARCH.into()
+}
+
 /// The manifest's file name in a release.
 pub const MANIFEST_NAME: &str = "image.json";
 /// The list of hashes the signature covers.
@@ -58,7 +68,12 @@ pub struct Manifest {
     /// downloaded.
     #[serde(default)]
     pub built: u64,
-    /// The guest kernel, an uncompressed arm64 `Image`.
+    /// The architecture the kernel, the initramfs and the root filesystem are built for, as Rust names it (see
+    /// [`HOST_ARCH`]). Signed with the rest; a manifest without it is `aarch64`, and a Runner from before it reads
+    /// past it.
+    #[serde(default = "first_arch")]
+    pub arch: String,
+    /// The guest kernel: an uncompressed `Image` on aarch64, the `vmlinux` ELF on x86_64.
     pub kernel: Asset,
     /// The initramfs with the supervisor and its modules.
     pub initramfs: Asset,
@@ -68,6 +83,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Whether this host can boot the image: it is built for [`HOST_ARCH`].
+    pub fn for_this_host(&self) -> Result<(), crate::ImageError> {
+        if self.arch == HOST_ARCH {
+            return Ok(());
+        }
+        Err(crate::ImageError::WrongArch {
+            found: self.arch.clone(),
+            host: HOST_ARCH.into(),
+        })
+    }
+
     /// Every file this manifest names, in the order `SHA256SUMS` lists them after `image.json`.
     pub fn assets(&self) -> Vec<&Asset> {
         let mut all = vec![&self.kernel, &self.initramfs];

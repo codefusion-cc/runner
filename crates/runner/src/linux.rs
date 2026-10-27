@@ -166,7 +166,8 @@ pub fn lines(facts: &Facts) -> Vec<Result<String, String>> {
     let mut lines = vec![match &facts.kvm {
         Ok(()) => Ok("/dev/kvm opens for reading and writing".to_string()),
         Err(Kvm::Missing) => Err(
-            "/dev/kvm is not there: this kernel or board offers no KVM, and no machine can start here"
+            "/dev/kvm is not there: this kernel, board or VM offers no KVM, and no machine can start here (a cloud VM \
+             needs nested virtualization: on GCP an Intel N2 or C3 VM made with `--enable-nested-virtualization`)"
                 .to_string(),
         ),
         Err(Kvm::Denied) => Err(format!(
@@ -401,7 +402,10 @@ mod tests {
         });
         assert_eq!(
             no_kvm,
-            ["/dev/kvm is not there: this kernel or board offers no KVM, and no machine can start here"]
+            [
+                "/dev/kvm is not there: this kernel, board or VM offers no KVM, and no machine can start here (a cloud VM \
+             needs nested virtualization: on GCP an Intel N2 or C3 VM made with `--enable-nested-virtualization`)"
+            ]
         );
         let v1 = missing(&Facts {
             cgroup2: false,

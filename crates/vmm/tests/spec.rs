@@ -175,8 +175,12 @@ fn a_machine_that_takes_no_stop_says_so_and_runs_until_it_is_let_go() {
 }
 
 #[test]
-fn the_guest_is_told_to_hide_sme_from_its_programs() {
-    assert!(cf_vmm::COMMAND_LINE.split(' ').any(|word| word == "arm64.nosme"));
+fn an_arm64_guest_is_told_to_hide_sme_from_its_programs_and_no_other_guest_is() {
+    let nosme = cf_vmm::COMMAND_LINE.split(' ').any(|word| word == "arm64.nosme");
+    assert_eq!(nosme, cfg!(target_arch = "aarch64"), "{}", cf_vmm::COMMAND_LINE);
+    for word in ["console=hvc0", "panic=-1"] {
+        assert!(cf_vmm::COMMAND_LINE.split(' ').any(|w| w == word), "{word}");
+    }
 }
 
 #[test]

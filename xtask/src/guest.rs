@@ -13,8 +13,9 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
+use crate::arch::Arch;
 use crate::cpio::{Archive, Kind};
-use crate::kernel::{APK_SHA256, APK_VERSION, PIN, WHAT, sources, unpack_zboot};
+use crate::kernel::Kernel;
 use crate::keys::{ephemeral_key, release_key};
 use crate::pinned::{Curl, ensure};
 use crate::{Result, cargo, run_command};
@@ -59,13 +60,16 @@ const DOCKER_MODULES: &[&str] = &[
 ];
 /// A release asset may be at most 2 GiB; the root filesystem is cut a little below that.
 const MAX_PART: u64 = 1_900_000_000;
-/// The names of the kernel and the initramfs in the bundle and in a release.
-const KERNEL_FILE: &str = "Image";
+/// The name of the initramfs in the bundle and in a release. The kernel's is its architecture's
+/// ([`Kernel::file_name`]).
 const INITRAMFS_FILE: &str = "initramfs.cpio.gz";
 
-/// Builds the bundle in `target/guest`, signed with a key made for this build. The key that signs image releases
-/// never signs a bundle: a bundle has no root filesystem and no build time, and must not pass as a release.
+/// Builds the bundle of the host's architecture in `target/guest`, signed with a key made for this build. The key
+/// that signs image releases never signs a bundle: a bundle has no root filesystem and no build time, and must not
+/// pass as a release.
 pub fn build(root: &Path) -> Result<()> {
+    let arch = Arch::host()?;
+    let pinned = Kernel::of(arch);
     let target = root.join("target");
     let staging = target.join("guest-staging");
     let out = target.join("guest");
@@ -74,9 +78,9 @@ pub fn build(root: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
     }
 
-    let package = fetch_package(&target.join("cache"))?;
-    let kernel = unpack_zboot(&fs::read(package.join("boot/vmlinuz-virt"))?)?;
-    fs::write(staging.join(KERNEL_FILE), &kernel)?;
+    let package = fetch_package(pinned, &target.join("cache"))?;
+    let kernel = (pinned.unpack)(&fs::read(package.join("boot/vmlinuz-virt"))?)?;
+    fs::write(staging.join(pinned.file_name), &kernel)?;
 
     let modules = collect_modules(&package, MODULES, &[])?;
     let docker_modules = collect_modules(&package, DOCKER_MODULES, &modules)?;
@@ -84,16 +88,18 @@ pub fn build(root: &Path) -> Result<()> {
         "build",
         "--release",
         "--target",
-        "aarch64-unknown-linux-musl",
+        arch.musl_target(),
         "-p",
         "cf-supervisor",
     ]))?;
-    let supervisor = fs::read(target.join("aarch64-unknown-linux-musl/release/supervisor"))?;
+    let supervisor = fs::read(target.join(arch.musl_target()).join("release/supervisor"))?;
     let initramfs = initramfs(&supervisor, &modules, &docker_modules)?;
     fs::write(staging.join(INITRAMFS_FILE), &initramfs)?;
 
     let version = format!(
-        "guest-{APK_VERSION}-{}",
+        "guest-{}-{}-{}",
+        arch.name(),
+        pinned.version,
         &format!("{:x}", Sha256::digest(&initramfs))[..12]
     );
     let key = ephemeral_key()?;
@@ -102,7 +108,8 @@ pub fn build(root: &Path) -> Result<()> {
         &ReleaseInputs {
             version: &version,
             built: 0,
-            kernel: &staging.join(KERNEL_FILE),
+            arch: arch.name(),
+            kernel: &staging.join(pinned.file_name),
             initramfs: &staging.join(INITRAMFS_FILE),
             rootfs: None,
             max_part: MAX_PART,
@@ -115,11 +122,14 @@ pub fn build(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--max-part BYTES]`:
-/// the folder the image workflow publishes, verified as a machine would verify it before this returns.
+/// `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--arch A]
+/// [--max-part BYTES]`: the folder the image workflow publishes, verified as a machine would verify it before this
+/// returns. The kernel, the initramfs and the root filesystem are of one architecture, the host's unless `--arch`
+/// names another; the manifest says which.
 pub fn release(root: &Path, args: &[String]) -> Result<()> {
     let (mut version, mut out, mut key_file, mut rootfs) = (None, None, None, None);
     let (mut guest, mut max_part, mut ephemeral) = (root.join("target/guest"), MAX_PART, false);
+    let mut arch = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == "--ephemeral" {
@@ -132,6 +142,7 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
             "--out" => out = Some(PathBuf::from(value)),
             "--key-file" => key_file = Some(PathBuf::from(value)),
             "--guest" => guest = PathBuf::from(value),
+            "--arch" => arch = Some(Arch::named(value)?),
             "--rootfs" => rootfs = Some(PathBuf::from(value)),
             "--max-part" => {
                 max_part = value
@@ -148,6 +159,7 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
         out.ok_or("--out is needed")?,
         rootfs.ok_or("--rootfs is needed")?,
     );
+    let arch = arch.map_or_else(Arch::host, Ok)?;
     let key = release_key(key_file.as_deref(), ephemeral)?;
     let built = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let manifest = write_release(
@@ -155,7 +167,8 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
         &ReleaseInputs {
             version: &version,
             built,
-            kernel: &guest.join(KERNEL_FILE),
+            arch: arch.name(),
+            kernel: &guest.join(Kernel::of(arch).file_name),
             initramfs: &guest.join(INITRAMFS_FILE),
             rootfs: Some(&rootfs),
             max_part,
@@ -180,14 +193,24 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
 ///
 /// A folder unpacked earlier is used as it is, without hashing it again: `target/` is trusted like the sources. A
 /// workflow that restores `target/` from a cache must therefore never sign what it builds.
-fn fetch_package(cache: &Path) -> Result<PathBuf> {
+fn fetch_package(pinned: &Kernel, cache: &Path) -> Result<PathBuf> {
     fs::create_dir_all(cache)?;
-    let apk = cache.join(format!("linux-virt-{APK_VERSION}.apk"));
-    let unpacked = cache.join(format!("linux-virt-{}", &APK_SHA256[..12]));
+    let apk = cache.join(format!(
+        "linux-virt-{}-{}.apk",
+        pinned.arch.name(),
+        pinned.version
+    ));
+    let unpacked = cache.join(format!("linux-virt-{}", &pinned.sha256[..12]));
     if unpacked.join("boot/vmlinuz-virt").exists() {
         return Ok(unpacked);
     }
-    ensure(&Curl::https(), &sources(), PIN, &apk, WHAT)?;
+    ensure(
+        &Curl::https(),
+        &pinned.sources(),
+        pinned.pin(),
+        &apk,
+        &pinned.what(),
+    )?;
     let partial = cache.join("unpack.partial");
     let _ = fs::remove_dir_all(&partial);
     fs::create_dir_all(&partial)?;

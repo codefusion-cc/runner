@@ -23,7 +23,7 @@ mod verify;
 pub use embedded::{Bundle, embedded_bundle, verify_embedded};
 pub use error::ImageError;
 pub use files::{DirFiles, Files, MemFiles};
-pub use manifest::{Asset, FORMAT, MANIFEST_NAME, Manifest, Rootfs, SIGNATURE_NAME, SUMS_NAME};
+pub use manifest::{Asset, FORMAT, HOST_ARCH, MANIFEST_NAME, Manifest, Rootfs, SIGNATURE_NAME, SUMS_NAME};
 pub use release::{ReleaseInputs, parse_signing_key, public_key_text, write_release};
 pub use verify::{Verified, parse_public_key, verify};
 

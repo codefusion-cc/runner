@@ -27,6 +27,9 @@ pub enum ImageError {
     /// The release is genuine but was built before the one already accepted.
     #[error("the release was built at {built}, before the one in use ({newest_accepted})")]
     Older { built: u64, newest_accepted: u64 },
+    /// The release is genuine but built for another architecture than this host's.
+    #[error("the release is built for {found}, this host runs {host}")]
+    WrongArch { found: String, host: String },
     /// A file the release needs is not there.
     #[error("{0} is missing")]
     Missing(String),
