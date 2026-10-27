@@ -2557,38 +2557,52 @@ fn no_session_for_a_while(rig: &Rig, set: i64) {
     );
 }
 
+/// Ends the job of `runner` just before GitHub answers the first `poll` that comes while a session is open.
+fn end_at_first_poll_with_a_session(github: &FakeGithub, poll: String, runner: String) {
+    github.before(&poll.clone(), move |github| {
+        if github.scale_sets().iter().any(|s| s.has_session) {
+            github.complete_job(&runner, "succeeded");
+        } else {
+            end_at_first_poll_with_a_session(github, poll, runner);
+        }
+    });
+}
+
 /// GPT, scaler.rs:525: a session opens with counts that name a running job, and the job ends right after them: at
-/// the Runner's first look at GitHub once the session is open, the REST view or the first poll. The counts are from
-/// before the end: no second machine starts for a job that is over.
+/// the Runner's first poll once the session is open (its start was heard, so the REST view is not asked). The counts
+/// are from before the end: no second machine starts for a job that is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_that_ends_as_a_session_opens_gets_no_second_machine_from_the_opening_counts() {
-    let rig = Rig::new(2).await;
-    rig.service.discover().await;
-    let runner = rig.job_running().await;
-    until("the start at the console", || heard(&rig, &runner).0).await;
-    let set = rig.github.scale_sets()[0].id;
-    for first_look in [
-        "GET /repos/org/app/actions/runners/".to_string(),
-        format!("GET /svc/_apis/runtime/runnerscalesets/{set}/messages"),
-    ] {
-        let runner = runner.clone();
-        rig.github.before(&first_look, move |github| {
-            if github.scale_sets().iter().any(|s| s.has_session) {
-                github.complete_job(&runner, "succeeded");
-            }
-        });
+    // The second time the session is lost as a poll fails: the Runner polls once more before it opens another.
+    for polls_again in [false, true] {
+        let rig = Rig::new(2).await;
+        rig.service.discover().await;
+        let runner = rig.job_running().await;
+        until("the start at the console", || heard(&rig, &runner).0).await;
+        let set = rig.github.scale_sets()[0].id;
+        let poll = format!("GET /svc/_apis/runtime/runnerscalesets/{set}/messages");
+        if polls_again {
+            let failed = poll.clone();
+            rig.github.before(&poll, move |github| {
+                github.lose_session(set);
+                github.fail(&failed, Reply::text(503, "unavailable"), 1);
+            });
+        }
+        end_at_first_poll_with_a_session(&rig.github, poll, runner.clone());
+        if !polls_again {
+            rig.github.lose_session(set);
+        }
+        until("the job over at GitHub", || {
+            !rig.github.runners().contains(&runner)
+        })
+        .await;
+        until("a session again", || {
+            rig.github.scale_sets().iter().any(|s| s.has_session)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(rig.parts.vms.started().len(), 1, "one job, one machine");
     }
-    rig.github.lose_session(set);
-    until("the job over at GitHub", || {
-        !rig.github.runners().contains(&runner)
-    })
-    .await;
-    until("a session again", || {
-        rig.github.scale_sets().iter().any(|s| s.has_session)
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(rig.parts.vms.started().len(), 1, "one job, one machine");
 }
 
 /// GPT, scaler.rs:582: a job is cancelled before its Actions runner took it, the surplus Actions runner is removed
