@@ -2,7 +2,9 @@ name: Image
 
 # The guest image: the root filesystem a job runs in (GitHub's Actions runner image plus tools, image/Dockerfile)
 # packed read-only (erofs) in parts below GitHub's 2 GB asset limit, with the guest kernel and initramfs, and a signed
-# list of their hashes.
+# list of their hashes. One release for each architecture a host runs, each built on a runner of that architecture:
+# arm64 under `image-<date>-<run>`, amd64 under `amd64-image-<date>-<run>`. The amd64 tag does not start with `image-`
+# on purpose: what takes the newest `image-` release (the console's connect steps) takes arm64's, as before.
 #
 # `build` makes all of it and proves the result verifies, signed with a key made for the run. It holds no secret, so
 # a pull request that touches the image runs it too. `publish` runs only on main: it signs what `build` made with
@@ -33,8 +35,20 @@ concurrency:
 
 jobs:
   build:
-    name: Build the image and prove it verifies
-    runs-on: ubuntu-24.04-arm
+    name: Build the ${{ matrix.platform }} image and prove it verifies
+    strategy:
+      fail-fast: false
+      matrix: &platforms
+        include:
+          - platform: arm64
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            tag: image-
+          - platform: amd64
+            arch: x86_64
+            runner: ubuntu-24.04
+            tag: amd64-image-
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -75,7 +89,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo xtask guest
-          cp target/guest/Image target/guest/initramfs.cpio.gz payload/
+          kernel="$(jq -r .kernel.name target/guest/image.json)"
+          test "$(jq -r .arch target/guest/image.json)" = "${{ matrix.arch }}"
+          cp "target/guest/$kernel" target/guest/initramfs.cpio.gz payload/
       # `publish` runs these two programs and compiles nothing, so they are built here, where no secret is.
       - name: The signer and the verifier
         run: |
@@ -87,7 +103,7 @@ jobs:
       - name: A release of it, signed with a key made for this run, verifies
         run: |
           set -euo pipefail
-          tools/xtask release --ephemeral --version dry-run --out "$RUNNER_TEMP/dry-run" \
+          tools/xtask release --ephemeral --version dry-run --out "$RUNNER_TEMP/dry-run" --arch ${{ matrix.arch }} \
             --guest payload --rootfs payload/rootfs.erofs --max-part 268435456
           ls -l "$RUNNER_TEMP/dry-run"
           # The key of this run is not the committed one, so the verifier must refuse the release for its signature.
@@ -100,7 +116,7 @@ jobs:
       - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: image
+          name: image-${{ matrix.platform }}
           path: |
             payload
             tools
@@ -110,10 +126,13 @@ jobs:
 
   # No checkout, no toolchain, no cache: the job that holds the key runs the two programs `build` made, and `gh`.
   publish:
-    name: Sign and publish the image
+    name: Sign and publish the ${{ matrix.platform }} image
     needs: build
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix: *platforms
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     environment: image
     permissions:
@@ -121,17 +140,17 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: image
+          name: image-${{ matrix.platform }}
       - name: Sign
         env:
           IMAGE_SIGNING_KEY: ${{ secrets.IMAGE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           chmod +x tools/xtask tools/codefusion-runner
-          version="image-$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
+          version="${{ matrix.tag }}$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
           echo "VERSION=$version" >> "$GITHUB_ENV"
           # The key goes in through standard input: never a file, an argument or a log line.
-          tools/xtask release --version "$version" --out release \
+          tools/xtask release --version "$version" --out release --arch ${{ matrix.arch }} \
             --guest payload --rootfs payload/rootfs.erofs --key-file /dev/stdin <<< "$IMAGE_SIGNING_KEY"
       - name: Verify what is about to be published, as a machine would after downloading it
         run: tools/codefusion-runner image verify release --version "$VERSION"

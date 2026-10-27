@@ -39,6 +39,7 @@ fn release_with(kernel: &[u8], initramfs: &[u8], rootfs: Option<&[u8]>, max_part
         &ReleaseInputs {
             version: VERSION,
             built: BUILT,
+            arch: cf_image::HOST_ARCH,
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs.cpio.gz"),
             rootfs: rootfs.map(|_| src.path().join("rootfs.erofs")).as_deref(),
@@ -433,6 +434,7 @@ fn a_folder_on_disk_verifies_like_memory_and_a_missing_folder_is_missing_files()
         &ReleaseInputs {
             version: VERSION,
             built: BUILT,
+            arch: cf_image::HOST_ARCH,
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs"),
             rootfs: None,
@@ -458,6 +460,7 @@ fn inputs<'a>(kernel: &'a std::path::Path, initramfs: &'a std::path::Path) -> Re
     ReleaseInputs {
         version: VERSION,
         built: BUILT,
+        arch: cf_image::HOST_ARCH,
         kernel,
         initramfs,
         rootfs: None,
@@ -922,4 +925,51 @@ proptest! {
         });
         prop_assert!(check(&release).is_err());
     }
+}
+
+#[test]
+fn the_architecture_is_signed_and_a_manifest_without_one_is_aarch64() {
+    let release = good();
+    let manifest = verify(&release.files, &release.key.verifying_key(), VERSION, 0)
+        .unwrap()
+        .manifest;
+    assert_eq!(manifest.arch, cf_image::HOST_ARCH);
+    assert_eq!(manifest.for_this_host(), Ok(()));
+
+    // Changed without the key, the manifest no longer matches the signed list.
+    let mut changed = good();
+    let other = text_of(&changed, MANIFEST_NAME).replace(
+        &format!("\"arch\": \"{}\"", cf_image::HOST_ARCH),
+        "\"arch\": \"riscv64\"",
+    );
+    assert_ne!(other, text_of(&changed, MANIFEST_NAME));
+    changed.files.insert(MANIFEST_NAME, other.into_bytes());
+    assert_eq!(
+        check(&changed),
+        Err(ImageError::HashMismatch(MANIFEST_NAME.into()))
+    );
+
+    // Every release before x86_64 hosts names no architecture: it is aarch64, and genuine.
+    let mut old = good();
+    rewrite_manifest(&mut old, |manifest| {
+        manifest.as_object_mut().unwrap().remove("arch");
+    });
+    let manifest = verify(&old.files, &old.key.verifying_key(), VERSION, 0)
+        .unwrap()
+        .manifest;
+    assert_eq!(manifest.arch, "aarch64");
+    assert_eq!(manifest.for_this_host().is_ok(), cf_image::HOST_ARCH == "aarch64");
+
+    let mut foreign = good();
+    rewrite_manifest(&mut foreign, |manifest| manifest["arch"] = "riscv64".into());
+    let manifest = verify(&foreign.files, &foreign.key.verifying_key(), VERSION, 0)
+        .unwrap()
+        .manifest;
+    assert_eq!(
+        manifest.for_this_host(),
+        Err(ImageError::WrongArch {
+            found: "riscv64".into(),
+            host: cf_image::HOST_ARCH.into()
+        })
+    );
 }

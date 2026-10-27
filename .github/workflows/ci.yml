@@ -34,10 +34,13 @@ jobs:
       - name: Guest image
         run: cargo xtask guest
       - run: cargo clippy --locked --workspace --all-targets -j3 -- -D warnings
-      # The guest's Linux code for its own target: musl's libc types are not glibc's, so the Linux job below does
-      # not stand in for this.
-      - name: Lint the guest supervisor for its own target
-        run: cargo clippy --locked -p cf-supervisor -p cf-nft --target aarch64-unknown-linux-musl --bins --lib -j3 -- -D warnings
+      # The guest's Linux code for its own targets, one for each architecture a host runs: musl's libc types are not
+      # glibc's, so the Linux jobs below do not stand in for this.
+      - name: Lint the guest supervisor for its own targets
+        run: |
+          for target in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            cargo clippy --locked -p cf-supervisor -p cf-nft --target "$target" --bins --lib -j3 -- -D warnings
+          done
       - name: Tests
         run: cargo test --locked --workspace -j3
         env:
@@ -64,8 +67,16 @@ jobs:
           retention-days: 7
 
   linux:
-    name: Linux (arm64)
-    runs-on: ubuntu-24.04-arm
+    name: Linux (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+          - platform: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
       # The crates that build and pass on Linux. Add a crate here once it does.

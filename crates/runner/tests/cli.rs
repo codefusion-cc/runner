@@ -30,6 +30,7 @@ fn a_release_signed_by_a_key_that_is_not_the_trusted_one_is_refused() {
         &ReleaseInputs {
             version: "v1",
             built: 0,
+            arch: cf_image::HOST_ARCH,
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs"),
             rootfs: None,
