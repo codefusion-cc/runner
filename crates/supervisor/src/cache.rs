@@ -1,5 +1,5 @@
-//! A job's cache disk: a copy of its repository's cache, mounted at [`MOUNT`]. It holds npm's cache and pnpm's store,
-//! which the job's user writes, and a Docker job's daemon data. Nothing else is kept: the job's end deletes the rest
+//! A job's cache disk: a copy of its repository's cache, mounted at [`MOUNT`]. It holds npm's cache, pnpm's store and
+//! Playwright's browsers, which the job's user writes, and a Docker job's daemon data. Nothing else is kept: the job's end deletes the rest
 //! ([`leftovers`]) before the disk is let go, so a cache holds downloaded packages and images, never a job's logs or
 //! programs that npx installed.
 
@@ -11,20 +11,27 @@ pub const DOCKER: &str = "docker";
 pub const NPM: &str = "npm";
 /// pnpm's store, the job user's.
 pub const PNPM: &str = "pnpm-store";
+/// Playwright's browsers, the job user's: each in a folder of its own revision, which Playwright looks for itself.
+pub const PLAYWRIGHT: &str = "ms-playwright";
 /// What npm keeps in its cache folder that is worth keeping: the downloaded packages and their metadata.
 pub const NPM_KEPT: &str = "_cacache";
 /// The folders of the disk's top level that are kept; `lost+found` is the file system's own.
-pub const KEPT: [&str; 4] = [DOCKER, NPM, PNPM, "lost+found"];
+pub const KEPT: [&str; 5] = [DOCKER, NPM, PNPM, PLAYWRIGHT, "lost+found"];
 /// The folders the job's user writes.
-pub const USER_FOLDERS: [&str; 2] = [NPM, PNPM];
+pub const USER_FOLDERS: [&str; 3] = [NPM, PNPM, PLAYWRIGHT];
 
-/// What a job with a cache disk is told: where the disk is, and npm's cache and pnpm's store on it. The job's own
+/// What a job with a cache disk is told: where the disk is, and npm's cache, pnpm's store and Playwright's browsers
+/// on it. The job's own
 /// entries come after these and win ([`crate::environment::workload_environment`]).
 pub fn environment(mount: &str) -> Vec<(String, String)> {
     vec![
         ("CF_JOB_CACHE".to_string(), mount.to_string()),
         ("npm_config_cache".to_string(), format!("{mount}/{NPM}")),
         ("pnpm_config_store_dir".to_string(), format!("{mount}/{PNPM}")),
+        (
+            "PLAYWRIGHT_BROWSERS_PATH".to_string(),
+            format!("{mount}/{PLAYWRIGHT}"),
+        ),
     ]
 }
 

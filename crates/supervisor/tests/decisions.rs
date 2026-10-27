@@ -1304,7 +1304,7 @@ fn folders(list: &[&str]) -> Vec<Entry> {
 }
 
 #[test]
-fn a_job_with_a_cache_points_npm_and_pnpm_at_it_and_its_own_entries_win() {
+fn a_job_with_a_cache_points_npm_pnpm_and_playwright_at_it_and_its_own_entries_win() {
     let told = cache::environment(MOUNT);
     assert_eq!(
         told,
@@ -1314,6 +1314,10 @@ fn a_job_with_a_cache_points_npm_and_pnpm_at_it_and_its_own_entries_win() {
             (
                 "pnpm_config_store_dir".to_string(),
                 "/mnt/cache/pnpm-store".to_string()
+            ),
+            (
+                "PLAYWRIGHT_BROWSERS_PATH".to_string(),
+                "/mnt/cache/ms-playwright".to_string()
             ),
         ]
     );
@@ -1334,8 +1338,15 @@ fn a_job_with_a_cache_points_npm_and_pnpm_at_it_and_its_own_entries_win() {
 }
 
 #[test]
-fn a_jobs_end_leaves_packages_and_docker_data_only() {
-    let mut top = folders(&["docker", "npm", "pnpm-store", "lost+found", "node_modules"]);
+fn a_jobs_end_leaves_packages_browsers_and_docker_data_only() {
+    let mut top = folders(&[
+        "docker",
+        "npm",
+        "pnpm-store",
+        "ms-playwright",
+        "lost+found",
+        "node_modules",
+    ]);
     top.extend([("secrets.env".to_string(), false), (".npmrc".to_string(), false)]);
     let mut npm = folders(&["_cacache", "_logs", "_npx", "_cacache.tmp"]);
     npm.push(("_update-notifier-last-checked".to_string(), false));
@@ -1353,7 +1364,7 @@ fn a_jobs_end_leaves_packages_and_docker_data_only() {
     );
     assert!(
         leftovers(
-            &folders(&["docker", "npm", "pnpm-store", "lost+found"]),
+            &folders(&["docker", "npm", "pnpm-store", "ms-playwright", "lost+found"]),
             &folders(&["_cacache"])
         )
         .is_empty()
@@ -1363,8 +1374,11 @@ fn a_jobs_end_leaves_packages_and_docker_data_only() {
     assert!(leftovers(&folders(&["pnpm-store"]), &folders(&["_logs"])).is_empty());
     // A name that only looks like a kept one goes.
     assert_eq!(
-        leftovers(&folders(&["Docker", "npm ", "pnpm-store2"]), &[]),
-        names(&["Docker", "npm ", "pnpm-store2"])
+        leftovers(
+            &folders(&["Docker", "npm ", "pnpm-store2", "ms-playwright-1"]),
+            &[]
+        ),
+        names(&["Docker", "npm ", "pnpm-store2", "ms-playwright-1"])
     );
 }
 
@@ -1393,7 +1407,7 @@ proptest! {
         // A folder's names are unique, so maps of name to whether it is a folder.
         top in proptest::collection::btree_map(prop_oneof![
             Just("docker".to_string()), Just("npm".to_string()), Just("pnpm-store".to_string()),
-            Just("lost+found".to_string()), "[^/\\x00]{1,20}"
+            Just("ms-playwright".to_string()), Just("lost+found".to_string()), "[^/\\x00]{1,20}"
         ], any::<bool>(), 0..12),
         npm in proptest::collection::btree_map(prop_oneof![Just("_cacache".to_string()), "[^/\\x00]{1,20}"], any::<bool>(), 0..12),
     ) {

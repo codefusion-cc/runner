@@ -194,7 +194,7 @@ fn contain(spec: &Spec, ask: OwnedFd, done: OwnedFd) -> Result<libc::c_int, Stri
             "",
         ),
     )?;
-    // The cache's folders the job writes, npm's and pnpm's, in this namespace only: they go with the container's
+    // The cache's folders the job writes, npm's, pnpm's and Playwright's, in this namespace only: they go with the container's
     // last process, and the supervisor can then let go of the disk. The top level and Docker's data are not the
     // job's to see. No devices or set-id programs; npx runs what it installed there, so they may execute.
     if let Some(cache) = &spec.cache {

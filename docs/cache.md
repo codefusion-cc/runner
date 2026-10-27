@@ -18,17 +18,19 @@ can, ext4 cannot) keeps none either.
   cache holds of the host's disk what the job wrote. It writes only its copy: jobs of one repository that run at
   once never write the same file, and the cache is one job's copy, whole. The Runner's own machines (a test run,
   the Docker check) get none.
-- The guest mounts it at `/mnt/cache`, without devices or set-id programs. `npm/` and `pnpm-store/` there are the
-  job user's alone (0700), and only they are in the job's container; the top level and `docker/` are root's, and
-  Docker's data reaches only the job's daemon. A link or a file where one of these folders goes is deleted, never
-  followed: the guest's root works on the disk, and the job's root (sudo) could leave one there. The job is told
-  `CF_JOB_CACHE=/mnt/cache`, `npm_config_cache=/mnt/cache/npm` and `pnpm_config_store_dir=/mnt/cache/pnpm-store`;
-  its own environment wins. A disk that cannot be had leaves npm, pnpm and Docker on the job's own disk.
-- At the job's end, once the job's control group holds no process, the guest deletes everything but packages and
-  Docker's data (`cf_supervisor::cache::leftovers`): any other top-level entry, and in `npm/` all but `_cacache`
-  (npm's logs, npx's installs). It gives what the job's root left in `npm/` and `pnpm-store/` back to the job's
-  user (a folder it cannot give back is emptied), trims the file system so the host's copy gives back the blocks
-  the job freed, then lets the disk go.
+- The guest mounts it at `/mnt/cache`, without devices or set-id programs. `npm/`, `pnpm-store/` and `ms-playwright/`
+  there are the job user's alone (0700), and only they are in the job's container; the top level and `docker/` are
+  root's, and Docker's data reaches only the job's daemon. A link or a file where one of these folders goes is
+  deleted, never followed: the guest's root works on the disk, and the job's root (sudo) could leave one there. The
+  job is told `CF_JOB_CACHE=/mnt/cache`, `npm_config_cache=/mnt/cache/npm`,
+  `pnpm_config_store_dir=/mnt/cache/pnpm-store` and `PLAYWRIGHT_BROWSERS_PATH=/mnt/cache/ms-playwright` (each browser
+  in a folder of its revision, so Playwright versions share it); its own environment wins. A disk that cannot be had
+  leaves npm, pnpm and Docker on the job's own disk.
+- At the job's end, once the job's control group holds no process, the guest deletes everything but packages, browsers
+  and Docker's data (`cf_supervisor::cache::leftovers`): any other top-level entry, and in `npm/` all but `_cacache`
+  (npm's logs, npx's installs). It gives what the job's root left in the user's three folders back to the job's user
+  (a folder it cannot give back is emptied), trims the file system so the host's copy gives back the blocks the job
+  freed, then lets the disk go.
 - A host with less free disk than one whole disk (20 GB) gives no copy: a copy can grow to that whatever it starts
   as.
 
