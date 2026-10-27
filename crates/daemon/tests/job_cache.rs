@@ -202,6 +202,71 @@ async fn a_pull_request_a_failure_or_an_unclean_disk_never_writes_the_cache() {
     ends(&mut w, &next, "failed", "push", ON_MAIN);
 }
 
+/// `len` bytes of `path` from `at`.
+fn region(path: &std::path::Path, at: u64, len: usize) -> Vec<u8> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path).unwrap();
+    file.seek(std::io::SeekFrom::Start(at)).unwrap();
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes).unwrap();
+    bytes
+}
+
+/// Writes `bytes` into `path` at `at`, in place, as a guest writes its disk.
+fn write_at(path: &std::path::Path, at: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt as _;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all_at(bytes, at).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[tokio::test]
+async fn a_pull_requests_writes_never_reach_the_kept_cache_while_it_runs_or_after() {
+    const DEEP: u64 = 1 << 30;
+    let Some((dir, mut w)) = caching() else { return };
+    let first = job(&mut w).await;
+    let main_copy = copy_of_last_start(&w);
+    write_at(&main_copy, 0, b"main's packages");
+    write_at(&main_copy, DEEP, b"main's store");
+    ends(&mut w, &first, "succeeded", "push", ON_MAIN);
+    let kept = dir.path().join(format!("{}.img", cf_daemon::caches::key(REPO)));
+    let as_kept = || (region(&kept, 0, 15), region(&kept, DEEP, 12));
+    assert_eq!(as_kept(), (b"main's packages".to_vec(), b"main's store".to_vec()));
+
+    // The pull request reads the cache: its copy starts as main left it.
+    let pr = job(&mut w).await;
+    let pr_copy = copy_of_last_start(&w);
+    assert_ne!(pr_copy, kept, "a copy, not the cache itself");
+    assert_eq!(region(&pr_copy, 0, 15), b"main's packages");
+    assert_eq!(region(&pr_copy, DEEP, 12), b"main's store");
+    // It overwrites both, as a hostile job would, while main's next job runs beside it.
+    write_at(&pr_copy, 0, b"pull request!!!");
+    write_at(&pr_copy, DEEP, b"poisoned!!!!");
+    assert_eq!(as_kept(), (b"main's packages".to_vec(), b"main's store".to_vec()));
+    let beside = job(&mut w).await;
+    assert_eq!(region(&copy_of_last_start(&w), 0, 15), b"main's packages");
+    assert_eq!(region(&copy_of_last_start(&w), DEEP, 12), b"main's store");
+
+    // It succeeds and its disk is let go cleanly while main's job still runs: still not kept.
+    let pull = "org/app/.github/workflows/ci.yml@refs/pull/3/merge";
+    w.github_run(EventKind::Started, &pr, "", "pull_request", pull);
+    assert!(
+        w.m.runs_to_read().is_empty(),
+        "a pull request's run is never read"
+    );
+    w.parts.vms.end(job_name(&pr), End::Ok);
+    pass(&w.m, 2);
+    w.github_run(EventKind::Completed, &pr, "succeeded", "pull_request", pull);
+    assert_eq!(as_kept(), (b"main's packages".to_vec(), b"main's store".to_vec()));
+    ends(&mut w, &beside, "failed", "push", ON_MAIN);
+    assert!(!pr_copy.exists(), "the pull request's copy is gone");
+    assert_eq!(as_kept(), (b"main's packages".to_vec(), b"main's store".to_vec()));
+    let next = job(&mut w).await;
+    assert_eq!(region(&copy_of_last_start(&w), 0, 15), b"main's packages");
+    assert_eq!(region(&copy_of_last_start(&w), DEEP, 12), b"main's store");
+    ends(&mut w, &next, "failed", "push", ON_MAIN);
+}
+
 #[tokio::test]
 async fn a_job_github_never_says_the_end_of_does_not_write_the_cache() {
     let Some((dir, mut w)) = caching() else { return };
