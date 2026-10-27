@@ -4,7 +4,7 @@
 mod common;
 
 use Size::{G2, G4, G6, G8};
-use cf_budget::{Budget, Charge, GIB, HostFacts, MIB, Mode, Refusal, Settings, Size, admit};
+use cf_budget::{Budget, Charge, GIB, HostFacts, Limits, MIB, Mode, Refusal, Settings, Size, admit};
 use common::*;
 use proptest::prelude::*;
 
@@ -162,12 +162,21 @@ fn the_rule_at_each_size_of_host() {
             (13 * GIB + 5 * GIB / 8, GIB + GIB / 2, 4, 2),
             [true, true, true, true],
         ),
-        // 32 GB with sixteen cores alike: all but two for CI, seven machines of 2 vCPUs side by side.
+        // A 16 GB cloud VM with eight vCPUs alike: all but two for CI, and the three cf-4g its memory holds share
+        // them, 2 vCPUs each, rather than two of 3 leaving 4 GB idle.
+        (
+            16 * GIB,
+            8,
+            0,
+            (13 * GIB + 7 * GIB / 16, GIB + GIB / 2, 6, 2),
+            [true, true, true, true],
+        ),
+        // 32 GB with sixteen cores alike: all but two for CI, seven machines of 2 vCPUs side by side, cf-4g too.
         (
             32 * GIB,
             16,
             0,
-            (28 * GIB + 3 * GIB / 16, 2 * GIB, 14, 4),
+            (28 * GIB + 3 * GIB / 16, 2 * GIB, 14, 2),
             [true, true, true, true],
         ),
     ];
@@ -244,11 +253,12 @@ fn ci_takes_the_fast_cores_of_a_board_whose_cores_differ_and_all_but_two_of_one_
     assert_eq!(cpus(2, 0), 1);
     assert_eq!(cpus(1, 0), 1);
     assert_eq!(cpus(1, 1), 1);
-    // With room for a machine beside it, cf-4g gets half the CPUs, between 2 and 4.
+    // With room for a machine beside it, cf-4g gets half the CPUs, between 2 and 4, and no more than its share
+    // among the three cf-4g 16 GB holds.
     let g4 = |cores: u32, fast: u32| Settings::for_headless(host(16 * GIB, cores), fast).vcpus_of(G4);
     assert_eq!(
         [g4(8, 4), g4(8, 0), g4(12, 0), g4(24, 0), g4(4, 0)],
-        [2, 3, 4, 4, 2]
+        [2, 2, 3, 4, 2]
     );
 }
 
@@ -314,4 +324,22 @@ proptest! {
             prop_assert_eq!(settings.vcpus_of(G4), limits.cpus.min(4));
         }
     }
+}
+
+#[test]
+fn a_16_gb_cloud_vm_runs_three_cf_4g_and_keeps_them_under_its_own_floor() {
+    let settings = Settings::for_headless(host(16 * GIB, 8), 0);
+    assert_eq!(settings.side_by_side(&settings.away, G4), 3);
+    // The owner's floor lowers the cap; the cf-4g still share the CPUs by what the memory holds.
+    let floor = Limits {
+        floor_percent: Some(20),
+        ..Limits::default()
+    };
+    let lowered = settings.limited(&floor).expect("a floor in range");
+    assert_eq!(
+        lowered.away.cap_bytes,
+        16 * GIB - cf_budget::percent_of(16 * GIB, 20)
+    );
+    assert_eq!(lowered.vcpus, [2, 2, 4, 4]);
+    assert_eq!(lowered.side_by_side(&lowered.away, G4), 3);
 }
