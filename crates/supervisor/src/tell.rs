@@ -15,6 +15,10 @@ pub struct JobFacts {
     /// Whether the job has a Docker daemon.
     #[serde(default)]
     pub docker: bool,
+    /// Whether the job has a cache disk. A Docker job's daemon keeps its data there, which the job's end leaves
+    /// without its containers.
+    #[serde(default)]
+    pub cache: bool,
 }
 
 /// A size as people write it: `3.75 GB`, `4 GB`, `512 MB`.

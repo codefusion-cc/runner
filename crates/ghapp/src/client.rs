@@ -7,7 +7,7 @@ use cf_secret::Secret;
 use cf_workflows::LabelSet;
 use reqwest::Method;
 use reqwest::header::ETAG;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -29,9 +29,31 @@ pub struct Installation {
     pub id: i64,
 }
 
+/// A workflow run as GitHub keeps it: where its code came from, which is not always where its workflow file did (a
+/// reusable workflow at another ref runs the caller's code).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    /// The branch of the code the run checked out; none for some events.
+    pub head_branch: Option<String>,
+    /// The repository of that code, `owner/name`: a fork's for a pull request from one.
+    pub head_repository: Option<String>,
+    /// `push`, `pull_request` and so on.
+    pub event: String,
+    /// The commit the run checked out. A tag's run names the tag in `head_branch`, so only this says whose code it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// Whether `head_sha` is on the repository's default branch, the branch GitHub names now: the Runner learns it
+    /// after reading the run ([`GitHubApp::commit_on_branch`]); GitHub's answer alone never sets it.
+    #[serde(default)]
+    pub on_default_branch: bool,
+}
+
 /// A repository the App may serve.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Repo {
+    /// GitHub's number for it; 0 when GitHub did not say.
+    #[serde(default)]
+    pub id: u64,
     /// `owner/name`.
     pub full_name: String,
     /// Changes with every push, so workflows need reading again only when it does.
@@ -49,6 +71,9 @@ pub struct Repo {
     /// Whether it is disabled.
     #[serde(default)]
     pub disabled: bool,
+    /// Its default branch, whose pushes may write its jobs' cache.
+    #[serde(default)]
+    pub default_branch: Option<String>,
 }
 
 /// How many runs' jobs one look reads, newest first.
@@ -460,6 +485,103 @@ impl GitHubApp {
         {
             Ok(response) => Ok(Some(decode::<RunnerState>("Actions runner", &response)?.busy)),
             Err(Error::Status(s)) if s.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// What GitHub says of a workflow run of a repository: the branch and repository its code came from and its
+    /// event. `None` when GitHub has no such run.
+    pub async fn workflow_run(
+        &self,
+        installation: i64,
+        repo: &str,
+        run_id: i64,
+    ) -> Result<Option<WorkflowRun>, Error> {
+        #[derive(Deserialize)]
+        struct Named {
+            full_name: String,
+        }
+        #[derive(Deserialize)]
+        struct Run {
+            head_branch: Option<String>,
+            head_repository: Option<Named>,
+            #[serde(default)]
+            event: String,
+            head_sha: Option<String>,
+        }
+        let path = format!("/repos/{repo}/actions/runs/{run_id}");
+        match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
+            Ok(response) => {
+                let run = decode::<Run>("workflow run", &response)?;
+                Ok(Some(WorkflowRun {
+                    head_branch: run.head_branch,
+                    head_repository: run.head_repository.map(|named| named.full_name),
+                    event: run.event,
+                    head_sha: run.head_sha,
+                    on_default_branch: false,
+                }))
+            }
+            Err(Error::Status(s)) if s.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `sha` is on `branch` of a repository: its tip or behind it. A branch GitHub does not have, or a name
+    /// that is not a plain branch name, is `false`.
+    pub async fn commit_on_branch(
+        &self,
+        installation: i64,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> Result<bool, Error> {
+        #[derive(Deserialize)]
+        struct Commit {
+            sha: String,
+        }
+        #[derive(Deserialize)]
+        struct Branch {
+            commit: Commit,
+        }
+        #[derive(Deserialize)]
+        struct Compare {
+            status: String,
+        }
+        let plain = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+        };
+        if !plain(branch) || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(false);
+        }
+        let path = format!("/repos/{repo}/branches/{branch}");
+        let tip = match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
+            Ok(response) => decode::<Branch>("branch", &response)?.commit.sha,
+            Err(Error::Status(s)) if s.status == 404 => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if tip.eq_ignore_ascii_case(sha) {
+            return Ok(true);
+        }
+        // Two commits, never names: a tag of the branch's name cannot stand in for it.
+        let path = format!("/repos/{repo}/compare/{sha}...{tip}");
+        match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
+            Ok(response) => Ok(matches!(
+                decode::<Compare>("comparison", &response)?.status.as_str(),
+                "ahead" | "identical"
+            )),
+            Err(Error::Status(s)) if s.status == 404 => Ok(false),
             Err(e) => Err(e),
         }
     }

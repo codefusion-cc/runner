@@ -15,6 +15,10 @@ pub const MAX_JOB_EVENTS: usize = 500;
 pub const MAX_RESULTS: usize = 50;
 /// The most Actions runners one status lists.
 pub const MAX_RUNNERS: usize = 64;
+/// The most job caches one status lists.
+pub const MAX_JOB_CACHES: usize = 64;
+/// The most job cache events one status carries.
+pub const MAX_JOB_CACHE_EVENTS: usize = 32;
 /// The most scale sets one status lists.
 pub const MAX_SCALE_SETS: usize = 500;
 /// The longest Mac name.
@@ -147,6 +151,12 @@ fn check(report: &Report, body: &[u8]) -> Result<(), Error> {
     }
     if report.status.runners.len() > MAX_RUNNERS {
         return refuse("more than 64 Actions runners in one status");
+    }
+    if report.status.job_caches.len() > MAX_JOB_CACHES {
+        return refuse("more than 64 job caches in one status");
+    }
+    if report.status.job_cache_events.len() > MAX_JOB_CACHE_EVENTS {
+        return refuse("more than 32 job cache events in one status");
     }
     if report.status.scale_sets.len() > MAX_SCALE_SETS {
         return refuse("more than 500 scale sets in one status");

@@ -247,3 +247,25 @@ pub fn last_words(tail: &[u8]) -> Vec<String> {
     lines.reverse();
     lines
 }
+
+/// What a Docker job's end asks its daemon before its cache may be kept: every container, and every volume.
+pub const LEFT_OVER: [&str; 2] = ["/containers/json?all=1", "/volumes"];
+
+/// Whether the daemon's answers to [`LEFT_OVER`], as raw HTTP responses in that order, say the job left nothing: no
+/// container and no volume. Anything else, an error or an answer this cannot read included, says something is left.
+pub fn left_nothing(containers: &str, volumes: &str) -> bool {
+    fn body(response: &str) -> Option<serde_json::Value> {
+        let (head, body) = response.split_once("\r\n\r\n")?;
+        let status = head.lines().next()?.split_whitespace().nth(1)?;
+        (status == "200").then(|| serde_json::from_str(body.trim()).ok())?
+    }
+    let none = |value: Option<&serde_json::Value>| match value {
+        Some(serde_json::Value::Array(items)) => items.is_empty(),
+        Some(serde_json::Value::Null) => true,
+        _ => false,
+    };
+    let containers = body(containers);
+    let volumes = body(volumes);
+    containers.is_some_and(|c| none(Some(&c)))
+        && volumes.is_some_and(|v| v.is_object() && none(v.get("Volumes")))
+}

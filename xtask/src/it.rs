@@ -174,6 +174,8 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         ("inside", inside),
         ("docker", docker),
         ("docker-oom", docker_oom),
+        ("docker-cache", docker_cache),
+        ("job-cache", job_cache),
         #[cfg(target_os = "macos")]
         ("launchd", launchd),
         #[cfg(target_os = "macos")]
@@ -337,9 +339,24 @@ fn mb(bytes: u64) -> String {
     format!("{} MB", bytes / MB)
 }
 
-fn request(bench: &Bench, job: &str, memory_mb: u64, deadline_s: u64, script: &str, docker: bool) -> Value {
+/// Whether a job gets a Docker daemon, and on which cache disk.
+#[derive(Clone, Copy)]
+enum Docker<'a> {
+    No,
+    Yes,
+    /// With this file as its cache disk, as the daemon would give a job its repository's cache.
+    Cached(&'a Path),
+    /// Without Docker, with this file as its cache disk.
+    CacheOnly(&'a Path),
+}
+
+fn request(bench: &Bench, job: &str, memory_mb: u64, deadline_s: u64, script: &str, docker: Docker) -> Value {
     json!({
-        "docker": docker,
+        "docker": matches!(docker, Docker::Yes | Docker::Cached(_)),
+        "cache": match docker {
+            Docker::Cached(path) | Docker::CacheOnly(path) => Some(path.display().to_string()),
+            _ => None,
+        },
         "job": job,
         "host": "the-test-host",
         "memory_bytes": memory_mb * MB,
@@ -383,7 +400,7 @@ fn start(
     script: &str,
     wrap: &[&str],
 ) -> Fallible<Running> {
-    start_job(bench, job, memory_mb, deadline_s, script, wrap, false)
+    start_job(bench, job, memory_mb, deadline_s, script, wrap, Docker::No)
 }
 
 /// [`start`] for a job that gets a Docker daemon when `docker` says so.
@@ -394,7 +411,7 @@ fn start_job(
     deadline_s: u64,
     script: &str,
     wrap: &[&str],
-    docker: bool,
+    docker: Docker,
 ) -> Fallible<Running> {
     forget(bench, job);
     let machines_before = machines();
@@ -1396,8 +1413,8 @@ T='{try_in_container}'
 docker run --rm alpine:3.22 sh -c "$T; {plain} wget -q -O /dev/null -T 20 https://github.com && echo c-github=open; awk 'NR==1{{print \"c-root=\" \$2}}' /proc/self/uid_map"
 docker run --rm --network host alpine:3.22 sh -c "$T; try $gw {open_port} h-gateway-open & try 10.1.2.3 80 h-private & wait"
 docker run --rm --privileged alpine:3.22 sh -c "$T; {privileged}
-  echo x > /proc/sys/kernel/core_pattern 2>/dev/null && echo p-core-pattern=written || echo p-core-pattern=refused
-  echo h > /proc/sysrq-trigger 2>/dev/null && echo p-sysrq=written || echo p-sysrq=refused
+  (echo x > /proc/sys/kernel/core_pattern) 2>/dev/null && echo p-core-pattern=written || echo p-core-pattern=refused
+  (echo h > /proc/sysrq-trigger) 2>/dev/null && echo p-sysrq=written || echo p-sysrq=refused
   head -c 1 /proc/kcore > /dev/null 2>&1 && echo p-kcore=read || echo p-kcore=refused
   (mknod /tmp/vda b 254 0 && head -c 1 /tmp/vda > /dev/null) 2>/dev/null && echo p-disk=read || echo p-disk=refused
   ip addr add 10.9.9.9/32 dev lo 2>/dev/null; echo p-own-network=\$?"
@@ -1406,7 +1423,7 @@ echo done"#,
         plain = probes("c-"),
         privileged = probes("p-"),
     );
-    let running = start_job(bench, "it-docker", 4096, 240, &script, &[], true);
+    let running = start_job(bench, "it-docker", 4096, 240, &script, &[], Docker::Yes);
     let first =
         running.and_then(|running| finish(bench, running, Duration::from_secs(300), &mut |_, _| Ok(())));
     let other = finish(bench, other, Duration::from_secs(300), &mut |_, _| Ok(()))?;
@@ -1515,7 +1532,7 @@ echo done"#,
 fn docker_oom(bench: &Bench) -> Fallible<Vec<String>> {
     let script = r#"/run/codefusion/job-started.sh
 docker run --rm alpine:3.22 sh -c 'tail /dev/zero'; echo after=$?"#;
-    let running = start_job(bench, "it-docker-oom", 2048, 240, script, &[], true)?;
+    let running = start_job(bench, "it-docker-oom", 2048, 240, script, &[], Docker::Yes)?;
     let finished = finish(bench, running, Duration::from_secs(300), &mut |_, _| Ok(()))?;
     ended(&finished, "oom")?;
     shows(&finished.console, &["out of memory: the kernel stopped"])?;
@@ -1526,6 +1543,222 @@ docker run --rm alpine:3.22 sh -c 'tail /dev/zero'; echo after=$?"#;
             "its step saw {code}"
         ))
     )])
+}
+
+/// A copy of a file that shares its blocks, as the daemon gives a job its repository's cache.
+fn clone_file(from: &Path, to: &Path) -> Fallible<()> {
+    let _ = fs::remove_file(to);
+    #[cfg(target_os = "macos")]
+    let status = Command::new("cp").arg("-c").arg(from).arg(to).status()?;
+    #[cfg(not(target_os = "macos"))]
+    let status = Command::new("cp")
+        .arg("--reflink=always")
+        .arg(from)
+        .arg(to)
+        .status()?;
+    expect(
+        status.success(),
+        "this host cannot share blocks between files: no job cache here",
+    )
+}
+
+/// What a job's guest said of its cache disk.
+fn cache_said(finished: &Finished) -> Value {
+    finished.state["end"]["summary"]["cache"].clone()
+}
+
+/// A `cf-docker` job on a cache disk: the first, on an empty file, fills it and leaves it clean (its end hook removes
+/// its containers and volumes, its daemon stops by itself, the disk is let go); the second, on a copy of it, finds
+/// the image and the build cached and nothing of the first job's containers; a disk of garbage is made anew.
+fn docker_cache(bench: &Bench) -> Fallible<Vec<String>> {
+    const BUILD: &str = r#"mkdir -p /tmp/b && cd /tmp/b && printf 'FROM alpine:3.22\nRUN echo layer > /layer && sleep 8\n' > Dockerfile
+s=$(date +%s); docker build -q -t cache-test . > /dev/null; echo build=$?; echo build-seconds=$(( $(date +%s) - s ))"#;
+    let first_disk = bench.work.join("cache-1.img");
+    let _ = fs::remove_file(&first_disk);
+    fs::File::create(&first_disk)?.set_len(20 << 30)?;
+    let script = format!(
+        r#"/run/codefusion/job-started.sh
+{BUILD}
+docker run -d --restart always --name left-behind -v left-volume:/v alpine:3.22 sleep 1000 > /dev/null; echo left=$?
+/run/codefusion/job-completed.sh"#
+    );
+    let first = job_with(bench, "it-docker-cache-1", &script, Docker::Cached(&first_disk))?;
+    ended(&first, "ok")?;
+    let said = cache_said(&first);
+    expect(
+        said == json!({"found": "fresh", "clean": true, "docker": true}),
+        format!("the first job's cache: {said}; {}", tail(&first.console)),
+    )?;
+    let first_build = printed(&first.console, "build-seconds")
+        .unwrap_or("?")
+        .to_string();
+
+    let second_disk = bench.work.join("cache-2.img");
+    clone_file(&first_disk, &second_disk)?;
+    let script = format!(
+        r#"/run/codefusion/job-started.sh
+echo image=$(docker image inspect -f ok alpine:3.22 2>/dev/null)
+echo containers=$(docker ps --all --quiet | wc -l)
+echo volumes=$(docker volume ls --quiet | wc -l)
+{BUILD}
+/run/codefusion/job-completed.sh"#
+    );
+    let second = job_with(bench, "it-docker-cache-2", &script, Docker::Cached(&second_disk))?;
+    ended(&second, "ok")?;
+    let value = |name: &str| {
+        printed(&second.console, name)
+            .unwrap_or("not printed")
+            .to_string()
+    };
+    let said = cache_said(&second);
+    expect(
+        said == json!({"found": "reused", "clean": true, "docker": true}),
+        format!("the second job's cache: {said}; {}", tail(&second.console)),
+    )?;
+    expect(
+        value("image") == "ok",
+        format!("the image was not in the cache: {}", tail(&second.console)),
+    )?;
+    expect(
+        value("containers") == "0" && value("volumes") == "0",
+        format!(
+            "the first job's containers or volumes came along: {} containers, {} volumes",
+            value("containers"),
+            value("volumes")
+        ),
+    )?;
+    let second_build: u64 = value("build-seconds").parse().unwrap_or(u64::MAX);
+    expect(
+        value("build") == "0" && second_build < 5,
+        format!("the build was not cached: {second_build} s against {first_build} s"),
+    )?;
+
+    let garbage = bench.work.join("cache-3.img");
+    fs::write(&garbage, vec![0x5a; 4 << 20])?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&garbage)?
+        .set_len(20 << 30)?;
+    let third = job_with(
+        bench,
+        "it-docker-cache-3",
+        "/run/codefusion/job-started.sh\ndocker run --rm alpine:3.22 true; echo ran=$?\n/run/codefusion/job-completed.sh",
+        Docker::Cached(&garbage),
+    )?;
+    ended(&third, "ok")?;
+    let said = cache_said(&third);
+    expect(
+        said["found"] == "replaced" && printed(&third.console, "ran") == Some("0"),
+        format!("a disk of garbage: {said}; {}", tail(&third.console)),
+    )?;
+    for name in ["it-docker-cache-1", "it-docker-cache-2", "it-docker-cache-3"] {
+        tidy(bench, name)?;
+    }
+    for disk in [first_disk, second_disk, garbage] {
+        let _ = fs::remove_file(disk);
+    }
+    Ok(vec![
+        format!("a first job filled an empty cache and left it clean; its build took {first_build} s"),
+        format!(
+            "the next, on a copy, had the image, none of the first job's containers or volumes, and built in {second_build} s"
+        ),
+        "a disk of garbage was made anew and the job ran on it".to_string(),
+    ])
+}
+
+/// A job without Docker on a cache disk: the first, on an empty file, finds npm and pnpm pointed at their folders
+/// there, which are its own, writes packages, a log and (through sudo) a file of root's, and cannot write the disk's
+/// top level; its end leaves the packages only, all the user's, and lets the disk go. The second, on a copy, finds
+/// the packages and not the log.
+fn job_cache(bench: &Bench) -> Fallible<Vec<String>> {
+    let first_disk = bench.work.join("job-cache-1.img");
+    let _ = fs::remove_file(&first_disk);
+    fs::File::create(&first_disk)?.set_len(20 << 30)?;
+    let script = r#"echo cache=$CF_JOB_CACHE npm=$npm_config_cache pnpm=$pnpm_config_store_dir
+echo owner=$(stat -c %U "$npm_config_cache")-$(stat -c %U "$pnpm_config_store_dir")
+mkdir -p "$npm_config_cache/_cacache/content" "$npm_config_cache/_logs" "$pnpm_config_store_dir/v10/files"
+echo package > "$npm_config_cache/_cacache/content/a"; echo log > "$npm_config_cache/_logs/debug.log"
+echo stored > "$pnpm_config_store_dir/v10/files/b"; echo wrote=$?
+sudo -n sh -c 'echo root > "$0/_cacache/content/root"' "$npm_config_cache"; echo sudo=$?
+touch "$CF_JOB_CACHE/stray" 2>/dev/null; echo stray=$?"#;
+    let first = job_with_disk(bench, "it-job-cache-1", script, Docker::CacheOnly(&first_disk))?;
+    ended(&first, "ok")?;
+    let said = cache_said(&first);
+    expect(
+        said == json!({"found": "fresh", "clean": true, "docker": null}),
+        format!("the first job's cache: {said}; {}", tail(&first.console)),
+    )?;
+    expect(
+        printed(&first.console, "cache") == Some("/mnt/cache npm=/mnt/cache/npm pnpm=/mnt/cache/pnpm-store"),
+        format!("what the job was told: {}", tail(&first.console)),
+    )?;
+    expect(
+        printed(&first.console, "owner") == Some("runner-runner")
+            && printed(&first.console, "wrote") == Some("0"),
+        format!(
+            "npm's and pnpm's folders are not the job's: {}",
+            tail(&first.console)
+        ),
+    )?;
+    expect(
+        printed(&first.console, "stray") != Some("0"),
+        "the job wrote the cache's top level".to_string(),
+    )?;
+
+    let second_disk = bench.work.join("job-cache-2.img");
+    clone_file(&first_disk, &second_disk)?;
+    let script = r#"echo package=$(cat "$npm_config_cache/_cacache/content/a" 2>/dev/null)
+echo stored=$(cat "$pnpm_config_store_dir/v10/files/b" 2>/dev/null)
+echo log=$(ls "$npm_config_cache/_logs" 2>/dev/null | wc -l)
+echo root-owner=$(stat -c %U "$npm_config_cache/_cacache/content/root" 2>/dev/null)"#;
+    let second = job_with_disk(bench, "it-job-cache-2", script, Docker::CacheOnly(&second_disk))?;
+    ended(&second, "ok")?;
+    let said = cache_said(&second);
+    expect(
+        said == json!({"found": "reused", "clean": true, "docker": null}),
+        format!("the second job's cache: {said}; {}", tail(&second.console)),
+    )?;
+    expect(
+        printed(&second.console, "package") == Some("package")
+            && printed(&second.console, "stored") == Some("stored")
+            && printed(&second.console, "log") == Some("0"),
+        format!(
+            "the packages were not kept, or the log was: {}",
+            tail(&second.console)
+        ),
+    )?;
+    // What the first job wrote as root through sudo is the user's again, when sudo worked there at all.
+    if printed(&first.console, "sudo") == Some("0") {
+        expect(
+            printed(&second.console, "root-owner") == Some("runner"),
+            format!(
+                "a file the job's root left is not the user's: {}",
+                tail(&second.console)
+            ),
+        )?;
+    }
+    for name in ["it-job-cache-1", "it-job-cache-2"] {
+        tidy(bench, name)?;
+    }
+    for disk in [first_disk, second_disk] {
+        let _ = fs::remove_file(disk);
+    }
+    Ok(vec![
+        "a job without Docker found npm and pnpm on its cache, its own, and the top level not".to_string(),
+        "the next, on a copy, had the packages and not the first job's log".to_string(),
+    ])
+}
+
+/// A job of 2 GB with this script on a disk, to its end.
+fn job_with_disk(bench: &Bench, name: &str, script: &str, docker: Docker) -> Fallible<Finished> {
+    let running = start_job(bench, name, 2048, 300, script, &[], docker)?;
+    finish(bench, running, Duration::from_secs(360), &mut |_, _| Ok(()))
+}
+
+/// A Docker job of 4 GB with this script, to its end.
+fn job_with(bench: &Bench, name: &str, script: &str, docker: Docker) -> Fallible<Finished> {
+    let running = start_job(bench, name, 4096, 300, script, &[], docker)?;
+    finish(bench, running, Duration::from_secs(360), &mut |_, _| Ok(()))
 }
 
 /// `a.b.c.d/n` as a network and its mask.
@@ -1652,7 +1885,7 @@ fn launchd(bench: &Bench) -> Fallible<Vec<String>> {
             512,
             120,
             "echo waiting; sleep 15; echo survived",
-            false,
+            Docker::No,
         )
         .to_string(),
     )?;

@@ -19,6 +19,7 @@ use cf_guest_proto::{StopReason, Workload};
 use cf_lifecycle::{BreakerLimits, Effect, End, Event, Limits, Phase, Slot, StartBreaker};
 use cf_vmhost::{JobRequest, JobState, OutOfMemory, Stage};
 
+use crate::caches::{self, CacheStore};
 use crate::docker_check::{self, DockerCheck};
 use crate::ends::{EndKind, machine_end};
 use crate::making::{Making, Offered, theirs};
@@ -58,6 +59,9 @@ pub struct MachineConfig {
     /// The most Docker jobs (`cf-docker`) at once: a daemon and its builds take the Mac's processors more than
     /// other jobs do.
     pub docker_max_jobs: usize,
+    /// Where jobs' caches are kept and how many bytes they may hold together; none, or a budget of 0, keeps no
+    /// cache.
+    pub cache: Option<(std::path::PathBuf, u64)>,
 }
 
 impl MachineConfig {
@@ -88,6 +92,7 @@ impl MachineConfig {
             boot: boot.to_string(),
             stand_in: None,
             docker_max_jobs: 1,
+            cache: None,
         }
     }
 }
@@ -215,6 +220,10 @@ pub struct Snapshot {
     pub waiting: usize,
     /// What one more machine of each size meets, in the order of [`Size::ALL`].
     pub rooms: [SizeRoom; 4],
+    /// Jobs' caches, and what last happened to them.
+    pub caches: Vec<caches::Cache>,
+    /// See `caches`.
+    pub cache_events: Vec<caches::CacheEvent>,
 }
 
 impl Snapshot {
@@ -344,6 +353,8 @@ struct Inner<H> {
     making: Making,
     /// The slots of Docker jobs; one given back leaves at the next count.
     docker: BTreeSet<SlotId>,
+    /// Jobs' caches, on a host that keeps them.
+    caches: Option<CacheStore>,
     /// What the last Docker check found; none before the first ended.
     docker_check: Option<DockerCheck>,
     /// When the last check's machine ended without an answer ([`DockerCheck::of_end`] said none), in seconds since
@@ -457,6 +468,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 offer: Offer::default(),
                 making: Making::default(),
                 docker: BTreeSet::new(),
+                caches: config
+                    .cache
+                    .as_ref()
+                    .and_then(|(dir, budget)| CacheStore::open(dir, *budget)),
                 // A failure the Runner before found holds until a check passes: nothing Docker comes meanwhile. A
                 // pass is not kept, so Docker is unknown until this start's own check ends.
                 docker_check: store.docker_failure(),
@@ -502,6 +517,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         let now = inner.host.now();
         let records = self.store.load();
         let known: BTreeSet<String> = records.iter().map(|r| r.job.clone()).collect();
+        if let Some(caches) = inner.caches.as_mut() {
+            caches.sweep(records.iter().filter_map(|record| record.cache_copy.as_ref()));
+        }
         for job in self.vms.jobs() {
             if !known.contains(&job) {
                 tracing::warn!(%job, "a machine without a record was found; it is ended and removed");
@@ -1123,6 +1141,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             wall_ms: summary.map(|s| s.wall_ms),
             message: vm_end.and_then(|e| e.message.clone()),
         });
+        if let Some(copy) = &mut job.record.cache_copy {
+            copy.end = summary.and_then(|s| s.cache);
+        }
         job.record.slot = Some(job.life.saved().into());
         job.ended_at = Some(now.elapsed);
         if job.record.probe {
@@ -1192,6 +1213,18 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             if !local && job.record.unheard() && !deaf {
                 return false;
             }
+            // A copy that may become the cache waits, as long, for the sweep to read its run: a short job ends
+            // before the sweep after its start.
+            let unread = job.record.cache_copy.as_ref().is_some_and(|copy| {
+                copy.run.is_none()
+                    && job.record.github.as_ref().is_some_and(|github| {
+                        github.run_id > 0
+                            && caches::worth_reading(&job.record.repo, copy.default_branch.as_deref(), github)
+                    })
+            });
+            if unread && !deaf && duration(waited) < RESULT_WAIT {
+                return false;
+            }
             if test_run && !job.record.start_reported {
                 // Its machine never came up: the console still hears of the run that it ended, and a completion
                 // needs a start.
@@ -1227,9 +1260,22 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 });
             }
             job.record.end_reported = true;
+            // The job's copy of its repository's cache: kept or thrown away now, once GitHub's word is in or late.
+            let copy = job.record.cache_copy.take();
             // A record with nothing left to do is removed below, not written first.
             if !job.record.finished() {
                 self.store.save(&job.record);
+            }
+            if let (Some(copy), Some(caches)) = (copy, inner.caches.as_mut()) {
+                let record = &job.record;
+                let why_not = caches::refusal(
+                    &record.repo,
+                    copy.default_branch.as_deref(),
+                    record.github.as_ref(),
+                    copy.run.as_ref(),
+                    copy.end,
+                );
+                caches.settle(&record.repo, &copy, why_not, self.wall());
             }
             opened = true;
         }
@@ -1238,6 +1284,44 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             inner.jobs.remove(name);
         }
         opened
+    }
+
+    /// The workflow runs to read for jobs' copies, as `(job, repository, run, default branch)`: a copy is kept only when GitHub
+    /// says its run checked out the default branch ([`caches::refusal`]). Only a job GitHub has not refused already
+    /// ([`caches::worth_reading`]): a pull request's run is never read. The sweep reads them while the jobs run and
+    /// gives each answer to [`Machines::run_read`].
+    pub fn runs_to_read(&self) -> Vec<(String, String, i64, String)> {
+        let inner = self.lock();
+        inner
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.record
+                    .cache_copy
+                    .as_ref()
+                    .is_some_and(|copy| copy.run.is_none())
+            })
+            .filter_map(|(name, job)| {
+                let github = job.record.github.as_ref().filter(|github| github.run_id > 0)?;
+                let branch = job.record.cache_copy.as_ref()?.default_branch.as_deref();
+                caches::worth_reading(&job.record.repo, branch, github).then(|| {
+                    let branch = branch.unwrap_or_default().to_string();
+                    (name.clone(), job.record.repo.clone(), github.run_id, branch)
+                })
+            })
+            .collect()
+    }
+
+    /// What GitHub said of a job's run, kept with its copy.
+    pub fn run_read(&self, name: &str, run: caches::WorkflowRun) {
+        let mut inner = self.lock();
+        let Some(job) = inner.jobs.get_mut(name) else {
+            return;
+        };
+        if let Some(copy) = job.record.cache_copy.as_mut().filter(|copy| copy.run.is_none()) {
+            copy.run = Some(run);
+            self.store.save(&job.record);
+        }
     }
 
     /// The registrations at GitHub that have to go: of Actions runners asking for their removal, of machines that
@@ -1414,6 +1498,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             repo: repo.to_string(),
             size: Some(size.label().to_string()),
             docker: request.docker,
+            cache_copy: None,
             memory_bytes: grant.vm_bytes,
             limit_bytes: grant.job_limit_bytes,
             cpus: grant.cpus,
@@ -1496,6 +1581,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             env: own.env,
             deadline_s: own.deadline.as_secs(),
             docker: own.docker,
+            // The Runner's own machines (a test run, the Docker check) never touch a repository's cache.
+            cache: None,
         };
         let mut record = Record {
             unregistered: true,
@@ -1709,6 +1796,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             waiting: inner.waiting.len(),
             rooms,
             budget,
+            caches: inner
+                .caches
+                .iter()
+                .flat_map(|caches| caches.list().iter().map(|(_, cache)| cache.clone()))
+                .collect(),
+            cache_events: inner
+                .caches
+                .iter()
+                .flat_map(|caches| caches.events().cloned())
+                .collect(),
         }
     }
 
@@ -2018,6 +2115,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             repo: repo.to_string(),
             size: None,
             docker: false,
+            cache_copy: None,
             memory_bytes: 0,
             limit_bytes: 0,
             cpus: 0,
@@ -2129,6 +2227,17 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             env: Vec::new(),
             deadline_s: self.config.deadline.as_secs(),
             docker: inner.docker.contains(&spec.ticket),
+            cache: None,
+        };
+        let wall = self.wall();
+        let copy = inner
+            .caches
+            .as_mut()
+            .zip(spec.cache.as_ref())
+            .and_then(|(caches, terms)| caches.prepare(&name, &spec.repo, terms, wall));
+        let request = JobRequest {
+            cache: copy.as_ref().map(|copy| copy.path.clone()),
+            ..request
         };
         let record = self.record(
             &spec.name,
@@ -2140,11 +2249,15 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
         );
         let record = Record {
             runner_id: Some(spec.runner_id),
+            cache_copy: copy,
             ..record
         };
         if let Err(error) = self.launch(&mut inner, now, spec.ticket, record.clone(), &request) {
             // Back to a registration without a machine, which the caller removes; the slot stays the caller's.
             let mut intent = record;
+            if let (Some(copy), Some(caches)) = (intent.cache_copy.take(), inner.caches.as_mut()) {
+                caches.discard(&copy);
+            }
             intent.slot = None;
             intent.end_reported = true;
             self.store.save(&intent);

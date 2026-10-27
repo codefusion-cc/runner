@@ -18,6 +18,8 @@ use time::OffsetDateTime;
 
 pub const SIZE: Size = Size::G2;
 pub const REPO: &str = "org/app";
+/// GitHub's number for it.
+pub const REPO_ID: u64 = 4242;
 pub const SET: i64 = 7;
 
 /// The Mac mini of 2026-10-13: 16 GB and 8 cores, given to CI. A cap of 12 GiB, a floor of 2 GiB, 6 vCPUs: a cf-2g
@@ -66,6 +68,14 @@ impl World {
         World::on(settings_for(machines))
     }
 
+    /// A Mac with room for `machines` machines that keeps jobs' caches in `dir`, `budget` bytes of them.
+    pub fn with_cache(machines: u32, dir: &std::path::Path, budget: u64) -> World {
+        let mut world = World::new(machines);
+        world.parts.cache = Some((dir.to_path_buf(), budget));
+        world.m = world.parts.machines(None);
+        world
+    }
+
     /// A Mac with these numbers.
     pub fn on(settings: cf_budget::Settings) -> World {
         World::keeping(settings, Arc::new(MemoryStore::default()))
@@ -82,6 +92,7 @@ impl World {
             settings,
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
+            cache: None,
             bell: Arc::default(),
         };
         let m = parts.machines(None);
@@ -159,6 +170,10 @@ impl World {
                 scale_set_id: SET,
                 runner_id: i64::from(self.next),
                 size,
+                cache: Some(cf_daemon::caches::CacheRepo {
+                    id: REPO_ID,
+                    default_branch: "main".into(),
+                }),
                 ticket,
                 jit_config: Secret::new("jit".to_string()),
             })
@@ -173,14 +188,19 @@ impl World {
 
     /// GitHub says a job started on the Actions runner, or completed with this result.
     pub fn github(&self, kind: EventKind, runner: &str, result: &str) {
+        self.github_run(kind, runner, result, "push", "ci.yml");
+    }
+
+    /// [`World::github`] for a run of this event, of a workflow at this ref (`owner/name/…/ci.yml@refs/heads/main`).
+    pub fn github_run(&self, kind: EventKind, runner: &str, result: &str, event: &str, workflow: &str) {
         self.m.job(&JobEvent {
             kind,
             runner: runner.into(),
             repo: REPO.into(),
             job: "build".into(),
-            workflow: "ci.yml".into(),
+            workflow: workflow.into(),
             run_id: 42,
-            event: "push".into(),
+            event: event.into(),
             queued_at: Some(OffsetDateTime::UNIX_EPOCH),
             started_at: Some(OffsetDateTime::UNIX_EPOCH),
             at: OffsetDateTime::UNIX_EPOCH,

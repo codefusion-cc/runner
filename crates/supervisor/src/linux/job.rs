@@ -1,13 +1,15 @@
 //! One job: its disks, its limits, its container, and the watch over it until it ends.
 
 use super::container::{STATUS_FD, Spec};
-use super::docker;
 use super::init::{Event, Failure, Host, spawn_self};
 use super::net::Network;
 use super::sys::{self, context, say};
+use super::{cache as disk_cache, docker};
 use cf_guest_proto::{
-    GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason, Summary, Usage, Workload,
+    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason,
+    Summary, Usage, Workload,
 };
+use cf_supervisor::cache::{self as plan, MOUNT};
 use cf_supervisor::disks::overlay_options;
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::oom::{self, Kill};
@@ -47,21 +49,23 @@ pub fn empty_summary(exit_code: Option<i32>) -> Summary {
         disk_peak_bytes: 0,
         oom: None,
         wall_ms: sys::uptime_ms(),
+        cache: None,
     }
 }
 
 /// The device of the disk the host attached under this name.
-fn disk(id: &str) -> Result<String, String> {
-    for _ in 0..500 {
-        for entry in fs::read_dir("/sys/block").into_iter().flatten().flatten() {
-            let serial = fs::read_to_string(entry.path().join("serial")).unwrap_or_default();
-            if serial.trim() == id {
-                return Ok(format!("/dev/{}", entry.file_name().to_string_lossy()));
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Err(format!("the machine has no disk {id}"))
+pub(super) fn disk(id: &str) -> Result<String, String> {
+    sys::until(Duration::from_secs(5), Duration::from_millis(10), || {
+        fs::read_dir("/sys/block")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|entry| {
+                fs::read_to_string(entry.path().join("serial")).is_ok_and(|serial| serial.trim() == id)
+            })
+            .map(|entry| format!("/dev/{}", entry.file_name().to_string_lossy()))
+    })
+    .ok_or_else(|| format!("the machine has no disk {id}"))
 }
 
 fn mount_image() -> Result<(), String> {
@@ -79,22 +83,40 @@ fn mount_image() -> Result<(), String> {
 pub fn format_scratch() -> Result<Summary, String> {
     mount_image()?;
     let device = disk(cf_guest_proto::SCRATCH_DISK)?;
-    sys::mount_at("devtmpfs", &format!("{IMAGE}/dev"), "devtmpfs", 0, "")?;
-    let mut command = Command::new("/usr/sbin/mke2fs");
+    let status = image_tool(&mke2fs_args(&device, false, false))?;
+    if !status.success() {
+        return Err(format!("the image's mke2fs ended with {status}"));
+    }
+    Ok(empty_summary(status.code()))
+}
+
+/// `mke2fs`'s arguments for an ext4 file system on `device`, owned by root, with no blocks kept for root. A disk
+/// that outlives its machine (a Docker cache) keeps a journal, so a machine stopped mid-write leaves it whole; a
+/// scratch disk, gone with its machine, needs none. On a disk that reads as zeros (`prezeroed`, a sparse file the
+/// host just made) nothing is zeroed, by mke2fs or later by the kernel, so the host's file stays as small as what
+/// the job writes.
+pub(super) fn mke2fs_args(device: &str, journal: bool, prezeroed: bool) -> Vec<String> {
+    let mut args = vec!["mke2fs", "-q", "-F", "-t", "ext4"];
+    if !journal {
+        args.extend(["-O", "^has_journal"]);
+    }
+    let extended = if prezeroed {
+        "assume_storage_prezeroed=1,nodiscard,root_owner=0:0"
+    } else {
+        "lazy_itable_init=1,nodiscard,root_owner=0:0"
+    };
+    args.extend(["-m", "0", "-E", extended, device]);
+    args.iter().map(|arg| arg.to_string()).collect()
+}
+
+/// Runs a program of the image's own (`mke2fs`, `e2fsck`), from inside the mounted image with its `/dev`, as the
+/// machine's root. The image is read-only and the job has not run yet, so the program is the image's as released.
+pub(super) fn image_tool(argv: &[String]) -> Result<std::process::ExitStatus, String> {
+    let devices = format!("{IMAGE}/dev");
+    let mounted = sys::mount("devtmpfs", &devices, "devtmpfs", 0, "").is_ok();
+    let mut command = Command::new(&argv[0]);
     command
-        .args([
-            "-q",
-            "-F",
-            "-t",
-            "ext4",
-            "-O",
-            "^has_journal",
-            "-m",
-            "0",
-            "-E",
-            "lazy_itable_init=1,nodiscard,root_owner=0:0",
-        ])
-        .arg(&device)
+        .args(&argv[1..])
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .stdin(Stdio::null());
@@ -108,11 +130,11 @@ pub fn format_scratch() -> Result<Summary, String> {
             Ok(())
         });
     }
-    let status = context("the image's mke2fs", command.status())?;
-    if !status.success() {
-        return Err(format!("the image's mke2fs ended with {status}"));
+    let status = context(&format!("the image's {}", argv[0]), command.status());
+    if mounted {
+        let _ = sys::umount(&devices, libc::MNT_DETACH);
     }
-    Ok(empty_summary(status.code()))
+    status
 }
 
 fn usage() -> Usage {
@@ -188,6 +210,17 @@ fn write_root(path: &str, text: &str) -> Result<(), String> {
 /// Stops every process of the job at once, whatever it ignores: the kernel kills the whole control group.
 fn kill_job() {
     let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
+}
+
+/// After [`kill_job`]: waits up to `longest` for the job's control group to hold no process, so nothing of the job
+/// changes the cache while the guest's root tidies it. Says whether it emptied.
+fn job_gone(longest: Duration) -> bool {
+    sys::until(longest, Duration::from_millis(20), || {
+        fs::read_to_string(format!("{CGROUP}/cgroup.events"))
+            .is_ok_and(|events| events.lines().any(|line| line == "populated 0"))
+            .then_some(())
+    })
+    .is_some()
 }
 
 fn share(name: &str, text: &str, mode: u32) -> Result<(), String> {
@@ -269,11 +302,32 @@ pub fn run(
     limits(&job).map_err(|error| ("limits", error))?;
     settings();
 
+    let passwd = fs::read_to_string(format!("{ROOT}/etc/passwd")).unwrap_or_default();
+    let (uid, gid, home) =
+        find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
+    // The job's cache, as found; a disk that cannot be had leaves npm, pnpm and Docker on the job's own disk.
+    let cache: Option<CacheFound> = job
+        .cache
+        .then(|| {
+            let found = disk_cache::mount()
+                .inspect_err(|error| say(&format!("no cache for this job: {error}")))
+                .ok()?;
+            match disk_cache::ready(uid, gid) {
+                Ok(()) => Some(found),
+                Err(error) => {
+                    say(&format!("no cache for this job: {error}"));
+                    let _ = sys::umount(MOUNT, libc::MNT_DETACH);
+                    None
+                }
+            }
+        })
+        .flatten();
     let facts = JobFacts {
         host: job.host.clone(),
         limits: job.limits,
         disk_bytes,
         docker: job.docker,
+        cache: cache.is_some(),
     };
     share(
         "job.json",
@@ -290,27 +344,38 @@ pub fn run(
         .map_err(container)?;
     }
 
-    let passwd = fs::read_to_string(format!("{ROOT}/etc/passwd")).unwrap_or_default();
-    let (uid, gid, home) =
-        find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
     let group = fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default();
     let groups = groups_of(&group, USER, gid);
+    // The folder of a Docker job's daemon's socket, once the daemon is started.
+    let mut sockets: Option<String> = None;
     if job.docker {
         // Started before the Actions runner, so the daemon is up by the first step. A job whose daemon cannot be
         // made runs on and is told why when it starts.
         let started = docker::prepare(
             ROOT,
-            SCRATCH,
+            (
+                SCRATCH,
+                &match cache {
+                    Some(_) => format!("{MOUNT}/{}", plan::DOCKER),
+                    None => format!("{SCRATCH}/docker"),
+                },
+            ),
             CGROUP,
             (uid, gid, &group),
             &name,
             job.limits.shm_bytes,
             &network.beside,
         )
-        .and_then(|spec| docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM)));
-        if let Err(error) = started {
-            say(&format!("no Docker for this job: {error}"));
-            share(cf_supervisor::docker::PROBLEM, &error, 0o644).map_err(container)?;
+        .and_then(|spec| {
+            docker::start(&spec, &format!("{SHARED}/{}", cf_supervisor::docker::PROBLEM))?;
+            Ok(spec.sockets)
+        });
+        match started {
+            Ok(folder) => sockets = Some(folder),
+            Err(error) => {
+                say(&format!("no Docker for this job: {error}"));
+                share(cf_supervisor::docker::PROBLEM, &error, 0o644).map_err(container)?;
+            }
         }
     }
     let argv = match &job.workload {
@@ -326,12 +391,19 @@ pub fn run(
         shared: SHARED.into(),
         cgroup: format!("{CGROUP}/run"),
         argv,
+        // The cache's entries first, so the job's own win.
         env: workload_environment(
             &home,
             USER,
-            &job.env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.expose().clone()))
+            &cache
+                .map(|_| plan::environment(MOUNT))
+                .unwrap_or_default()
+                .into_iter()
+                .chain(
+                    job.env
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.expose().clone())),
+                )
                 .collect::<Vec<_>>(),
         ),
         uid,
@@ -339,6 +411,7 @@ pub fn run(
         groups,
         home,
         shm_bytes: job.limits.shm_bytes,
+        cache: cache.map(|_| MOUNT.to_string()),
     };
 
     let kernel_log = fs::OpenOptions::new()
@@ -383,7 +456,28 @@ pub fn run(
     // not looked for yet.
     watch.last_look();
     let summary_usage = usage();
+    // A Docker job's cache is kept only when its daemon wrote down its state and stopped by itself, before the rest
+    // goes. One the host stopped is never kept and its end must reach the host within the stop's slack, so nothing
+    // waits for it. A daemon that never started (the image lacks a tool) says nothing of the cache: a cache is
+    // dropped only when a daemon that ran on it stopped answering.
+    let daemon = sockets.as_deref().filter(|_| cache.is_some()).map(|sockets| {
+        let answers = docker::daemon_answers(sockets);
+        // What the end hook's tidying left: a container that starts again, or a volume, is no cache's.
+        let tidy = answers && docker::left_nothing(sockets);
+        let stopped = answers && watch.stop.is_none() && docker::stop_daemon(&format!("{CGROUP}/docker"));
+        (answers, tidy && stopped)
+    });
     kill_job();
+    let cache = cache.map(|found| CacheEnd {
+        found,
+        docker: daemon.map(|(answers, _)| answers),
+        // A job the host stopped is never kept: its disk is not tidied or waited for. Nor is one whose processes
+        // outlived the kill.
+        clean: watch.stop.is_none()
+            && daemon.is_none_or(|(_, stopped)| stopped)
+            && job_gone(Duration::from_secs(5))
+            && disk_cache::let_go(uid, gid),
+    });
 
     let mut report = String::new();
     let _ = File::from(status).take(REPORT_BYTES).read_to_string(&mut report);
@@ -398,6 +492,7 @@ pub fn run(
         usage: summary_usage,
         oom: watch.oom,
         wall_ms: watch.started.elapsed().as_millis() as u64,
+        cache,
     })
 }
 

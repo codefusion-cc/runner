@@ -12,9 +12,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, DockerStatus, HeldJobs, HostStatus, JobKind, JobLimits,
-    MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
-    RunnerUsage, ScaleSetStatus, SizeStatus, Status, Update,
+    Activity, Answer, Client, Command, CommandResult, DockerStatus, HeldJobs, HostStatus, JobCache,
+    JobCacheEvent, JobKind, JobLimits, MAX_JOB_CACHE_EVENTS, MAX_JOB_CACHES, MAX_RUNNERS, MAX_SCALE_SETS,
+    MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
+    Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -25,6 +26,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
+use crate::caches::{CacheRepo, CacheTerms};
 use crate::held::{self, HeldSet, OwnRunners, SetView};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
@@ -181,6 +183,8 @@ pub struct SetState {
     pub size: Size,
     /// Whether its jobs get a Docker daemon (`cf-docker`).
     pub docker: bool,
+    /// What its jobs need to get the repository's cache now; none when they get none ([`CacheRepo::of`]).
+    pub cache: CacheTerms,
     /// Why its listener is not listening, when it is not.
     pub error: Option<String>,
     /// Since when, in seconds since 1970.
@@ -248,6 +252,7 @@ struct Wanted {
     labels: Vec<String>,
     size: Size,
     docker: bool,
+    cache: Option<CacheRepo>,
 }
 
 struct Serving {
@@ -795,7 +800,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
         for (name, want) in wanted {
             let mut serving = shared.serving.lock().expect("serving");
-            if serving.contains_key(&name) {
+            if let Some(set) = serving.get(&name) {
+                // What reads a run's commit checks against: a renamed default branch counts at once.
+                set.state.lock().expect("set").cache.set(want.cache.clone());
                 continue;
             }
             let state = Arc::new(Mutex::new(SetState {
@@ -805,6 +812,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 labels: want.labels.clone(),
                 size: want.size,
                 docker: want.docker,
+                cache: CacheTerms::new(want.cache.clone()),
                 error: None,
                 error_at: None,
                 statistics: None,
@@ -891,6 +899,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     labels: q.set.labels().to_vec(),
                     size: q.size,
                     docker: q.set.docker(),
+                    cache: read
+                        .repos
+                        .iter()
+                        .find(|(repo, _)| repo.full_name == q.repo)
+                        .and_then(|(repo, _)| CacheRepo::of(repo)),
                 };
                 Some((name.clone(), want))
             })
@@ -1161,6 +1174,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             labels: set.labels().to_vec(),
                             size,
                             docker: set.docker(),
+                            cache: CacheRepo::of(&repo),
                         },
                     );
                 }
@@ -1377,11 +1391,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return None;
         };
         let registry = SetRegistry::own(client, state.labels.clone());
+        let cache = state.cache.get();
         let at = Start {
             machine: &shared.config.machine,
             repo: &state.repo,
             scale_set_id: held::OWN,
             size: state.size,
+            cache: cache.as_ref(),
         };
         match start_runner(&registry, machines, &shared.roster, &*shared.clock, at, ticket).await {
             Ok(runner) => {
@@ -1546,6 +1562,56 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
+        self.read_runs().await;
+    }
+
+    /// Reads the workflow runs of jobs with a cache copy ([`Machines::runs_to_read`]), and whether each run's commit
+    /// is on the repository's default branch as GitHub names it now: a branch renamed since the job started is no
+    /// longer the one whose code may be kept. A run that cannot be read is asked again at the next sweep; one never
+    /// read keeps its job's copy from becoming the cache.
+    async fn read_runs(&self) {
+        let shared = &self.shared;
+        for (job, repo, run_id, branch) in shared.machines.runs_to_read() {
+            let Some(client) = self.client_for(&repo).await else {
+                continue;
+            };
+            let mut run = match client.workflow_run(run_id).await {
+                Ok(Some(run)) => run,
+                Ok(None) => {
+                    tracing::debug!(%job, %repo, run_id, "GitHub has no such run yet");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::debug!(%job, %repo, run_id, %error, "a run was not read; asked again");
+                    continue;
+                }
+            };
+            let now = self.default_branch_now(&repo);
+            run.on_default_branch = match (run.head_sha.as_deref(), now) {
+                (Some(sha), Some(now)) if now == branch => {
+                    match client.commit_on_branch(&branch, sha).await {
+                        Ok(on) => on,
+                        Err(error) => {
+                            tracing::debug!(%job, %repo, run_id, %error, "a run's commit was not checked; asked again");
+                            continue;
+                        }
+                    }
+                }
+                _ => false,
+            };
+            shared.machines.run_read(&job, run);
+        }
+    }
+
+    /// A repository's default branch as the newest look at GitHub named it, while its jobs get a cache.
+    fn default_branch_now(&self, repo: &str) -> Option<String> {
+        let serving = self.shared.serving.lock().expect("serving");
+        serving.values().find_map(|set| {
+            let state = set.state.lock().expect("set");
+            (state.repo == repo)
+                .then(|| state.cache.get().map(|cache| cache.default_branch))
+                .flatten()
+        })
     }
 
     /// Leaves a registration to a later sweep.
@@ -1751,6 +1817,28 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             })
                             .map(|error| cut(error, STATUS_TEXT_MAX)),
                         error_at: set.error_at.map(iso),
+                    })
+                    .collect(),
+                job_caches: snapshot
+                    .caches
+                    .iter()
+                    .take(MAX_JOB_CACHES)
+                    .map(|cache| JobCache {
+                        repo: cut(cache.repo.clone(), STATUS_TEXT_MAX),
+                        bytes: cache.bytes,
+                        written_at: iso(cache.written_at),
+                        used_at: iso(cache.used_at),
+                    })
+                    .collect(),
+                job_cache_events: snapshot
+                    .cache_events
+                    .iter()
+                    .take(MAX_JOB_CACHE_EVENTS)
+                    .map(|event| JobCacheEvent {
+                        at: iso(event.at),
+                        repo: cut(event.repo.clone(), STATUS_TEXT_MAX),
+                        kind: event.kind.name().to_string(),
+                        why: event.why.clone().map(|why| cut(why, STATUS_TEXT_MAX)),
                     })
                     .collect(),
                 runners: snapshot
@@ -2526,13 +2614,14 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
     stop: Shutdown,
 ) {
     let bell = shared.nudge.subscribe();
-    let (name, labels, size, docker, repo) = {
+    let (name, labels, size, docker, cache, repo) = {
         let state = state.lock().expect("set");
         (
             state.name.clone(),
             state.labels.clone(),
             state.size,
             state.docker,
+            state.cache.clone(),
             state.repo.clone(),
         )
     };
@@ -2544,6 +2633,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
         || {
             let (shared, client, state, bell) = (shared.clone(), client.clone(), state.clone(), bell.clone());
             let (name, labels, repo, stop) = (name.clone(), labels.clone(), repo.clone(), session_stop.clone());
+            let cache = cache.clone();
             async move {
                 let set = client.ensure_scale_set(&name, &labels).await?;
                 state.lock().expect("set").id = set.id;
@@ -2567,6 +2657,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         machine: shared.config.machine.clone(),
                         size,
                         docker,
+                        cache,
                     },
                     session.clone(),
                     registry,

@@ -17,7 +17,7 @@ mod source;
 
 pub use client::{
     API, DEFAULT_RUNNER_GROUP, GitHubApp, Installation, JOBS_PAGE, MAX_RUN_SETS, PlainJit, Repo,
-    WAITING_RUNS, Waiting, WaitingJob,
+    WAITING_RUNS, Waiting, WaitingJob, WorkflowRun,
 };
 pub use credentials::{AppCredentials, AppKey, KeyError};
 pub use error::{Error, StatusError};

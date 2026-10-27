@@ -128,6 +128,8 @@ pub fn status(machine: &str) -> Status {
             error_at: None,
         }],
         runners: vec![],
+        job_caches: vec![],
+        job_cache_events: vec![],
     }
 }
 

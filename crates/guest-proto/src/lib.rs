@@ -22,8 +22,9 @@ pub use frame::{
     write_message,
 };
 pub use message::{
-    GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS, NAME_CHARS, OomEvent,
-    Process, STAGE_CHARS, Start, Stop, StopReason, Summary, Task, Usage, Workload, clip, secret_env,
+    CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS,
+    NAME_CHARS, OomEvent, Process, STAGE_CHARS, Start, Stop, StopReason, Summary, Task, Usage, Workload,
+    clip, secret_env,
 };
 
 /// The protocol's version. A supervisor that hears another one refuses to start a task.
@@ -37,3 +38,6 @@ pub const IMAGE_DISK: &str = "cf-image";
 
 /// The serial of the job's own disk.
 pub const SCRATCH_DISK: &str = "cf-scratch";
+
+/// The serial of a job's cache disk: a copy of its repository's cache that the job may write.
+pub const CACHE_DISK: &str = "cf-job-cache";

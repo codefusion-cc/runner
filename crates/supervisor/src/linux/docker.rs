@@ -23,6 +23,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// The modules only a Docker job loads (`cargo xtask guest` lists them), and where they wait until then.
 pub const MODULE_LIST: &str = "/etc/modules-docker";
@@ -58,12 +59,14 @@ fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
 }
 
 /// The modules, the sandbox's control group and folders, and the socket's folder in the job's root. `root` is the
-/// job's root, `scratch` the job's disk, `cgroup` the job's control group; `passwd` and `group` are the image's;
+/// job's root, `scratch` the job's disk and `data` where the daemon keeps its data (on the job's disk, or on its cache
+/// disk, [`super::cache::mount`]), `cgroup` the job's control group; the job user's ids come with the image's
+/// `/etc/group`.
 /// `beside` is what is next to the machine, which the daemon's networks stay clear of ([`plan::networks`]).
 /// An error says what the job is missing; the job runs without Docker and is told why.
 pub fn prepare(
     root: &str,
-    scratch: &str,
+    (scratch, data): (&str, &str),
     cgroup: &str,
     (uid, gid, group): (u32, u32, &str),
     host_name: &str,
@@ -95,8 +98,7 @@ pub fn prepare(
         }
     }
 
-    let data = format!("{scratch}/docker");
-    let sockets = format!("{scratch}/sockets");
+    let (data, sockets) = (data.to_string(), format!("{scratch}/sockets"));
     for (folder, owner_group, mode) in [(&data, SHIFT, 0o700), (&sockets, docker_gid, 0o750)] {
         context(folder, fs::create_dir_all(folder))?;
         chown(folder, SHIFT, owner_group)?;
@@ -469,4 +471,51 @@ fn daemon_process(ready: OwnedFd, go: OwnedFd, networks: &plan::Networks) -> Res
     let command = plan::dockerd_command(networks);
     let error = sandbox_command(&command).exec();
     Err(format!("{}: {error}", command[0]))
+}
+
+/// How long the daemon gets to stop by itself at the job's end: its containers are gone by then (the job's end
+/// hook removed them), so it only writes down its state.
+const DAEMON_STOP: Duration = Duration::from_secs(15);
+
+/// Whether a Docker job's daemon still answers on its socket, in the folder `sockets`.
+pub fn daemon_answers(sockets: &str) -> bool {
+    std::os::unix::net::UnixStream::connect(format!("{sockets}/{}", plan::SOCKET_NAME)).is_ok()
+}
+
+/// Whether a Docker job's daemon, in the folder `sockets`, says the job left no container or volume
+/// ([`plan::left_nothing`]): the end hook's tidying, done or not, is what the next job on the cache would find.
+pub fn left_nothing(sockets: &str) -> bool {
+    let ask = |path: &str| -> Option<String> {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(format!("{sockets}/{}", plan::SOCKET_NAME)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        write!(stream, "GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n").ok()?;
+        let mut answer = String::new();
+        stream.take(1 << 20).read_to_string(&mut answer).ok()?;
+        Some(answer)
+    };
+    let [containers, volumes] = plan::LEFT_OVER.map(ask);
+    plan::left_nothing(&containers.unwrap_or_default(), &volumes.unwrap_or_default())
+}
+
+/// At a Docker job's end, before the job's processes are stopped: asks the daemon to stop and waits for it. Says
+/// whether it stopped by itself. `sandbox` is the sandbox's control group.
+pub fn stop_daemon(sandbox: &str) -> bool {
+    let daemons = || -> Vec<u32> {
+        fs::read_to_string(format!("{sandbox}/daemon/cgroup.procs"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|pid| pid.trim().parse().ok())
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "dockerd")
+            })
+            .collect()
+    };
+    for pid in daemons() {
+        sys::kill(pid, libc::SIGTERM);
+    }
+    sys::until(DAEMON_STOP, Duration::from_millis(100), || {
+        daemons().is_empty().then_some(())
+    })
+    .is_some()
 }

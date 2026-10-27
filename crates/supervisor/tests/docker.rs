@@ -325,3 +325,29 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_docker_jobs_cache_is_tidy_only_when_its_daemon_says_no_container_or_volume_is_left() {
+    use cf_supervisor::docker::left_nothing;
+    let ok = |body: &str| format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}\n");
+    let none = (ok("[]"), ok(r#"{"Volumes":[],"Warnings":null}"#));
+    assert!(left_nothing(&none.0, &none.1));
+    assert!(left_nothing(&none.0, &ok(r#"{"Volumes":null,"Warnings":null}"#)));
+    // What the end hook could not remove: a container that would start again, a volume.
+    assert!(!left_nothing(&ok(r#"[{"Id":"abc","State":"exited"}]"#), &none.1));
+    assert!(!left_nothing(
+        &none.0,
+        &ok(r#"{"Volumes":[{"Name":"data"}],"Warnings":null}"#)
+    ));
+    // A daemon that did not answer, answered an error or something this cannot read says nothing is tidy.
+    for broken in [
+        String::new(),
+        "HTTP/1.0 500 Internal Server Error\r\n\r\n[]".to_string(),
+        ok("not json"),
+        ok("{}"),
+        "[]".to_string(),
+    ] {
+        assert!(!left_nothing(&broken, &none.1), "containers: {broken:?}");
+        assert!(!left_nothing(&none.0, &broken), "volumes: {broken:?}");
+    }
+}

@@ -17,8 +17,8 @@ mod tokens;
 mod wire;
 
 pub use client::{
-    Client, MACHINE_NAME_MAX, MAX_BODY_BYTES, MAX_JOB_EVENTS, MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS,
-    RESULT_ID_MAX, RUNNER_NAME_MAX, enroll, is_machine_name, units,
+    Client, MACHINE_NAME_MAX, MAX_BODY_BYTES, MAX_JOB_CACHE_EVENTS, MAX_JOB_CACHES, MAX_JOB_EVENTS,
+    MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS, RESULT_ID_MAX, RUNNER_NAME_MAX, enroll, is_machine_name, units,
 };
 pub use error::{BROKER_OFF, Error, RETRY_AFTER_MAX};
 pub use github::{

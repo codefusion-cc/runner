@@ -5,6 +5,7 @@ use cf_ghapp::Clock;
 use cf_scaleset::{Error, JobBase, Message, Statistics};
 use time::OffsetDateTime;
 
+use crate::caches::{CacheRepo, CacheTerms};
 use crate::machines::Answer;
 use crate::names::runner_name;
 use crate::roster::{JobInfo, Roster, Runner};
@@ -39,6 +40,8 @@ pub struct ScalerConfig {
     pub size: Size,
     /// Whether its jobs get a Docker daemon (`cf-docker`).
     pub docker: bool,
+    /// What its jobs need to get its cache now; none when they get none ([`CacheRepo::of`]).
+    pub cache: CacheTerms,
 }
 
 /// A slot promised to a job this scaler acquired.
@@ -454,11 +457,13 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     async fn start(&mut self, ticket: Ticket) -> Result<(), Error> {
+        let cache = self.config.cache.get();
         let at = Start {
             machine: &self.config.machine,
             repo: &self.config.repo,
             scale_set_id: self.config.scale_set_id,
             size: self.config.size,
+            cache: cache.as_ref(),
         };
         start_runner(
             &self.registry,
@@ -572,6 +577,8 @@ pub struct Start<'a> {
     pub scale_set_id: i64,
     /// The machine's size.
     pub size: Size,
+    /// What its jobs need to get its cache; none when they get none ([`CacheRepo::of`]).
+    pub cache: Option<&'a CacheRepo>,
 }
 
 /// Registers an Actions runner with `registry` and starts its machine in the slot `ticket`, which is the machine's
@@ -626,6 +633,7 @@ pub async fn start_runner<R: Registry, H: Hosts>(
         scale_set_id: at.scale_set_id,
         runner_id,
         size: at.size,
+        cache: at.cache.cloned(),
         ticket,
         jit_config: jit.encoded,
     };

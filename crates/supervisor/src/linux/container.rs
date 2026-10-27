@@ -43,6 +43,10 @@ pub struct Spec {
     pub home: String,
     /// The size of `/dev/shm`.
     pub shm_bytes: u64,
+    /// The job's cache disk as the supervisor mounted it, which the container sees at the same path; none without
+    /// one.
+    #[serde(default)]
+    pub cache: Option<String>,
 }
 
 fn report(outcome: &Outcome) {
@@ -190,6 +194,25 @@ fn contain(spec: &Spec, ask: OwnedFd, done: OwnedFd) -> Result<libc::c_int, Stri
             "",
         ),
     )?;
+    // The cache's folders the job writes, npm's, pnpm's and Playwright's, in this namespace only: they go with the container's
+    // last process, and the supervisor can then let go of the disk. The top level and Docker's data are not the
+    // job's to see. No devices or set-id programs; npx runs what it installed there, so they may execute.
+    if let Some(cache) = &spec.cache {
+        for folder in cf_supervisor::cache::USER_FOLDERS {
+            let path = format!("{cache}/{folder}");
+            sys::mount_at(&path, &at(&path), "", libc::MS_BIND, "")?;
+            context(
+                "the cache's options",
+                sys::mount(
+                    "",
+                    &at(&path),
+                    "",
+                    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+                    "",
+                ),
+            )?;
+        }
+    }
     // What would let root in the container reach the machine: the keys that reboot it, its memory, its settings.
     for masked in ["/proc/sysrq-trigger", "/proc/kcore"] {
         if fs::metadata(at(masked)).is_ok() {

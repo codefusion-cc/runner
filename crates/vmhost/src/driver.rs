@@ -10,7 +10,7 @@ use crate::task::{describe, now_ns, now_s, put_down};
 use cf_guest_proto::{
     HostMessage, Job, PORT, PROTOCOL, Start, Stop, StopReason, Task, read_guest_message, write_message,
 };
-use cf_vmm::{Channel, Network, Vm, Vmm};
+use cf_vmm::{Channel, Disk, Network, Vm, Vmm};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
@@ -188,6 +188,7 @@ fn run_in(
         oom_grace_ms: 15_000,
         blocked: crate::host_net::host_networks(),
         docker: request.docker,
+        cache: request.cache.is_some(),
     });
 
     let snapshot = |machine: Option<&Machine>, stage: Stage| JobState {
@@ -283,8 +284,15 @@ fn run_in(
         let _ = fs::remove_file(&state_path);
         return Err(RunError::Scratch(error));
     }
+    // The job's copy of its repository's cache, which the guest finds by its id.
+    let cache = request.cache.iter().map(|path| Disk {
+        path: path.clone(),
+        id: cf_guest_proto::CACHE_DISK.into(),
+        read_only: false,
+    });
     let spec = files.machine(
         &scratch_disk,
+        cache.collect(),
         request.memory_bytes,
         request.cpus as usize,
         Network::Nat,

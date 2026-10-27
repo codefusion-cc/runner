@@ -513,6 +513,24 @@ impl ScaleSetClient {
             .await?)
     }
 
+    /// What GitHub says of a workflow run of the repository; `None` when it has no such run.
+    pub async fn workflow_run(&self, run_id: i64) -> Result<Option<cf_ghapp::WorkflowRun>, Error> {
+        Ok(self
+            .inner
+            .app
+            .workflow_run(self.inner.installation, &self.inner.repo, run_id)
+            .await?)
+    }
+
+    /// Whether a commit is on a branch of the repository ([`cf_ghapp::GitHubApp::commit_on_branch`]).
+    pub async fn commit_on_branch(&self, branch: &str, sha: &str) -> Result<bool, Error> {
+        Ok(self
+            .inner
+            .app
+            .commit_on_branch(self.inner.installation, &self.inner.repo, branch, sha)
+            .await?)
+    }
+
     /// Removes a registered Actions runner. An Actions runner with a job refuses (the service answers 422); one that is
     /// gone is [`Error::is_not_found`].
     pub async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {

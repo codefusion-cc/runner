@@ -65,11 +65,18 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
   group. A job that runs out ends `oom` like any other; the Mac is not touched. A container may have limits of its
   own (`--memory`, Compose's `mem_limit`, `--cpus`); one stopped at its own limit exits 137 and the job goes on, since
   only the job's own limit makes the job `oom`. A Docker job's daemon and a small Compose stack hold about 750 MB.
-- Disk: the job's 40 GB disk, `/var/lib/docker` included, gone with the machine.
+- Disk: the job's 40 GB disk, gone with the machine; `/var/lib/docker` is on a cache disk where the host keeps
+  caches (below), and on the job's disk where it does not.
 - One Docker job at a time per Mac (`docker_max_jobs`, 1 to 8). It counts promised, waiting and running Docker jobs
   until their machine is gone, after a Runner restart too. A job GitHub assigns past the cap without being offered
   room still runs, as any assigned job does; the log says so.
-- Nothing is cached between jobs yet: each job pulls its images.
+
+## The cache
+
+A Docker job's daemon keeps its data on the job's cache disk, one per repository, which only the default branch
+writes: [cache.md](cache.md). The job's end hook removes its containers, volumes and networks from the job's daemon,
+by its socket, whatever context the job chose; images and build cache stay, so a next job starts with none of the
+containers of the one before.
 
 ## How it fails
 
@@ -94,6 +101,7 @@ kernel's settings, trigger sysrq, read kcore or open the machine's disks.
   a running machine, one assigned past the cap and a restart, and a Docker scale set that acquires one job only.
 - `crates/workflows/tests/labels.rs`, `crates/daemon/src/names.rs`, `crates/runner/src/config.rs`: the label, the
   repositories that get Docker, the settings.
+- The cache's tests: [cache.md](cache.md).
 - `cargo xtask it --only docker`, against real machines: a Compose stack built and published, a bind mount of `/tmp`,
   and the probes from plain, privileged and host-network containers. The target that shows the firewall at work is
   a port the test opens on the host itself: through pasta a closed port and a dropped packet look alike. The

@@ -307,6 +307,42 @@ pub struct Status {
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
     pub runners: Vec<RunnerStatus>,
+    /// Jobs' caches on this host, one per repository, at most 64 (`MAX_JOB_CACHES`). Left out while it
+    /// keeps none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_caches: Vec<JobCache>,
+    /// What last happened to them, oldest first, at most 32 (`MAX_JOB_CACHE_EVENTS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_cache_events: Vec<JobCacheEvent>,
+}
+
+/// A repository's job cache on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobCache {
+    /// `owner/name`.
+    pub repo: String,
+    /// What it holds of the host's disk.
+    pub bytes: u64,
+    /// When a job last wrote it (ISO 8601).
+    pub written_at: String,
+    /// When a job last started from it.
+    pub used_at: String,
+}
+
+/// Something that happened to a job cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobCacheEvent {
+    /// When (ISO 8601).
+    pub at: String,
+    /// `owner/name`.
+    pub repo: String,
+    /// `kept`, `discarded`, `replaced`, `dropped` or `evicted`.
+    pub kind: String,
+    /// Why, for `discarded` and `dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// What one more machine of a size meets on the host now.
