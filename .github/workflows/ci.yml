@@ -161,6 +161,10 @@ jobs:
           echo "IMAGE=$image" >> "$GITHUB_ENV"
       - name: Set up the host
         run: |
+          # GitHub's image sets XDG_CONFIG_HOME to its own user's folder in /etc/environment, and pam_env gives it to
+          # every user's systemd, so the Runner's user would read its units from a folder it cannot write.
+          grep -n XDG_ /etc/environment || true
+          sudo sed -i '/^XDG_CONFIG_HOME=/d' /etc/environment
           sudo scripts/host-setup.sh --machine ci-fresh --console "$CONSOLE" --code-file "$RUNNER_TEMP/code" \
             --repo /tmp/runner.git --image "$IMAGE" --github-api "$GITHUB"
       - name: A run again changes nothing
