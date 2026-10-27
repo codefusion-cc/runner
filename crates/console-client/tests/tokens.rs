@@ -774,9 +774,18 @@ async fn the_consoles_runner_limit_is_a_429_whose_wait_is_kept() {
     assert_eq!(status_of(&error), Some(429), "{error}");
     assert!(error.is_transient(), "{error}");
     assert!(error.to_string().contains("five minutes"), "{error}");
+    // The console counts the five minutes from the first call in whole seconds, so a second that turns between the
+    // first call and this one makes its wait 299: the wait kept is the one it said, whichever that was.
+    let said: u64 = error
+        .to_string()
+        .split("ask again in ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next()?.parse().ok())
+        .expect("the console's words say the wait");
+    assert!((299..=300).contains(&said), "{error}");
     assert_eq!(
         error.retry_after(),
-        Some(Duration::from_secs(300)),
+        Some(Duration::from_secs(said)),
         "the console's Retry-After"
     );
     assert_eq!(rig.console.calls() - before, 1, "not tried again");
