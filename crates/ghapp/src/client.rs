@@ -7,7 +7,7 @@ use cf_secret::Secret;
 use cf_workflows::LabelSet;
 use reqwest::Method;
 use reqwest::header::ETAG;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -499,7 +499,10 @@ impl GitHubApp {
             event: String,
         }
         let path = format!("/repos/{repo}/actions/runs/{run_id}");
-        match self.as_installation(installation, Method::GET, &path).await {
+        match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
             Ok(response) => {
                 let run = decode::<Run>("workflow run", &response)?;
                 Ok(Some(WorkflowRun {
