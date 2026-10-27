@@ -4313,6 +4313,74 @@ async fn a_repository_gets_at_most_8_sets_of_queued_jobs_the_newest_and_the_rest
     assert!(error.contains(REPO) && error.contains("at most 8"), "{error}");
 }
 
+// added: a set the bound pushes out while GitHub is making it goes at GitHub in the same look: its listener ends
+// before the sets are listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_pushed_out_while_github_makes_it_is_deleted_in_the_same_look() {
+    let rig = Rig::new(2).await;
+    // GitHub is slow to make scale sets: the look that pushes the oldest out comes while it is made.
+    rig.github.delay(
+        "POST /svc/_apis/runtime/runnerscalesets",
+        Duration::from_secs(1),
+        9,
+    );
+    let labels: Vec<String> = (1..=9).map(|n| format!("pr-{n}")).collect();
+    for label in &labels[..8] {
+        under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", label]);
+    }
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g"]);
+    rig.service.discover().await;
+
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", &labels[8]]);
+    rig.service.look_at_queue().await;
+    assert_eq!(rig.service.sets().len(), 9);
+    assert_eq!(
+        served_with(&rig, "pr-1"),
+        (false, false),
+        "the oldest goes, at GitHub too"
+    );
+    for label in &labels[1..] {
+        serving(&rig, label).await;
+    }
+}
+
+// added: a set the bound pushes out goes though GitHub has not made it yet: its listener is still trying, and the
+// set must not stay served beside the newest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_pushed_out_before_github_made_it_is_not_served() {
+    let rig = Rig::new(2).await;
+    // No scale set is made at GitHub until it recovers: every listener is still trying.
+    rig.github.fail_until_recovered(
+        "POST /svc/_apis/runtime/runnerscalesets",
+        Reply::text(503, "unavailable"),
+    );
+    let labels: Vec<String> = (1..=9).map(|n| format!("pr-{n}")).collect();
+    for label in &labels[..8] {
+        under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", label]);
+    }
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g"]);
+    rig.service.discover().await;
+    assert_eq!(rig.service.sets().len(), 9, "8 of queued jobs and main's");
+
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", &labels[8]]);
+    rig.service.look_at_queue().await;
+    assert_eq!(
+        rig.service.sets().len(),
+        9,
+        "the oldest goes though GitHub never had it"
+    );
+    assert!(!served_with(&rig, "pr-1").0, "pr-1 is no longer served");
+    rig.github.recover("POST /svc/_apis/runtime/runnerscalesets");
+    for label in &labels[1..] {
+        serving(&rig, label).await;
+    }
+    assert_eq!(
+        served_with(&rig, "pr-1"),
+        (false, false),
+        "and GitHub does not get it later"
+    );
+}
+
 // added: at most 32 label sets of queued jobs on the host, whatever repositories ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_host_serves_at_most_32_sets_of_queued_jobs() {

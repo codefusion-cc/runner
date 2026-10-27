@@ -225,6 +225,8 @@ struct State {
     faults: Vec<Fault>,
     /// (matcher, how many more answers get lost)
     lost: Vec<(String, usize)>,
+    /// (matcher, how long, how many more requests wait so long before they are handled)
+    delays: Vec<(String, Duration, usize)>,
     /// Where registration and sessions say the service and its message queue are, when not here.
     service_at: Option<String>,
     queue_at: Option<String>,
@@ -517,6 +519,7 @@ impl FakeGithub {
                 next_job: 1000,
                 faults: vec![],
                 lost: vec![],
+                delays: vec![],
                 service_at: None,
                 queue_at: None,
                 hooks: vec![],
@@ -719,6 +722,12 @@ impl FakeGithub {
     /// the caller never sees the answer to what was done.
     pub fn lose_answer(&self, matcher: &str, times: usize) {
         self.lock().lost.push((matcher.to_string(), times));
+    }
+
+    /// Handles the next `times` requests whose `METHOD path` contains `matcher` only after `wait`: GitHub is slow
+    /// to do them, and does them all the same.
+    pub fn delay(&self, matcher: &str, wait: Duration, times: usize) {
+        self.lock().delays.push((matcher.to_string(), wait, times));
     }
 
     /// Makes Actions runner registration name `url` as the Actions service from now on.
@@ -1071,6 +1080,19 @@ impl FakeGithub {
         };
         if let Some(hook) = hook {
             hook(self);
+        }
+        let delay = {
+            let mut st = self.lock();
+            st.delays
+                .iter_mut()
+                .find(|(m, _, left)| *left > 0 && line.contains(m))
+                .map(|delay| {
+                    delay.2 -= 1;
+                    delay.1
+                })
+        };
+        if let Some(wait) = delay {
+            tokio::time::sleep(wait).await;
         }
         {
             let mut st = self.lock();
