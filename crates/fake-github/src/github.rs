@@ -730,6 +730,20 @@ impl FakeGithub {
         self.lock().delays.push((matcher.to_string(), wait, times));
     }
 
+    /// The matchers of faults and lost answers set for a number of requests that not that many requests met yet.
+    pub fn unspent_faults(&self) -> Vec<String> {
+        let st = self.lock();
+        let faults = st
+            .faults
+            .iter()
+            .filter(|f| f.remaining > 0 && f.remaining != usize::MAX);
+        let lost = st.lost.iter().filter(|(_, left)| *left > 0);
+        faults
+            .map(|f| f.matcher.clone())
+            .chain(lost.map(|(m, _)| m.clone()))
+            .collect()
+    }
+
     /// Makes Actions runner registration name `url` as the Actions service from now on.
     pub fn send_the_service_to(&self, url: &str) {
         self.lock().service_at = Some(url.to_string());

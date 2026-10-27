@@ -797,7 +797,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "401 as the session opens",
             answers(
-                "POST /svc/_apis/runtime/runnerscalesets/1/sessions",
+                "POST /svc/_apis/runtime/runnerscalesets/10/sessions",
                 || Reply::text(401, "bad credentials"),
                 2,
             ),
@@ -805,7 +805,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "409: a session of before is still open",
             answers(
-                "POST /svc/_apis/runtime/runnerscalesets/1/sessions",
+                "POST /svc/_apis/runtime/runnerscalesets/10/sessions",
                 || Reply::status_json(409, &json!({"message": "exists"})),
                 3,
             ),
@@ -813,7 +813,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "429 on the long poll",
             answers(
-                "GET /svc/_apis/runtime/runnerscalesets/1/messages",
+                "GET /svc/_apis/runtime/runnerscalesets/10/messages",
                 || Reply::text(429, "slow down").with_header("retry-after", "0"),
                 3,
             ),
@@ -821,7 +821,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "5xx on the long poll",
             answers(
-                "GET /svc/_apis/runtime/runnerscalesets/1/messages",
+                "GET /svc/_apis/runtime/runnerscalesets/10/messages",
                 || Reply::text(503, "unavailable"),
                 4,
             ),
@@ -833,7 +833,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         (
             "5xx as the scale set is made",
             answers(
-                "POST /svc/_apis/runtime/runnerscalesets?",
+                "POST /svc/_apis/runtime/runnerscalesets",
                 || Reply::text(502, "bad gateway"),
                 2,
             ),
@@ -857,7 +857,7 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         ),
         (
             "the answer to the acquired job's message is lost",
-            Box::new(|github| github.lose_answer("GET /svc/_apis/runtime/runnerscalesets/1/messages", 1)),
+            Box::new(|github| github.lose_answer("GET /svc/_apis/runtime/runnerscalesets/10/messages", 1)),
         ),
     ];
     for (what, fault) in faults {
@@ -870,6 +870,11 @@ async fn whatever_github_answers_the_job_still_runs_and_nothing_is_left() {
         assert_eq!(rig.events()[1].1, json!("success"), "{what}");
         rig.nothing_left().await;
         assert_eq!(rig.parts.vms.started().len(), 1, "{what}: one job, one machine");
+        assert_eq!(
+            rig.github.unspent_faults(),
+            Vec::<String>::new(),
+            "{what}: GitHub went wrong as often as set"
+        );
     }
 }
 
