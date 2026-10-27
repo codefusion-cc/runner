@@ -52,6 +52,8 @@ pub fn run(args: &[String]) -> Result<()> {
         .await;
         (github, FakeConsole::start().await)
     });
+    // As long as GitHub's own tokens run now, past the 255 characters a Runner once refused.
+    github.set_read_token_length(1000);
     github.add_repo(REPO, true);
     github.set_workflow(REPO, "ci.yml", WORKFLOW);
     console.serve_github(github.clone());
