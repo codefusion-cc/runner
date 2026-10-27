@@ -1,21 +1,22 @@
-//! The Linux monitor: cloud-hypervisor's static aarch64 build, pinned in `crates/vmm-ch/src/pins.rs`.
+//! The Linux monitor: cloud-hypervisor's static build for each architecture, pinned in `crates/vmm-ch/src/pins.rs`.
 //!
-//! `cargo xtask cloud-hypervisor` fetches it into `target/vmm-programs`, where the build script of `cf-vmm-ch`
-//! embeds it. A file already there with the pinned bytes is kept. It is read from our copy first, a release of this
-//! repository tagged `cloud-hypervisor-<version>`, and from the project's release only when the copy is missing
-//! (`pinned.rs`).
+//! `cargo xtask cloud-hypervisor` fetches the host's into `target/vmm-programs`, where the build script of
+//! `cf-vmm-ch` embeds it. A file already there with the pinned bytes is kept. It is read from our copy first, a
+//! release of this repository tagged `cloud-hypervisor-<version>`, and from the project's release only when the copy
+//! is missing (`pinned.rs`).
 //!
-//! `cargo xtask cloud-hypervisor check`, run weekly by `.github/workflows/pins.yml`, goes red when our copy stops
-//! answering with the pinned bytes, and says when the project has a newer release.
+//! `cargo xtask cloud-hypervisor check`, run weekly by `.github/workflows/pins.yml`, goes red when our copy of either
+//! architecture's stops answering with the pinned bytes, and says when the project has a newer release.
 //!
-//! To move the pin: take `cloud-hypervisor-static-aarch64` of the new release, check that its SHA-256 is the
-//! `digest` GitHub lists for the asset (`gh api repos/cloud-hypervisor/cloud-hypervisor/releases/tags/<version>`),
-//! publish our copy (`gh release create cloud-hypervisor-<version> cloud-hypervisor-static-aarch64 --prerelease
-//! --latest=false`, by the owner), then change the three numbers in `pins.rs`.
+//! To move the pin: take both static builds of the new release (`pins.rs` names the assets), check that each one's
+//! SHA-256 is the `digest` GitHub lists for the asset (`gh api repos/cloud-hypervisor/cloud-hypervisor/releases/tags/
+//! <version>`), publish our copy of both (`pins.rs` says how, by the owner), then change the version and each one's
+//! size and hash in `pins.rs`.
 
 use std::path::{Path, PathBuf};
 
 use crate::Result;
+use crate::arch::Arch;
 use crate::pinned::{self, Checked, Curl, GITHUB_RELEASE_HOSTS, Pin, Scratch, Source};
 
 mod pins {
@@ -26,31 +27,37 @@ pub use pins::CLOUD_HYPERVISOR_VERSION as VERSION;
 
 /// What the build calls it.
 const WHAT: &str = "cloud-hypervisor";
-/// The asset's name in a release.
-const ASSET: &str = "cloud-hypervisor-static-aarch64";
 /// Where `cf-vmm-ch`'s build script looks for it, below the workspace.
 const DIR: &str = "target/vmm-programs";
 
-/// The pinned file.
-pub const PIN: Pin<'static> = Pin {
-    size: pins::CLOUD_HYPERVISOR_SIZE,
-    sha256: pins::CLOUD_HYPERVISOR_SHA256,
-};
+/// The build pinned for an architecture.
+fn pinned(arch: Arch) -> Result<&'static pins::CloudHypervisorPin> {
+    pins::cloud_hypervisor_for(arch.name())
+        .ok_or_else(|| format!("no cloud-hypervisor is pinned for {}", arch.name()).into())
+}
+
+fn pin_of(pinned: &pins::CloudHypervisorPin) -> Pin<'static> {
+    Pin {
+        size: pinned.size,
+        sha256: pinned.sha256,
+    }
+}
 
 /// Where a build reads it, in order: our copy, then the project's release.
-pub fn sources() -> [Source; 2] {
+fn sources(pinned: &pins::CloudHypervisorPin) -> [Source; 2] {
+    let asset = pinned.asset;
     [
         Source {
             name: "our copy",
             url: format!(
-                "https://github.com/codefusion-cc/runner/releases/download/cloud-hypervisor-{VERSION}/{ASSET}"
+                "https://github.com/codefusion-cc/runner/releases/download/cloud-hypervisor-{VERSION}/{asset}"
             ),
             hosts: GITHUB_RELEASE_HOSTS,
         },
         Source {
             name: "the project's release",
             url: format!(
-                "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/{VERSION}/{ASSET}"
+                "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/{VERSION}/{asset}"
             ),
             hosts: GITHUB_RELEASE_HOSTS,
         },
@@ -74,34 +81,67 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
     }
 }
 
-/// Puts the pinned file into `target/vmm-programs` and returns its path.
+/// Puts the file pinned for the host's architecture into `target/vmm-programs` and returns its path.
 pub fn fetch(root: &Path) -> Result<PathBuf> {
+    let arch = Arch::host()?;
+    let pinned = pinned(arch)?;
     let dest = root.join(DIR).join("cloud-hypervisor");
-    pinned::ensure(&Curl::https(), &sources(), PIN, &dest, WHAT)?;
-    println!("{} is cloud-hypervisor {VERSION}", dest.display());
+    pinned::ensure(&Curl::https(), &sources(pinned), pin_of(pinned), &dest, WHAT)?;
+    println!(
+        "{} is cloud-hypervisor {VERSION} for {}",
+        dest.display(),
+        arch.name()
+    );
     Ok(dest)
 }
 
-/// Fails only when our copy does not give the pinned bytes. The project slow, down or newer is a warning.
+/// Fails only when our copy of an architecture's build does not give the pinned bytes. The project slow, down or
+/// newer is a warning, said once. Every architecture is checked before it fails.
 fn check(root: &Path, args: &[String]) -> Result<()> {
     crate::no_options(args)?;
+    let curl = Curl::https();
     let dir = Scratch::new(root.join("target/cloud-hypervisor-check"))?;
-    let checked = check_sources(&Curl::https(), &sources(), PIN, &latest_release(), dir.path());
-    pinned::conclude(checked, WHAT, "xtask/src/cloud_hypervisor.rs")
+    let copies = pinned::all(Arch::ALL.map(|arch| {
+        let pinned = pinned(arch)?;
+        let what = format!("{WHAT} for {}", arch.name());
+        let checked = pinned::check_sources(&curl, &sources(pinned), pin_of(pinned), dir.path(), &what);
+        pinned::conclude(checked, &what, FIX)
+    }));
+    let newer = Checked {
+        copy: Ok(()),
+        notices: newer_release(&curl, &latest_release(), dir.path())
+            .into_iter()
+            .collect(),
+    };
+    pinned::conclude(newer, WHAT, FIX)?;
+    copies
 }
 
+/// Where a check that fails says to look.
+const FIX: &str = "xtask/src/cloud_hypervisor.rs";
+
+/// What the check says of one build's sources and of the project's newest release.
+#[cfg(test)]
 fn check_sources(curl: &Curl, sources: &[Source], pin: Pin<'_>, latest: &Source, dir: &Path) -> Checked {
     let mut checked = pinned::check_sources(curl, sources, pin, dir, WHAT);
-    match pinned::newest(curl, latest, dir, tag_of) {
-        Ok(newest) if newest == VERSION => println!("cloud-hypervisor has no release newer than {VERSION}"),
-        Ok(newest) => checked.notices.push(format!(
-            "cloud-hypervisor has {newest}, the pin is {VERSION}: move the pin (xtask/src/cloud_hypervisor.rs)"
-        )),
-        Err(error) => checked
-            .notices
-            .push(format!("could not read cloud-hypervisor's latest release: {error}")),
-    }
+    checked.notices.extend(newer_release(curl, latest, dir));
     checked
+}
+
+/// A warning when the project has a release newer than the pin, or cannot say which is newest.
+fn newer_release(curl: &Curl, latest: &Source, dir: &Path) -> Option<String> {
+    match pinned::newest(curl, latest, dir, tag_of) {
+        Ok(newest) if newest == VERSION => {
+            println!("cloud-hypervisor has no release newer than {VERSION}");
+            None
+        }
+        Ok(newest) => Some(format!(
+            "cloud-hypervisor has {newest}, the pin is {VERSION}: move the pin ({FIX})"
+        )),
+        Err(error) => Some(format!(
+            "could not read cloud-hypervisor's latest release: {error}"
+        )),
+    }
 }
 
 /// The tag of a release as GitHub's API describes it.
@@ -212,29 +252,40 @@ mod tests {
     }
 
     #[test]
-    fn the_sources_are_https_release_assets_of_the_pinned_version() {
-        let [ours, project] = sources();
-        assert_eq!(
-            ours.url,
-            format!(
-                "https://github.com/codefusion-cc/runner/releases/download/cloud-hypervisor-{VERSION}/{ASSET}"
-            )
-        );
-        assert_eq!(
-            project.url,
-            format!(
-                "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/{VERSION}/{ASSET}"
-            )
-        );
-        for source in [ours, project, latest_release()] {
-            assert!(source.url.starts_with("https://"), "{}", source.url);
-            assert!(source.hosts.contains(&host_of(&source.url).unwrap().as_str()));
+    fn the_sources_are_https_release_assets_of_the_pinned_version_of_each_arch() {
+        let mut assets = Vec::new();
+        for arch in Arch::ALL {
+            let pinned = pinned(arch).unwrap();
+            assert_eq!(pinned.arch, arch.name());
+            let asset = pinned.asset;
+            let [ours, project] = sources(pinned);
+            assert_eq!(
+                ours.url,
+                format!(
+                    "https://github.com/codefusion-cc/runner/releases/download/cloud-hypervisor-{VERSION}/{asset}"
+                )
+            );
+            assert_eq!(
+                project.url,
+                format!(
+                    "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/{VERSION}/{asset}"
+                )
+            );
+            for source in [ours, project, latest_release()] {
+                assert!(source.url.starts_with("https://"), "{}", source.url);
+                assert!(source.hosts.contains(&host_of(&source.url).unwrap().as_str()));
+            }
+            let pin = pin_of(pinned);
+            assert_eq!(pin.sha256.len(), 64);
+            assert!(
+                pin.sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+            assets.push(asset);
         }
-        assert_eq!(PIN.sha256.len(), 64);
-        assert!(
-            PIN.sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        );
+        // Both live in one release of ours, so their names differ.
+        assert_ne!(assets[0], assets[1]);
+        assert!(pins::cloud_hypervisor_for("riscv64").is_none());
     }
 }

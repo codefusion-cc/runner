@@ -285,6 +285,19 @@ pub fn conclude(checked: Checked, what: &str, fix: &str) -> Result<()> {
     })
 }
 
+/// Ends checks that each ran to the end: fails with every failure, one per line, when any failed.
+pub fn all(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    let failed: Vec<String> = results
+        .into_iter()
+        .filter_map(|result| result.err())
+        .map(|error| error.to_string())
+        .collect();
+    match failed.is_empty() {
+        true => Ok(()),
+        false => Err(failed.join("\n").into()),
+    }
+}
+
 /// A scratch folder for a check, made empty, and removed with what is in it when the check ends.
 pub struct Scratch(std::path::PathBuf);
 

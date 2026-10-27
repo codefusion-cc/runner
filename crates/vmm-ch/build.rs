@@ -1,6 +1,7 @@
 //! Embeds cloud-hypervisor, which `cargo xtask cloud-hypervisor` left in `target/vmm-programs` (or in
-//! `$CF_VMM_PROGRAMS_DIR`), into a build for Linux on arm64, the one architecture it is pinned for. It must be the
-//! pinned file. Without it, or for another system or architecture, the build still works and carries no monitor.
+//! `$CF_VMM_PROGRAMS_DIR`), into a build for Linux on an architecture it is pinned for (`src/pins.rs`: aarch64 and
+//! x86_64). It must be the file pinned for the architecture of the build. Without it, or for another system or
+//! architecture, the build still works and carries no monitor.
 
 use sha2::{Digest, Sha256};
 use std::env;
@@ -20,30 +21,35 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dir.display());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("embedded.rs");
     let linux = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "linux");
-    let arm64 = env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|arch| arch == "aarch64");
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let pin = cloud_hypervisor_for(&arch).filter(|_| linux);
     let ch = dir.join("cloud-hypervisor");
-    let code = if !linux || !arm64 || !ch.exists() {
-        if linux && arm64 {
+    let code = match pin {
+        Some(_) if !ch.exists() => {
             println!(
                 "cargo:warning=no cloud-hypervisor in {}: building without it (cargo xtask cloud-hypervisor)",
                 dir.display()
             );
+            NONE.to_string()
         }
-        NONE.to_string()
-    } else {
-        let ch = fs::canonicalize(&ch).unwrap();
-        println!("cargo:rerun-if-changed={}", ch.display());
-        let bytes = fs::read(&ch).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        assert!(
-            bytes.len() as u64 == CLOUD_HYPERVISOR_SIZE && hash == CLOUD_HYPERVISOR_SHA256,
-            "{} is not the pinned cloud-hypervisor {CLOUD_HYPERVISOR_VERSION}",
-            ch.display()
-        );
-        format!(
-            "const EMBEDDED: Option<&[u8]> = Some(include_bytes!({:?}));\n",
-            ch.display().to_string()
-        )
+        None => NONE.to_string(),
+        Some(pin) => {
+            let ch = fs::canonicalize(&ch).unwrap();
+            println!("cargo:rerun-if-changed={}", ch.display());
+            let bytes = fs::read(&ch).unwrap();
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            assert!(
+                bytes.len() as u64 == pin.size && hash == pin.sha256,
+                "{} is not the pinned cloud-hypervisor {CLOUD_HYPERVISOR_VERSION} for {arch} ({}): \
+                 cargo xtask cloud-hypervisor fetches the host's",
+                ch.display(),
+                pin.asset
+            );
+            format!(
+                "const EMBEDDED: Option<&[u8]> = Some(include_bytes!({:?}));\n",
+                ch.display().to_string()
+            )
+        }
     };
     fs::write(out, code).unwrap();
 }

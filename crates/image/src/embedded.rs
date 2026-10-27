@@ -49,5 +49,7 @@ impl Bundle {
 /// binary; it is no defence against someone who can rewrite the binary, who can rewrite the key as well.
 pub fn verify_embedded() -> Result<Verified, ImageError> {
     let bundle = embedded_bundle().ok_or(ImageError::NoEmbeddedImage)?;
-    verify(&bundle.mem_files(), &bundle.verifying_key()?, bundle.version, 0)
+    let verified = verify(&bundle.mem_files(), &bundle.verifying_key()?, bundle.version, 0)?;
+    verified.manifest.for_this_host()?;
+    Ok(verified)
 }
