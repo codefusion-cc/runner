@@ -95,8 +95,14 @@ jobs:
           fi
       # pasta, as a Linux host runs machines with it, for cf-vmm-ch's isolation tests (`ip` and `unshare` are there), and
       # OpenSSL's headers, which the service's HTTPS client builds against on Linux.
+      # A mirror that stops answering once held a job here for its whole 30 minutes: each request gives up after 30 s
+      # and is asked again, and the step after 5 minutes.
       - name: pasta and OpenSSL's headers
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends passt pkg-config libssl-dev
+        timeout-minutes: 5
+        run: |
+          apt=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt[@]}" update -qq
+          sudo apt-get "${apt[@]}" install -y -qq --no-install-recommends passt pkg-config libssl-dev
       - run: cargo clippy --locked $LINUX_CRATES --all-targets -j4 -- -D warnings
       # The guest's Linux code for its own target: musl's libc types are not glibc's, so the line above does not stand
       # in for this.

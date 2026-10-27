@@ -50,6 +50,9 @@ pub struct Settings {
     pub guest_overhead_bytes: u64,
     /// vCPUs of a VM of each size, in the order of [`Size::ALL`].
     pub vcpus: [u32; 4],
+    /// Whether this is a headless host ([`Settings::for_headless`]), whose cf-4g share the CPUs by how many the
+    /// memory holds ([`vcpus_for`]).
+    pub headless: bool,
     /// The most VMs at once, whatever the caps leave room for; `None` for as many as they do.
     pub max_machines: Option<u32>,
     /// Once the Mac was under its floor, it must be this far above it before that counts as over.
@@ -210,7 +213,8 @@ impl Settings {
             idle_after: Millis::mins(15),
             vm_host_overhead_bytes: Self::VM_HOST_OVERHEAD,
             guest_overhead_bytes: Self::GUEST_OVERHEAD_ESTIMATE,
-            vcpus: vcpus_for(all_but_two, away.cap_bytes),
+            vcpus: vcpus_for(all_but_two, away.cap_bytes, false),
+            headless: false,
             max_machines: None,
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
@@ -248,7 +252,7 @@ impl Settings {
             Mode::Dedicated => fast_cores,
             Mode::Workstation => self.in_use.cpus.min(fast_cores),
         };
-        self.vcpus = vcpus_for(fast_cores, self.away.cap_bytes);
+        self.vcpus = vcpus_for(fast_cores, self.away.cap_bytes, self.headless);
         self
     }
 
@@ -277,8 +281,9 @@ impl Settings {
     ///   its overhead) or two cf-2g (4.4 GB) at a time; a cf-4g beside a cf-2g (6.4 GB) never, nor a cf-6g (6.2 GB
     ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
     /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
-    ///   two. 2 vCPUs for cf-2g, half the CPUs for cf-4g (at least 2, at most 4), 4 for the larger
-    ///   sizes: on 4 fast cores, two machines of 2 vCPUs. A cf-4g with no room beside it under the cap takes up to
+    ///   two. 2 vCPUs for cf-2g, half the CPUs for cf-4g but no more than its share among as many cf-4g as the
+    ///   cap holds (at least 2, at most 4), 4 for the larger sizes: on 4 fast cores, two machines of 2 vCPUs; on
+    ///   a 16 GB cloud VM with 8 vCPUs, three cf-4g of 2. A cf-4g with no room beside it under the cap takes up to
     ///   4 ([`vcpus_for`]): on 7.75 GB, the four fast cores, which no other machine could use while it runs.
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
@@ -295,7 +300,8 @@ impl Settings {
             floor_bytes: floor,
             cpus,
         };
-        settings.vcpus = vcpus_for(cpus, limits.cap_bytes);
+        settings.headless = true;
+        settings.vcpus = vcpus_for(cpus, limits.cap_bytes, true);
         settings.away = limits;
         settings.in_use = limits;
         settings
@@ -326,7 +332,7 @@ impl Settings {
             let away_cap = self.away.cap_bytes.min(self.total_bytes.saturating_sub(floor));
             if away_cap != self.away.cap_bytes {
                 self.away.cap_bytes = away_cap;
-                self.vcpus = vcpus_for(self.away.cpus, away_cap);
+                self.vcpus = vcpus_for(self.away.cpus, away_cap, self.headless);
             }
             self.in_use.cap_bytes = self
                 .in_use
@@ -451,8 +457,16 @@ impl Settings {
 /// runs beside it. Where the cap has no room for even a cf-2g beside a cf-4g, the cf-4g runs alone and takes all of
 /// them, at most 4: half would leave the rest idle for as long as it runs. Measured on an RK3588 board with 4 fast
 /// cores, a Vitest suite took 210 s on 2 of them and 95 s on all 4.
-fn vcpus_for(cpus: u32, cap_bytes: u64) -> [u32; 4] {
+///
+/// On a `headless` host, which runs CI and nothing else, a cf-4g takes no more than its share of the CPUs among
+/// as many cf-4g as the cap holds: a 16 GB cloud VM with 6 CPUs for CI runs three of 2 vCPUs, not two of 3 with
+/// 4 GB idle while jobs queue. A Mac keeps half: its jobs run faster, and its person's work needs the rest.
+fn vcpus_for(cpus: u32, cap_bytes: u64, headless: bool) -> [u32; 4] {
     let alone = cap_bytes < Size::G4.vm_bytes() + Size::G2.vm_bytes();
-    let g4 = if alone { cpus } else { cpus / 2 };
+    let mut g4 = if alone { cpus } else { cpus / 2 };
+    if headless {
+        let fit = u32::try_from(cap_bytes / Size::G4.vm_bytes()).unwrap_or(u32::MAX);
+        g4 = g4.min(cpus / fit.max(1));
+    }
     [2, g4.clamp(2, 4), 4, 4]
 }
