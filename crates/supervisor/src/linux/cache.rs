@@ -134,13 +134,19 @@ pub fn let_go(uid: u32, gid: u32) -> bool {
         }
     }
     for folder in plan::USER_FOLDERS {
-        if let Err(error) = give(&Path::new(MOUNT).join(folder), uid, gid) {
+        let path = Path::new(MOUNT).join(folder);
+        if let Err(error) = give(&path, uid, gid) {
+            // What cannot be the user's goes, so that one stubborn file does not keep every next copy from the cache.
             say(&format!(
-                "the cache's {folder} folder is not all the job user's: {error}"
+                "the cache's {folder} folder is not all the job user's, so it is emptied: {error}"
             ));
-            whole = false;
+            if let Err(error) = fs::remove_dir_all(&path) {
+                say(&format!("the cache's {folder} folder stays: {error}"));
+                whole = false;
+            }
         }
     }
+    trim();
     let mut busy = None;
     let let_go = sys::until(LET_GO, Duration::from_millis(100), || {
         sys::umount(MOUNT, 0).map_err(|error| busy = Some(error)).ok()
@@ -149,4 +155,36 @@ pub fn let_go(uid: u32, gid: u32) -> bool {
         say(&format!("the cache disk stays busy: {error}"));
     }
     whole && let_go.is_some()
+}
+
+/// Hands the blocks the job freed on the cache back to the host's copy, so that what a cache holds of the host's
+/// disk shrinks as well as grows. A disk that cannot discard says so and is kept as it is.
+fn trim() {
+    use std::os::fd::AsRawFd as _;
+    /// `struct fstrim_range` of `linux/fs.h`.
+    #[repr(C)]
+    struct Range {
+        start: u64,
+        len: u64,
+        minlen: u64,
+    }
+    /// `FITRIM`: `_IOWR('X', 121, struct fstrim_range)`.
+    const FITRIM: u32 = 0xC018_5879;
+    let Ok(folder) = File::open(MOUNT) else {
+        return;
+    };
+    let mut range = Range {
+        start: 0,
+        len: u64::MAX,
+        minlen: 0,
+    };
+    // SAFETY: `folder` is open for the call, and `range` is the `fstrim_range` FITRIM reads and writes.
+    #[allow(clippy::cast_possible_wrap, reason = "the request's type is the C library's")]
+    let status = unsafe { libc::ioctl(folder.as_raw_fd(), FITRIM as _, &raw mut range) };
+    if status != 0 {
+        say(&format!(
+            "the cache disk was not trimmed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
 }

@@ -468,3 +468,20 @@ async fn only_a_docker_job_whose_daemon_failed_drops_the_cache() {
     assert!(head(&copy_of_last_start(&w)).iter().all(|byte| *byte == 0));
     ends(&mut w, &next, "failed", "push", ON_MAIN);
 }
+
+#[tokio::test]
+async fn a_short_job_that_ends_before_its_run_is_read_still_keeps_its_copy() {
+    let Some((dir, mut w)) = caching() else { return };
+    let runner = job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"main").unwrap();
+    // It is over before the sweep reads its run: its machine and GitHub's word both in.
+    w.github_run(EventKind::Started, &runner, "", "push", ON_MAIN);
+    w.parts.vms.end(job_name(&runner), End::Ok);
+    pass(&w.m, 2);
+    w.github_run(EventKind::Completed, &runner, "succeeded", "push", ON_MAIN);
+    pass(&w.m, 2);
+    assert!(kept_repos(dir.path()).is_empty(), "the copy waits for its run");
+    read_run(&w, &runner, run_of("push", ON_MAIN));
+    w.assert_nothing_left();
+    assert_eq!(kept_repos(dir.path()), [REPO]);
+}

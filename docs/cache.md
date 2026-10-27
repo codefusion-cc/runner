@@ -22,7 +22,10 @@ can, ext4 cannot) keeps none either.
 - At the job's end, once the job's control group holds no process, the guest deletes everything but packages and
   Docker's data (`cf_supervisor::cache::leftovers`): any other top-level entry, and in `npm/` all but `_cacache`
   (npm's logs, npx's installs). It gives what the job's root left in `npm/` and `pnpm-store/` back to the job's
-  user, then lets the disk go.
+  user (a folder it cannot give back is emptied), trims the file system so the host's copy gives back the blocks
+  the job freed, then lets the disk go.
+- A host with less free disk than one whole disk (20 GB) gives no copy: a copy can grow to that whatever it starts
+  as.
 
 ## What becomes the cache
 
@@ -31,15 +34,18 @@ Once the job is over, the copy becomes the repository's cache only when everythi
 
 - GitHub said the job succeeded, on a push, a schedule or a manual dispatch.
 - The workflow is the repository's own, at `refs/heads/<its default branch>`.
-- GitHub's REST API says the run checked out that branch of this repository (read while the job runs; a workflow's
-  ref is where its file is, and a reusable workflow at the default branch called from another branch runs that
-  branch's code).
-- The guest let the disk go cleanly, and for a Docker job its daemon still answered and stopped by itself.
+- GitHub's REST API says the run checked out that branch of this repository, and its commit is that branch's tip or
+  behind it, the branch being the repository's default as the newest look at GitHub named it (read while the job
+  runs, or within two minutes of its end; a workflow's ref is where its file is, and a reusable workflow at the default
+  branch called from another branch, or from a tag of the branch's name, runs that ref's code).
+- The guest let the disk go cleanly, and for a Docker job its daemon still answered, held no container or volume
+  (what the end hook could not remove would start again in the next job), and stopped by itself.
 
 Anything else is thrown away: a pull request, a fork, another branch, a failed or cancelled job, a job GitHub never
 said the end of, a run that could not be read, a disk let go uncleanly. So a cache holds what the default branch
 downloaded and built, and nothing a pull request, a fork or another repository left. A pull request's job still
-starts from the default branch's cache, as GitHub's own cache lets it. A cache's key is a hash of its repository's
+starts from the default branch's cache, as GitHub's own cache lets it: it can read all of it, private packages and
+images the default branch fetched with its secrets among them. A cache's key is a hash of its repository's
 name in lowercase, and its record names the repository, which is checked before it is used.
 
 ## How it fails
@@ -47,7 +53,12 @@ name in lowercase, and its record names the repository, which is checked before 
 - A cache that does not mount: the image's `e2fsck` checks it first; one it cannot make whole is made anew and the
   job runs on an empty one (`replaced`).
 - A Docker job's daemon could not run on the cache: the cache is deleted (`dropped`), and the next job starts empty.
-  A job without Docker never drops a cache.
+  Only a job that could have written the cache drops it, and only the cache it started from: a pull request that
+  stops its own daemon, or a job that started before a newer cache was kept, drops nothing. A job without Docker
+  never drops a cache.
+- A cache that cannot be copied (its file unreadable) is deleted, and the job starts an empty one.
+- A store that cannot share blocks any more, a full disk among the reasons, keeps no cache and deletes the copies a
+  Runner before left. An image whose record was never written is deleted when the store opens.
 - Over the budget the cache used longest ago goes (`evicted`), never one a job holds now.
 - A job the host stopped (its deadline, a cancellation) is never kept, so nothing is tidied or waited for.
 - The report's `jobCaches` and `jobCacheEvents` list each host's caches with their size and last write, and what

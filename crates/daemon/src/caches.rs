@@ -36,6 +36,11 @@ pub fn key(repo: &str) -> String {
     format!("{:x}", Sha256::digest(repo.to_lowercase().as_bytes()))[..32].to_string()
 }
 
+/// Why a writer's copy is refused when its Docker daemon could not run on it: the one refusal after which the cache
+/// it came from may be dropped ([`CacheStore::settle`]). Every other check passed by then, so only a job that could
+/// have written the cache can drop it.
+pub const DAEMON_SILENT: &str = "the daemon did not answer at the job's end";
+
 /// The events of a run whose job may write its repository's cache.
 const WRITERS: [&str; 3] = ["push", "schedule", "workflow_dispatch"];
 
@@ -88,7 +93,7 @@ pub fn refusal(
         return Some("the machine said nothing of the cache");
     };
     if end.docker == Some(false) {
-        return Some("the daemon did not answer at the job's end");
+        return Some(DAEMON_SILENT);
     }
     if !end.clean {
         return Some("the disk was not let go cleanly");
@@ -230,6 +235,9 @@ pub struct CacheCopy {
     pub key: String,
     /// The copy the machine got.
     pub path: PathBuf,
+    /// When the cache it was copied from was written; `None` for an empty copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<i64>,
     /// The repository's default branch when the job was given its machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
@@ -259,11 +267,12 @@ impl CacheStore {
         let probe = dir.join(".clone-probe");
         let copy = dir.join(".clone-probe.copy");
         let _ = fs::remove_file(&copy);
-        fs::write(&probe, b"probe").ok()?;
-        let shares = cf_vmhost::scratch::clone(&probe, &copy).is_ok();
+        let probed = fs::write(&probe, b"probe").and_then(|()| cf_vmhost::scratch::clone(&probe, &copy));
         let _ = (fs::remove_file(&probe), fs::remove_file(&copy));
-        if !shares {
-            tracing::info!(dir = %dir.display(), "no job cache: this file system cannot share blocks between files");
+        if let Err(error) = probed {
+            // No job gets a copy now, so the copies a Runner before left are nobody's: their room comes back.
+            let _ = fs::remove_dir_all(dir.join("jobs"));
+            tracing::info!(dir = %dir.display(), %error, "no job cache: blocks cannot be shared between files here");
             return None;
         }
         let mut store = CacheStore {
@@ -274,6 +283,7 @@ impl CacheStore {
             copies: BTreeMap::new(),
         };
         store.listing = store.read_all();
+        store.drop_strays();
         Some(store)
     }
 
@@ -304,6 +314,21 @@ impl CacheStore {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Deletes the images no record names: a Runner stopped between keeping one and writing its record, or could not
+    /// write it. Nothing would count or evict them.
+    fn drop_strays(&self) {
+        for entry in fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(key) = name.strip_suffix(".img") else {
+                continue;
+            };
+            if !self.listing.iter().any(|(found, _)| found == key) {
+                tracing::info!(%key, "a cache without its record is deleted");
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     fn write(&self, key: &str, cache: &Cache) {
@@ -341,25 +366,42 @@ impl CacheStore {
         let key = key(repo);
         let path = self.dir.join("jobs").join(format!("{job}.img"));
         let _ = fs::remove_file(&path);
+        // A copy may grow to the whole disk whatever it starts as: none without room for that.
+        let room = free_bytes(&self.dir);
+        if room.is_none_or(|room| room < DISK_BYTES) {
+            tracing::info!(%repo, %job, room, "no cache for this job: too little disk for a copy");
+            return None;
+        }
         let found = self.listing.iter().position(|(found, _)| *found == key);
-        let made = match found {
-            Some(at) if self.listing[at].1.repo.eq_ignore_ascii_case(repo) => {
-                self.listing[at].1.used_at = now;
-                self.write(&key, &self.listing[at].1);
-                cf_vmhost::scratch::clone(&self.image(&key), &path)
-            }
-            found => {
-                if found.is_some() {
-                    // Not this repository's, whatever its key: it is neither used nor kept.
-                    self.forget(&key);
+        let mut from = None;
+        if let Some(at) = found {
+            if self.listing[at].1.repo.eq_ignore_ascii_case(repo) {
+                match cf_vmhost::scratch::clone(&self.image(&key), &path) {
+                    Ok(()) => {
+                        self.listing[at].1.used_at = now;
+                        self.write(&key, &self.listing[at].1);
+                        from = Some(self.listing[at].1.written_at);
+                    }
+                    Err(error) => {
+                        // A cache that cannot be copied is never used again: the job starts an empty one.
+                        tracing::warn!(%repo, %job, %error, "the cache could not be copied; it goes");
+                        let _ = fs::remove_file(&path);
+                        self.forget(&key);
+                    }
                 }
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .and_then(|file| file.set_len(DISK_BYTES))
+            } else {
+                // Not this repository's, whatever its key: it is neither used nor kept.
+                self.forget(&key);
             }
+        }
+        let made = match from {
+            Some(_) => Ok(()),
+            None => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|file| file.set_len(DISK_BYTES)),
         };
         match made {
             Ok(()) => {
@@ -367,6 +409,7 @@ impl CacheStore {
                 Some(CacheCopy {
                     key,
                     path,
+                    from,
                     default_branch: default_branch.map(str::to_string),
                     end: None,
                     run: None,
@@ -422,7 +465,13 @@ impl CacheStore {
             },
             Some(why) => {
                 let _ = fs::remove_file(&copy.path);
-                if spoiled(copy.end) {
+                // Only a writer drops it, and only the cache it started from: a newer one was not tried.
+                let current = self
+                    .listing
+                    .iter()
+                    .find(|(key, _)| *key == copy.key)
+                    .map(|(_, cache)| cache.written_at);
+                if spoiled(copy.end) && why == DAEMON_SILENT && copy.from.is_some() && current == copy.from {
                     self.forget(&copy.key);
                     self.event(now, repo, CacheEventKind::Dropped, Some(why));
                 } else {
@@ -476,4 +525,22 @@ impl CacheStore {
             }
         }
     }
+}
+
+/// What an unprivileged process may still write on the file system of `dir`, in bytes; `None` when it cannot be read.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `path` ends with a NUL and `stats` is a statvfs this call may write.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statvfs returned 0, so it wrote the whole struct.
+    let stats = unsafe { stats.assume_init() };
+    #[allow(
+        clippy::useless_conversion,
+        reason = "the field types differ between macOS and Linux"
+    )]
+    Some(u64::from(stats.f_bavail).saturating_mul(u64::from(stats.f_frsize)))
 }

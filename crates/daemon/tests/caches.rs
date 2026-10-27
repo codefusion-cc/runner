@@ -9,7 +9,7 @@ use std::path::Path;
 
 use cf_daemon::GithubJob;
 use cf_daemon::caches::{
-    Cache, CacheCopy, CacheStore, DISK_BYTES, WorkflowRun, evictions, key, refusal, spoiled,
+    Cache, CacheCopy, CacheStore, DAEMON_SILENT, DISK_BYTES, WorkflowRun, evictions, key, refusal, spoiled,
 };
 use cf_guest_proto::{CacheEnd, CacheFound};
 use proptest::prelude::*;
@@ -506,11 +506,43 @@ fn a_cache_its_daemon_could_not_run_on_goes_and_the_next_job_starts_empty() {
         clean: true,
         docker: Some(false),
     });
-    caches.settle(REPO, &second, Some("the daemon did not answer"), 40);
+    caches.settle(REPO, &second, Some(DAEMON_SILENT), 40);
     assert!(caches.list().is_empty());
     assert_eq!(kinds(&caches), ["kept", "dropped"]);
     let third = caches.prepare("job3", REPO, Some("main"), 50).unwrap();
     assert!(empty(&third.path));
+}
+
+#[test]
+fn only_a_writer_drops_a_cache_and_only_the_one_it_started_from() {
+    let Some((_dir, mut caches)) = store(100 << 30) else {
+        return;
+    };
+    let silent = Some(CacheEnd {
+        found: CacheFound::Reused,
+        clean: true,
+        docker: Some(false),
+    });
+    keep(&mut caches, REPO, "job1", 20, b"v1");
+    // A pull request kills its own daemon: refused for its event, the cache stays.
+    let mut pull = caches.prepare("pull", REPO, Some("main"), 30).unwrap();
+    pull.end = silent;
+    caches.settle(
+        REPO,
+        &pull,
+        Some("only a push, a schedule or a dispatch writes the cache"),
+        31,
+    );
+    assert_eq!(caches.list().len(), 1, "a pull request drops nothing");
+    // A writer started from v1 while another kept v2: v2 was never tried, and stays.
+    let mut late = caches.prepare("late", REPO, Some("main"), 40).unwrap();
+    late.end = silent;
+    keep(&mut caches, REPO, "newer", 50, b"v2");
+    caches.settle(REPO, &late, Some(DAEMON_SILENT), 60);
+    assert_eq!(caches.list().len(), 1, "the newer cache stays");
+    let next = caches.prepare("next", REPO, Some("main"), 70).unwrap();
+    assert_eq!(head(&next.path), b"v2");
+    assert_eq!(kinds(&caches), ["kept", "discarded", "kept", "discarded"]);
 }
 
 #[test]
@@ -678,4 +710,54 @@ fn only_a_job_github_has_not_refused_already_has_its_run_read() {
         None,
     );
     assert!(cf_daemon::caches::worth_reading(REPO, Some("main"), &running));
+}
+
+#[test]
+fn a_store_that_cannot_share_blocks_now_deletes_the_copies_left_behind() {
+    let Some(dir) = cache_folder() else { return };
+    let mut caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
+    let left = caches.prepare("job1", REPO, Some("main"), 10).unwrap();
+    fs::write(&left.path, b"a copy").unwrap();
+    drop(caches);
+    // The probe cannot be written, as on a full disk.
+    fs::create_dir(dir.path().join(".clone-probe")).unwrap();
+    assert!(CacheStore::open(dir.path(), 100 << 30).is_none());
+    assert!(!left.path.exists(), "its room comes back");
+    fs::remove_dir(dir.path().join(".clone-probe")).unwrap();
+    assert!(
+        CacheStore::open(dir.path(), 100 << 30).is_some(),
+        "and the store opens once it can"
+    );
+}
+
+#[test]
+fn an_image_no_record_names_is_deleted_when_the_store_opens() {
+    let Some(dir) = cache_folder() else { return };
+    let mut caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
+    keep(&mut caches, REPO, "job1", 10, b"kept");
+    drop(caches);
+    // A Runner stopped between keeping a copy and writing its record.
+    let stray = dir.path().join(format!("{}.img", key("codefusion-cc/other")));
+    fs::write(&stray, vec![1; 1 << 20]).unwrap();
+    let caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
+    assert!(!stray.exists(), "nothing would ever count or evict it");
+    assert_eq!(caches.list().len(), 1, "the cache with its record stays");
+}
+
+#[test]
+fn a_cache_that_cannot_be_copied_goes_and_the_job_starts_empty() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some((dir, mut caches)) = store(100 << 30) else {
+        return;
+    };
+    keep(&mut caches, REPO, "job1", 10, b"kept");
+    let image = dir.path().join(format!("{}.img", key(REPO)));
+    fs::set_permissions(&image, fs::Permissions::from_mode(0o000)).unwrap();
+    let copy = caches
+        .prepare("job2", REPO, Some("main"), 20)
+        .expect("an empty copy");
+    assert_eq!(copy.from, None);
+    assert!(empty(&copy.path));
+    assert!(caches.list().is_empty(), "never tried again");
+    assert!(!image.exists());
 }

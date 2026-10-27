@@ -482,6 +482,22 @@ pub fn daemon_answers(sockets: &str) -> bool {
     std::os::unix::net::UnixStream::connect(format!("{sockets}/{}", plan::SOCKET_NAME)).is_ok()
 }
 
+/// Whether a Docker job's daemon, in the folder `sockets`, says the job left no container or volume
+/// ([`plan::left_nothing`]): the end hook's tidying, done or not, is what the next job on the cache would find.
+pub fn left_nothing(sockets: &str) -> bool {
+    let ask = |path: &str| -> Option<String> {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(format!("{sockets}/{}", plan::SOCKET_NAME)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        write!(stream, "GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n").ok()?;
+        let mut answer = String::new();
+        stream.take(1 << 20).read_to_string(&mut answer).ok()?;
+        Some(answer)
+    };
+    let [containers, volumes] = plan::LEFT_OVER.map(ask);
+    plan::left_nothing(&containers.unwrap_or_default(), &volumes.unwrap_or_default())
+}
+
 /// At a Docker job's end, before the job's processes are stopped: asks the daemon to stop and waits for it. Says
 /// whether it stopped by itself. `sandbox` is the sandbox's control group.
 pub fn stop_daemon(sandbox: &str) -> bool {

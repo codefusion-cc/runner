@@ -1213,6 +1213,18 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             if !local && job.record.unheard() && !deaf {
                 return false;
             }
+            // A copy that may become the cache waits, as long, for the sweep to read its run: a short job ends
+            // before the sweep after its start.
+            let unread = job.record.cache_copy.as_ref().is_some_and(|copy| {
+                copy.run.is_none()
+                    && job.record.github.as_ref().is_some_and(|github| {
+                        github.run_id > 0
+                            && caches::worth_reading(&job.record.repo, copy.default_branch.as_deref(), github)
+                    })
+            });
+            if unread && !deaf && duration(waited) < RESULT_WAIT {
+                return false;
+            }
             if test_run && !job.record.start_reported {
                 // Its machine never came up: the console still hears of the run that it ended, and a completion
                 // needs a start.

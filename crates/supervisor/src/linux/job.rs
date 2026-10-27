@@ -462,8 +462,10 @@ pub fn run(
     // dropped only when a daemon that ran on it stopped answering.
     let daemon = sockets.as_deref().filter(|_| cache.is_some()).map(|sockets| {
         let answers = docker::daemon_answers(sockets);
+        // What the end hook's tidying left: a container that starts again, or a volume, is no cache's.
+        let tidy = answers && docker::left_nothing(sockets);
         let stopped = answers && watch.stop.is_none() && docker::stop_daemon(&format!("{CGROUP}/docker"));
-        (answers, stopped)
+        (answers, tidy && stopped)
     });
     kill_job();
     let cache = cache.map(|found| CacheEnd {
