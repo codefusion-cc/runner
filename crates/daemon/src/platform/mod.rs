@@ -195,7 +195,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     config.stand_in = setup.stand_in;
     config.docker_max_jobs = setup.policy.docker_max_jobs;
     // A budget of 0 keeps no cache, and deletes what the folder held.
-    config.docker_cache = Some((state.join("docker-cache"), setup.policy.docker_cache_bytes));
+    config.cache = Some((state.join("job-cache"), setup.policy.cache_bytes));
     let rings = bell.clone();
     let machines = Machines::restore(MachineParts {
         host,

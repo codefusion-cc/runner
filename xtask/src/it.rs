@@ -175,6 +175,7 @@ pub fn run(root: &Path, args: &[String]) -> Fallible<()> {
         ("docker", docker),
         ("docker-oom", docker_oom),
         ("docker-cache", docker_cache),
+        ("job-cache", job_cache),
         #[cfg(target_os = "macos")]
         ("launchd", launchd),
         #[cfg(target_os = "macos")]
@@ -345,13 +346,15 @@ enum Docker<'a> {
     Yes,
     /// With this file as its cache disk, as the daemon would give a job its repository's cache.
     Cached(&'a Path),
+    /// Without Docker, with this file as its cache disk.
+    CacheOnly(&'a Path),
 }
 
 fn request(bench: &Bench, job: &str, memory_mb: u64, deadline_s: u64, script: &str, docker: Docker) -> Value {
     json!({
-        "docker": !matches!(docker, Docker::No),
-        "docker_cache": match docker {
-            Docker::Cached(path) => Some(path.display().to_string()),
+        "docker": matches!(docker, Docker::Yes | Docker::Cached(_)),
+        "cache": match docker {
+            Docker::Cached(path) | Docker::CacheOnly(path) => Some(path.display().to_string()),
             _ => None,
         },
         "job": job,
@@ -1555,13 +1558,13 @@ fn clone_file(from: &Path, to: &Path) -> Fallible<()> {
         .status()?;
     expect(
         status.success(),
-        "this host cannot share blocks between files: no Docker cache here",
+        "this host cannot share blocks between files: no job cache here",
     )
 }
 
-/// What a Docker job's guest said of its cache disk.
+/// What a job's guest said of its cache disk.
 fn cache_said(finished: &Finished) -> Value {
-    finished.state["end"]["summary"]["docker_cache"].clone()
+    finished.state["end"]["summary"]["cache"].clone()
 }
 
 /// A `cf-docker` job on a cache disk: the first, on an empty file, fills it and leaves it clean (its end hook removes
@@ -1583,7 +1586,7 @@ docker run -d --restart always --name left-behind -v left-volume:/v alpine:3.22 
     ended(&first, "ok")?;
     let said = cache_said(&first);
     expect(
-        said == json!({"found": "fresh", "clean": true, "daemon": true}),
+        said == json!({"found": "fresh", "clean": true, "docker": true}),
         format!("the first job's cache: {said}; {}", tail(&first.console)),
     )?;
     let first_build = printed(&first.console, "build-seconds")
@@ -1609,7 +1612,7 @@ echo volumes=$(docker volume ls --quiet | wc -l)
     };
     let said = cache_said(&second);
     expect(
-        said == json!({"found": "reused", "clean": true, "daemon": true}),
+        said == json!({"found": "reused", "clean": true, "docker": true}),
         format!("the second job's cache: {said}; {}", tail(&second.console)),
     )?;
     expect(
@@ -1661,6 +1664,95 @@ echo volumes=$(docker volume ls --quiet | wc -l)
         ),
         "a disk of garbage was made anew and the job ran on it".to_string(),
     ])
+}
+
+/// A job without Docker on a cache disk: the first, on an empty file, finds npm and pnpm pointed at their folders
+/// there, which are its own, writes packages, a log and (through sudo) a file of root's, and cannot write the disk's
+/// top level; its end leaves the packages only, all the user's, and lets the disk go. The second, on a copy, finds
+/// the packages and not the log.
+fn job_cache(bench: &Bench) -> Fallible<Vec<String>> {
+    let first_disk = bench.work.join("job-cache-1.img");
+    let _ = fs::remove_file(&first_disk);
+    fs::File::create(&first_disk)?.set_len(20 << 30)?;
+    let script = r#"echo cache=$CF_JOB_CACHE npm=$npm_config_cache pnpm=$pnpm_config_store_dir
+echo owner=$(stat -c %U "$npm_config_cache")-$(stat -c %U "$pnpm_config_store_dir")
+mkdir -p "$npm_config_cache/_cacache/content" "$npm_config_cache/_logs" "$pnpm_config_store_dir/v10/files"
+echo package > "$npm_config_cache/_cacache/content/a"; echo log > "$npm_config_cache/_logs/debug.log"
+echo stored > "$pnpm_config_store_dir/v10/files/b"; echo wrote=$?
+sudo -n sh -c 'echo root > "$0/_cacache/content/root"' "$npm_config_cache"; echo sudo=$?
+touch "$CF_JOB_CACHE/stray" 2>/dev/null; echo stray=$?"#;
+    let first = job_with_disk(bench, "it-job-cache-1", script, Docker::CacheOnly(&first_disk))?;
+    ended(&first, "ok")?;
+    let said = cache_said(&first);
+    expect(
+        said == json!({"found": "fresh", "clean": true, "docker": null}),
+        format!("the first job's cache: {said}; {}", tail(&first.console)),
+    )?;
+    expect(
+        printed(&first.console, "cache") == Some("/mnt/cache npm=/mnt/cache/npm pnpm=/mnt/cache/pnpm-store"),
+        format!("what the job was told: {}", tail(&first.console)),
+    )?;
+    expect(
+        printed(&first.console, "owner") == Some("runner-runner")
+            && printed(&first.console, "wrote") == Some("0"),
+        format!(
+            "npm's and pnpm's folders are not the job's: {}",
+            tail(&first.console)
+        ),
+    )?;
+    expect(
+        printed(&first.console, "stray") != Some("0"),
+        "the job wrote the cache's top level".to_string(),
+    )?;
+
+    let second_disk = bench.work.join("job-cache-2.img");
+    clone_file(&first_disk, &second_disk)?;
+    let script = r#"echo package=$(cat "$npm_config_cache/_cacache/content/a" 2>/dev/null)
+echo stored=$(cat "$pnpm_config_store_dir/v10/files/b" 2>/dev/null)
+echo log=$(ls "$npm_config_cache/_logs" 2>/dev/null | wc -l)
+echo root-owner=$(stat -c %U "$npm_config_cache/_cacache/content/root" 2>/dev/null)"#;
+    let second = job_with_disk(bench, "it-job-cache-2", script, Docker::CacheOnly(&second_disk))?;
+    ended(&second, "ok")?;
+    let said = cache_said(&second);
+    expect(
+        said == json!({"found": "reused", "clean": true, "docker": null}),
+        format!("the second job's cache: {said}; {}", tail(&second.console)),
+    )?;
+    expect(
+        printed(&second.console, "package") == Some("package")
+            && printed(&second.console, "stored") == Some("stored")
+            && printed(&second.console, "log") == Some("0"),
+        format!(
+            "the packages were not kept, or the log was: {}",
+            tail(&second.console)
+        ),
+    )?;
+    // What the first job wrote as root through sudo is the user's again, when sudo worked there at all.
+    if printed(&first.console, "sudo") == Some("0") {
+        expect(
+            printed(&second.console, "root-owner") == Some("runner"),
+            format!(
+                "a file the job's root left is not the user's: {}",
+                tail(&second.console)
+            ),
+        )?;
+    }
+    for name in ["it-job-cache-1", "it-job-cache-2"] {
+        tidy(bench, name)?;
+    }
+    for disk in [first_disk, second_disk] {
+        let _ = fs::remove_file(disk);
+    }
+    Ok(vec![
+        "a job without Docker found npm and pnpm on its cache, its own, and the top level not".to_string(),
+        "the next, on a copy, had the packages and not the first job's log".to_string(),
+    ])
+}
+
+/// A job of 2 GB with this script on a disk, to its end.
+fn job_with_disk(bench: &Bench, name: &str, script: &str, docker: Docker) -> Fallible<Finished> {
+    let running = start_job(bench, name, 2048, 300, script, &[], docker)?;
+    finish(bench, running, Duration::from_secs(360), &mut |_, _| Ok(()))
 }
 
 /// A Docker job of 4 GB with this script, to its end.

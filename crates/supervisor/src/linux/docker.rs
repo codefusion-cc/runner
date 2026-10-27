@@ -11,10 +11,8 @@
 
 use super::container::{await_ids, give_ids, read_spec};
 use super::init::{SELF_COPY, load_modules, spawn_self};
-use super::job::{disk, image_tool, mke2fs_args};
 use super::net;
 use super::sys::{self, check, context, exit_code, fork, say, unshare, wait};
-use cf_guest_proto::{CACHE_DISK, CacheFound};
 use cf_supervisor::docker::{self as plan, SHIFT};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -61,18 +59,18 @@ fn chown(path: &str, uid: u32, gid: u32) -> Result<(), String> {
 }
 
 /// The modules, the sandbox's control group and folders, and the socket's folder in the job's root. `root` is the
-/// job's root, `scratch` the job's disk, `cgroup` the job's control group; the job user's ids come with the image's
-/// `/etc/group`. `data` is where the daemon keeps its data: on the job's disk, or on a cache ([`mount_cache`]).
+/// job's root, `scratch` the job's disk and `data` where the daemon keeps its data (on the job's disk, or on its cache
+/// disk, [`super::cache::mount`]), `cgroup` the job's control group; the job user's ids come with the image's
+/// `/etc/group`.
 /// `beside` is what is next to the machine, which the daemon's networks stay clear of ([`plan::networks`]).
 /// An error says what the job is missing; the job runs without Docker and is told why.
 pub fn prepare(
     root: &str,
-    scratch: &str,
+    (scratch, data): (&str, &str),
     cgroup: &str,
     (uid, gid, group): (u32, u32, &str),
     host_name: &str,
     shm_bytes: u64,
-    data: &str,
     beside: &[(plan::Ip, u8)],
 ) -> Result<Spec, String> {
     // Before anything is changed for the daemon: an image from before Docker jobs lacks its programs.
@@ -475,52 +473,9 @@ fn daemon_process(ready: OwnedFd, go: OwnedFd, networks: &plan::Networks) -> Res
     Err(format!("{}: {error}", command[0]))
 }
 
-/// Where a Docker job's cache disk is mounted, in the supervisor's view; the sandbox sees its `docker` folder as
-/// [`plan::DATA`].
-pub const CACHE: &str = "/mnt/cache";
-
-/// Mounts the cache disk at [`CACHE`] and says what it held. A disk the image's `e2fsck` cannot make whole, or that
-/// does not mount, is made anew: the job runs with an empty cache rather than none.
-pub fn mount_cache() -> Result<CacheFound, String> {
-    let device = disk(CACHE_DISK)?;
-    let flags = libc::MS_NOATIME | libc::MS_NODEV | libc::MS_NOSUID;
-    context("the cache's folder", fs::create_dir_all(CACHE))?;
-    let empty = empty_disk(&device);
-    if !empty {
-        // `-p` repairs what it safely can and says 4 or more for what it cannot.
-        let checked = image_tool(&["e2fsck".into(), "-p".into(), device.clone()])
-            .is_ok_and(|status| status.code().is_some_and(|code| code < 4));
-        if checked && sys::mount(&device, CACHE, "ext4", flags, "").is_ok() {
-            return Ok(CacheFound::Reused);
-        }
-        say("the cache disk does not mount: it is made anew");
-    }
-    let found = if empty {
-        CacheFound::Fresh
-    } else {
-        CacheFound::Replaced
-    };
-    let status = image_tool(&mke2fs_args(&device, true, empty))?;
-    if !status.success() {
-        return Err(format!("the image's mke2fs ended with {status}"));
-    }
-    sys::mount_at(&device, CACHE, "ext4", flags, "")?;
-    Ok(found)
-}
-
-/// Whether a disk's first megabyte is all zeros: a file the host made empty, never formatted.
-fn empty_disk(device: &str) -> bool {
-    let mut start = vec![0u8; 1 << 20];
-    File::open(device)
-        .and_then(|mut file| file.read_exact(&mut start))
-        .is_ok_and(|()| start.iter().all(|byte| *byte == 0))
-}
-
 /// How long the daemon gets to stop by itself at the job's end: its containers are gone by then (the job's end
 /// hook removed them), so it only writes down its state.
 const DAEMON_STOP: Duration = Duration::from_secs(15);
-/// How long the cache disk may stay busy once every process of the sandbox is gone.
-const LET_GO: Duration = Duration::from_secs(5);
 
 /// Whether a Docker job's daemon still answers on its socket, in the folder `sockets`.
 pub fn daemon_answers(sockets: &str) -> bool {
@@ -547,17 +502,4 @@ pub fn stop_daemon(sandbox: &str) -> bool {
         daemons().is_empty().then_some(())
     })
     .is_some()
-}
-
-/// Once every process of the job is gone: unmounts the cache, which the sandbox's namespaces held until they went.
-/// Says whether it let go; a disk still mounted is not kept.
-pub fn let_go_of_cache() -> bool {
-    let mut busy = None;
-    let let_go = sys::until(LET_GO, Duration::from_millis(100), || {
-        sys::umount(CACHE, 0).map_err(|error| busy = Some(error)).ok()
-    });
-    if let (None, Some(error)) = (let_go, busy) {
-        say(&format!("the cache disk stays busy: {error}"));
-    }
-    let_go.is_some()
 }

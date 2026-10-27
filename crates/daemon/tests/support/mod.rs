@@ -4,7 +4,7 @@
 
 pub mod world;
 
-/// A folder for Docker jobs' caches, or none where its file system cannot share blocks between files (as on most
+/// A folder for jobs' caches, or none where its file system cannot share blocks between files (as on most
 /// Linux CI disks): a test that needs one then passes without running.
 pub fn cache_folder() -> Option<tempfile::TempDir> {
     let dir = tempfile::tempdir().unwrap();
@@ -400,7 +400,7 @@ pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harn
         settings,
         nudges: Arc::new(AtomicUsize::new(0)),
         boot: "start-1".into(),
-        docker_cache: None,
+        cache: None,
         bell: Arc::default(),
     };
     let machines = parts.machines(None);

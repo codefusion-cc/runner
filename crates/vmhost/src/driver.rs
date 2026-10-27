@@ -188,7 +188,7 @@ fn run_in(
         oom_grace_ms: 15_000,
         blocked: crate::host_net::host_networks(),
         docker: request.docker,
-        docker_cache: request.docker_cache.is_some(),
+        cache: request.cache.is_some(),
     });
 
     let snapshot = |machine: Option<&Machine>, stage: Stage| JobState {
@@ -284,8 +284,8 @@ fn run_in(
         let _ = fs::remove_file(&state_path);
         return Err(RunError::Scratch(error));
     }
-    // A Docker job's copy of its repository's cache, which the guest finds by its id.
-    let cache = request.docker_cache.iter().map(|path| Disk {
+    // The job's copy of its repository's cache, which the guest finds by its id.
+    let cache = request.cache.iter().map(|path| Disk {
         path: path.clone(),
         id: cf_guest_proto::CACHE_DISK.into(),
         read_only: false,

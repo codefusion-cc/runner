@@ -66,10 +66,10 @@ impl World {
         World::on(settings_for(machines))
     }
 
-    /// A Mac with room for `machines` machines that keeps Docker jobs' caches in `dir`, `budget` bytes of them.
-    pub fn with_docker_cache(machines: u32, dir: &std::path::Path, budget: u64) -> World {
+    /// A Mac with room for `machines` machines that keeps jobs' caches in `dir`, `budget` bytes of them.
+    pub fn with_cache(machines: u32, dir: &std::path::Path, budget: u64) -> World {
         let mut world = World::new(machines);
-        world.parts.docker_cache = Some((dir.to_path_buf(), budget));
+        world.parts.cache = Some((dir.to_path_buf(), budget));
         world.m = world.parts.machines(None);
         world
     }
@@ -90,7 +90,7 @@ impl World {
             settings,
             nudges: Arc::new(AtomicUsize::new(0)),
             boot: "start-1".into(),
-            docker_cache: None,
+            cache: None,
             bell: Arc::default(),
         };
         let m = parts.machines(None);

@@ -1,5 +1,6 @@
 //! The supervisor's hands: system calls in the guest. What it decides is in the library, where tests reach it.
 
+mod cache;
 pub mod container;
 pub mod docker;
 pub mod hook;

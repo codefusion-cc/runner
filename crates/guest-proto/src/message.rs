@@ -62,9 +62,10 @@ pub struct Job {
     /// Whether the job gets a Docker daemon of its own, in a sandbox beside its container.
     #[serde(default)]
     pub docker: bool,
-    /// Whether the machine has a cache disk ([`crate::CACHE_DISK`]) for the daemon's data.
+    /// Whether the machine has a cache disk ([`crate::CACHE_DISK`]): its repository's package caches and, for a
+    /// Docker job, its daemon's data.
     #[serde(default)]
-    pub docker_cache: bool,
+    pub cache: bool,
 }
 
 /// A job's limits, enforced by the guest kernel on the job's control group.
@@ -281,24 +282,26 @@ pub struct Summary {
     pub oom: Option<OomEvent>,
     /// From the workload's start to its end, in milliseconds.
     pub wall_ms: u64,
-    /// A Docker job's cache disk: what the guest found on it and how it was let go.
+    /// The job's cache disk: what the guest found on it and how it was let go.
     #[serde(default)]
-    pub docker_cache: Option<CacheEnd>,
+    pub cache: Option<CacheEnd>,
 }
 
-/// What became of a Docker job's cache disk.
+/// What became of a job's cache disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheEnd {
     /// What the disk held when the job started.
     pub found: CacheFound,
-    /// Whether the daemon stopped by itself and the disk was let go cleanly: only such a disk is worth keeping.
+    /// Whether the disk was let go cleanly, after a Docker job's daemon stopped by itself: only such a disk is worth
+    /// keeping.
     pub clean: bool,
-    /// Whether the daemon still answered at the job's end. A cache it could not run on is not used again.
+    /// Whether a Docker job's daemon still answered at the job's end; none for a job without Docker. A cache its
+    /// daemon could not run on is not used again.
     #[serde(default)]
-    pub daemon: bool,
+    pub docker: Option<bool>,
 }
 
-/// What a Docker job's cache disk held when the job started.
+/// What a job's cache disk held when the job started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CacheFound {

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cf_console_client::{
-    Client, Enroll, Error, MAX_BODY_BYTES, MAX_DOCKER_CACHE_EVENTS, MAX_DOCKER_CACHES, MAX_JOB_EVENTS,
-    MAX_RESULTS, MAX_RUNNERS, MAX_SCALE_SETS, Os, Outbox, Report, enroll, is_machine_name,
+    Client, Enroll, Error, MAX_BODY_BYTES, MAX_JOB_CACHE_EVENTS, MAX_JOB_CACHES, MAX_JOB_EVENTS, MAX_RESULTS,
+    MAX_RUNNERS, MAX_SCALE_SETS, Os, Outbox, Report, enroll, is_machine_name,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::httpd::{Handler, Reply, Server};
@@ -380,11 +380,11 @@ async fn a_report_the_console_would_refuse_is_not_sent() {
     r.status.scale_sets = (0..=MAX_SCALE_SETS).map(scale_set).collect();
     cases.push(("501 scale sets", r));
     let mut r = report("mac-a");
-    r.status.docker_caches = (0..=MAX_DOCKER_CACHES).map(docker_cache).collect();
-    cases.push(("65 Docker caches", r));
+    r.status.job_caches = (0..=MAX_JOB_CACHES).map(cache).collect();
+    cases.push(("65 job caches", r));
     let mut r = report("mac-a");
-    r.status.docker_cache_events = (0..=MAX_DOCKER_CACHE_EVENTS).map(docker_cache_event).collect();
-    cases.push(("33 Docker cache events", r));
+    r.status.job_cache_events = (0..=MAX_JOB_CACHE_EVENTS).map(job_cache_event).collect();
+    cases.push(("33 job cache events", r));
     let mut r = report("mac-a");
     r.jobs = vec![cf_console_client::JobEvent {
         runner: String::new(),
@@ -463,8 +463,8 @@ async fn every_bound_at_its_maximum_is_sent_and_accepted() {
             error_at: None,
         })
         .collect();
-    r.status.docker_caches = (0..MAX_DOCKER_CACHES).map(docker_cache).collect();
-    r.status.docker_cache_events = (0..MAX_DOCKER_CACHE_EVENTS).map(docker_cache_event).collect();
+    r.status.job_caches = (0..MAX_JOB_CACHES).map(cache).collect();
+    r.status.job_cache_events = (0..MAX_JOB_CACHE_EVENTS).map(job_cache_event).collect();
     w.client.report(&r).await.expect("everything at its maximum");
     assert_eq!(w.fake.job_events().len(), 500);
 }
@@ -871,8 +871,8 @@ async fn events_with_empty_very_long_and_unicode_names_reach_the_console_as_the_
     assert_eq!(seen[5]["workflow"].as_str().map(|s| s.chars().count()), Some(400));
 }
 
-fn docker_cache(i: usize) -> cf_console_client::DockerCache {
-    cf_console_client::DockerCache {
+fn cache(i: usize) -> cf_console_client::JobCache {
+    cf_console_client::JobCache {
         repo: format!("org/app{i}"),
         bytes: 1 << 30,
         written_at: "2026-10-14T10:00:00Z".into(),
@@ -880,8 +880,8 @@ fn docker_cache(i: usize) -> cf_console_client::DockerCache {
     }
 }
 
-fn docker_cache_event(i: usize) -> cf_console_client::DockerCacheEvent {
-    cf_console_client::DockerCacheEvent {
+fn job_cache_event(i: usize) -> cf_console_client::JobCacheEvent {
+    cf_console_client::JobCacheEvent {
         at: "2026-10-14T10:00:00Z".into(),
         repo: format!("org/app{i}"),
         kind: "evicted".into(),
@@ -890,30 +890,30 @@ fn docker_cache_event(i: usize) -> cf_console_client::DockerCacheEvent {
 }
 
 #[test]
-fn docker_caches_go_by_their_wire_names_and_a_report_before_them_has_none() {
+fn job_caches_go_by_their_wire_names_and_a_report_before_them_has_none() {
     let mut status = support::status("mac-a");
-    status.docker_caches = vec![cf_console_client::DockerCache {
+    status.job_caches = vec![cf_console_client::JobCache {
         repo: "org/app".into(),
         bytes: 3 << 30,
         written_at: "2026-10-14T10:00:00Z".into(),
         used_at: "2026-10-14T11:00:00Z".into(),
     }];
-    status.docker_cache_events = vec![cf_console_client::DockerCacheEvent {
+    status.job_cache_events = vec![cf_console_client::JobCacheEvent {
         at: "2026-10-14T10:00:00Z".into(),
         repo: "org/app".into(),
         kind: "discarded".into(),
         why: Some("only a push, a schedule or a dispatch writes the cache".into()),
     }];
     let value = serde_json::to_value(&status).unwrap();
-    assert_eq!(value["dockerCaches"][0]["writtenAt"], "2026-10-14T10:00:00Z");
-    assert_eq!(value["dockerCaches"][0]["bytes"], 3u64 << 30);
-    assert_eq!(value["dockerCacheEvents"][0]["kind"], "discarded");
+    assert_eq!(value["jobCaches"][0]["writtenAt"], "2026-10-14T10:00:00Z");
+    assert_eq!(value["jobCaches"][0]["bytes"], 3u64 << 30);
+    assert_eq!(value["jobCacheEvents"][0]["kind"], "discarded");
     let back: cf_console_client::Status = serde_json::from_value(value).unwrap();
     assert_eq!(back, status);
 
     let mut old = serde_json::to_value(support::status("mac-a")).unwrap();
-    assert!(old.get("dockerCaches").is_none(), "left out while there are none");
-    old.as_object_mut().unwrap().remove("dockerCacheEvents");
+    assert!(old.get("jobCaches").is_none(), "left out while there are none");
+    old.as_object_mut().unwrap().remove("jobCacheEvents");
     let read: cf_console_client::Status = serde_json::from_value(old).unwrap();
-    assert!(read.docker_caches.is_empty() && read.docker_cache_events.is_empty());
+    assert!(read.job_caches.is_empty() && read.job_cache_events.is_empty());
 }

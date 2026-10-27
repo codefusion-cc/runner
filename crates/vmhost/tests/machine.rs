@@ -41,7 +41,7 @@ fn summary(end: GuestEnd, exit_code: Option<i32>, oom: bool) -> Summary {
         disk_peak_bytes: 7,
         oom,
         wall_ms: 11,
-        docker_cache: None,
+        cache: None,
     }
 }
 

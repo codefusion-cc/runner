@@ -83,8 +83,8 @@ pub struct ServePolicy {
     pub docker_repos: Vec<String>,
     /// The most Docker jobs at once ([`crate::machines::MachineConfig::docker_max_jobs`]).
     pub docker_max_jobs: usize,
-    /// How many bytes Docker jobs' caches may hold together; 0 keeps none.
-    pub docker_cache_bytes: u64,
+    /// How many bytes jobs' caches may hold together; 0 keeps none.
+    pub cache_bytes: u64,
     /// The host labels this host has ([`cf_workflows::is_host_label`]): a set that asks for others is left to
     /// the hosts that have them.
     pub host_labels: Vec<String>,
@@ -97,7 +97,7 @@ impl Default for ServePolicy {
             public_repos: Vec::new(),
             docker_repos: Vec::new(),
             docker_max_jobs: 1,
-            docker_cache_bytes: 0,
+            cache_bytes: 0,
             host_labels: Vec::new(),
         }
     }

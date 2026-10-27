@@ -39,7 +39,7 @@ pub struct ScalerConfig {
     pub size: Size,
     /// Whether its jobs get a Docker daemon (`cf-docker`).
     pub docker: bool,
-    /// The repository's default branch, when GitHub named it: only a run there writes a Docker cache.
+    /// The repository's default branch, when GitHub named it: only a run there writes a cache.
     pub default_branch: Option<String>,
 }
 

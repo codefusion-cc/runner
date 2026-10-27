@@ -2,6 +2,7 @@
 
 use cf_guest_proto::{Limits, OomEvent, Process as Used, StopReason};
 use cf_nft::{BLOCKED, IPV4, IPV6, Packet, Verdict, decide};
+use cf_supervisor::cache::{self, Entry, KEPT, MOUNT, NPM, NPM_KEPT, PNPM, leftovers};
 use cf_supervisor::dhcp::{self, Lease, Reply};
 use cf_supervisor::environment::{find_group, find_user, workload_environment};
 use cf_supervisor::firewall::{self, own_network, policy};
@@ -783,7 +784,7 @@ fn facts() -> JobFacts {
         },
         disk_bytes: 30 << 30,
         docker: false,
-        docker_cache: false,
+        cache: false,
     }
 }
 
@@ -1288,5 +1289,126 @@ proptest! {
             }
             last = count;
         }
+    }
+}
+
+// A job's cache disk: what the job is told, and what its end leaves on it.
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| name.to_string()).collect()
+}
+
+/// Folders of these names.
+fn folders(list: &[&str]) -> Vec<Entry> {
+    list.iter().map(|name| (name.to_string(), true)).collect()
+}
+
+#[test]
+fn a_job_with_a_cache_points_npm_and_pnpm_at_it_and_its_own_entries_win() {
+    let told = cache::environment(MOUNT);
+    assert_eq!(
+        told,
+        [
+            ("CF_JOB_CACHE".to_string(), "/mnt/cache".to_string()),
+            ("npm_config_cache".to_string(), "/mnt/cache/npm".to_string()),
+            (
+                "pnpm_config_store_dir".to_string(),
+                "/mnt/cache/pnpm-store".to_string()
+            ),
+        ]
+    );
+    let mut extra = told;
+    extra.push(("npm_config_cache".into(), "/tmp/own".into()));
+    let environment = workload_environment("/home/runner", "runner", &extra);
+    let npm: Vec<&str> = environment
+        .iter()
+        .filter(|(name, _)| name == "npm_config_cache")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(npm, ["/tmp/own"], "once, the job's own");
+    assert!(
+        environment
+            .iter()
+            .any(|(name, value)| name == "CF_JOB_CACHE" && value == "/mnt/cache")
+    );
+}
+
+#[test]
+fn a_jobs_end_leaves_packages_and_docker_data_only() {
+    let mut top = folders(&["docker", "npm", "pnpm-store", "lost+found", "node_modules"]);
+    top.extend([("secrets.env".to_string(), false), (".npmrc".to_string(), false)]);
+    let mut npm = folders(&["_cacache", "_logs", "_npx", "_cacache.tmp"]);
+    npm.push(("_update-notifier-last-checked".to_string(), false));
+    assert_eq!(
+        leftovers(&top, &npm),
+        names(&[
+            "node_modules",
+            "secrets.env",
+            ".npmrc",
+            "npm/_logs",
+            "npm/_npx",
+            "npm/_cacache.tmp",
+            "npm/_update-notifier-last-checked",
+        ])
+    );
+    assert!(
+        leftovers(
+            &folders(&["docker", "npm", "pnpm-store", "lost+found"]),
+            &folders(&["_cacache"])
+        )
+        .is_empty()
+    );
+    assert!(leftovers(&[], &[]).is_empty(), "an empty disk has nothing to go");
+    // npm's entries are looked at only when npm's folder is there.
+    assert!(leftovers(&folders(&["pnpm-store"]), &folders(&["_logs"])).is_empty());
+    // A name that only looks like a kept one goes.
+    assert_eq!(
+        leftovers(&folders(&["Docker", "npm ", "pnpm-store2"]), &[]),
+        names(&["Docker", "npm ", "pnpm-store2"])
+    );
+}
+
+#[test]
+fn a_link_where_a_kept_folder_goes_is_deleted_and_never_followed() {
+    // `ln -s /etc npm`: the link goes, and nothing behind it is listed for deletion.
+    let top = vec![
+        ("npm".to_string(), false),
+        ("docker".to_string(), false),
+        ("pnpm-store".to_string(), true),
+    ];
+    assert_eq!(
+        leftovers(&top, &folders(&["passwd", "shadow"])),
+        names(&["npm", "docker"])
+    );
+    // A link named like npm's packages goes too.
+    assert_eq!(
+        leftovers(&folders(&["npm"]), &[("_cacache".to_string(), false)]),
+        names(&["npm/_cacache"])
+    );
+}
+
+proptest! {
+    #[test]
+    fn a_jobs_end_never_takes_a_kept_folder_and_takes_all_else(
+        // A folder's names are unique, so maps of name to whether it is a folder.
+        top in proptest::collection::btree_map(prop_oneof![
+            Just("docker".to_string()), Just("npm".to_string()), Just("pnpm-store".to_string()),
+            Just("lost+found".to_string()), "[^/\\x00]{1,20}"
+        ], any::<bool>(), 0..12),
+        npm in proptest::collection::btree_map(prop_oneof![Just("_cacache".to_string()), "[^/\\x00]{1,20}"], any::<bool>(), 0..12),
+    ) {
+        let top: Vec<Entry> = top.into_iter().collect();
+        let npm: Vec<Entry> = npm.into_iter().collect();
+        let gone = leftovers(&top, &npm);
+        for (name, folder) in &top {
+            prop_assert_eq!(gone.contains(name), !(*folder && KEPT.contains(&name.as_str())), "{} {}", name, folder);
+        }
+        let npm_there = top.iter().any(|(name, folder)| name == NPM && *folder);
+        for (name, folder) in &npm {
+            let path = format!("{NPM}/{name}");
+            prop_assert_eq!(gone.contains(&path), npm_there && !(*folder && name == NPM_KEPT), "{}", path);
+        }
+        let in_pnpm = format!("{PNPM}/");
+        prop_assert!(!gone.iter().any(|path| path.starts_with(&in_pnpm)));
     }
 }

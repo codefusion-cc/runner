@@ -24,7 +24,7 @@ struct FakeVm {
     silent: bool,
     files: bool,
     unkillable: bool,
-    /// What its guest says of a Docker cache disk at the end, when it has one.
+    /// What its guest says of a cache disk at the end, when it has one.
     cache: Option<CacheEnd>,
 }
 
@@ -283,7 +283,7 @@ impl FakeVms {
         self.jobs()
     }
 
-    /// What the guests of machines started from now on say of their Docker cache disk at the end.
+    /// What the guests of machines started from now on say of their cache disk at the end.
     pub fn cache_end(&self, end: CacheEnd) {
         self.lock().cache_end = Some(end);
     }
@@ -309,7 +309,7 @@ fn finish(vm: &mut FakeVm, end: End) {
             disk_peak_bytes: 5 << 20,
             oom: vm.state.oom.clone(),
             wall_ms: 4200,
-            docker_cache: vm.cache,
+            cache: vm.cache,
         }),
         at: 0,
     });
@@ -361,11 +361,11 @@ impl Vms for FakeVms {
             silent: false,
             files,
             unkillable: false,
-            cache: request.docker_cache.as_ref().map(|_| {
+            cache: request.cache.as_ref().map(|_| {
                 state.cache_end.unwrap_or(CacheEnd {
                     found: CacheFound::Fresh,
                     clean: true,
-                    daemon: true,
+                    docker: request.docker.then_some(true),
                 })
             }),
         };
@@ -491,8 +491,8 @@ pub struct TestParts {
     pub bell: Arc<crate::service::Nudge>,
     /// The Mac's boot.
     pub boot: String,
-    /// Where Docker jobs' caches are kept, and their budget; none keeps none.
-    pub docker_cache: Option<(std::path::PathBuf, u64)>,
+    /// Where jobs' caches are kept, and their budget; none keeps none.
+    pub cache: Option<(std::path::PathBuf, u64)>,
 }
 
 impl TestParts {
@@ -519,7 +519,7 @@ impl TestParts {
     fn restored_with(&self, host: FakeHost, tweak: impl FnOnce(&mut MachineConfig)) -> Arc<TestMachines> {
         let (nudges, bell) = (self.nudges.clone(), self.bell.clone());
         let mut config = MachineConfig {
-            docker_cache: self.docker_cache.clone(),
+            cache: self.cache.clone(),
             ..MachineConfig::new("mac-b", "2026.10.1", &self.boot, Duration::from_secs(6 * 3600))
         };
         tweak(&mut config);

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
-    Activity, Answer, Client, Command, CommandResult, DockerCache, DockerCacheEvent, DockerStatus, HeldJobs,
-    HostStatus, JobKind, JobLimits, MAX_DOCKER_CACHE_EVENTS, MAX_DOCKER_CACHES, MAX_RUNNERS, MAX_SCALE_SETS,
+    Activity, Answer, Client, Command, CommandResult, DockerStatus, HeldJobs, HostStatus, JobCache,
+    JobCacheEvent, JobKind, JobLimits, MAX_JOB_CACHE_EVENTS, MAX_JOB_CACHES, MAX_RUNNERS, MAX_SCALE_SETS,
     MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus, RunnerUsage, ScaleSetStatus, SizeStatus,
     Status, Update,
 };
@@ -1760,22 +1760,22 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         error_at: set.error_at.map(iso),
                     })
                     .collect(),
-                docker_caches: snapshot
+                job_caches: snapshot
                     .caches
                     .iter()
-                    .take(MAX_DOCKER_CACHES)
-                    .map(|cache| DockerCache {
+                    .take(MAX_JOB_CACHES)
+                    .map(|cache| JobCache {
                         repo: cut(cache.repo.clone(), STATUS_TEXT_MAX),
                         bytes: cache.bytes,
                         written_at: iso(cache.written_at),
                         used_at: iso(cache.used_at),
                     })
                     .collect(),
-                docker_cache_events: snapshot
+                job_cache_events: snapshot
                     .cache_events
                     .iter()
-                    .take(MAX_DOCKER_CACHE_EVENTS)
-                    .map(|event| DockerCacheEvent {
+                    .take(MAX_JOB_CACHE_EVENTS)
+                    .map(|event| JobCacheEvent {
                         at: iso(event.at),
                         repo: cut(event.repo.clone(), STATUS_TEXT_MAX),
                         kind: event.kind.name().to_string(),

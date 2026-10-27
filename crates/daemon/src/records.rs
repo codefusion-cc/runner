@@ -91,7 +91,7 @@ pub struct Record {
     pub docker: bool,
     /// A Docker job's copy of its repository's cache, until the job is over and it was kept or thrown away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docker_copy: Option<crate::caches::CacheCopy>,
+    pub cache_copy: Option<crate::caches::CacheCopy>,
     /// The machine's memory and CPUs, and how the budget came to grant them.
     pub memory_bytes: u64,
     /// The job's own share of that memory.

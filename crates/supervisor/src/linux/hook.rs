@@ -105,7 +105,7 @@ pub fn run(name: &str) -> ! {
             }
         }
         "job-completed" => {
-            if facts.as_ref().is_some_and(|facts| facts.docker_cache) {
+            if facts.as_ref().is_some_and(|facts| facts.docker && facts.cache) {
                 tidy_docker();
             }
             if let Some(oom) = read::<OomEvent>("oom.json") {

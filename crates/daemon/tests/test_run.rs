@@ -631,7 +631,7 @@ async fn the_token_shows_in_no_debug_print_of_the_machines_request() {
         oom_grace_ms: 0,
         blocked: Vec::new(),
         docker: false,
-        docker_cache: false,
+        cache: false,
     };
     assert!(!format!("{message:?}").contains(run.token.expose().as_str()));
     // On the wire it is there, as before: the vm-host and the guest read it.

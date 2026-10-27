@@ -1,13 +1,14 @@
-//! Docker jobs' caches: one disk per repository with its daemon's data (images, build cache), which spares a job
-//! the pulls and builds the one before it made.
+//! Jobs' caches: one disk per repository with npm's cache, pnpm's store and a Docker job's daemon data (images,
+//! build cache), which spares a job the downloads, pulls and builds the one before it made.
 //!
-//! A Docker job gets a copy of its repository's cache that shares every block until written (APFS's clonefile,
-//! Linux's reflink; a host without either keeps no cache), and writes only that copy. Once the job is over the copy
-//! becomes the repository's cache only when everything says it may ([`refusal`]): GitHub's word that the job succeeded,
-//! on a push, a schedule or a dispatch, of a workflow of the repository itself on its default branch, and the guest's
-//! word that the daemon stopped by itself and the disk was let go. Anything else, a pull request first of all, is
-//! thrown away. So a cache holds what the default branch built and nothing a pull request, a fork or another
-//! repository left.
+//! Every job gets a copy of its repository's cache that shares every block until written (APFS's clonefile, Linux's
+//! reflink; a host without either keeps no cache), and writes only that copy, so jobs that run at once never write
+//! the same file. Once the job is over the copy becomes the repository's cache only when everything says it may
+//! ([`refusal`]): GitHub's word that the job succeeded, on a push, a schedule or a dispatch, of a workflow of the
+//! repository itself on its default branch, and the guest's word that the disk was let go cleanly (after a Docker
+//! job's daemon stopped by itself). Anything else, a pull request first of all, is thrown away. So a cache holds what
+//! the default branch downloaded and built and nothing a pull request, a fork or another repository left; the guest
+//! keeps only packages and Docker's data on it (`cf_supervisor::cache`).
 //!
 //! The caches together stay under a budget: the one used longest ago goes first ([`evictions`]).
 
@@ -26,7 +27,7 @@ pub use cf_ghapp::WorkflowRun;
 /// The size of a cache disk as the guest sees it. The file is sparse: the host holds only what was written.
 pub const DISK_BYTES: u64 = 20 << 30;
 /// The events kept for the console: the newest ones.
-pub const EVENTS_KEPT: usize = cf_console_client::MAX_DOCKER_CACHE_EVENTS;
+pub const EVENTS_KEPT: usize = cf_console_client::MAX_JOB_CACHE_EVENTS;
 
 /// A repository's cache key. GitHub's names ignore case, so one repository has one key however a workflow or a
 /// listing spells it; two repositories never share one, and the cache's own record names its repository, which is
@@ -58,6 +59,49 @@ pub fn refusal(
     if !matches!(github.result.as_deref(), Some("succeeded" | "success")) {
         return Some("the job did not succeed");
     }
+    if let Some(why) = job_refusal(repo, default_branch, github) {
+        return Some(why);
+    }
+    // Known and not empty: `job_refusal` refused otherwise.
+    let branch = default_branch.unwrap_or_default();
+    let Some(run) = run else {
+        return Some("GitHub's run was not read");
+    };
+    if run.head_branch.as_deref() != Some(branch) {
+        return Some("the run's code is not the default branch's");
+    }
+    if !run
+        .head_repository
+        .as_deref()
+        .is_some_and(|head| head.eq_ignore_ascii_case(repo))
+    {
+        return Some("the run's code is another repository's");
+    }
+    if run.event != github.event {
+        return Some("the run's event is not the job's");
+    }
+    let Some(end) = end else {
+        return Some("the machine said nothing of the cache");
+    };
+    if end.docker == Some(false) {
+        return Some("the daemon did not answer at the job's end");
+    }
+    if !end.clean {
+        return Some("the disk was not let go cleanly");
+    }
+    None
+}
+
+/// Whether GitHub's run is worth reading for a job's copy: what GitHub said of the job, as far as it is known while
+/// the job runs, does not refuse it already ([`job_refusal`]). A pull request's job, the most common, then costs no
+/// call.
+pub fn worth_reading(repo: &str, default_branch: Option<&str>, github: &GithubJob) -> bool {
+    job_refusal(repo, default_branch, github).is_none()
+}
+
+/// What refuses a job's copy from what GitHub said of the job before it ended: its event, its workflow's repository
+/// and ref, the default branch. The run itself and the job's end are [`refusal`]'s.
+fn job_refusal(repo: &str, default_branch: Option<&str>, github: &GithubJob) -> Option<&'static str> {
     if !WRITERS.contains(&github.event.as_str()) {
         return Some("only a push, a schedule or a dispatch writes the cache");
     }
@@ -78,38 +122,13 @@ pub fn refusal(
     if git_ref != format!("refs/heads/{branch}") {
         return Some("the run is not on the default branch");
     }
-    let Some(run) = run else {
-        return Some("GitHub's run was not read");
-    };
-    if run.head_branch.as_deref() != Some(branch) {
-        return Some("the run's code is not the default branch's");
-    }
-    if !run
-        .head_repository
-        .as_deref()
-        .is_some_and(|head| head.eq_ignore_ascii_case(repo))
-    {
-        return Some("the run's code is another repository's");
-    }
-    if run.event != github.event {
-        return Some("the run's event is not the job's");
-    }
-    let Some(end) = end else {
-        return Some("the machine said nothing of the cache");
-    };
-    if !end.daemon {
-        return Some("the daemon did not answer at the job's end");
-    }
-    if !end.clean {
-        return Some("the daemon did not stop by itself, or the disk was not let go");
-    }
     None
 }
 
-/// Whether a repository's cache is to go after this job: the job found it as it was and its daemon could not run
-/// on it to the end. A next job then starts from an empty one.
+/// Whether a repository's cache is to go after this job: a Docker job found it as it was and its daemon could not
+/// run on it to the end. A next job then starts from an empty one.
 pub fn spoiled(end: Option<CacheEnd>) -> bool {
-    end.is_some_and(|end| end.found == CacheFound::Reused && !end.daemon)
+    end.is_some_and(|end| end.found == CacheFound::Reused && end.docker == Some(false))
 }
 
 /// A repository's cache as the store keeps it.
@@ -226,7 +245,7 @@ impl CacheStore {
         if budget == 0 {
             match fs::remove_dir_all(dir) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    tracing::warn!(dir = %dir.display(), %error, "the Docker caches were not deleted");
+                    tracing::warn!(dir = %dir.display(), %error, "the job caches were not deleted");
                 }
                 _ => {}
             }
@@ -240,7 +259,7 @@ impl CacheStore {
         let shares = cf_vmhost::scratch::clone(&probe, &copy).is_ok();
         let _ = (fs::remove_file(&probe), fs::remove_file(&copy));
         if !shares {
-            tracing::info!(dir = %dir.display(), "no Docker cache: this file system cannot share blocks between files");
+            tracing::info!(dir = %dir.display(), "no job cache: this file system cannot share blocks between files");
             return None;
         }
         let mut store = CacheStore {
@@ -293,7 +312,7 @@ impl CacheStore {
     }
 
     fn event(&mut self, at: i64, repo: &str, kind: CacheEventKind, why: Option<&str>) {
-        tracing::info!(%repo, kind = kind.name(), why = why.unwrap_or(""), "Docker cache");
+        tracing::info!(%repo, kind = kind.name(), why = why.unwrap_or(""), "job cache");
         self.events.push_back(CacheEvent {
             at,
             repo: repo.to_string(),
@@ -305,9 +324,9 @@ impl CacheStore {
         }
     }
 
-    /// The copy a Docker job of `repo` runs with, named after the job: its repository's cache shared block by block,
-    /// or an empty sparse file the guest makes a file system on. `None` when no copy could be made; the job then
-    /// keeps its daemon's data on its own disk.
+    /// The copy a job of `repo` runs with, named after the job: its repository's cache shared block by block, or an
+    /// empty sparse file the guest makes a file system on. `None` when no copy could be made; the job then keeps its
+    /// packages and its daemon's data on its own disk.
     pub fn prepare(
         &mut self,
         job: &str,
@@ -350,7 +369,7 @@ impl CacheStore {
                 })
             }
             Err(error) => {
-                tracing::warn!(%repo, %job, %error, "no Docker cache for this job");
+                tracing::warn!(%repo, %job, %error, "no cache for this job");
                 let _ = fs::remove_file(&path);
                 None
             }

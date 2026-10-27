@@ -1,14 +1,15 @@
 //! One job: its disks, its limits, its container, and the watch over it until it ends.
 
 use super::container::{STATUS_FD, Spec};
-use super::docker;
 use super::init::{Event, Failure, Host, spawn_self};
 use super::net::Network;
 use super::sys::{self, context, say};
+use super::{cache as disk_cache, docker};
 use cf_guest_proto::{
     CacheEnd, CacheFound, GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason,
     Summary, Usage, Workload,
 };
+use cf_supervisor::cache::{self as plan, MOUNT};
 use cf_supervisor::disks::overlay_options;
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::oom::{self, Kill};
@@ -48,7 +49,7 @@ pub fn empty_summary(exit_code: Option<i32>) -> Summary {
         disk_peak_bytes: 0,
         oom: None,
         wall_ms: sys::uptime_ms(),
-        docker_cache: None,
+        cache: None,
     }
 }
 
@@ -211,6 +212,17 @@ fn kill_job() {
     let _ = fs::write(format!("{CGROUP}/cgroup.kill"), "1");
 }
 
+/// After [`kill_job`]: waits up to `longest` for the job's control group to hold no process, so nothing of the job
+/// changes the cache while the guest's root tidies it. Says whether it emptied.
+fn job_gone(longest: Duration) -> bool {
+    sys::until(longest, Duration::from_millis(20), || {
+        fs::read_to_string(format!("{CGROUP}/cgroup.events"))
+            .is_ok_and(|events| events.lines().any(|line| line == "populated 0"))
+            .then_some(())
+    })
+    .is_some()
+}
+
 fn share(name: &str, text: &str, mode: u32) -> Result<(), String> {
     let path = format!("{SHARED}/{name}");
     let temporary = format!("{path}.new");
@@ -290,12 +302,24 @@ pub fn run(
     limits(&job).map_err(|error| ("limits", error))?;
     settings();
 
-    // A Docker job's cache, as found; a disk that cannot be had leaves the daemon on the job's own disk.
-    let cache: Option<CacheFound> = (job.docker && job.docker_cache)
+    let passwd = fs::read_to_string(format!("{ROOT}/etc/passwd")).unwrap_or_default();
+    let (uid, gid, home) =
+        find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
+    // The job's cache, as found; a disk that cannot be had leaves npm, pnpm and Docker on the job's own disk.
+    let cache: Option<CacheFound> = job
+        .cache
         .then(|| {
-            docker::mount_cache()
-                .inspect_err(|error| say(&format!("no cache for this job's Docker: {error}")))
-                .ok()
+            let found = disk_cache::mount()
+                .inspect_err(|error| say(&format!("no cache for this job: {error}")))
+                .ok()?;
+            match disk_cache::ready(uid, gid) {
+                Ok(()) => Some(found),
+                Err(error) => {
+                    say(&format!("no cache for this job: {error}"));
+                    let _ = sys::umount(MOUNT, libc::MNT_DETACH);
+                    None
+                }
+            }
         })
         .flatten();
     let facts = JobFacts {
@@ -303,7 +327,7 @@ pub fn run(
         limits: job.limits,
         disk_bytes,
         docker: job.docker,
-        docker_cache: cache.is_some(),
+        cache: cache.is_some(),
     };
     share(
         "job.json",
@@ -320,9 +344,6 @@ pub fn run(
         .map_err(container)?;
     }
 
-    let passwd = fs::read_to_string(format!("{ROOT}/etc/passwd")).unwrap_or_default();
-    let (uid, gid, home) =
-        find_user(&passwd, USER).ok_or_else(|| container(format!("the image has no user {USER}")))?;
     let group = fs::read_to_string(format!("{ROOT}/etc/group")).unwrap_or_default();
     let groups = groups_of(&group, USER, gid);
     // The folder of a Docker job's daemon's socket, once the daemon is started.
@@ -332,15 +353,17 @@ pub fn run(
         // made runs on and is told why when it starts.
         let started = docker::prepare(
             ROOT,
-            SCRATCH,
+            (
+                SCRATCH,
+                &match cache {
+                    Some(_) => format!("{MOUNT}/{}", plan::DOCKER),
+                    None => format!("{SCRATCH}/docker"),
+                },
+            ),
             CGROUP,
             (uid, gid, &group),
             &name,
             job.limits.shm_bytes,
-            &match cache {
-                Some(_) => format!("{}/docker", docker::CACHE),
-                None => format!("{SCRATCH}/docker"),
-            },
             &network.beside,
         )
         .and_then(|spec| {
@@ -368,12 +391,19 @@ pub fn run(
         shared: SHARED.into(),
         cgroup: format!("{CGROUP}/run"),
         argv,
+        // The cache's entries first, so the job's own win.
         env: workload_environment(
             &home,
             USER,
-            &job.env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.expose().clone()))
+            &cache
+                .map(|_| plan::environment(MOUNT))
+                .unwrap_or_default()
+                .into_iter()
+                .chain(
+                    job.env
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.expose().clone())),
+                )
                 .collect::<Vec<_>>(),
         ),
         uid,
@@ -381,6 +411,7 @@ pub fn run(
         groups,
         home,
         shm_bytes: job.limits.shm_bytes,
+        cache: cache.map(|_| MOUNT.to_string()),
     };
 
     let kernel_log = fs::OpenOptions::new()
@@ -425,18 +456,25 @@ pub fn run(
     // not looked for yet.
     watch.last_look();
     let summary_usage = usage();
-    // A cache is kept only when its daemon wrote down its state and stopped by itself, before the rest goes. One the
-    // host stopped is never kept and its end must reach the host within the stop's slack, so nothing waits for it.
-    let daemon = cache.map(|found| {
-        let answers = sockets.as_deref().is_some_and(docker::daemon_answers);
+    // A Docker job's cache is kept only when its daemon wrote down its state and stopped by itself, before the rest
+    // goes. One the host stopped is never kept and its end must reach the host within the stop's slack, so nothing
+    // waits for it. A daemon that never started (the image lacks a tool) says nothing of the cache: a cache is
+    // dropped only when a daemon that ran on it stopped answering.
+    let daemon = sockets.as_deref().filter(|_| cache.is_some()).map(|sockets| {
+        let answers = docker::daemon_answers(sockets);
         let stopped = answers && watch.stop.is_none() && docker::stop_daemon(&format!("{CGROUP}/docker"));
-        (found, answers, stopped)
+        (answers, stopped)
     });
     kill_job();
-    let docker_cache = daemon.map(|(found, answers, stopped)| CacheEnd {
+    let cache = cache.map(|found| CacheEnd {
         found,
-        daemon: answers,
-        clean: stopped && docker::let_go_of_cache(),
+        docker: daemon.map(|(answers, _)| answers),
+        // A job the host stopped is never kept: its disk is not tidied or waited for. Nor is one whose processes
+        // outlived the kill.
+        clean: watch.stop.is_none()
+            && daemon.is_none_or(|(_, stopped)| stopped)
+            && job_gone(Duration::from_secs(5))
+            && disk_cache::let_go(uid, gid),
     });
 
     let mut report = String::new();
@@ -452,7 +490,7 @@ pub fn run(
         usage: summary_usage,
         oom: watch.oom,
         wall_ms: watch.started.elapsed().as_millis() as u64,
-        docker_cache,
+        cache,
     })
 }
 

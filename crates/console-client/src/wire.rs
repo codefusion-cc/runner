@@ -302,19 +302,19 @@ pub struct Status {
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.
     pub runners: Vec<RunnerStatus>,
-    /// Docker jobs' caches on this host, one per repository, at most 64 (`MAX_DOCKER_CACHES`). Left out while it
+    /// Jobs' caches on this host, one per repository, at most 64 (`MAX_JOB_CACHES`). Left out while it
     /// keeps none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub docker_caches: Vec<DockerCache>,
-    /// What last happened to them, oldest first, at most 32 (`MAX_DOCKER_CACHE_EVENTS`).
+    pub job_caches: Vec<JobCache>,
+    /// What last happened to them, oldest first, at most 32 (`MAX_JOB_CACHE_EVENTS`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub docker_cache_events: Vec<DockerCacheEvent>,
+    pub job_cache_events: Vec<JobCacheEvent>,
 }
 
-/// A repository's Docker cache on a host.
+/// A repository's job cache on a host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DockerCache {
+pub struct JobCache {
     /// `owner/name`.
     pub repo: String,
     /// What it holds of the host's disk.
@@ -325,10 +325,10 @@ pub struct DockerCache {
     pub used_at: String,
 }
 
-/// Something that happened to a Docker cache.
+/// Something that happened to a job cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DockerCacheEvent {
+pub struct JobCacheEvent {
     /// When (ISO 8601).
     pub at: String,
     /// `owner/name`.

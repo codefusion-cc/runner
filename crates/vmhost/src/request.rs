@@ -33,11 +33,11 @@ pub struct JobRequest {
     /// Whether the job gets a Docker daemon of its own beside its container (`cf-docker`).
     #[serde(default)]
     pub docker: bool,
-    /// A Docker job's cache disk: the daemon's copy of its repository's cache, or an empty file for a first one,
-    /// which the machine gets beside its scratch disk. It is the job's to write; the daemon decides afterwards
-    /// whether it becomes the repository's cache.
+    /// The job's cache disk: the daemon's copy of its repository's cache, or an empty file for a first one, which
+    /// the machine gets beside its scratch disk. It is the job's to write; the daemon decides afterwards whether it
+    /// becomes the repository's cache.
     #[serde(default)]
-    pub docker_cache: Option<PathBuf>,
+    pub cache: Option<PathBuf>,
 }
 
 /// Why a request is refused before anything starts.
@@ -100,13 +100,10 @@ impl JobRequest {
         {
             return refuse("the command is empty");
         }
-        if let Some(cache) = &self.docker_cache {
-            if !self.docker {
-                return refuse("a cache disk for a job without Docker");
-            }
-            if !cache.is_absolute() {
-                return refuse("the cache disk's path is not absolute");
-            }
+        if let Some(cache) = &self.cache
+            && !cache.is_absolute()
+        {
+            return refuse("the cache disk's path is not absolute");
         }
         Ok(())
     }

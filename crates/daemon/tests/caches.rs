@@ -1,4 +1,4 @@
-//! Docker jobs' caches: one per repository, written back only by a successful run of the repository's own workflow
+//! Jobs' caches: one per repository, written back only by a successful run of the repository's own workflow
 //! on its default branch whose disk was let go cleanly, under a budget the least recently used cache leaves first.
 
 mod support;
@@ -50,11 +50,12 @@ fn main_run() -> WorkflowRun {
     }
 }
 
+/// A job without Docker whose disk the guest let go cleanly.
 fn clean(found: CacheFound) -> Option<CacheEnd> {
     Some(CacheEnd {
         found,
         clean: true,
-        daemon: true,
+        docker: None,
     })
 }
 
@@ -239,15 +240,33 @@ fn each_condition_alone_refuses() {
         refusal(REPO, Some("main"), Some(&tricked), Some(&tricked_run), end).is_some(),
         "two refs, and the run's own branch"
     );
-    for (clean, daemon) in [(false, true), (true, false), (false, false)] {
+    for (clean, docker) in [
+        (false, None),
+        (false, Some(true)),
+        (true, Some(false)),
+        (false, Some(false)),
+    ] {
         let end = Some(CacheEnd {
             found: CacheFound::Reused,
             clean,
-            daemon,
+            docker,
         });
         assert!(
             refusal(REPO, Some("main"), Some(&on_main()), Some(&run), end).is_some(),
-            "{clean} {daemon}"
+            "{clean} {docker:?}"
+        );
+    }
+    // A clean disk is kept with or without Docker, as long as a Docker job's daemon answered.
+    for docker in [None, Some(true)] {
+        let end = Some(CacheEnd {
+            found: CacheFound::Reused,
+            clean: true,
+            docker,
+        });
+        assert_eq!(
+            refusal(REPO, Some("main"), Some(&on_main()), Some(&run), end),
+            None,
+            "{docker:?}"
         );
     }
 }
@@ -260,12 +279,12 @@ proptest! {
         repo in prop_oneof![Just(REPO.to_string()), Just("CODEFUSION-CC/SHOP".to_string()), "[a-z-]{1,8}/[a-z-]{1,8}"],
         result in prop_oneof![Just("succeeded".to_string()), "[a-z]{0,10}"],
         clean in any::<bool>(),
-        daemon in any::<bool>(),
+        docker in prop_oneof![Just(None), Just(Some(true)), Just(Some(false))],
         head in prop_oneof![Just("main".to_string()), "[a-z@/-]{0,12}"],
         read in any::<bool>(),
     ) {
         let job = github(&event, &format!("{repo}/.github/workflows/x.yml@refs/heads/{branch}"), Some(&result));
-        let end = Some(CacheEnd { found: CacheFound::Reused, clean, daemon });
+        let end = Some(CacheEnd { found: CacheFound::Reused, clean, docker });
         let run = WorkflowRun { head_branch: Some(head.clone()), head_repository: Some(repo.clone()), event: event.clone() };
         if refusal(REPO, Some("main"), Some(&job), read.then_some(&run), end).is_none() {
             prop_assert!(read);
@@ -274,7 +293,7 @@ proptest! {
             prop_assert_eq!(branch, "main");
             prop_assert!(repo.eq_ignore_ascii_case(REPO));
             prop_assert!(result == "succeeded" || result == "success");
-            prop_assert!(clean && daemon);
+            prop_assert!(clean && docker != Some(false));
         }
     }
 
@@ -292,20 +311,24 @@ proptest! {
 
 #[test]
 fn a_cache_is_dropped_only_when_its_daemon_could_not_run_on_it() {
-    let end = |found, daemon| {
+    let end = |found, docker| {
         Some(CacheEnd {
             found,
             clean: true,
-            daemon,
+            docker,
         })
     };
-    assert!(spoiled(end(CacheFound::Reused, false)));
-    assert!(!spoiled(end(CacheFound::Reused, true)));
+    assert!(spoiled(end(CacheFound::Reused, Some(false))));
+    assert!(!spoiled(end(CacheFound::Reused, Some(true))));
     assert!(
-        !spoiled(end(CacheFound::Fresh, false)),
+        !spoiled(end(CacheFound::Reused, None)),
+        "a job without Docker has no daemon to fail"
+    );
+    assert!(
+        !spoiled(end(CacheFound::Fresh, Some(false))),
         "a fresh one held nothing to blame"
     );
-    assert!(!spoiled(end(CacheFound::Replaced, false)));
+    assert!(!spoiled(end(CacheFound::Replaced, Some(false))));
     assert!(!spoiled(None));
 }
 
@@ -461,7 +484,7 @@ fn a_cache_its_daemon_could_not_run_on_goes_and_the_next_job_starts_empty() {
     second.end = Some(CacheEnd {
         found: CacheFound::Reused,
         clean: true,
-        daemon: false,
+        docker: Some(false),
     });
     caches.settle(REPO, &second, Some("the daemon did not answer"), 40);
     assert!(caches.list().is_empty());
@@ -595,4 +618,44 @@ fn no_budget_no_store_and_no_caches_left() {
     assert!(CacheStore::open(dir.path(), 0).is_none());
     assert!(!dir.path().join(format!("{}.img", kept.key)).exists());
     assert!(!dir.path().exists(), "the folder is gone with what it held");
+}
+
+#[test]
+fn only_a_job_github_has_not_refused_already_has_its_run_read() {
+    assert!(cf_daemon::caches::worth_reading(REPO, Some("main"), &on_main()));
+    let refused = [
+        github(
+            "pull_request",
+            "codefusion-cc/shop/.github/workflows/ci.yml@refs/pull/3/merge",
+            None,
+        ),
+        github(
+            "push",
+            "codefusion-cc/shop/.github/workflows/ci.yml@refs/heads/feature",
+            None,
+        ),
+        github(
+            "push",
+            "other/tools/.github/workflows/ci.yml@refs/heads/main",
+            None,
+        ),
+    ];
+    for job in &refused {
+        assert!(
+            !cf_daemon::caches::worth_reading(REPO, Some("main"), job),
+            "{}",
+            job.workflow
+        );
+    }
+    assert!(
+        !cf_daemon::caches::worth_reading(REPO, None, &on_main()),
+        "no default branch known"
+    );
+    // How the job ends is not known while it runs: a job still running is worth reading.
+    let running = github(
+        "push",
+        "codefusion-cc/shop/.github/workflows/ci.yml@refs/heads/main",
+        None,
+    );
+    assert!(cf_daemon::caches::worth_reading(REPO, Some("main"), &running));
 }

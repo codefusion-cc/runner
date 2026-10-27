@@ -237,7 +237,7 @@ fn service(
             public_repos: config.public_repos.clone(),
             docker_repos: config.docker_repos.clone(),
             docker_max_jobs: config.docker_max_jobs,
-            docker_cache_bytes: config.docker_cache_gb << 30,
+            cache_bytes: config.cache_gb << 30,
             host_labels: config.labels.clone(),
         },
         console: console(config)?,

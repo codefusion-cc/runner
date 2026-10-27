@@ -67,7 +67,7 @@ pub struct Repo {
     /// Whether it is disabled.
     #[serde(default)]
     pub disabled: bool,
-    /// Its default branch, whose pushes may write a Docker job's cache.
+    /// Its default branch, whose pushes may write its jobs' cache.
     #[serde(default)]
     pub default_branch: Option<String>,
 }
