@@ -772,6 +772,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
             }
         }
+        // And those GitHub does not list yet: their listener is still trying to make them. Once one does, the next
+        // look deletes it.
+        let unlisted: Vec<String> = shared
+            .serving
+            .lock()
+            .expect("serving")
+            .iter()
+            .filter(|(name, serving)| {
+                let repo = &serving.state.lock().expect("set").repo;
+                !wanted.contains_key(*name)
+                    && !unread.contains(repo)
+                    && only.is_none_or(|only| only.contains(repo))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in unlisted {
+            self.close(&name).await;
+        }
 
         for (name, want) in wanted {
             let mut serving = shared.serving.lock().expect("serving");
