@@ -343,3 +343,55 @@ fn a_16_gb_cloud_vm_runs_three_cf_4g_and_keeps_them_under_its_own_floor() {
     assert_eq!(lowered.vcpus, [2, 2, 4, 4]);
     assert_eq!(lowered.side_by_side(&lowered.away, G4), 3);
 }
+
+#[test]
+fn the_owner_sets_a_sizes_vcpus_and_the_machines_side_by_side_follow() {
+    let settings = Settings::for_headless(host(16 * GIB, 8), 0);
+    assert_eq!(settings.away.cpus, 6);
+    assert_eq!(
+        (
+            settings.side_by_side(&settings.away, G4),
+            settings.side_by_side(&settings.away, G6)
+        ),
+        (3, 1)
+    );
+    let three = |sizes: &[Size]| {
+        let mut limits = Limits::default();
+        for size in sizes {
+            limits.vcpus[size.index()] = Some(3);
+        }
+        settings.clone().limited(&limits)
+    };
+    let set = three(&[G4, G6]).expect("3 of 6 CPUs");
+    assert_eq!(set.vcpus, [2, 3, 3, 4], "only the sizes named change");
+    assert_eq!(
+        set.side_by_side(&set.away, G4),
+        2,
+        "two cf-4g of 3, not three of 2"
+    );
+    assert_eq!(
+        set.side_by_side(&set.away, G6),
+        2,
+        "two cf-6g of 3 fit the memory and the CPUs"
+    );
+    let granted = grants(set, &[G4, G4, G4]);
+    assert_eq!(granted[..2], [Ok(3), Ok(3)], "each cf-4g gets its 3 vCPUs");
+    assert!(granted[2].is_err(), "a third cf-4g of 3 vCPUs on 6");
+    // A floor set beside them recomputes the defaults, not what the owner set.
+    let mut limits = Limits {
+        floor_percent: Some(20),
+        ..Limits::default()
+    };
+    limits.vcpus[G4.index()] = Some(3);
+    assert_eq!(settings.clone().limited(&limits).unwrap().vcpus[G4.index()], 3);
+}
+
+#[test]
+fn a_sizes_vcpus_are_at_least_one_and_no_more_than_ci_may_use() {
+    let settings = Settings::for_headless(host(16 * GIB, 8), 0);
+    for (vcpus, ok) in [(0, false), (1, true), (6, true), (7, false), (u32::MAX, false)] {
+        let mut limits = Limits::default();
+        limits.vcpus[G4.index()] = Some(vcpus);
+        assert_eq!(settings.clone().limited(&limits).is_ok(), ok, "{vcpus} vCPUs");
+    }
+}

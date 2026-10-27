@@ -44,7 +44,7 @@ pub use records::{
     Upgrade,
 };
 pub use roster::{JobInfo, Roster, Runner};
-pub use scaler::{IDLE_GRACE, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};
+pub use scaler::{IDLE_GRACE, PLACE_LIMIT, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};
 pub use service::{
     Console, HostExtras, LoggedReports, Nudge, OutboxReports, STALL_WARN_AFTER, Service, ServiceConfig,
     ServiceParts, SetState, iso, job_event,

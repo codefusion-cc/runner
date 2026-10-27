@@ -75,6 +75,12 @@ pub trait Slots: Send + Sync {
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
 
+    /// Whether the machine is paused, or waits for its machines to end before it stops or starts again: a job in line
+    /// starts here only after that.
+    fn held(&self) -> bool {
+        false
+    }
+
     /// [`Slots::reserve`] for a Docker job (`cf-docker`): refused while as many Docker jobs as the machine allows
     /// hold a slot, and counted as one from then on ([`Slots::mark_docker`]). A machine without a cap takes it as
     /// any other.

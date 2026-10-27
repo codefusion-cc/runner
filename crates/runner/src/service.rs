@@ -1080,6 +1080,7 @@ mod tests {
                 max_machines: Some(2),
                 idle_after: None,
                 floor_percent: Some(30),
+                ..Limits::default()
             }
         );
         let written = std::fs::read_to_string(&here.path).expect("read");
