@@ -465,7 +465,10 @@ pub fn scaler_with(parts: &Parts<'_>, repo: &str, docker: bool) -> TestScaler {
             machine: MACHINE.into(),
             size: SIZE,
             docker,
-            default_branch: Some("main".into()),
+            cache: cf_daemon::caches::CacheTerms::new(Some(cf_daemon::caches::CacheRepo {
+                id: 1,
+                default_branch: "main".into(),
+            })),
         },
         parts.session.clone(),
         SetRegistry::of_set(parts.client.clone(), parts.set.id),

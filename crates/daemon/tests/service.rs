@@ -370,9 +370,13 @@ impl Rig {
 
     /// Queues a job once the Mac's last two polls offered room, so GitHub hands it over at once.
     async fn queue(&self) -> i64 {
-        self.settles("the Mac to offer room", || self.github.offers_room(REPO))
+        self.queue_on(REPO).await
+    }
+
+    async fn queue_on(&self, repo: &str) -> i64 {
+        self.settles("the Mac to offer room", || self.github.offers_room(repo))
             .await;
-        self.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build")
+        self.github.queue_job(repo, &["self-hosted", "cf-2g"], "build")
     }
 
     /// The Actions runners whose machine stands.
@@ -402,8 +406,13 @@ impl Rig {
 
     /// [`Rig::job_running`], with what the test says of the queued job (by its request) before it starts.
     async fn job_running_then(&self, queued: impl FnOnce(i64)) -> String {
+        self.job_running_on(REPO, queued).await
+    }
+
+    /// [`Rig::job_running_then`] for a job of `repo`.
+    async fn job_running_on(&self, repo: &str, queued: impl FnOnce(i64)) -> String {
         let before = self.standing();
-        queued(self.queue().await);
+        queued(self.queue_on(repo).await);
         self.settles("a machine for the job", || self.standing().len() > before.len())
             .await;
         let runner = self
@@ -5487,5 +5496,88 @@ async fn only_a_run_whose_commit_is_on_the_default_branch_writes_the_jobs_cache(
     rig.settles("main's copy settled", || events().len() == 2).await;
     assert_eq!(events()[1], ("kept".to_string(), None));
     assert_eq!(rig.machines.snapshot().caches.len(), 1);
+    rig.nothing_left().await;
+}
+
+// added: a public repository's jobs get no cache disk at all: anyone may open a pull request there, and the Runner
+// gives a machine its disk before GitHub says which job it runs. A private repository's job on the same host does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_public_repositorys_job_gets_no_cache_and_a_private_ones_does() {
+    let Some(dir) = support::cache_folder() else {
+        return;
+    };
+    let rig = Rig::caching(2, dir.path()).await;
+    rig.github.add_repo(OPEN, false);
+    rig.github.set_workflow(OPEN, "ci.yml", WORKFLOW);
+    rig.service.discover().await;
+    until("both scale sets", || {
+        rig.github.scale_sets().iter().filter(|s| s.has_session).count() == 2
+    })
+    .await;
+    let copy_of = |runner: &str| {
+        rig.parts
+            .store
+            .load()
+            .into_iter()
+            .find(|record| record.runner == runner)
+            .map(|record| record.cache_copy.is_some())
+    };
+
+    let public = rig.job_running_on(OPEN, |_| {}).await;
+    assert_eq!(copy_of(&public), Some(false), "no cache disk");
+
+    let private = rig.job_running().await;
+    assert_eq!(
+        copy_of(&private),
+        Some(true),
+        "the private repository's job has one"
+    );
+
+    rig.finish(&public, "succeeded");
+    rig.finish(&private, "succeeded");
+    rig.nothing_left().await;
+    assert!(
+        rig.machines
+            .snapshot()
+            .cache_events
+            .iter()
+            .all(|event| event.repo == REPO),
+        "nothing of the public repository's"
+    );
+}
+
+// added: a repository made public while its scale set listens gives the next machine no cache once the Runner looked
+// at GitHub again, without a new session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_made_public_gives_its_next_job_no_cache() {
+    let Some(dir) = support::cache_folder() else {
+        return;
+    };
+    let rig = Rig::caching(2, dir.path()).await;
+    // Served while public too, as the policy lists it.
+    rig.github.add_repo(OPEN, true);
+    rig.github.set_workflow(OPEN, "ci.yml", WORKFLOW);
+    rig.service.discover().await;
+    until("both scale sets", || {
+        rig.github.scale_sets().iter().filter(|s| s.has_session).count() == 2
+    })
+    .await;
+    let copy_of = |runner: &str| {
+        rig.parts
+            .store
+            .load()
+            .into_iter()
+            .find(|record| record.runner == runner)
+            .map(|record| record.cache_copy.is_some())
+    };
+    let private = rig.job_running_on(OPEN, |_| {}).await;
+    assert_eq!(copy_of(&private), Some(true));
+    rig.finish(&private, "succeeded");
+
+    rig.github.set_private(OPEN, false);
+    rig.service.discover().await;
+    let public = rig.job_running_on(OPEN, |_| {}).await;
+    assert_eq!(copy_of(&public), Some(false), "no cache disk");
+    rig.finish(&public, "succeeded");
     rig.nothing_left().await;
 }

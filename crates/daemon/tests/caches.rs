@@ -9,7 +9,8 @@ use std::path::Path;
 
 use cf_daemon::GithubJob;
 use cf_daemon::caches::{
-    Cache, CacheCopy, CacheStore, DAEMON_SILENT, DISK_BYTES, WorkflowRun, evictions, key, refusal, spoiled,
+    Cache, CacheCopy, CacheRepo, CacheStore, DAEMON_SILENT, DISK_BYTES, WorkflowRun, evictions, key, refusal,
+    spoiled,
 };
 use cf_guest_proto::{CacheEnd, CacheFound};
 use proptest::prelude::*;
@@ -318,14 +319,9 @@ proptest! {
     }
 
     #[test]
-    fn one_repository_one_key_two_repositories_two(a in "[A-Za-z0-9-]{1,10}/[A-Za-z0-9._-]{1,10}", b in "[A-Za-z0-9-]{1,10}/[A-Za-z0-9._-]{1,10}") {
-        prop_assert_eq!(key(&a), key(&a.to_uppercase()));
-        prop_assert_eq!(key(&a), key(&a.to_lowercase()));
-        if !a.eq_ignore_ascii_case(&b) {
-            prop_assert_ne!(key(&a), key(&b));
-        }
-        prop_assert_eq!(key(&a).len(), 32);
-        prop_assert!(key(&a).bytes().all(|byte| byte.is_ascii_hexdigit()));
+    fn one_repository_one_key_two_repositories_two(a in any::<u64>(), b in any::<u64>()) {
+        prop_assert_eq!(key(a) == key(b), a == b);
+        prop_assert!(key(a).bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
     }
 }
 
@@ -355,6 +351,7 @@ fn a_cache_is_dropped_only_when_its_daemon_could_not_run_on_it() {
 fn cache(bytes: u64, used_at: i64) -> Cache {
     Cache {
         repo: "r".into(),
+        repo_id: 1,
         bytes,
         written_at: 0,
         used_at,
@@ -406,6 +403,21 @@ proptest! {
     }
 }
 
+/// GitHub's number for a repository of these tests, the same however its name is spelled.
+fn id(repo: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    repo.to_lowercase().hash(&mut hash);
+    hash.finish() | 1
+}
+
+fn terms(repo: &str) -> CacheRepo {
+    CacheRepo {
+        id: id(repo),
+        default_branch: "main".into(),
+    }
+}
+
 /// A store keeping `budget` bytes in a folder of the test's own, or none where its file system cannot share blocks.
 fn store(budget: u64) -> Option<(TempDir, CacheStore)> {
     let dir = cache_folder()?;
@@ -419,7 +431,7 @@ fn empty(path: &Path) -> bool {
 
 /// A job of `repo` that writes `bytes` to its copy, ends cleanly and is kept.
 fn keep(caches: &mut CacheStore, repo: &str, job: &str, at: i64, bytes: &[u8]) -> CacheCopy {
-    let mut copy = caches.prepare(job, repo, Some("main"), at).expect("a copy");
+    let mut copy = caches.prepare(job, repo, &terms(repo), at).expect("a copy");
     fs::write(&copy.path, bytes).unwrap();
     copy.end = clean(CacheFound::Fresh);
     caches.settle(repo, &copy, None, at);
@@ -435,7 +447,7 @@ fn a_kept_copy_is_what_the_next_job_of_the_repository_starts_from() {
     let Some((_dir, mut caches)) = store(100 << 30) else {
         return;
     };
-    let first = caches.prepare("job1", REPO, Some("main"), 10).expect("a copy");
+    let first = caches.prepare("job1", REPO, &terms(REPO), 10).expect("a copy");
     assert_eq!(
         fs::metadata(&first.path).unwrap().len(),
         DISK_BYTES,
@@ -459,17 +471,18 @@ fn a_kept_copy_is_what_the_next_job_of_the_repository_starts_from() {
     assert_eq!((kept[0].1.repo.as_str(), kept[0].1.written_at), (REPO, 20));
     assert!(kept[0].1.bytes > 0, "its size on the host's disk");
 
+    // Renamed since: GitHub's number for it stays.
     let second = caches
-        .prepare("job2", "CodeFusion-CC/Shop", None, 30)
+        .prepare("job2", "codefusion-cc/store", &terms(REPO), 30)
         .expect("a copy");
     assert_eq!(
         head(&second.path),
         b"layers of the first job",
-        "the same repository, any case"
+        "the same repository, under any name"
     );
     assert_eq!(caches.list()[0].1.used_at, 30);
     let other = caches
-        .prepare("job3", "codefusion-cc/blog", None, 30)
+        .prepare("job3", "codefusion-cc/blog", &terms("codefusion-cc/blog"), 30)
         .expect("a copy");
     assert!(empty(&other.path), "another repository never gets it");
 }
@@ -480,12 +493,12 @@ fn a_refused_copy_is_thrown_away_and_the_cache_stays_as_it_was() {
         return;
     };
     keep(&mut caches, REPO, "job1", 20, b"main's layers");
-    let mut pull_request = caches.prepare("job2", REPO, Some("main"), 30).unwrap();
+    let mut pull_request = caches.prepare("job2", REPO, &terms(REPO), 30).unwrap();
     fs::write(&pull_request.path, b"a pull request's layers").unwrap();
     pull_request.end = clean(CacheFound::Reused);
     caches.settle(REPO, &pull_request, Some("only a push"), 40);
     assert!(!pull_request.path.exists());
-    let next = caches.prepare("job3", REPO, Some("main"), 50).unwrap();
+    let next = caches.prepare("job3", REPO, &terms(REPO), 50).unwrap();
     assert_eq!(head(&next.path), b"main's layers");
     assert_eq!(kinds(&caches), ["kept", "discarded"]);
     assert_eq!(
@@ -500,7 +513,7 @@ fn a_cache_its_daemon_could_not_run_on_goes_and_the_next_job_starts_empty() {
         return;
     };
     keep(&mut caches, REPO, "job1", 20, b"broken");
-    let mut second = caches.prepare("job2", REPO, Some("main"), 30).unwrap();
+    let mut second = caches.prepare("job2", REPO, &terms(REPO), 30).unwrap();
     second.end = Some(CacheEnd {
         found: CacheFound::Reused,
         clean: true,
@@ -509,7 +522,7 @@ fn a_cache_its_daemon_could_not_run_on_goes_and_the_next_job_starts_empty() {
     caches.settle(REPO, &second, Some(DAEMON_SILENT), 40);
     assert!(caches.list().is_empty());
     assert_eq!(kinds(&caches), ["kept", "dropped"]);
-    let third = caches.prepare("job3", REPO, Some("main"), 50).unwrap();
+    let third = caches.prepare("job3", REPO, &terms(REPO), 50).unwrap();
     assert!(empty(&third.path));
 }
 
@@ -525,7 +538,7 @@ fn only_a_writer_drops_a_cache_and_only_the_one_it_started_from() {
     });
     keep(&mut caches, REPO, "job1", 20, b"v1");
     // A pull request kills its own daemon: refused for its event, the cache stays.
-    let mut pull = caches.prepare("pull", REPO, Some("main"), 30).unwrap();
+    let mut pull = caches.prepare("pull", REPO, &terms(REPO), 30).unwrap();
     pull.end = silent;
     caches.settle(
         REPO,
@@ -535,12 +548,12 @@ fn only_a_writer_drops_a_cache_and_only_the_one_it_started_from() {
     );
     assert_eq!(caches.list().len(), 1, "a pull request drops nothing");
     // A writer started from v1 while another kept v2: v2 was never tried, and stays.
-    let mut late = caches.prepare("late", REPO, Some("main"), 40).unwrap();
+    let mut late = caches.prepare("late", REPO, &terms(REPO), 40).unwrap();
     late.end = silent;
     keep(&mut caches, REPO, "newer", 50, b"v2");
     caches.settle(REPO, &late, Some(DAEMON_SILENT), 60);
     assert_eq!(caches.list().len(), 1, "the newer cache stays");
-    let next = caches.prepare("next", REPO, Some("main"), 70).unwrap();
+    let next = caches.prepare("next", REPO, &terms(REPO), 70).unwrap();
     assert_eq!(head(&next.path), b"v2");
     assert_eq!(kinds(&caches), ["kept", "discarded", "kept", "discarded"]);
 }
@@ -550,7 +563,7 @@ fn a_disk_the_guest_replaced_is_told() {
     let Some((_dir, mut caches)) = store(100 << 30) else {
         return;
     };
-    let mut copy = caches.prepare("job1", REPO, Some("main"), 10).unwrap();
+    let mut copy = caches.prepare("job1", REPO, &terms(REPO), 10).unwrap();
     copy.end = clean(CacheFound::Replaced);
     caches.settle(REPO, &copy, Some("only a push"), 20);
     assert_eq!(kinds(&caches), ["replaced", "discarded"]);
@@ -562,12 +575,14 @@ fn a_cache_whose_record_names_another_repository_is_never_used() {
         return;
     };
     keep(&mut caches, REPO, "job1", 20, b"the shop's layers");
-    // The record says another repository, under this repository's key: as if two names shared a key.
-    let record = dir.path().join(format!("{}.json", key(REPO)));
-    let text = fs::read_to_string(&record).unwrap().replace(REPO, "someone/else");
+    // The record says another repository, under this repository's key.
+    let record = dir.path().join(format!("{}.json", key(id(REPO))));
+    let text = fs::read_to_string(&record)
+        .unwrap()
+        .replace(&format!("\"repo_id\":{}", id(REPO)), "\"repo_id\":7");
     fs::write(&record, text).unwrap();
     let mut caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
-    let copy = caches.prepare("job2", REPO, Some("main"), 30).unwrap();
+    let copy = caches.prepare("job2", REPO, &terms(REPO), 30).unwrap();
     assert!(empty(&copy.path));
     assert!(caches.list().is_empty(), "the stray cache is deleted, not kept");
     assert!(!record.exists());
@@ -583,7 +598,7 @@ fn over_the_budget_the_one_used_longest_ago_goes_and_one_in_use_stays() {
     keep(&mut caches, "o/a", "j1", 10, &layers);
     keep(&mut caches, "o/b", "j2", 20, &layers);
     // A job runs with a copy of o/a, which stays the one used longest ago.
-    let busy = caches.prepare("busy", "o/a", Some("main"), 15).unwrap();
+    let busy = caches.prepare("busy", "o/a", &terms("o/a"), 15).unwrap();
     keep(&mut caches, "o/c", "j3", 30, &layers);
     let left: Vec<&str> = caches
         .list()
@@ -618,7 +633,7 @@ fn a_copy_whose_machine_never_started_is_deleted_and_holds_its_cache_no_longer()
     };
     let layers = vec![7u8; 1 << 20];
     keep(&mut caches, "o/a", "j1", 10, &layers);
-    let never = caches.prepare("never", "o/a", Some("main"), 10).unwrap();
+    let never = caches.prepare("never", "o/a", &terms("o/a"), 10).unwrap();
     caches.discard(&never);
     assert!(!never.path.exists());
     keep(&mut caches, "o/b", "j2", 20, &layers);
@@ -634,8 +649,8 @@ fn copies_nothing_knows_are_swept_and_known_ones_stay_in_use() {
     };
     let layers = vec![7u8; 1 << 20];
     keep(&mut caches, "o/a", "j1", 10, &layers);
-    let known = caches.prepare("job1", "o/a", Some("main"), 10).unwrap();
-    let stray = caches.prepare("job2", "o/b", Some("main"), 10).unwrap();
+    let known = caches.prepare("job1", "o/a", &terms("o/a"), 10).unwrap();
+    let stray = caches.prepare("job2", "o/b", &terms("o/b"), 10).unwrap();
     // A Runner that starts again knows its copies from its records.
     let mut caches = CacheStore::open(dir.path(), (5 << 20) / 2).unwrap();
     caches.sweep([&known]);
@@ -716,7 +731,7 @@ fn only_a_job_github_has_not_refused_already_has_its_run_read() {
 fn a_store_that_cannot_share_blocks_now_deletes_the_copies_left_behind() {
     let Some(dir) = cache_folder() else { return };
     let mut caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
-    let left = caches.prepare("job1", REPO, Some("main"), 10).unwrap();
+    let left = caches.prepare("job1", REPO, &terms(REPO), 10).unwrap();
     fs::write(&left.path, b"a copy").unwrap();
     drop(caches);
     // The probe cannot be written, as on a full disk.
@@ -731,17 +746,80 @@ fn a_store_that_cannot_share_blocks_now_deletes_the_copies_left_behind() {
 }
 
 #[test]
-fn an_image_no_record_names_is_deleted_when_the_store_opens() {
+fn an_image_or_record_without_the_other_is_deleted_when_the_store_opens() {
     let Some(dir) = cache_folder() else { return };
     let mut caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
     keep(&mut caches, REPO, "job1", 10, b"kept");
     drop(caches);
     // A Runner stopped between keeping a copy and writing its record.
-    let stray = dir.path().join(format!("{}.img", key("codefusion-cc/other")));
+    let stray = dir.path().join(format!("{}.img", key(id("codefusion-cc/other"))));
     fs::write(&stray, vec![1; 1 << 20]).unwrap();
+    // A record this Runner cannot read, with its image: one keyed by name, from before the number.
+    let unread = dir.path().join("0a1b2c.json");
+    fs::write(
+        &unread,
+        r#"{"repo":"codefusion-cc/blog","written_at":1,"used_at":1}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("0a1b2c.img"), b"old").unwrap();
     let caches = CacheStore::open(dir.path(), 100 << 30).unwrap();
     assert!(!stray.exists(), "nothing would ever count or evict it");
+    assert!(
+        !unread.exists() && !dir.path().join("0a1b2c.img").exists(),
+        "nor these"
+    );
     assert_eq!(caches.list().len(), 1, "the cache with its record stays");
+}
+
+#[test]
+fn a_repository_made_again_under_a_name_that_had_a_cache_starts_empty() {
+    let Some((_dir, mut caches)) = store(100 << 30) else {
+        return;
+    };
+    keep(&mut caches, REPO, "job1", 10, b"the deleted repository's layers");
+    let again = CacheRepo {
+        id: id(REPO) + 2,
+        default_branch: "main".into(),
+    };
+    let copy = caches.prepare("job2", REPO, &again, 20).expect("a copy");
+    assert_eq!(copy.from, None);
+    assert!(empty(&copy.path), "nothing of the deleted repository's");
+}
+
+#[test]
+fn only_a_private_repository_github_named_fully_gets_a_cache() {
+    let listed = |json: serde_json::Value| CacheRepo::of(&serde_json::from_value(json).unwrap());
+    assert_eq!(
+        listed(serde_json::json!({"id": 42, "full_name": REPO, "private": true, "default_branch": "main"})),
+        Some(CacheRepo {
+            id: 42,
+            default_branch: "main".into()
+        })
+    );
+    for (json, why) in [
+        (
+            serde_json::json!({"id": 42, "full_name": REPO, "private": false, "default_branch": "main"}),
+            "public: anyone may open a pull request there",
+        ),
+        (
+            serde_json::json!({"id": 42, "full_name": REPO, "default_branch": "main"}),
+            "not said to be private",
+        ),
+        (
+            serde_json::json!({"full_name": REPO, "private": true, "default_branch": "main"}),
+            "no number",
+        ),
+        (
+            serde_json::json!({"id": 42, "full_name": REPO, "private": true}),
+            "no default branch",
+        ),
+        (
+            serde_json::json!({"id": 42, "full_name": REPO, "private": true, "default_branch": ""}),
+            "an empty default branch",
+        ),
+    ] {
+        assert_eq!(listed(json), None, "{why}");
+    }
 }
 
 #[test]
@@ -751,10 +829,10 @@ fn a_cache_that_cannot_be_copied_goes_and_the_job_starts_empty() {
         return;
     };
     keep(&mut caches, REPO, "job1", 10, b"kept");
-    let image = dir.path().join(format!("{}.img", key(REPO)));
+    let image = dir.path().join(format!("{}.img", key(id(REPO))));
     fs::set_permissions(&image, fs::Permissions::from_mode(0o000)).unwrap();
     let copy = caches
-        .prepare("job2", REPO, Some("main"), 20)
+        .prepare("job2", REPO, &terms(REPO), 20)
         .expect("an empty copy");
     assert_eq!(copy.from, None);
     assert!(empty(&copy.path));

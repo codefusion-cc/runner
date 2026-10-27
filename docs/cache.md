@@ -8,7 +8,12 @@ can, ext4 cannot) keeps none either.
 
 ## What a job gets
 
-- Every job of a scale set gets a copy of its repository's cache that shares every block until it is written
+- Only a private repository's jobs get a cache, and only when GitHub named its number and default branch
+  (`cf_daemon::caches::CacheRepo::of`). A public repository's get none: anyone may open a pull request there, and
+  the Runner gives a machine its disk at boot, before GitHub says which job it runs, so it cannot tell a pull request
+  from a push then. A repository GitHub's listing did not say is private counts as public; a set made public since
+  gives its next machine no disk.
+- Every other job of a scale set gets a copy of its repository's cache that shares every block until it is written
   (APFS's clonefile, Linux's reflink), or an empty one the guest makes a file system on, writing no zeros, so a new
   cache holds of the host's disk what the job wrote. It writes only its copy: jobs of one repository that run at
   once never write the same file, and the cache is one job's copy, whole. The Runner's own machines (a test run,
@@ -45,8 +50,11 @@ Anything else is thrown away: a pull request, a fork, another branch, a failed o
 said the end of, a run that could not be read, a disk let go uncleanly. So a cache holds what the default branch
 downloaded and built, and nothing a pull request, a fork or another repository left. A pull request's job still
 starts from the default branch's cache, as GitHub's own cache lets it: it can read all of it, private packages and
-images the default branch fetched with its secrets among them. A cache's key is a hash of its repository's
-name in lowercase, and its record names the repository, which is checked before it is used.
+images the default branch fetched with its secrets among them. On a private repository only people who may read the
+repository open pull requests, and what they can read in the cache is what they could build themselves. A cache's key
+is GitHub's number for its repository (`repo-<id>`): a rename keeps the cache, and a repository made again under the
+name of one that had a cache never gets it. Its record names the number too, which is checked before it is used, and
+a record the Runner cannot read goes with its disk when the store opens.
 
 ## How it fails
 
@@ -95,7 +103,8 @@ deletion (`--auto-delete` is off for an attached disk), so a rebuilt VM attaches
 
 - `crates/daemon/tests/caches.rs`: the rule (each condition refusing alone, with and without Docker, and a property:
   nothing but a successful run of the repository's own workflow on its default branch with a clean disk is kept),
-  the key (one per repository in any case, two repositories never one), eviction (least recently used first, none
+  the key (one per repository number, two numbers never one), who gets a cache (a private repository GitHub named
+  fully, never a public one or one whose listing left something out), a repository made again under a name, eviction (least recently used first, none
   in use), and the store on a real file system: kept, thrown away, replaced, dropped, a record naming another
   repository, a copy in use or whose machine never started, sweeping after a restart, a budget of 0, and what a
   store reads back.
@@ -104,6 +113,9 @@ deletion (`--auto-delete` is off for an attached disk), so a rebuilt VM attaches
   unclean disk, a job GitHub never said the end of, a reusable workflow at main run from another branch and a run
   never read do not; a copy outlives a restart; two jobs at once each write their own copy; a Docker job and a job
   without Docker start from one cache; only a Docker job whose daemon failed drops it.
+- `crates/daemon/tests/service.rs`: against a fake GitHub, a public repository's job gets no disk while a private
+  one's on the same host does, a repository made public gives its next machine none, and only a run whose commit is
+  on the default branch writes the cache.
 - `crates/supervisor/tests/decisions.rs`: what the job is told and that its own entries win; what the job's end
   deletes, a link where a kept folder goes among it (and a property: never a kept folder, always the rest).
 - `crates/guest-proto/tests/protocol.rs`: a cache end without Docker names no daemon.

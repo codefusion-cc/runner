@@ -26,6 +26,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
+use crate::caches::{CacheRepo, CacheTerms};
 use crate::held::{self, HeldSet, OwnRunners, SetView};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
@@ -182,8 +183,8 @@ pub struct SetState {
     pub size: Size,
     /// Whether its jobs get a Docker daemon (`cf-docker`).
     pub docker: bool,
-    /// The repository's default branch, when GitHub named it.
-    pub default_branch: Option<String>,
+    /// What its jobs need to get the repository's cache now; none when they get none ([`CacheRepo::of`]).
+    pub cache: CacheTerms,
     /// Why its listener is not listening, when it is not.
     pub error: Option<String>,
     /// Since when, in seconds since 1970.
@@ -251,7 +252,7 @@ struct Wanted {
     labels: Vec<String>,
     size: Size,
     docker: bool,
-    default_branch: Option<String>,
+    cache: Option<CacheRepo>,
 }
 
 struct Serving {
@@ -801,7 +802,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             let mut serving = shared.serving.lock().expect("serving");
             if let Some(set) = serving.get(&name) {
                 // What reads a run's commit checks against: a renamed default branch counts at once.
-                set.state.lock().expect("set").default_branch = want.default_branch.clone();
+                set.state.lock().expect("set").cache.set(want.cache.clone());
                 continue;
             }
             let state = Arc::new(Mutex::new(SetState {
@@ -811,7 +812,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 labels: want.labels.clone(),
                 size: want.size,
                 docker: want.docker,
-                default_branch: want.default_branch.clone(),
+                cache: CacheTerms::new(want.cache.clone()),
                 error: None,
                 error_at: None,
                 statistics: None,
@@ -898,11 +899,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     labels: q.set.labels().to_vec(),
                     size: q.size,
                     docker: q.set.docker(),
-                    default_branch: read
+                    cache: read
                         .repos
                         .iter()
                         .find(|(repo, _)| repo.full_name == q.repo)
-                        .and_then(|(repo, _)| repo.default_branch.clone()),
+                        .and_then(|(repo, _)| CacheRepo::of(repo)),
                 };
                 Some((name.clone(), want))
             })
@@ -1173,7 +1174,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             labels: set.labels().to_vec(),
                             size,
                             docker: set.docker(),
-                            default_branch: repo.default_branch.clone(),
+                            cache: CacheRepo::of(&repo),
                         },
                     );
                 }
@@ -1390,12 +1391,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return None;
         };
         let registry = SetRegistry::own(client, state.labels.clone());
+        let cache = state.cache.get();
         let at = Start {
             machine: &shared.config.machine,
             repo: &state.repo,
             scale_set_id: held::OWN,
             size: state.size,
-            default_branch: state.default_branch.as_deref(),
+            cache: cache.as_ref(),
         };
         match start_runner(&registry, machines, &shared.roster, &*shared.clock, at, ticket).await {
             Ok(runner) => {
@@ -1601,13 +1603,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
     }
 
-    /// A repository's default branch as the newest look at GitHub named it.
+    /// A repository's default branch as the newest look at GitHub named it, while its jobs get a cache.
     fn default_branch_now(&self, repo: &str) -> Option<String> {
         let serving = self.shared.serving.lock().expect("serving");
         serving.values().find_map(|set| {
             let state = set.state.lock().expect("set");
             (state.repo == repo)
-                .then(|| state.default_branch.clone())
+                .then(|| state.cache.get().map(|cache| cache.default_branch))
                 .flatten()
         })
     }
@@ -2612,14 +2614,14 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
     stop: Shutdown,
 ) {
     let bell = shared.nudge.subscribe();
-    let (name, labels, size, docker, default_branch, repo) = {
+    let (name, labels, size, docker, cache, repo) = {
         let state = state.lock().expect("set");
         (
             state.name.clone(),
             state.labels.clone(),
             state.size,
             state.docker,
-            state.default_branch.clone(),
+            state.cache.clone(),
             state.repo.clone(),
         )
     };
@@ -2631,7 +2633,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
         || {
             let (shared, client, state, bell) = (shared.clone(), client.clone(), state.clone(), bell.clone());
             let (name, labels, repo, stop) = (name.clone(), labels.clone(), repo.clone(), session_stop.clone());
-            let default_branch = default_branch.clone();
+            let cache = cache.clone();
             async move {
                 let set = client.ensure_scale_set(&name, &labels).await?;
                 state.lock().expect("set").id = set.id;
@@ -2655,7 +2657,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         machine: shared.config.machine.clone(),
                         size,
                         docker,
-                        default_branch,
+                        cache,
                     },
                     session.clone(),
                     registry,

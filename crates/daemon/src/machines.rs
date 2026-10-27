@@ -2233,7 +2233,8 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
         let copy = inner
             .caches
             .as_mut()
-            .and_then(|caches| caches.prepare(&name, &spec.repo, spec.default_branch.as_deref(), wall));
+            .zip(spec.cache.as_ref())
+            .and_then(|(caches, terms)| caches.prepare(&name, &spec.repo, terms, wall));
         let request = JobRequest {
             cache: copy.as_ref().map(|copy| copy.path.clone()),
             ..request

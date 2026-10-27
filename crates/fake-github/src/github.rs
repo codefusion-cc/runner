@@ -144,6 +144,7 @@ const PLAIN: i64 = 0;
 
 #[derive(Debug, Clone)]
 struct Repo {
+    id: u64,
     private: bool,
     workflows: BTreeMap<String, String>,
     variables: BTreeMap<String, String>,
@@ -207,6 +208,8 @@ struct State {
     /// Whether a session's first poll makes the service look at its queue; see
     clock_offset: i64,
     next: u32,
+    /// The number the newest repository got.
+    repo_ids: u64,
     repos: BTreeMap<String, Repo>,
     /// token -> expires_at (epoch seconds)
     installation_tokens: HashMap<String, i64>,
@@ -510,6 +513,7 @@ impl FakeGithub {
                 opts,
                 clock_offset: 0,
                 next: 0,
+                repo_ids: 0,
                 repos: BTreeMap::new(),
                 installation_tokens: HashMap::new(),
                 read_only: BTreeSet::new(),
@@ -570,16 +574,28 @@ impl FakeGithub {
 
     // ---- setup ----
 
-    /// Adds a repository the App's one installation (ID 1) covers.
+    /// Adds a repository the App's one installation (ID 1) covers, with a number of its own; one added again under its
+    /// name is made anew and gets another.
     pub fn add_repo(&self, full_name: &str, private: bool) {
-        self.lock().repos.insert(
+        let mut st = self.lock();
+        st.repo_ids += 1;
+        let id = st.repo_ids;
+        st.repos.insert(
             full_name.to_string(),
             Repo {
+                id,
                 private,
                 workflows: BTreeMap::new(),
                 variables: BTreeMap::new(),
             },
         );
+    }
+
+    /// Makes a repository public or private; it keeps its number.
+    pub fn set_private(&self, full_name: &str, private: bool) {
+        if let Some(repo) = self.lock().repos.get_mut(full_name) {
+            repo.private = private;
+        }
     }
 
     /// Sets a workflow file of a repository.
@@ -1196,7 +1212,7 @@ impl FakeGithub {
                     .repos
                     .iter()
                     .map(|(name, r)| {
-                        json!({"full_name": name, "private": r.private, "archived": false, "disabled": false,
+                        json!({"id": r.id, "full_name": name, "private": r.private, "archived": false, "disabled": false,
                                "pushed_at": "2026-10-10T10:00:00Z", "html_url": format!("https://github.com/{name}"),
                                "default_branch": "main"})
                     })

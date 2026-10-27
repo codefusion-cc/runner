@@ -9,7 +9,7 @@ use cf_daemon::names::job_name;
 use cf_daemon::testing::pass;
 use cf_daemon::{Claim, EventKind, Slots};
 use cf_vmhost::End;
-use support::world::{SIZE, World};
+use support::world::{REPO_ID, SIZE, World};
 use support::*;
 
 const ON_MAIN: &str = "org/app/.github/workflows/ci.yml@refs/heads/main";
@@ -237,7 +237,9 @@ async fn a_pull_requests_writes_never_reach_the_kept_cache_while_it_runs_or_afte
     write_at(&main_copy, 0, b"main's packages");
     write_at(&main_copy, DEEP, b"main's store");
     ends(&mut w, &first, "succeeded", "push", ON_MAIN);
-    let kept = dir.path().join(format!("{}.img", cf_daemon::caches::key(REPO)));
+    let kept = dir
+        .path()
+        .join(format!("{}.img", cf_daemon::caches::key(REPO_ID)));
     let as_kept = || (region(&kept, 0, 15), region(&kept, DEEP, 12));
     assert_eq!(as_kept(), (b"main's packages".to_vec(), b"main's store".to_vec()));
 

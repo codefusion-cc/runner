@@ -18,6 +18,8 @@ use time::OffsetDateTime;
 
 pub const SIZE: Size = Size::G2;
 pub const REPO: &str = "org/app";
+/// GitHub's number for it.
+pub const REPO_ID: u64 = 4242;
 pub const SET: i64 = 7;
 
 /// The Mac mini of 2026-10-13: 16 GB and 8 cores, given to CI. A cap of 12 GiB, a floor of 2 GiB, 6 vCPUs: a cf-2g
@@ -168,7 +170,10 @@ impl World {
                 scale_set_id: SET,
                 runner_id: i64::from(self.next),
                 size,
-                default_branch: Some("main".into()),
+                cache: Some(cf_daemon::caches::CacheRepo {
+                    id: REPO_ID,
+                    default_branch: "main".into(),
+                }),
                 ticket,
                 jit_config: Secret::new("jit".to_string()),
             })

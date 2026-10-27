@@ -16,10 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use cf_guest_proto::{CacheEnd, CacheFound};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::records::GithubJob;
 pub use cf_ghapp::WorkflowRun;
@@ -29,11 +29,61 @@ pub const DISK_BYTES: u64 = 20 << 30;
 /// The events kept for the console: the newest ones.
 pub const EVENTS_KEPT: usize = cf_console_client::MAX_JOB_CACHE_EVENTS;
 
-/// A repository's cache key. GitHub's names ignore case, so one repository has one key however a workflow or a
-/// listing spells it; two repositories never share one, and the cache's own record names its repository, which is
-/// held against the job's before the cache is used ([`CacheStore::prepare`]).
-pub fn key(repo: &str) -> String {
-    format!("{:x}", Sha256::digest(repo.to_lowercase().as_bytes()))[..32].to_string()
+/// A scale set's [`CacheRepo`] as the newest look at GitHub found it, shared by its state and whatever starts its
+/// machines: a repository made public since gives its next machine no cache.
+#[derive(Debug, Clone, Default)]
+pub struct CacheTerms(Arc<Mutex<Option<CacheRepo>>>);
+
+impl CacheTerms {
+    pub fn new(terms: Option<CacheRepo>) -> CacheTerms {
+        CacheTerms(Arc::new(Mutex::new(terms)))
+    }
+
+    pub fn get(&self) -> Option<CacheRepo> {
+        self.0.lock().expect("cache terms").clone()
+    }
+
+    pub fn set(&self, terms: Option<CacheRepo>) {
+        *self.0.lock().expect("cache terms") = terms;
+    }
+}
+
+impl PartialEq for CacheTerms {
+    fn eq(&self, other: &CacheTerms) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for CacheTerms {}
+
+/// A repository's cache key: GitHub's number for it, which a rename keeps and a repository made again under the same
+/// name does not get. The cache's own record names it too, and is held against the job's before the cache is used
+/// ([`CacheStore::prepare`]).
+pub fn key(repo_id: u64) -> String {
+    format!("repo-{repo_id}")
+}
+
+/// What a repository's jobs need to get its cache: GitHub's number for it and its default branch, whose pushes write
+/// the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRepo {
+    /// GitHub's number for the repository.
+    pub id: u64,
+    /// Its default branch when GitHub was last asked.
+    pub default_branch: String,
+}
+
+impl CacheRepo {
+    /// The terms of a repository GitHub listed, or `None` when its jobs get no cache: a public one, since anyone may
+    /// open a pull request there and the Runner gives a machine its disk before GitHub says which job it runs, and one
+    /// GitHub did not name a number or a default branch for. What was not read counts as public.
+    pub fn of(repo: &cf_ghapp::Repo) -> Option<CacheRepo> {
+        let default_branch = repo.default_branch.clone().filter(|branch| !branch.is_empty())?;
+        (repo.private && repo.id != 0).then_some(CacheRepo {
+            id: repo.id,
+            default_branch,
+        })
+    }
 }
 
 /// Why a writer's copy is refused when its Docker daemon could not run on it: the one refusal after which the cache
@@ -143,8 +193,10 @@ pub fn spoiled(end: Option<CacheEnd>) -> bool {
 /// A repository's cache as the store keeps it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
-    /// `owner/name`, as the first job that wrote it spelled it.
+    /// `owner/name`, as the last job that wrote it spelled it.
     pub repo: String,
+    /// GitHub's number for the repository.
+    pub repo_id: u64,
     /// What it holds of the host's disk, as the store last found it; not written down.
     #[serde(skip)]
     pub bytes: u64,
@@ -233,6 +285,9 @@ pub struct CacheStore {
 pub struct CacheCopy {
     /// The repository's key.
     pub key: String,
+    /// GitHub's number for the repository.
+    #[serde(default)]
+    pub repo_id: u64,
     /// The copy the machine got.
     pub path: PathBuf,
     /// When the cache it was copied from was written; `None` for an empty copy.
@@ -316,16 +371,17 @@ impl CacheStore {
         out
     }
 
-    /// Deletes the images no record names: a Runner stopped between keeping one and writing its record, or could not
-    /// write it. Nothing would count or evict them.
+    /// Deletes the images no readable record names, and the records that cannot be read: a Runner stopped between
+    /// keeping one and writing its record, could not write it, or wrote what this one does not read. Nothing would
+    /// count or evict them.
     fn drop_strays(&self) {
         for entry in fs::read_dir(&self.dir).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(key) = name.strip_suffix(".img") else {
+            let Some(key) = name.strip_suffix(".img").or_else(|| name.strip_suffix(".json")) else {
                 continue;
             };
             if !self.listing.iter().any(|(found, _)| found == key) {
-                tracing::info!(%key, "a cache without its record is deleted");
+                tracing::info!(%key, "a cache or record without the other is deleted");
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -356,14 +412,8 @@ impl CacheStore {
     /// The copy a job of `repo` runs with, named after the job: its repository's cache shared block by block, or an
     /// empty sparse file the guest makes a file system on. `None` when no copy could be made; the job then keeps its
     /// packages and its daemon's data on its own disk.
-    pub fn prepare(
-        &mut self,
-        job: &str,
-        repo: &str,
-        default_branch: Option<&str>,
-        now: i64,
-    ) -> Option<CacheCopy> {
-        let key = key(repo);
+    pub fn prepare(&mut self, job: &str, repo: &str, terms: &CacheRepo, now: i64) -> Option<CacheCopy> {
+        let key = key(terms.id);
         let path = self.dir.join("jobs").join(format!("{job}.img"));
         let _ = fs::remove_file(&path);
         // A copy may grow to the whole disk whatever it starts as: none without room for that.
@@ -375,7 +425,7 @@ impl CacheStore {
         let found = self.listing.iter().position(|(found, _)| *found == key);
         let mut from = None;
         if let Some(at) = found {
-            if self.listing[at].1.repo.eq_ignore_ascii_case(repo) {
+            if self.listing[at].1.repo_id == terms.id {
                 match cf_vmhost::scratch::clone(&self.image(&key), &path) {
                     Ok(()) => {
                         self.listing[at].1.used_at = now;
@@ -408,9 +458,10 @@ impl CacheStore {
                 self.copies.insert(path.clone(), key.clone());
                 Some(CacheCopy {
                     key,
+                    repo_id: terms.id,
                     path,
                     from,
-                    default_branch: default_branch.map(str::to_string),
+                    default_branch: Some(terms.default_branch.clone()),
                     end: None,
                     run: None,
                 })
@@ -448,6 +499,7 @@ impl CacheStore {
                 Ok(()) => {
                     let cache = Cache {
                         repo: repo.to_string(),
+                        repo_id: copy.repo_id,
                         bytes: self.bytes(&copy.key).unwrap_or(0),
                         written_at: now,
                         used_at: now,

@@ -144,6 +144,7 @@ mod tests {
 
     fn repo(name: &str, private: bool) -> Repo {
         Repo {
+            id: 1,
             full_name: name.into(),
             pushed_at: None,
             html_url: String::new(),

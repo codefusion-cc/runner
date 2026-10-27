@@ -51,6 +51,9 @@ pub struct WorkflowRun {
 /// A repository the App may serve.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Repo {
+    /// GitHub's number for it; 0 when GitHub did not say.
+    #[serde(default)]
+    pub id: u64,
     /// `owner/name`.
     pub full_name: String,
     /// Changes with every push, so workflows need reading again only when it does.

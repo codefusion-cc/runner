@@ -2,6 +2,8 @@ use cf_budget::{Size, SlotId, Turn};
 use cf_scaleset::{Error, JitConfig};
 use cf_secret::Secret;
 use cf_vmhost::OutOfMemory;
+
+use crate::caches::CacheRepo;
 use std::future::Future;
 use time::OffsetDateTime;
 
@@ -114,8 +116,8 @@ pub struct RunnerSpec {
     pub runner_id: i64,
     /// The machine's size.
     pub size: Size,
-    /// The repository's default branch, when GitHub named it.
-    pub default_branch: Option<String>,
+    /// What its jobs need to get the repository's cache; none when they get none.
+    pub cache: Option<CacheRepo>,
     /// The slot it runs in.
     pub ticket: Ticket,
     /// What the Actions runner starts with. A credential.
