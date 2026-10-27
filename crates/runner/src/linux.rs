@@ -31,6 +31,8 @@ pub struct Facts {
     /// The file system of the state folder (or of the nearest folder above it that is there), when it is mounted
     /// `noexec`: where it is mounted.
     pub noexec: Option<PathBuf>,
+    /// Whether that file system opens a file for direct I/O, which a machine's disk is written with, and why not.
+    pub direct_io: Result<(), String>,
 }
 
 /// Why `/dev/kvm` does not open.
@@ -76,6 +78,7 @@ impl Facts {
                 max_user_namespaces: number("/proc/sys/user/max_user_namespaces"),
             },
             noexec: noexec_mount(state_dir),
+            direct_io: direct_io(state_dir),
             user,
             uid,
         }
@@ -130,6 +133,32 @@ fn try_user_namespace() -> Result<(), String> {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("/bin/true in a user namespace: {status}")),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether the file system of `folder`, or of the nearest folder above it that is there, opens a new file with
+/// `O_DIRECT`: a machine's disk is written past the host's page cache. Only the file system's refusal (`EINVAL`) is
+/// an error; a folder this user may not write to says nothing about it.
+fn direct_io(folder: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Some(there) = folder.ancestors().find(|each| each.exists()) else {
+        return Ok(());
+    };
+    let probe = there.join(format!(".direct-io-{}", std::process::id()));
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&probe);
+    if opened.is_ok() {
+        let _ = std::fs::remove_file(&probe);
+    }
+    match opened {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Err(format!(
+            "{} is on a file system that does not open files for direct I/O",
+            there.display()
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -256,6 +285,12 @@ pub fn lines(facts: &Facts) -> Vec<Result<String, String>> {
             mount.display()
         )),
     });
+    lines.push(match &facts.direct_io {
+        Ok(()) => Ok("the state folder's file system takes direct I/O".to_string()),
+        Err(why) => Err(format!(
+            "{why}, and every machine's disk is written with it: give `state_dir` a folder on ext4, xfs or btrfs"
+        )),
+    });
     lines
 }
 
@@ -286,6 +321,7 @@ mod tests {
             userns: Ok(()),
             userns_switches: Switches::default(),
             noexec: None,
+            direct_io: Ok(()),
         }
     }
 
@@ -296,7 +332,7 @@ mod tests {
     #[test]
     fn a_ready_host_misses_nothing() {
         let lines = lines(&ready());
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 7);
         assert!(lines.iter().all(Result::is_ok), "{lines:?}");
     }
 
@@ -381,6 +417,15 @@ mod tests {
                     ..ready()
                 },
                 "`sudo mount -o remount,exec /data`".into(),
+            ),
+            (
+                Facts {
+                    direct_io: Err(
+                        "/data is on a file system that does not open files for direct I/O".into(),
+                    ),
+                    ..ready()
+                },
+                "give `state_dir` a folder on ext4, xfs or btrfs".into(),
             ),
         ];
         for (facts, says) in cases {
@@ -473,5 +518,9 @@ mod tests {
         );
         // A state folder that is not made yet is judged by the folder above it.
         assert_eq!(noexec_mount(&root.path().join("not/there/yet")), None);
+        // The temporary folder of a test host takes direct I/O, and the probe leaves nothing behind.
+        let empty = tempfile::tempdir().expect("an empty folder");
+        assert_eq!(direct_io(&empty.path().join("not/there/yet")), Ok(()));
+        assert_eq!(std::fs::read_dir(empty.path()).expect("the folder").count(), 0);
     }
 }

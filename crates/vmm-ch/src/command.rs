@@ -85,12 +85,18 @@ pub fn monitor(
         "--event-monitor".into(),
         format!("path={}", option_path(files.events)?),
     ];
+    // A disk the guest writes goes past the host's page cache (`direct=on`): the guest caches it already, and the
+    // host's dirty pages would count against the machine's cgroup, which holds only the guest's memory and the
+    // overhead. On a disk slower to write back than the guest writes (a cloud VM's), they filled what was left and
+    // the machine ended in an OOM it did not cause. A read-only disk keeps the cache, clean and shared by every
+    // machine that reads it.
     for disk in &spec.disks {
         args.push("--disk".into());
         args.push(format!(
-            "path={},readonly={},serial={},image_type=raw",
+            "path={},readonly={},direct={},serial={},image_type=raw",
             option_path(&disk.path)?,
             if disk.read_only { "on" } else { "off" },
+            if disk.read_only { "off" } else { "on" },
             disk.id
         ));
     }
@@ -223,9 +229,9 @@ mod tests {
                 "--event-monitor",
                 "path=/state/machines/vm-1-0/events",
                 "--disk",
-                "path=/state/images/root.img,readonly=on,serial=root,image_type=raw",
+                "path=/state/images/root.img,readonly=on,direct=off,serial=root,image_type=raw",
                 "--disk",
-                "path=/state/run/job/work.img,readonly=off,serial=work,image_type=raw",
+                "path=/state/run/job/work.img,readonly=off,direct=on,serial=work,image_type=raw",
             ]
         );
     }
