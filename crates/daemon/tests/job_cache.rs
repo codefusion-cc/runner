@@ -51,6 +51,9 @@ fn run_of(event: &str, workflow: &str) -> WorkflowRun {
         ),
         head_repository: Some(REPO.into()),
         event: event.into(),
+        head_sha: Some("c".repeat(40)),
+        // What the sweep learns of a run on the branch it names.
+        on_default_branch: true,
     }
 }
 
@@ -64,7 +67,12 @@ fn read_run(w: &World, runner: &str, run: WorkflowRun) {
     let wanted = w.m.runs_to_read();
     assert_eq!(
         wanted,
-        [(job_name(runner).to_string(), REPO.to_string(), 42)],
+        [(
+            job_name(runner).to_string(),
+            REPO.to_string(),
+            42,
+            "main".to_string()
+        )],
         "the run to read"
     );
     w.m.run_read(job_name(runner), run);
@@ -317,7 +325,7 @@ async fn a_machine_that_does_not_start_leaves_no_copy() {
 }
 
 #[tokio::test]
-async fn a_job_whose_run_checked_out_another_branch_or_was_never_read_does_not_write_the_cache() {
+async fn a_job_whose_run_checked_out_another_branch_or_a_tag_or_was_never_read_does_not_write_the_cache() {
     let Some((dir, mut w)) = caching() else { return };
     let first = job(&mut w).await;
     std::fs::write(copy_of_last_start(&w), b"main").unwrap();
@@ -331,6 +339,15 @@ async fn a_job_whose_run_checked_out_another_branch_or_was_never_read_does_not_w
         ..run_of("push", ON_MAIN)
     };
     ends_with_run(&mut w, &called, "succeeded", "push", ON_MAIN, Some(feature));
+    // The same workflow called by a push of a tag named `main`: GitHub names the tag as the run's branch, and only
+    // its commit, on no branch, says the code is not main's.
+    let tag = job(&mut w).await;
+    std::fs::write(copy_of_last_start(&w), b"a tag named main").unwrap();
+    let tagged = WorkflowRun {
+        on_default_branch: false,
+        ..run_of("push", ON_MAIN)
+    };
+    ends_with_run(&mut w, &tag, "succeeded", "push", ON_MAIN, Some(tagged));
     // A run the sweep never read: GitHub was away the whole job.
     let unread = job(&mut w).await;
     std::fs::write(copy_of_last_start(&w), b"unread").unwrap();
@@ -348,6 +365,10 @@ async fn a_job_whose_run_checked_out_another_branch_or_was_never_read_does_not_w
             .collect();
     assert!(
         whys.contains(&"the run's code is not the default branch's".to_string()),
+        "{whys:?}"
+    );
+    assert!(
+        whys.contains(&"the run's commit is not on the default branch".to_string()),
         "{whys:?}"
     );
     assert!(

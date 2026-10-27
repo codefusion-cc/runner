@@ -47,6 +47,8 @@ fn main_run() -> WorkflowRun {
         head_branch: Some("main".into()),
         head_repository: Some(REPO.into()),
         event: "push".into(),
+        head_sha: Some("c".repeat(40)),
+        on_default_branch: true,
     }
 }
 
@@ -204,6 +206,16 @@ fn each_condition_alone_refuses() {
             "a reusable workflow at main run from {head_branch:?}"
         );
     }
+    // A tag named `main` that calls main's reusable workflow: GitHub names the tag as the run's branch.
+    let tag = WorkflowRun {
+        on_default_branch: false,
+        ..main_run()
+    };
+    assert_eq!(
+        on(Some(&tag)),
+        Some("the run's commit is not on the default branch"),
+        "a tag named like the default branch"
+    );
     for head_repository in [
         None,
         Some("someone/shop"),
@@ -282,12 +294,20 @@ proptest! {
         docker in prop_oneof![Just(None), Just(Some(true)), Just(Some(false))],
         head in prop_oneof![Just("main".to_string()), "[a-z@/-]{0,12}"],
         read in any::<bool>(),
+        on_default_branch in any::<bool>(),
     ) {
         let job = github(&event, &format!("{repo}/.github/workflows/x.yml@refs/heads/{branch}"), Some(&result));
         let end = Some(CacheEnd { found: CacheFound::Reused, clean, docker });
-        let run = WorkflowRun { head_branch: Some(head.clone()), head_repository: Some(repo.clone()), event: event.clone() };
+        let run = WorkflowRun {
+            head_branch: Some(head.clone()),
+            head_repository: Some(repo.clone()),
+            event: event.clone(),
+            head_sha: None,
+            on_default_branch,
+        };
         if refusal(REPO, Some("main"), Some(&job), read.then_some(&run), end).is_none() {
             prop_assert!(read);
+            prop_assert!(on_default_branch);
             prop_assert_eq!(head, "main");
             prop_assert!(["push", "schedule", "workflow_dispatch"].contains(&event.as_str()));
             prop_assert_eq!(branch, "main");

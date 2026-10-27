@@ -70,6 +70,10 @@ pub fn refusal(
     if run.head_branch.as_deref() != Some(branch) {
         return Some("the run's code is not the default branch's");
     }
+    // A tag's run names the tag as its branch: only its commit says whose code it ran.
+    if !run.on_default_branch {
+        return Some("the run's commit is not on the default branch");
+    }
     if !run
         .head_repository
         .as_deref()

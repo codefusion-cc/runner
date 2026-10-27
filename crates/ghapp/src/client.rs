@@ -39,6 +39,13 @@ pub struct WorkflowRun {
     pub head_repository: Option<String>,
     /// `push`, `pull_request` and so on.
     pub event: String,
+    /// The commit the run checked out. A tag's run names the tag in `head_branch`, so only this says whose code it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// Whether `head_sha` is on the repository's default branch, the branch GitHub names now: the Runner learns it
+    /// after reading the run ([`GitHubApp::commit_on_branch`]); GitHub's answer alone never sets it.
+    #[serde(default)]
+    pub on_default_branch: bool,
 }
 
 /// A repository the App may serve.
@@ -497,6 +504,7 @@ impl GitHubApp {
             head_repository: Option<Named>,
             #[serde(default)]
             event: String,
+            head_sha: Option<String>,
         }
         let path = format!("/repos/{repo}/actions/runs/{run_id}");
         match self
@@ -509,9 +517,68 @@ impl GitHubApp {
                     head_branch: run.head_branch,
                     head_repository: run.head_repository.map(|named| named.full_name),
                     event: run.event,
+                    head_sha: run.head_sha,
+                    on_default_branch: false,
                 }))
             }
             Err(Error::Status(s)) if s.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether `sha` is on `branch` of a repository: its tip or behind it. A branch GitHub does not have, or a name
+    /// that is not a plain branch name, is `false`.
+    pub async fn commit_on_branch(
+        &self,
+        installation: i64,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> Result<bool, Error> {
+        #[derive(Deserialize)]
+        struct Commit {
+            sha: String,
+        }
+        #[derive(Deserialize)]
+        struct Branch {
+            commit: Commit,
+        }
+        #[derive(Deserialize)]
+        struct Compare {
+            status: String,
+        }
+        let plain = |name: &str| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+        };
+        if !plain(branch) || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(false);
+        }
+        let path = format!("/repos/{repo}/branches/{branch}");
+        let tip = match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
+            Ok(response) => decode::<Branch>("branch", &response)?.commit.sha,
+            Err(Error::Status(s)) if s.status == 404 => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if tip.eq_ignore_ascii_case(sha) {
+            return Ok(true);
+        }
+        // Two commits, never names: a tag of the branch's name cannot stand in for it.
+        let path = format!("/repos/{repo}/compare/{sha}...{tip}");
+        match self
+            .as_installation(installation, Some(repo), Method::GET, &path)
+            .await
+        {
+            Ok(response) => Ok(matches!(
+                decode::<Compare>("comparison", &response)?.status.as_str(),
+                "ahead" | "identical"
+            )),
+            Err(Error::Status(s)) if s.status == 404 => Ok(false),
             Err(e) => Err(e),
         }
     }

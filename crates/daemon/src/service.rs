@@ -799,7 +799,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
         for (name, want) in wanted {
             let mut serving = shared.serving.lock().expect("serving");
-            if serving.contains_key(&name) {
+            if let Some(set) = serving.get(&name) {
+                // What reads a run's commit checks against: a renamed default branch counts at once.
+                set.state.lock().expect("set").default_branch = want.default_branch.clone();
                 continue;
             }
             let state = Arc::new(Mutex::new(SetState {
@@ -1561,20 +1563,53 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         self.read_runs().await;
     }
 
-    /// Reads the workflow runs of Docker jobs with a cache copy ([`Machines::runs_to_read`]). A run that cannot be read
-    /// is asked again at the next sweep; one never read keeps its job's copy from becoming the cache.
+    /// Reads the workflow runs of jobs with a cache copy ([`Machines::runs_to_read`]), and whether each run's commit
+    /// is on the repository's default branch as GitHub names it now: a branch renamed since the job started is no
+    /// longer the one whose code may be kept. A run that cannot be read is asked again at the next sweep; one never
+    /// read keeps its job's copy from becoming the cache.
     async fn read_runs(&self) {
         let shared = &self.shared;
-        for (job, repo, run_id) in shared.machines.runs_to_read() {
+        for (job, repo, run_id, branch) in shared.machines.runs_to_read() {
             let Some(client) = self.client_for(&repo).await else {
                 continue;
             };
-            match client.workflow_run(run_id).await {
-                Ok(Some(run)) => shared.machines.run_read(&job, run),
-                Ok(None) => tracing::debug!(%job, %repo, run_id, "GitHub has no such run yet"),
-                Err(error) => tracing::debug!(%job, %repo, run_id, %error, "a run was not read; asked again"),
-            }
+            let mut run = match client.workflow_run(run_id).await {
+                Ok(Some(run)) => run,
+                Ok(None) => {
+                    tracing::debug!(%job, %repo, run_id, "GitHub has no such run yet");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::debug!(%job, %repo, run_id, %error, "a run was not read; asked again");
+                    continue;
+                }
+            };
+            let now = self.default_branch_now(&repo);
+            run.on_default_branch = match (run.head_sha.as_deref(), now) {
+                (Some(sha), Some(now)) if now == branch => {
+                    match client.commit_on_branch(&branch, sha).await {
+                        Ok(on) => on,
+                        Err(error) => {
+                            tracing::debug!(%job, %repo, run_id, %error, "a run's commit was not checked; asked again");
+                            continue;
+                        }
+                    }
+                }
+                _ => false,
+            };
+            shared.machines.run_read(&job, run);
         }
+    }
+
+    /// A repository's default branch as the newest look at GitHub named it.
+    fn default_branch_now(&self, repo: &str) -> Option<String> {
+        let serving = self.shared.serving.lock().expect("serving");
+        serving.values().find_map(|set| {
+            let state = set.state.lock().expect("set");
+            (state.repo == repo)
+                .then(|| state.default_branch.clone())
+                .flatten()
+        })
     }
 
     /// Leaves a registration to a later sweep.

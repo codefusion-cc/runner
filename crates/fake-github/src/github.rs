@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -243,6 +243,8 @@ struct State {
     rest_seen: HashMap<i64, Option<bool>>,
     /// The branch a run's code came from where it is not its workflow's ([`FakeGithub::set_run_head`]).
     run_heads: HashMap<i64, String>,
+    /// The runs whose commit is on no branch of their repository ([`FakeGithub::set_run_off_branch`]).
+    off_branch: HashSet<i64>,
     /// Whether every request is dropped unanswered and changes nothing ([`FakeGithub::set_down`]).
     down: bool,
     /// How often a job was handed to a scale set, the same job again after a take-back included.
@@ -532,6 +534,7 @@ impl FakeGithub {
                 rest_stale: false,
                 rest_seen: HashMap::new(),
                 run_heads: HashMap::new(),
+                off_branch: HashSet::new(),
                 down: false,
                 assignments: 0,
                 not_modified: 0,
@@ -632,6 +635,19 @@ impl FakeGithub {
             .map(|j| j.run_id)
         {
             st.run_heads.insert(run, branch.to_string());
+        }
+    }
+
+    /// Says that the run of a queued job checked out a commit no branch has: a tag's, named like a branch.
+    pub fn set_run_off_branch(&self, request_id: i64) {
+        let mut st = self.lock();
+        if let Some(run) = st
+            .jobs
+            .iter()
+            .find(|j| j.request_id == request_id)
+            .map(|j| j.run_id)
+        {
+            st.off_branch.insert(run);
         }
     }
 
@@ -1335,11 +1351,24 @@ impl FakeGithub {
                     Reply::json(&json!({
                         "id": id,
                         "head_branch": head,
+                        "head_sha": run_sha(id),
                         "event": event,
                         "path": ".github/workflows/ci.yml",
                         "head_repository": {"full_name": name},
                         "repository": {"full_name": name},
                     }))
+                })
+            }
+            // A branch, with its tip: every branch of every repository has the same one here.
+            ("GET", ["repos", _owner, _repo, "branches", ..]) => {
+                self.with_installation(&req, |_| Reply::json(&json!({"commit": {"sha": BRANCH_TIP}})))
+            }
+            // Two commits compared: a run's commit is behind the tip unless the test put it off every branch.
+            ("GET", ["repos", _owner, _repo, "compare", range]) => {
+                let base = range.split("...").next().unwrap_or_default().to_string();
+                self.with_installation(&req, |st| {
+                    let off = st.off_branch.iter().any(|run| run_sha(*run) == base);
+                    Reply::json(&json!({"status": if off { "diverged" } else { "ahead" }}))
                 })
             }
             // Probe H, 2026-10-12: `busy` and `status` for an Actions runner registered for a scale set, by the ID its
@@ -2029,4 +2058,12 @@ fn generate_jit(st: &mut State, id: i64, req: &Request) -> Reply {
         "runner": {"id": rid, "name": name, "runnerScaleSetId": id},
         "encodedJITConfig": b64url(format!("jit-config-for-{name}").as_bytes()),
     }))
+}
+
+/// The tip of every branch in the fake.
+const BRANCH_TIP: &str = "ffffffffffffffffffffffffffffffffffffffff";
+
+/// The commit a run checked out.
+fn run_sha(run: i64) -> String {
+    format!("{run:040x}")
 }

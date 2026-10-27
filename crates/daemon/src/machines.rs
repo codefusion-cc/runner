@@ -1274,11 +1274,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         opened
     }
 
-    /// The workflow runs to read for jobs' copies, as `(job, repository, run)`: a copy is kept only when GitHub
+    /// The workflow runs to read for jobs' copies, as `(job, repository, run, default branch)`: a copy is kept only when GitHub
     /// says its run checked out the default branch ([`caches::refusal`]). Only a job GitHub has not refused already
     /// ([`caches::worth_reading`]): a pull request's run is never read. The sweep reads them while the jobs run and
     /// gives each answer to [`Machines::run_read`].
-    pub fn runs_to_read(&self) -> Vec<(String, String, i64)> {
+    pub fn runs_to_read(&self) -> Vec<(String, String, i64, String)> {
         let inner = self.lock();
         inner
             .jobs
@@ -1292,8 +1292,10 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             .filter_map(|(name, job)| {
                 let github = job.record.github.as_ref().filter(|github| github.run_id > 0)?;
                 let branch = job.record.cache_copy.as_ref()?.default_branch.as_deref();
-                caches::worth_reading(&job.record.repo, branch, github)
-                    .then(|| (name.clone(), job.record.repo.clone(), github.run_id))
+                caches::worth_reading(&job.record.repo, branch, github).then(|| {
+                    let branch = branch.unwrap_or_default().to_string();
+                    (name.clone(), job.record.repo.clone(), github.run_id, branch)
+                })
             })
             .collect()
     }
