@@ -8,7 +8,8 @@
 #   scripts/host-setup.sh --machine <name> --console <url> --code-file <file>
 #
 # --code-file  the console's one-time connect code, alone in a file only root reads; deleted once the host enrolled
-# --ref        the commit the Runner is built at (default: the commit of the clone this script is in)
+# --ref        the commit the Runner is built at (default: the commit of the clone this script is in; needed when the
+#              script comes on standard input: curl -fsSL <raw URL at that commit> | bash -s -- --ref <commit> …)
 # --image      the image release to install (default: the newest of the host's architecture)
 # --home       the Runner user's home, where images and job disks go (default: /home/codefusion-runner)
 # --repo       where the Runner's checkout is cloned from (default: GitHub's); its origin is GitHub's either way
@@ -26,7 +27,9 @@ RELEASES_API=https://api.github.com/repos/codefusion-cc/runner/releases
 PACKAGES=(passt git curl jq build-essential pkg-config libssl-dev ca-certificates)
 
 machine='' console='' code_file='' ref='' image='' home=/home/$USER_NAME repo=$GITHUB_REPO github_api='' check=0
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# The clone this script is in; none when it came on standard input (curl … | bash -s), which then names --ref.
+here=''
+[[ -f ${BASH_SOURCE[0]:-} ]] && here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 step=arguments
 fail() {
@@ -62,7 +65,9 @@ if ((!check)); then
 fi
 ((EUID == 0)) || fail "run it as root"
 if [[ -z $ref ]]; then
-  ref=$(git -C "$here" rev-parse HEAD 2>/dev/null) || fail "--ref: this script is not in a clone; name the commit"
+  if [[ -z $here ]] || ! ref=$(git -C "$here" rev-parse HEAD 2>/dev/null); then
+    fail "--ref: this script is not in a clone; name the commit"
+  fi
 fi
 [[ $ref =~ ^[0-9a-f]{7,40}$ ]] || fail "--ref: a commit, 7 to 40 lowercase hex characters"
 case $(uname -m) in
