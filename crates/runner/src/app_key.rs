@@ -1,0 +1,454 @@
+//! The GitHub App's key file a host held before the console held the key. A Runner that starts on a settings file
+//! that still names the key's folder (`app_dir`) deletes the key file, takes `app_dir` out of the file and keeps
+//! everything else, and remembers where the file was, so that its report names a key file that is back or could
+//! not go. Without a console it gets its GitHub tokens from, it refuses to start: an update rolls back to the
+//! program before, which still has the key.
+
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Component, Path, PathBuf};
+
+use crate::config::{APP_DIR, APP_DIR_GONE, Config};
+
+/// The key file's name in the App's folder.
+pub const KEY_FILE: &str = "app.pem";
+
+/// The file in the state folder that names the key file the host held.
+const REMEMBERED: &str = "app-key-file";
+
+/// The longest path the report carries.
+const PATH_MAX: usize = 1024;
+
+/// What [`take_out`] did, for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenOut {
+    /// The key file it looked at; none when `app_dir` named no folder.
+    pub key_file: Option<PathBuf>,
+    /// What became of it.
+    pub key: Key,
+}
+
+/// What became of the key file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    /// It was a file, and is deleted.
+    Deleted,
+    /// It was not there.
+    Missing,
+    /// It was a symbolic link: the link is deleted, and the file it named is left, as the Runner deletes nothing
+    /// outside the App's folder.
+    LinkDeleted { to: PathBuf },
+    /// It could not be deleted; the report names it until it is gone.
+    Kept { why: String },
+}
+
+/// Takes the App's key out of the host: when the settings file at `path` names `app_dir`, the key file in it is
+/// deleted, the key is taken out of the file and the key file is remembered in the state folder. `None` when the
+/// file names no `app_dir`: nothing is done, and nothing is read but the file.
+///
+/// Refused, with nothing changed, when the file can be written by others, names no console, or the host holds no
+/// token for it: the Runner could not get its GitHub tokens.
+pub fn take_out(path: &Path) -> Result<Option<TakenOut>, String> {
+    let said = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
+    let text = crate::config::read_settings(path)?;
+    let mut file: serde_json::Value = serde_json::from_str(&text).map_err(|error| said(&error))?;
+    let keys = file.as_object_mut().ok_or_else(|| said(&"no JSON object"))?;
+    let Some(app_dir) = keys.get(APP_DIR).cloned() else {
+        return Ok(None);
+    };
+    let console = keys.get("console").and_then(|console| console.as_str());
+    let state_dir = keys
+        .get("state_dir")
+        .and_then(|state| state.as_str())
+        .map(PathBuf::from)
+        .filter(|state| state.is_absolute())
+        .ok_or_else(|| said(&"state_dir: no absolute path"))?;
+    // `enroll` reads the file as a Runner does, so it comes after `app_dir` is out: the key stays until a person
+    // does both.
+    if console.is_none() {
+        return Err(said(&format!(
+            "{APP_DIR_GONE}. This file names no console, so the key file is left as it is"
+        )));
+    }
+    if !enrolled(&state_dir) {
+        return Err(said(&format!(
+            "{APP_DIR_GONE}. This host holds no token for the console, so the key file is left as it is"
+        )));
+    }
+    let key_file = match &app_dir {
+        serde_json::Value::Null => None,
+        // A folder named through `..` could name a key file outside it; such a file is no Runner's.
+        serde_json::Value::String(folder)
+            if Path::new(folder).is_absolute()
+                && !Path::new(folder)
+                    .components()
+                    .any(|part| part == Component::ParentDir) =>
+        {
+            Some(Path::new(folder).join(KEY_FILE))
+        }
+        _ => return Err(said(&"app_dir: no absolute path without `..`")),
+    };
+
+    keys.remove(APP_DIR);
+    // A file a Runner could not start on changes nothing, the key included.
+    let text = serde_json::to_string(&file).map_err(|error| said(&error))?;
+    Config::parse(&text).map_err(|error| said(&error))?;
+
+    // First what is remembered, then the key, then the file: a Runner that dies between two steps does the rest
+    // when it starts again, and a key file left behind is always named.
+    let key = match &key_file {
+        Some(key_file) => {
+            let linked = std::fs::read_link(key_file)
+                .ok()
+                .map(|to| match key_file.parent() {
+                    Some(folder) if to.is_relative() => folder.join(to),
+                    _ => to,
+                });
+            remember(&state_dir, linked.as_deref().unwrap_or(key_file))?;
+            // `unlink` never follows the last part of a path: a link is deleted and not the file it names.
+            match std::fs::remove_file(key_file) {
+                Ok(()) => match linked {
+                    Some(to) => Key::LinkDeleted { to },
+                    None => Key::Deleted,
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Key::Missing,
+                Err(error) => Key::Kept {
+                    why: error.to_string(),
+                },
+            }
+        }
+        None => Key::Missing,
+    };
+    write_settings(path, &file, |next| Config::load(next).map(|_| ()))?;
+    Ok(Some(TakenOut { key_file, key }))
+}
+
+/// Whether the host holds a token for its console, as `enroll` keeps it.
+fn enrolled(state_dir: &Path) -> bool {
+    std::fs::read_to_string(state_dir.join("console-token")).is_ok_and(|token| !token.trim().is_empty())
+}
+
+/// Keeps `key_file` in the state folder, for this user alone.
+fn remember(state_dir: &Path, key_file: &Path) -> Result<(), String> {
+    let said = |error: std::io::Error| format!("{}: {error}", state_dir.display());
+    cf_secret::private_dir(state_dir).map_err(said)?;
+    let mut bytes = key_file.as_os_str().as_bytes().to_vec();
+    bytes.push(b'\n');
+    cf_secret::replace_private(&state_dir.join(REMEMBERED), &bytes).map_err(said)
+}
+
+/// The key file the host held, as [`take_out`] remembered it in `state_dir`: an absolute path of at most 1024 bytes.
+/// The report names it while something is there.
+pub fn remembered(state_dir: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(state_dir.join(REMEMBERED)).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?.trim_end_matches('\n');
+    let path = PathBuf::from(text);
+    (path.is_absolute() && text.len() <= PATH_MAX && !text.contains('\n')).then_some(path)
+}
+
+/// Puts `file` in place of the settings file at `path` in one step, once `check` took it: it is written to a file of
+/// its own beside it (`<path>.next`, for this user alone), checked there and renamed over it. Refused by `check`,
+/// the settings file is left as it was and the error names it, not the file beside it.
+pub fn write_settings(
+    path: &Path,
+    file: &serde_json::Value,
+    check: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let said = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
+    let mut written = serde_json::to_string_pretty(file).map_err(|error| said(&error))?;
+    written.push('\n');
+    let next = path.with_extension("json.next");
+    cf_secret::replace_private(&next, written.as_bytes()).map_err(|error| said(&error))?;
+    if let Err(why) = check(&next) {
+        let _ = std::fs::remove_file(&next);
+        return Err(why.replace(&next.display().to_string(), &path.display().to_string()));
+    }
+    std::fs::rename(&next, path).map_err(|error| {
+        let _ = std::fs::remove_file(&next);
+        said(&error)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A host as an update finds it: a settings file that names the App's folder with its key, a console and its
+    /// token.
+    struct Host {
+        folder: tempfile::TempDir,
+    }
+
+    const KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\nnot a key, a marker\n-----END RSA PRIVATE KEY-----\n";
+
+    impl Host {
+        fn new() -> Host {
+            let host = Host {
+                folder: tempfile::tempdir().expect("folder"),
+            };
+            std::fs::create_dir_all(host.app()).expect("the App's folder");
+            std::fs::write(host.app().join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+            std::fs::write(host.key(), KEY).expect("the key");
+            std::fs::create_dir_all(host.state()).expect("the state folder");
+            std::fs::write(host.state().join("console-token"), "cfr_token\n").expect("a token");
+            host.write(&host.settings(true));
+            host
+        }
+
+        fn app(&self) -> PathBuf {
+            self.folder.path().join("app")
+        }
+
+        fn key(&self) -> PathBuf {
+            self.app().join(KEY_FILE)
+        }
+
+        fn state(&self) -> PathBuf {
+            self.folder.path().join("state")
+        }
+
+        fn path(&self) -> PathBuf {
+            self.folder.path().join("config.json")
+        }
+
+        fn settings(&self, console: bool) -> serde_json::Value {
+            let mut settings = serde_json::json!({
+                "machine": "mac-a-vm",
+                "state_dir": self.state(),
+                "app_dir": self.app(),
+                "image": "2026.10.1",
+                "use": "dedicated",
+                "max_jobs": 2,
+                "repos": ["org/app"],
+            });
+            if console {
+                settings["console"] = "https://console.example".into();
+            }
+            settings
+        }
+
+        fn write(&self, settings: &serde_json::Value) {
+            std::fs::write(self.path(), settings.to_string()).expect("written");
+            std::fs::set_permissions(self.path(), std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        }
+
+        fn read(&self) -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(self.path()).expect("read")).expect("JSON")
+        }
+    }
+
+    #[test]
+    fn the_key_file_is_deleted_app_dir_taken_out_and_every_other_key_kept() {
+        let host = Host::new();
+        let mut expected = host.settings(true);
+        expected.as_object_mut().expect("object").remove("app_dir");
+        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        assert_eq!(
+            taken,
+            TakenOut {
+                key_file: Some(host.key()),
+                key: Key::Deleted
+            }
+        );
+        assert!(std::fs::symlink_metadata(host.key()).is_err(), "the key is gone");
+        assert!(host.app().join("app.json").exists(), "only the key file goes");
+        assert_eq!(host.read(), expected);
+        assert_eq!(
+            std::fs::metadata(host.path())
+                .expect("there")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!host.path().with_extension("json.next").exists());
+        Config::load(&host.path()).expect("a Runner starts on it");
+        assert_eq!(remembered(&host.state()), Some(host.key()));
+        assert_eq!(
+            std::fs::metadata(host.state().join(REMEMBERED))
+                .expect("there")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "for this user alone"
+        );
+    }
+
+    #[test]
+    fn taken_out_twice_is_taken_out_once() {
+        let host = Host::new();
+        take_out(&host.path()).expect("first").expect("there was one");
+        let after = std::fs::read(host.path()).expect("read");
+        assert_eq!(take_out(&host.path()), Ok(None), "nothing left to do");
+        assert_eq!(
+            std::fs::read(host.path()).expect("read"),
+            after,
+            "not written again"
+        );
+        assert_eq!(remembered(&host.state()), Some(host.key()));
+    }
+
+    #[test]
+    fn a_runner_that_died_after_the_key_went_does_the_rest() {
+        let host = Host::new();
+        std::fs::remove_file(host.key()).expect("gone already");
+        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        assert_eq!(taken.key, Key::Missing);
+        assert!(host.read().get("app_dir").is_none());
+        // A folder that was named null holds no key.
+        let host = Host::new();
+        let mut settings = host.settings(true);
+        settings["app_dir"] = serde_json::Value::Null;
+        host.write(&settings);
+        assert_eq!(
+            take_out(&host.path()).expect("taken out").expect("named").key,
+            Key::Missing
+        );
+        assert!(host.key().exists(), "a key no folder names is not looked for");
+        assert!(host.read().get("app_dir").is_none());
+    }
+
+    #[test]
+    fn without_a_console_or_its_token_nothing_changes_and_the_runner_does_not_start() {
+        let host = Host::new();
+        host.write(&host.settings(false));
+        let before = std::fs::read(host.path()).expect("read");
+        let said = take_out(&host.path()).expect_err("refused");
+        assert!(
+            said.contains(APP_DIR_GONE)
+                && said.contains("names no console")
+                && said.contains("left as it is"),
+            "{said}"
+        );
+        assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+        assert_eq!(std::fs::read(host.path()).expect("read"), before);
+        assert_eq!(remembered(&host.state()), None);
+
+        let host = Host::new();
+        std::fs::remove_file(host.state().join("console-token")).expect("not enrolled");
+        let said = take_out(&host.path()).expect_err("refused");
+        assert!(said.contains("no token for the console"), "{said}");
+        assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+        assert!(host.read().get("app_dir").is_some());
+
+        std::fs::write(host.state().join("console-token"), " \n").expect("an empty token");
+        assert!(take_out(&host.path()).is_err(), "an empty token is none");
+    }
+
+    #[test]
+    fn a_settings_file_others_can_write_is_not_acted_on() {
+        let host = Host::new();
+        std::fs::set_permissions(host.path(), std::fs::Permissions::from_mode(0o666)).expect("a mode");
+        assert!(
+            take_out(&host.path())
+                .expect_err("refused")
+                .contains("others can write it")
+        );
+        assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+    }
+
+    #[test]
+    fn only_a_file_named_app_pem_in_the_named_folder_is_ever_deleted() {
+        // A link in its place: the link goes, and what it names stays and is remembered for the report.
+        let host = Host::new();
+        let elsewhere = host.folder.path().join("elsewhere.pem");
+        std::fs::write(&elsewhere, KEY).expect("a key elsewhere");
+        std::fs::remove_file(host.key()).expect("removed");
+        std::os::unix::fs::symlink("../elsewhere.pem", host.key()).expect("a link");
+        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        let to = host.app().join("../elsewhere.pem");
+        assert_eq!(taken.key, Key::LinkDeleted { to: to.clone() });
+        assert!(std::fs::symlink_metadata(host.key()).is_err(), "the link is gone");
+        assert_eq!(std::fs::read_to_string(&elsewhere).expect("kept"), KEY);
+        assert_eq!(remembered(&host.state()), Some(to));
+
+        // A folder in its place is not emptied: it stays, and is named.
+        let host = Host::new();
+        std::fs::remove_file(host.key()).expect("removed");
+        std::fs::create_dir_all(host.key().join("inside")).expect("a folder");
+        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        assert!(matches!(taken.key, Key::Kept { .. }), "{taken:?}");
+        assert!(host.key().join("inside").exists());
+        assert!(
+            host.read().get("app_dir").is_none(),
+            "the Runner goes on without the key"
+        );
+        assert_eq!(remembered(&host.state()), Some(host.key()));
+
+        // A folder that is no absolute path, or that goes through `..`, is refused.
+        for app_dir in [
+            serde_json::json!("app"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+        ] {
+            let host = Host::new();
+            let mut settings = host.settings(true);
+            settings["app_dir"] = app_dir.clone();
+            host.write(&settings);
+            assert!(
+                take_out(&host.path())
+                    .expect_err("refused")
+                    .contains("no absolute path"),
+                "{app_dir}"
+            );
+            assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+        }
+        let host = Host::new();
+        let mut settings = host.settings(true);
+        let app = host.app();
+        let around = app.join("..").join(app.file_name().expect("a name"));
+        settings["app_dir"] = serde_json::json!(around);
+        host.write(&settings);
+        assert!(
+            take_out(&host.path()).expect_err("refused").contains("`..`"),
+            "a folder named through `..`"
+        );
+        assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+        assert_eq!(host.read()["app_dir"], serde_json::json!(around));
+    }
+
+    #[test]
+    fn a_file_that_would_not_start_a_runner_is_left_as_it_was() {
+        let host = Host::new();
+        let mut settings = host.settings(true);
+        settings["max_jobs"] = 0.into();
+        host.write(&settings);
+        let said = take_out(&host.path()).expect_err("refused");
+        assert!(said.contains("max_jobs") && !said.contains("json.next"), "{said}");
+        assert!(host.read().get("app_dir").is_some());
+        assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+        assert_eq!(remembered(&host.state()), None);
+        assert!(!host.path().with_extension("json.next").exists());
+    }
+
+    #[test]
+    fn only_a_remembered_absolute_path_is_named() {
+        let state = tempfile::tempdir().expect("folder");
+        assert_eq!(remembered(state.path()), None, "nothing remembered");
+        for (text, named) in [
+            ("/Users/someone/app/app.pem\n", true),
+            ("app/app.pem\n", false),
+            ("", false),
+            ("/a\n/b\n", false),
+        ] {
+            std::fs::write(state.path().join(REMEMBERED), text).expect("written");
+            assert_eq!(remembered(state.path()).is_some(), named, "{text:?}");
+        }
+        std::fs::write(
+            state.path().join(REMEMBERED),
+            format!("/{}\n", "a".repeat(PATH_MAX)),
+        )
+        .expect("written");
+        assert_eq!(remembered(state.path()), None, "longer than the report carries");
+        std::fs::write(
+            state.path().join(REMEMBERED),
+            format!("/{}\n", "a".repeat(PATH_MAX - 1)),
+        )
+        .expect("written");
+        assert!(
+            remembered(state.path()).is_some(),
+            "as long as the report carries"
+        );
+    }
+}

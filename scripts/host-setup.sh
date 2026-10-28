@@ -221,7 +221,7 @@ if [[ ! -d $state/images/$image ]]; then
 fi
 
 step=config
-# No app_dir: the host takes its GitHub tokens from the console it enrols with.
+# The host takes its GitHub tokens from the console it enrols with, which holds the GitHub App's key.
 as_user "mkdir -p '$config_dir' && umask 022 && cat > '$config.new' <<EOF
 {
   \"machine\": \"$machine\",

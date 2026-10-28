@@ -13,10 +13,10 @@ use cf_budget::{Limits, Mode};
 use cf_daemon::names::ServePolicy;
 use cf_daemon::{HostMachines, HostService, HostSetup, This, host_service, records_dir};
 use cf_fake_console::FakeConsole;
-use cf_fake_github::harness::REPO;
-use cf_fake_github::{FakeGithub, Options, test_key};
-use cf_ghapp::{Http, RetryPolicy, SystemClock};
+use cf_fake_github::{FakeGithub, Options};
+use cf_ghapp::{Http, RetryPolicy, SystemClock, SystemMonotonic};
 use cf_guest_proto::Workload;
+use cf_harness::REPO;
 use cf_scaleset::ShutdownTrigger;
 use cf_secret::Secret;
 use tokio::runtime::Runtime;
@@ -63,6 +63,8 @@ impl World {
         github.add_repo(REPO, true);
         github.set_workflow(REPO, "ci.yml", WORKFLOW);
         console.add_code(CODE);
+        // The console holds the Runners App and makes the host's GitHub calls once the owner turned that on.
+        console.serve_github(github.clone());
         Ok(World {
             runtime,
             github,
@@ -98,11 +100,22 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
             version: "0.0.0-it".into(),
             state_dir: bench.state.clone(),
             program: bench.binary.clone(),
-            app: cf_fake_github::harness::app(
-                &world.github,
-                Http::new(Duration::from_secs(30), RetryPolicy::default()),
-                Arc::new(SystemClock),
-            ),
+            app: {
+                let http = Http::new(Duration::from_secs(30), RetryPolicy::default());
+                let client = cf_console_client::Client::new(
+                    &world.console.url(),
+                    Secret::new(token.expose().clone()),
+                    http.clone(),
+                );
+                cf_harness::app_on(
+                    &world.github,
+                    &client,
+                    MACHINE,
+                    http,
+                    Arc::new(SystemClock),
+                    Arc::new(SystemMonotonic),
+                )
+            },
             image: bench.image.clone(),
             deadline: Duration::from_secs(300),
             mode: Mode::Dedicated,
@@ -114,6 +127,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
             }),
             updates: None,
             settings: None,
+            app_key_file: None,
         })?
     };
     let service = Arc::new(service);
@@ -301,6 +315,9 @@ pub fn service(bench: &Bench) -> Fallible<Vec<String>> {
             },
         ))?
         .token;
+    if !world.console.set_broker(MACHINE, true) {
+        return Err("the console does not know the enrolled host".into());
+    }
     let mut lines = Vec::new();
 
     // One job, from GitHub's queue to the console's page.
@@ -475,29 +492,20 @@ pub fn commands(bench: &Bench) -> Fallible<Vec<String>> {
     let _ = fs::remove_dir_all(&folder);
     let (home, state, app) = (folder.join("home"), folder.join("state"), folder.join("app"));
     fs::create_dir_all(&home)?;
-    fs::create_dir_all(&app)?;
     install(&bench.binary, &bench.release, &bench.image, &state)?;
-    fs::write(
-        app.join("app.json"),
-        json!({ "client_id": "Iv23test" }).to_string(),
-    )?;
-    fs::write(app.join("app.pem"), &test_key().private_pem)?;
-    fs::set_permissions(app.join("app.pem"), fs::Permissions::from_mode(0o600))?;
     let world = World::start()?;
     let config = folder.join("config.json");
     let configured = |machine: &str| {
         json!({
             "machine": machine,
             "state_dir": state,
-            "app_dir": app,
             "github_api": world.github.url(),
             "image": bench.image,
             "console": world.console.url(),
             "use": "dedicated",
         })
-        .to_string()
     };
-    fs::write(&config, configured(MACHINE))?;
+    write_settings(&config, &configured(MACHINE))?;
     let config_arg = config.display().to_string();
     let mut lines = Vec::new();
 
@@ -538,6 +546,11 @@ pub fn commands(bench: &Bench) -> Fallible<Vec<String>> {
         "enroll: the code went in on standard input, the token is kept for its owner alone, neither was printed; a second one is refused"
             .to_string(),
     );
+    // The owner's tap that lets the console make the host's GitHub calls.
+    expect(
+        world.console.set_broker(MACHINE, true),
+        "the console does not know the enrolled host",
+    )?;
 
     let (ok, said) = run_program(bench, &home, &["check", "--config", &config_arg, "--github"], "")?;
     expect(
@@ -554,6 +567,12 @@ pub fn commands(bench: &Bench) -> Fallible<Vec<String>> {
             .map(|line| format!("check --github: {line}")),
     );
 
+    // A host from when it held the GitHub App's key: the folder in its settings and the key in the folder. The daemon
+    // deletes the key, takes the folder out of the settings and keeps the rest, before it reads them.
+    let key = plant_key(&app)?;
+    let mut held = configured(MACHINE);
+    held["app_dir"] = json!(app);
+    write_settings(&config, &held)?;
     let mut daemon = Command::new(&bench.binary)
         .args(["daemon", "--config", &config_arg])
         .env("HOME", &home)
@@ -599,11 +618,30 @@ pub fn commands(bench: &Bench) -> Fallible<Vec<String>> {
         "the daemon left its session open at GitHub",
     )?;
     expect(
-        !log.contains(&token) && !log.contains("BEGIN RSA"),
+        !log.contains(&token) && !log.contains("BEGIN RSA") && !log.contains(KEY_MARKER),
         "the log holds a secret",
     )?;
+    let settings: Value = serde_json::from_str(&fs::read_to_string(&config)?)?;
+    expect(
+        fs::symlink_metadata(&key).is_err()
+            && app.join("app.json").exists()
+            && settings == configured(MACHINE)
+            && log.contains("the key file here is deleted"),
+        format!(
+            "the App's key was not taken out as it should be: {settings}; {}",
+            tail(&log)
+        ),
+    )?;
+    expect(
+        world
+            .console
+            .reports()
+            .iter()
+            .all(|report| report["status"].get("appKeyFile").is_none()),
+        "a report named a key file that is gone",
+    )?;
     lines.push(format!(
-        "daemon: a scale set with a session and a report with the Mac's boot time at the console; after a SIGTERM it closed its session and ended in {:.1} s",
+        "daemon: deleted the App's key and took app_dir out of the settings; a scale set with a session and a report with the Mac's boot time at the console; after a SIGTERM it closed its session and ended in {:.1} s",
         began.elapsed().as_secs_f32()
     ));
 

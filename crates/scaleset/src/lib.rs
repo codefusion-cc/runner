@@ -1,9 +1,11 @@
 //! GitHub's scale set client: one repository's scale sets, their message sessions, the long poll, acquiring jobs
 //! and the one-job configuration of an Actions runner.
 //!
-//! [`ScaleSetClient`] is the administrator's side (scale sets, sessions, Actions runners); [`MessageSession`] is one
-//! session's queue; [`listen`] polls it into a [`Scaler`] and [`supervise`] opens it again, with a backoff, when it
-//! ends. The GitHub App behind it is `cf-ghapp`'s, and so are its HTTP retries and its [`cf_ghapp::Error`].
+//! [`ScaleSetClient`] is the administrator's side (scale sets, sessions, Actions runners), which the CodeFusion Console
+//! makes for the machine: the console alone holds the Runners App's key, registration tokens and the Actions service's
+//! admin token. [`MessageSession`] is one session's queue, read with the session's own token; [`listen`] polls it into
+//! a [`Scaler`] and [`supervise`] opens it again, with a backoff, when it ends. The GitHub App behind it is
+//! `cf-ghapp`'s, and so are its HTTP retries and its [`cf_ghapp::Error`].
 //!
 //! Nothing here panics on what GitHub or the network does: every call returns a [`Result`]. Tokens and Actions runner
 //! configurations are [`cf_secret::Secret`]s and appear in no error and no log.

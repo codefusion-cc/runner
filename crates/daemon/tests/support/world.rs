@@ -12,7 +12,7 @@ use cf_daemon::{
     Answer, Claim, EndKind, EventKind, Events, HostError, Hosts, JobEvent, JobReport, MemoryStore,
     RESULT_WAIT, Roster, RunnerSpec, Seen, Slots, Store, Ticket, Vms,
 };
-use cf_fake_github::harness::TestClock;
+use cf_harness::TestClock;
 use cf_secret::Secret;
 use time::OffsetDateTime;
 

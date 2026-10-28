@@ -1,5 +1,5 @@
-//! The scaler against the fake GitHub, with real sockets, the real GitHub App client and the real scale set client,
-//! on the real budget and lifecycle. Only the vm-hosts and the Mac's readings are stand-ins.
+//! The scaler against the fake GitHub behind the fake console, with real sockets, the real GitHub App client and the
+//! real scale set client, on the real budget and lifecycle. Only the vm-hosts and the Mac's readings are stand-ins.
 #![allow(dead_code)]
 
 pub mod world;
@@ -20,9 +20,9 @@ use cf_daemon::{
     Claim, HostError, Hosts, MemoryStore, Refusal, Roster, RunnerSpec, Scaler, ScalerConfig, SetRegistry,
     Slots, Ticket,
 };
-pub use cf_fake_github::harness::{REPO, TestClock};
-use cf_fake_github::harness::{fast, harness_with as github};
 use cf_fake_github::{FakeGithub, Options};
+pub use cf_harness::{REPO, TestClock};
+use cf_harness::{fast, harness_as as github};
 use cf_scaleset::{Message, MessageSession, ScaleSet, ScaleSetClient, Statistics};
 use cf_vmhost::OutOfMemory;
 
@@ -329,6 +329,10 @@ impl Hosts for Spy {
 
 pub struct Harness {
     pub fake: FakeGithub,
+    /// The fake console, which holds the App and asks GitHub for the machine.
+    pub console: cf_fake_console::FakeConsole,
+    /// The machine's console client.
+    pub console_client: cf_console_client::Client,
     pub app: cf_ghapp::GitHubApp,
     pub client: ScaleSetClient,
     pub clock: Arc<TestClock>,
@@ -356,18 +360,21 @@ pub async fn harness_with(machines: u32, options: Options) -> Harness {
 
 /// A machine with these budget settings.
 pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harness {
-    let cf_fake_github::harness::Harness {
+    let cf_harness::Harness {
         fake,
+        console,
+        console_client,
         app,
         client,
         clock,
-    } = github(options, fast(), Duration::from_secs(10)).await;
+        ..
+    } = github(MACHINE, options, fast(), Duration::from_secs(10)).await;
     let labels = vec!["self-hosted".to_string(), SIZE.label().to_string()];
     let set = client
         .ensure_scale_set("mac-b--cf-2g", &labels)
         .await
         .expect("scale set");
-    let session = client.open_session(set.id, MACHINE).await.expect("session");
+    let session = client.open_session(set.id).await.expect("session");
     let roster = Arc::new(Roster::new());
     let parts = TestParts {
         vms: FakeVms::default(),
@@ -396,6 +403,8 @@ pub async fn harness_on(settings: cf_budget::Settings, options: Options) -> Harn
     });
     Harness {
         fake,
+        console,
+        console_client,
         app,
         client,
         clock,
@@ -468,9 +477,10 @@ impl Harness {
         self.fake.add_repo(repo, true);
         let client = ScaleSetClient::new(
             self.app.clone(),
+            self.console_client.clone(),
+            MACHINE,
             1,
             repo,
-            &format!("{}/{repo}", self.fake.url()),
             Duration::from_secs(10),
         );
         let labels = vec!["self-hosted".to_string(), SIZE.label().to_string()];
@@ -478,7 +488,7 @@ impl Harness {
             .ensure_scale_set(&format!("mac-b--cf-2g--{}", repo.replace('/', "-")), &labels)
             .await
             .expect("scale set");
-        let session = client.open_session(set.id, MACHINE).await.expect("session");
+        let session = client.open_session(set.id).await.expect("session");
         scaler_for(
             &Parts {
                 client: &client,

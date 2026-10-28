@@ -21,11 +21,11 @@ use cf_daemon::{
     ServiceConfig, ServiceParts, Slots,
 };
 use cf_fake_console::FakeConsole;
-use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Clock as _, Http, RetryPolicy};
 use cf_guest_proto::{Pressure as Stalls, Psi, StopReason};
+use cf_harness::{REPO, TestClock, Ticks, app_on, enrolled, fast, until};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 use cf_vmhost::End;
@@ -149,6 +149,11 @@ impl Rig {
         )
         .await
         .expect("enrolled");
+        // The console holds the Runners App and asks GitHub for the Mac.
+        console.serve_github(github.clone());
+        // GitHub fails on purpose here, and names no wait: the console's 30 seconds would outlast every wait below.
+        console.github_busy_wait(1);
+        assert!(console.set_broker(MACHINE, true));
         let folder = tempfile::tempdir().expect("folder");
         let outbox = Arc::new(Outbox::open(folder.path().join("outbox.json"), OUTBOX_CAPACITY));
         let clock = Arc::new(TestClock::default());
@@ -490,14 +495,22 @@ fn service_with(
         Duration::from_secs(60),
     );
     tweak(&mut config);
+    let client = Client::new(&console.url(), Secret::new(token.expose().clone()), http());
     Service::new(ServiceParts {
-        app: app(github, http(), parts.clock.clone()),
+        app: app_on(
+            github,
+            &client,
+            MACHINE,
+            http(),
+            parts.clock.clone(),
+            Arc::new(Ticks(parts.clock.clone())),
+        ),
         machines: machines.clone(),
         roster: parts.roster.clone(),
         clock: parts.clock.clone(),
         nudge: parts.bell.clone(),
         console: Some(Console {
-            client: Client::new(&console.url(), Secret::new(token.expose().clone()), http()),
+            client,
             outbox: outbox.clone(),
         }),
         config,
@@ -983,7 +996,8 @@ async fn a_registration_github_will_not_remove_yet_is_tried_again_until_it_is_go
 async fn while_the_console_is_away_reports_wait_and_arrive_later_in_order_each_once() {
     let rig = Rig::new(2).await;
     rig.service.discover().await;
-    rig.console.down(true);
+    // Its GitHub routes still answer: without them no job would start at all.
+    rig.console.reports_down(true);
     let mut expected = Vec::new();
     for result in ["succeeded", "failed", "canceled"] {
         let runner = rig.job_running().await;
@@ -1000,8 +1014,8 @@ async fn while_the_console_is_away_reports_wait_and_arrive_later_in_order_each_o
     .await;
 
     // An answer that is lost on the way back: the console took the events and the Mac cannot know.
-    rig.console.down(false);
-    rig.console.accept_then_drop_next(1);
+    rig.console.reports_down(false);
+    rig.console.accept_then_drop_next_report(1);
     until("everything arrived", || rig.outbox.is_empty()).await;
     let sent = rig.console.job_event_ids();
     assert!(
@@ -1756,11 +1770,20 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
     assert_eq!(rig.machines.snapshot().waiting, 0);
 
     // Another Mac serves the same repository with the same labels and has room: the job is its.
+    let other = enrolled(&rig.console, "mac-c", http()).await;
     let elsewhere = ScaleSetClient::new(
-        app(&rig.github, http(), rig.parts.clock.clone()),
+        app_on(
+            &rig.github,
+            &other,
+            "mac-c",
+            http(),
+            rig.parts.clock.clone(),
+            Arc::new(Ticks(rig.parts.clock.clone())),
+        ),
+        other,
+        "mac-c",
         1,
         OTHER,
-        &format!("{}/{OTHER}", rig.github.url()),
         Duration::from_secs(5),
     );
     let labels = ["self-hosted".to_string(), "cf-2g".to_string()];
@@ -1768,7 +1791,7 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
         .ensure_scale_set("mac-c--cf-2g", &labels)
         .await
         .expect("a scale set");
-    let session = elsewhere.open_session(set.id, "mac-c").await.expect("a session");
+    let session = elsewhere.open_session(set.id).await.expect("a session");
     rig.github.set_poll_timeout(Duration::from_millis(150));
     session.poll(0, 1).await.expect("a poll");
     session.poll(0, 1).await.expect("a poll");
@@ -3081,10 +3104,13 @@ async fn a_surplus_found_gone_while_its_machine_stands_ran_a_job() {
         !rig.github.runners().contains(&runner),
         "a one-job Actions runner removes its own registration"
     );
-    let removals = rig.github.count(REMOVAL);
+    let calls = rig.console.github_calls().len();
     rig.github.recover(REMOVAL);
-    until("the next removal, answered 404", || {
-        rig.github.count(REMOVAL) > removals
+    // The console looks the registration up before it removes it, and finds it gone: no removal reaches GitHub.
+    until("the next removal, which finds it gone", || {
+        rig.console.github_calls()[calls..]
+            .iter()
+            .any(|call| call.route == "scaleset/remove" && call.status == 200)
     })
     .await;
     until("the start at the console", || heard(&rig, &runner).0).await;
@@ -3768,7 +3794,7 @@ async fn a_runner_says_it_starts_until_its_first_look_at_github_ends() {
         let mut rig = Rig::new(2).await;
         if !github_answers {
             rig.github.fail(
-                "GET /app/installations",
+                "GET /installation/repositories",
                 Reply::status_json(503, &json!({"message": "unavailable"})),
                 usize::MAX,
             );
@@ -3782,6 +3808,87 @@ async fn a_runner_says_it_starts_until_its_first_look_at_github_ends() {
         assert!(last.get("starting").is_none(), "{last}");
         assert_eq!(last["discoveryError"].is_string(), !github_answers, "{last}");
     }
+}
+
+/// F1: a job served from end to end, through every fault GitHub can throw at it above, never has the Runner ask for a
+/// registration token or hold the Actions service's admin token: the console makes both and keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_served_end_to_end_never_has_the_runner_ask_for_a_registration_or_hold_an_admin_token() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.finish(&runner, "succeeded");
+    until("the end at the console", || rig.events().len() == 2).await;
+    rig.nothing_left().await;
+    assert_eq!(
+        cf_harness::registrations(&rig.github),
+        0,
+        "a registration token asked for"
+    );
+    assert_eq!(
+        cf_harness::admin_requests_from_machines(&rig.github),
+        Vec::<String>::new(),
+        "an admin token used by the Runner"
+    );
+    let routes: Vec<String> = rig
+        .console
+        .github_calls()
+        .into_iter()
+        .map(|call| call.route)
+        .collect();
+    for route in [
+        "scaleset/create",
+        "scaleset/session/open",
+        "scaleset/jit",
+        "scaleset/remove",
+    ] {
+        assert!(
+            routes.iter().any(|r| r == route),
+            "{route} not through the console: {routes:?}"
+        );
+    }
+}
+
+/// The App's key file the host held before the console held the key: the report names it while it is on disk,
+/// and stops once it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_names_an_app_key_file_the_host_still_holds_until_it_is_gone() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let key = rig.folder.path().join("app").join("app.pem");
+    std::fs::create_dir_all(key.parent().expect("a folder")).expect("the App's folder");
+    std::fs::write(&key, "-----BEGIN RSA PRIVATE KEY-----\n").expect("a key file");
+    let held = key.clone();
+    let service = service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        move |config| config.app_key_file = Some(held),
+    );
+    service.report().await;
+    assert_eq!(
+        last_status(&rig.console)["appKeyFile"],
+        json!(key.display().to_string()),
+        "the file on disk"
+    );
+    std::fs::remove_file(&key).expect("deleted");
+    service.report().await;
+    let last = last_status(&rig.console);
+    assert!(last.get("appKeyFile").is_none(), "{last}");
+    // A Runner that never held one says nothing.
+    rig.service.report().await;
+    let last = last_status(&rig.console);
+    assert!(last.get("appKeyFile").is_none(), "{last}");
 }
 
 fn changed(id: &str) -> SettingsLook {

@@ -5,7 +5,7 @@
 //! test drives them one at a time; [`Service::run`] is the loop that calls them until it is told to stop.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -107,6 +107,9 @@ pub struct ServiceConfig {
     pub queued_keep: Duration,
     /// The most label sets of queued jobs served for one repository, and for the host: the newest are.
     pub queued_bounds: (usize, usize),
+    /// Where a GitHub App key this host held before the console held it would be (`<the old app_dir>/app.pem`), as
+    /// the update that deleted it remembered: reported to the console while a file is there (`appKeyFile`).
+    pub app_key_file: Option<PathBuf>,
 }
 
 impl ServiceConfig {
@@ -137,6 +140,7 @@ impl ServiceConfig {
             queue_budget: Duration::from_secs(45),
             queued_keep: Duration::from_secs(30 * 60),
             queued_bounds: (8, 32),
+            app_key_file: None,
         }
     }
 }
@@ -517,6 +521,31 @@ impl Reports for LoggedReports {
     }
 }
 
+impl<H, V> Shared<H, V> {
+    /// The scale set client of `repo` (`owner/name`) through the console, made once and kept for removing what is
+    /// left there; none on a Runner that is not enrolled, which has no scale sets.
+    fn client_of(&self, installation: i64, repo: &str) -> Option<ScaleSetClient> {
+        let console = self.console.as_ref()?;
+        let client = self
+            .clients
+            .lock()
+            .expect("clients")
+            .entry(repo.to_string())
+            .or_insert_with(|| {
+                ScaleSetClient::new(
+                    self.app.clone(),
+                    console.client.clone(),
+                    &self.config.machine,
+                    installation,
+                    repo,
+                    self.config.poll_timeout,
+                )
+            })
+            .clone();
+        Some(client)
+    }
+}
+
 impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// Another handle on this service, for a task of its own.
     fn handle(&self) -> Service<H, V> {
@@ -796,7 +825,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 if shared.roster.active(&repo, set.id) == 0 {
                     match client.delete_scale_set(set.id).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             tracing::info!(%repo, set = %set.name, "a scale set nothing asks for was deleted")
                         }
                         Err(error) => {
@@ -1114,21 +1143,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 served.push((repo.clone(), installation.id));
                 let name = repo.full_name.clone();
-                let client = shared
-                    .clients
-                    .lock()
-                    .expect("clients")
-                    .entry(name.clone())
-                    .or_insert_with(|| {
-                        ScaleSetClient::new(
-                            shared.app.clone(),
-                            installation.id,
-                            &name,
-                            &repo.html_url,
-                            shared.config.poll_timeout,
-                        )
-                    })
-                    .clone();
+                let Some(client) = shared.client_of(installation.id, &name) else {
+                    problems.push(format!(
+                        "{name}: scale sets need the console, and this Runner is not enrolled"
+                    ));
+                    continue;
+                };
                 let files = match shared
                     .app
                     .workflow_files(installation.id, &name, shared.config.max_workflow_bytes)
@@ -1236,6 +1256,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if let Some(client) = shared.clients.lock().expect("clients").get(repo) {
             return Some(client.clone());
         }
+        shared.console.as_ref()?;
         let installation = shared.app.repo_installation(repo).await.ok()?;
         let found = shared
             .app
@@ -1244,19 +1265,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .ok()?
             .into_iter()
             .find(|found| found.full_name.eq_ignore_ascii_case(repo))?;
-        let client = ScaleSetClient::new(
-            shared.app.clone(),
-            installation,
-            repo,
-            &found.html_url,
-            shared.config.poll_timeout,
-        );
-        shared
-            .clients
-            .lock()
-            .expect("clients")
-            .insert(repo.to_string(), client.clone());
-        Some(client)
+        shared.client_of(installation, &found.full_name)
     }
 
     /// Finds the jobs GitHub holds back from this host's scale sets while they have room ([`crate::held`]), keeps
@@ -1525,24 +1534,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 self.sweep_later(registration.runner);
                 continue;
             };
-            let id = match registration.runner_id {
-                Some(id) => Ok(Some(id)),
-                // Registered or not, nobody heard: GitHub is asked by name.
-                None => client
-                    .runner_by_name(&registration.runner)
-                    .await
-                    .map(|found| found.map(|runner| runner.id)),
-            };
-            // GitHub's answer is what proves anything (`Machines::answered`); no answer (a 5xx, a timeout, a dropped
-            // connection) proves nothing, and the removal is sent again at a later sweep.
-            let answer = match id {
-                Ok(None) => Ok(machines::Answer::Gone),
-                Ok(Some(id)) => match client.remove_runner(id).await {
-                    Ok(()) => Ok(machines::Answer::Removed),
-                    Err(error) if error.is_not_found() => Ok(machines::Answer::Gone),
-                    Err(error) if error.status() == Some(422) => Ok(machines::Answer::Refused),
-                    Err(error) => Err(error),
-                },
+            // Removed by its name, which the console checks is this machine's: an ID heard or not, the name is the
+            // registration's. GitHub's answer is what proves anything (`Machines::answered`); no answer (a 5xx, a
+            // timeout, a dropped connection) proves nothing, and the removal is sent again at a later sweep.
+            let answer = match client.remove_runner_named(&registration.runner).await {
+                Ok(true) => Ok(machines::Answer::Removed),
+                Ok(false) => Ok(machines::Answer::Gone),
+                Err(error) if error.status() == Some(422) => Ok(machines::Answer::Refused),
                 Err(error) => Err(error),
             };
             match answer {
@@ -1720,6 +1718,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 update,
                 not_serving,
                 starting: !shared.looked.load(Ordering::SeqCst),
+                app_key_file: held_key_file(shared.config.app_key_file.as_deref()),
                 settings_error: settings_error
                     .as_ref()
                     .map(|(error, _)| cut(error.clone(), STATUS_TEXT_MAX)),
@@ -2578,7 +2577,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     machines.answered(runner, answer);
                 })
                 .await;
-                let session = client.open_session(set.id, &shared.config.machine).await?;
+                let session = client.open_session(set.id).await?;
                 tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
                 let slots: Arc<dyn Slots> = machines.clone();
                 let mut scaler = Scaler::new(
@@ -2654,4 +2653,15 @@ impl<S: cf_scaleset::Scaler, F: Fn(Option<usize>) + Send + Sync> cf_scaleset::Sc
         (self.1)(capacity.as_ref().ok().copied());
         capacity
     }
+}
+
+/// The key file a host still holds where its App's key was, as the report names it: an absolute path of at most 1024
+/// bytes that is there (a link included, which is not followed), or none.
+fn held_key_file(path: Option<&Path>) -> Option<String> {
+    let path = path?;
+    let text = path.to_str()?;
+    if !path.is_absolute() || text.len() > 1024 {
+        return None;
+    }
+    std::fs::symlink_metadata(path).ok().map(|_| text.to_string())
 }

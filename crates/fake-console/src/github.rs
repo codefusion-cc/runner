@@ -83,7 +83,7 @@ impl State {
         reply
     }
 
-    fn name_of(&self, machine: u64) -> String {
+    pub(crate) fn name_of(&self, machine: u64) -> String {
         self.machines
             .iter()
             .find(|m| m.id == machine)

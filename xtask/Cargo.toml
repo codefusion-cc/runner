@@ -12,6 +12,7 @@ ed25519-dalek.workspace = true
 cf-budget = { path = "../crates/budget" }
 cf-fake-console = { path = "../crates/fake-console" }
 cf-fake-github = { path = "../crates/fake-github" }
+cf-harness = { path = "../crates/harness" }
 cf-image = { path = "../crates/image" }
 flate2 = "1"
 serde_json.workspace = true

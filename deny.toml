@@ -10,13 +10,10 @@ targets = [
 
 [advisories]
 version = 2
-# RUSTSEC-2023-0071 is a timing leak when `rsa` decrypts or signs. Only cf-fake-github depends on it, only to
-# generate a throwaway key in tests, and nothing ships it; the Runner signs with `ring`.
-ignore = ["RUSTSEC-2023-0071"]
 
 [licenses]
 version = 2
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Zlib", "MPL-2.0", "CC0-1.0"]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "BSD-2-Clause", "Unicode-3.0", "Zlib", "MPL-2.0", "CC0-1.0"]
 # The workspace's own crates have no licence (publish = false); that is not a finding.
 private = { ignore = true }
 

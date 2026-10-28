@@ -702,8 +702,7 @@ pub async fn start_runner<R: Registry, H: Hosts>(
         Ok(handle) => handle,
         Err(e) => {
             match registry.remove_runner(runner_id).await {
-                Ok(()) => hosts.not_registered(&name),
-                Err(remove) if remove.is_not_found() => hosts.not_registered(&name),
+                Ok(_) => hosts.not_registered(&name),
                 // The host keeps the name as a registration to remove.
                 Err(remove) => {
                     tracing::warn!(runner = %name, error = %remove, "could not unregister an Actions runner that failed to start");

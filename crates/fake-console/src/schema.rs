@@ -369,6 +369,8 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "notServing", Nullish, text(300))?;
     field(o, path, "scaleSets", Nullish, list(500, scale_set))?;
     field(o, path, "runners", Nullish, list(64, runner))
+    // `appKeyFile`, a GitHub App key file the host still holds (an absolute path of at most 1024 characters), is read
+    // with `.catch(undefined)`: a bad value is dropped, never refused, so nothing here refuses one.
     // `commands`, the console's commands this Runner does, is read with `.catch`: one the console cannot read is
     // dropped and the console assumes the commands of a Runner before it, so no value refuses a report.
     // `heldJobs`, the jobs GitHub holds back from scale sets with room, is not read: the schema drops keys it does not
@@ -555,4 +557,110 @@ pub(crate) fn github_jit(v: &Value) -> Check {
             .enumerate()
             .try_for_each(|(n, l)| label(l, &join(p, &n.to_string())))
     })
+}
+
+/// A scale set's id, `z.number().int().positive()`.
+fn set_id(v: &Value, path: &str) -> Check {
+    int(v, path, 1.0, 9_007_199_254_740_991.0)
+}
+
+/// The machine a scale set name is of (`SCALE_SET_NAME`: a machine's name, `--`, then 1 or more of `[a-z0-9-]`, at
+/// most 100 characters), or none for a name not of that shape. Machine names never hold `--`, so the first one ends it.
+pub(crate) fn set_machine(name: &str) -> Option<&str> {
+    if name.len() > 100 {
+        return None;
+    }
+    let (machine, rest) = name.split_once("--")?;
+    let machine_ok = machine.len() <= 24
+        && machine.split('-').all(|part| {
+            !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    let rest_ok = !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    (machine_ok && rest_ok).then_some(machine)
+}
+
+fn set_name(v: &Value, path: &str) -> Check {
+    string(v, path, 1, 100)?;
+    if set_machine(v.as_str().unwrap_or("")).is_some() {
+        Ok(())
+    } else {
+        Err(bad(
+            path,
+            "the machine's name, -- and lowercase letters, digits and dashes",
+        ))
+    }
+}
+
+fn labels(v: &Value, path: &str) -> Check {
+    let all = v
+        .as_array()
+        .ok_or_else(|| bad(path, "Invalid input: expected array"))?;
+    if all.is_empty() || all.len() > 20 {
+        return Err(bad(path, "1 to 20 labels"));
+    }
+    all.iter()
+        .enumerate()
+        .try_for_each(|(n, l)| label(l, &join(path, &n.to_string())))
+}
+
+fn session_id(v: &Value, path: &str) -> Check {
+    string(v, path, 1, 100)?;
+    if v.as_str()
+        .unwrap_or("")
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err(bad(path, "letters, digits and dashes"))
+    }
+}
+
+/// The schemas of `scaleset/<route>`, by route; none for a route the console does not have.
+pub(crate) fn scaleset(route: &str, v: &Value) -> Option<Check> {
+    let check = || -> Check {
+        let o = object(v, "")?;
+        field(o, "", "protocol", Required, literal_protocol)?;
+        field(o, "", "repo", Required, repo)?;
+        match route {
+            "list" => Ok(()),
+            "create" => {
+                field(o, "", "name", Required, set_name)?;
+                field(o, "", "labels", Required, labels)
+            }
+            "delete" | "session/open" => field(o, "", "setId", Required, set_id),
+            "session/refresh" | "session/close" => {
+                field(o, "", "setId", Required, set_id)?;
+                field(o, "", "sessionId", Required, session_id)
+            }
+            "jit" => {
+                field(o, "", "setId", Required, set_id)?;
+                field(o, "", "name", Required, runner_name)
+            }
+            _ => {
+                field(o, "", "runnerId", Nullish, set_id)?;
+                field(o, "", "name", Nullish, runner_name)?;
+                let given = |k: &str| o.get(k).is_some_and(|v| !v.is_null());
+                if given("runnerId") == given("name") {
+                    return Err(bad("", "exactly one of runnerId and name"));
+                }
+                Ok(())
+            }
+        }
+    };
+    matches!(
+        route,
+        "list"
+            | "create"
+            | "delete"
+            | "session/open"
+            | "session/refresh"
+            | "session/close"
+            | "jit"
+            | "remove"
+    )
+    .then(check)
 }

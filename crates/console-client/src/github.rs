@@ -1,5 +1,5 @@
-//! GitHub through the console (protocol 1, `/agent/runners/github/{read,registration,jit}`): the console holds the
-//! Runners App's key and hands a machine the tokens it needs, each with how long it lasts. The console answers 403
+//! GitHub through the console (protocol 1, `/agent/runners/github/{read,jit}`): the console holds the Runners App's
+//! key and hands a machine the tokens it needs, each with how long it lasts. The console answers 403
 //! with the code `broker_off` ([`Error::GithubOff`]) while the owner has not turned GitHub tokens on for the machine;
 //! any other 403 is a refusal of the call itself ([`Error::Refused`]).
 
@@ -42,15 +42,6 @@ pub struct InstallationToken {
     /// The token.
     pub token: Secret<String>,
     /// How long it lasts from when the answer was asked for, at most [`MAX_TOKEN_LIFE`].
-    pub expires_in: Duration,
-}
-
-/// A token that registers Actions runners with one repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegistrationToken {
-    /// The token.
-    pub token: Secret<String>,
-    /// How long it lasts, at most [`MAX_TOKEN_LIFE`].
     pub expires_in: Duration,
 }
 
@@ -107,7 +98,7 @@ pub fn is_runner_of(machine: &str, name: &str) -> bool {
 }
 
 /// A token as the console sends it: non-empty, at most [`TOKEN_MAX`], visible ASCII only (it becomes a header).
-fn token_of(what: &str, token: String) -> Result<Secret<String>, Error> {
+pub(crate) fn token_of(what: &str, token: String) -> Result<Secret<String>, Error> {
     if token.is_empty() || token.len() > TOKEN_MAX || !token.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(Error::Protocol(format!("{what}: not a token")));
     }
@@ -127,7 +118,7 @@ fn life_of(what: &str, seconds: u64) -> Result<Duration, Error> {
     Ok(life.min(MAX_TOKEN_LIFE))
 }
 
-fn refuse(why: &str) -> Error {
+pub(crate) fn refuse(why: &str) -> Error {
     Error::Protocol(why.to_string())
 }
 
@@ -187,27 +178,6 @@ impl Client {
                 })
             })
             .collect()
-    }
-
-    /// `github/registration`: a token that registers Actions runners with `repo` (`owner/name`). A name the console
-    /// would refuse is refused here as [`Error::Protocol`], unsent. Tried again as [`Client::github_read`] is.
-    pub async fn github_registration(&self, repo: &str) -> Result<RegistrationToken, Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Wire {
-            token: String,
-            expires_in_s: u64,
-        }
-        if !is_repo_name(repo) {
-            return Err(refuse("not a repository the console takes"));
-        }
-        let body = body_of(&serde_json::json!({ "repo": repo }))?;
-        let response = self.post("github/registration", body).await?;
-        let wire: Wire = read("the registration token's answer", &response)?;
-        Ok(RegistrationToken {
-            token: token_of("the registration token's answer", wire.token)?,
-            expires_in: life_of("the registration token's answer", wire.expires_in_s)?,
-        })
     }
 
     /// `github/jit`: one Actions runner `name` for one job of `repo`, with exactly `labels`. Sent once and never again

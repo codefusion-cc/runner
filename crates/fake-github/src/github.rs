@@ -8,13 +8,10 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use crate::httpd::{Handler, Reply, Request, Server};
-use crate::keys::test_key;
 
 /// How the fake behaves.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// The App's client ID, the `iss` of its tokens.
-    pub client_id: String,
     /// How long a long poll waits before it answers 202.
     pub poll_timeout: Duration,
     /// How long an installation token lives.
@@ -49,7 +46,6 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            client_id: "Iv23test".into(),
             poll_timeout: Duration::from_millis(400),
             installation_token_ttl: Duration::from_secs(3600),
             admin_token_ttl: Duration::from_secs(3600),
@@ -172,7 +168,15 @@ pub struct Logged {
     pub max_capacity: Option<String>,
     /// The `lastMessageId` of polls.
     pub last_message_id: Option<String>,
+    /// Whether the request bore an admin token of the Actions service ([`FakeGithub::mint_admin_token`]) that
+    /// was good when it came.
+    pub admin: bool,
+    /// Whether the request said it came from the fake console ([`CONSOLE_MARK`]).
+    pub from_console: bool,
 }
+
+/// The header the fake console sends with each of its own requests, so a test can tell them from the Runner's.
+pub const CONSOLE_MARK: &str = "x-cf-fake-console";
 
 /// A scale set as the service has it.
 #[derive(Debug, Clone)]
@@ -332,6 +336,25 @@ impl State {
         self.registration_tokens
             .insert(token.clone(), (exp, repo.to_string()));
         Some((token, exp))
+    }
+
+    /// A new admin token of the Actions service for `repo`: where the service is, the token, when it expires.
+    fn admin_token(&mut self, repo: String) -> (String, String, i64) {
+        let exp = self.now() + self.opts.admin_token_ttl.as_secs() as i64;
+        self.next += 1;
+        let payload = json!({"exp": exp, "n": self.next}).to_string();
+        let admin = format!(
+            "{}.{}.{}",
+            b64url(br#"{"alg":"RS256"}"#),
+            b64url(payload.as_bytes()),
+            "sig"
+        );
+        self.admin_tokens.insert(admin.clone(), (exp, repo));
+        let url = self
+            .service_at
+            .clone()
+            .unwrap_or_else(|| format!("{}/svc", self.base));
+        (url, admin, exp)
     }
 
     fn scale_set(&mut self, id: i64) -> Option<&mut ScaleSet> {
@@ -664,6 +687,26 @@ impl FakeGithub {
     /// for a repository the App lacks.
     pub fn mint_registration_token(&self, repo: &str) -> Option<(String, i64)> {
         self.lock().registration_token(repo)
+    }
+
+    /// The Actions service's address and an admin token for `repo`, with when it expires, as the console gets them with
+    /// a registration token of its own (`POST /actions/runner-registration`), made here without a request reaching
+    /// the fake; none for a repository the App lacks. The address is where [`FakeGithub::send_the_service_to`] sent
+    /// the service, if anywhere.
+    pub fn mint_admin_token(&self, repo: &str) -> Option<(String, String, i64)> {
+        let mut st = self.lock();
+        let repo = st.repos.keys().find(|r| r.eq_ignore_ascii_case(repo))?.clone();
+        Some(st.admin_token(repo))
+    }
+
+    /// An installation token with every permission of the console's App (Administration among them), made as the
+    /// console makes one with its key, with when it expires (no request reaches the fake).
+    pub fn mint_installation_token(&self) -> (String, i64) {
+        let mut st = self.lock();
+        let token = st.token("ghs");
+        let exp = st.now() + st.opts.installation_token_ttl.as_secs() as i64;
+        st.installation_tokens.insert(token.clone(), exp);
+        (token, exp)
     }
 
     /// An Actions runner for one job of `repo`, registered as the console registers one: its ID and configuration,
@@ -1091,13 +1134,21 @@ impl FakeGithub {
         let line = req.line();
         let hook = {
             let mut st = self.lock();
+            let authorization = req.header("authorization").map(String::from);
+            let admin = authorization
+                .as_deref()
+                .and_then(|a| a.strip_prefix("Bearer "))
+                .and_then(|token| st.admin_tokens.get(token))
+                .is_some_and(|(exp, _)| *exp > st.now());
             st.log.push(Logged {
                 line: line.clone(),
                 query: req.query.clone(),
-                authorization: req.header("authorization").map(String::from),
+                authorization,
                 body: String::from_utf8_lossy(&req.body).to_string(),
                 max_capacity: req.header("x-scalesetmaxcapacity").map(String::from),
                 last_message_id: req.query("lastMessageId").map(String::from),
+                admin,
+                from_console: req.header(CONSOLE_MARK).is_some(),
             });
             st.hooks
                 .iter()
@@ -1148,19 +1199,6 @@ impl FakeGithub {
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         let m = req.method.as_str();
         match (m, segs.as_slice()) {
-            ("GET", ["app", "installations"]) => self.with_jwt(&req, |_| Reply::json(&json!([{"id": 1, "account": {"login": "org"}}]))),
-            ("POST", ["app", "installations", id, "access_tokens"]) => {
-                let id = id.to_string();
-                self.with_jwt(&req, |st| {
-                    if id != "1" {
-                        return Reply::status_json(404, &json!({"message": "Not Found"}));
-                    }
-                    let token = st.token("ghs");
-                    let exp = st.now() + st.opts.installation_token_ttl.as_secs() as i64;
-                    st.installation_tokens.insert(token.clone(), exp);
-                    Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
-                })
-            }
             ("GET", ["installation", "repositories"]) => self.with_installation(&req, |st| {
                 let repos: Vec<Value> = st
                     .repos
@@ -1172,16 +1210,6 @@ impl FakeGithub {
                     .collect();
                 Reply::json(&json!({"total_count": repos.len(), "repositories": repos}))
             }),
-            ("GET", ["repos", owner, repo, "installation"]) => {
-                let name = format!("{owner}/{repo}");
-                self.with_jwt(&req, |st| {
-                    if st.repos.contains_key(&name) {
-                        Reply::json(&json!({"id": 1}))
-                    } else {
-                        Reply::status_json(404, &json!({"message": "Not Found"}))
-                    }
-                })
-            }
             ("GET", ["repos", owner, repo, "contents", ".github", "workflows"]) => {
                 let name = format!("{owner}/{repo}");
                 self.with_installation(&req, |st| match st.repos.get(&name) {
@@ -1347,21 +1375,6 @@ impl FakeGithub {
         Reply::status_json(401, &json!({"message": message}))
     }
 
-    /// Checks an App JWT as GitHub does: signature, issuer, not issued in its future, not valid for over ten minutes.
-    fn with_jwt(&self, req: &Request, f: impl FnOnce(&mut State) -> Reply) -> Reply {
-        let mut st = self.lock();
-        let Some(token) = req
-            .header("authorization")
-            .and_then(|h| h.strip_prefix("Bearer "))
-        else {
-            return self.unauthorized(&st, "A JSON web token could not be decoded");
-        };
-        match verify_jwt(token, &st.opts.client_id, st.now()) {
-            Ok(()) => f(&mut st),
-            Err(why) => self.unauthorized(&st, &why),
-        }
-    }
-
     fn with_installation(&self, req: &Request, f: impl FnOnce(&mut State) -> Reply) -> Reply {
         let mut st = self.lock();
         let token = req
@@ -1384,20 +1397,7 @@ impl FakeGithub {
             Some((exp, repo)) if *exp > st.now() => repo.clone(),
             _ => return Reply::status_json(401, &json!({"message": "Bad credentials"})),
         };
-        let exp = st.now() + st.opts.admin_token_ttl.as_secs() as i64;
-        st.next += 1;
-        let payload = json!({"exp": exp, "n": st.next}).to_string();
-        let admin = format!(
-            "{}.{}.{}",
-            b64url(br#"{"alg":"RS256"}"#),
-            b64url(payload.as_bytes()),
-            "sig"
-        );
-        st.admin_tokens.insert(admin.clone(), (exp, repo));
-        let url = st
-            .service_at
-            .clone()
-            .unwrap_or_else(|| format!("{}/svc", st.base));
+        let (url, admin, _) = st.admin_token(repo);
         Reply::json(&json!({"url": url, "token": admin}))
     }
 
@@ -1689,46 +1689,6 @@ fn sha_of(content: &str) -> String {
     format!("{h:016x}{:08x}", content.len())
 }
 
-fn verify_jwt(token: &str, client_id: &str, now: i64) -> Result<(), String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err("A JSON web token could not be decoded".into());
-    }
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let sig = URL_SAFE_NO_PAD
-        .decode(parts[2])
-        .map_err(|_| "A JSON web token could not be decoded".to_string())?;
-    let key = ring::signature::UnparsedPublicKey::new(
-        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-        test_key().public_der.as_slice(),
-    );
-    key.verify(signing_input.as_bytes(), &sig)
-        .map_err(|_| "Bad credentials: the JSON web token signature is not valid".to_string())?;
-    let header: Value =
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap_or_default()).unwrap_or_default();
-    if header["alg"] != "RS256" {
-        return Err("A JSON web token must be signed with RS256".into());
-    }
-    let claims: Value =
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap_or_default()).unwrap_or_default();
-    if claims["iss"] != client_id {
-        return Err("'Issuer' claim ('iss') does not name this App".into());
-    }
-    let (Some(iat), Some(exp)) = (claims["iat"].as_i64(), claims["exp"].as_i64()) else {
-        return Err("'iat' and 'exp' must be integers".into());
-    };
-    if iat > now {
-        return Err("'Issued at' claim ('iat') must be an Integer representing the time that the assertion was issued".into());
-    }
-    if exp <= now {
-        return Err("'Expiration time' claim ('exp') must be a numeric value representing the future time at which the assertion expires".into());
-    }
-    if exp - now > 600 {
-        return Err("'Expiration time' claim ('exp') is too far in the future".into());
-    }
-    Ok(())
-}
-
 fn scale_set_json(st: &State, s: &ScaleSet) -> Value {
     json!({
         "id": s.id, "name": s.name, "runnerGroupId": 1, "runnerGroupName": "Default",
@@ -1827,7 +1787,9 @@ fn create_session(st: &mut State, id: i64, req: &Request) -> Reply {
     let now = st.now();
     let ttl = st.opts.session_token_ttl.as_secs() as i64;
     let token = st.token("mq");
-    let sid = st.token("sess");
+    // GitHub names sessions by GUID.
+    st.next += 1;
+    let sid = format!("5e55{:04x}-0000-4000-8000-{:012x}", st.next & 0xffff, st.next);
     let Some(set) = st.scale_set(id) else {
         return json_error(404, "RunnerScaleSetNotFoundException", "scale set not found");
     };

@@ -1,5 +1,5 @@
 //! GitHub tokens through the console, end to end: the real App client on [`ConsoleTokens`], against the fake console
-//! (`github/{read,registration,jit}`, its switch per machine, its kept tokens and limits) and the fake GitHub that
+//! (`github/{read,jit}`, its switch per machine, its kept tokens and limits) and the fake GitHub that
 //! makes and takes the tokens. Written from the console's contract and the ways it can fail: an outage before and
 //! after the last token ends, a switch that is off or turned off, answers that break the contract, renewal, and many
 //! callers at once.
@@ -10,14 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cf_console_client::{
-    Client, ConsoleTokens, END_MARGIN, Error, FAILED_WAIT, GATE_RECHECK, GATE_RECHECK_ALONE, MAX_TOKEN_LIFE,
-    enroll,
+    Client, ConsoleTokens, END_MARGIN, Error, FAILED_WAIT, GATE_RECHECK_ALONE, MAX_TOKEN_LIFE, enroll,
 };
 use cf_fake_console::FakeConsole;
-use cf_fake_github::harness::{REPO, TestClock, fast, labels};
 use cf_fake_github::httpd::Reply;
-use cf_fake_github::{FakeGithub, Options, test_key};
-use cf_ghapp::{AppKey, Error as GitHubError, GitHubApp, Http, KeyTokens, TokenSource};
+use cf_fake_github::{FakeGithub, Options};
+use cf_ghapp::{Error as GitHubError, GitHubApp, Http, TokenSource};
+use cf_harness::{REPO, TestClock, fast, labels};
 use cf_secret::Secret;
 use serde_json::json;
 
@@ -49,11 +48,6 @@ impl Rig {
             .filter(|c| c.route == route)
             .count()
     }
-
-    /// Installation tokens the local key asked GitHub for.
-    fn key_tokens(&self) -> usize {
-        self.github.count("/access_tokens")
-    }
 }
 
 fn epoch_now() -> i64 {
@@ -64,12 +58,12 @@ fn epoch_now() -> i64 {
 }
 
 /// A machine `mac-a` enrolled with a console that holds a Runners App on the fake GitHub; the console's switch for it
-/// `on` or not, and the App's own key on the machine or not.
-async fn rig(on: bool, key: bool) -> Rig {
-    rig_with(on, key, fast()).await
+/// `on` or not.
+async fn rig(on: bool) -> Rig {
+    rig_with(on, fast()).await
 }
 
-async fn rig_with(on: bool, key: bool, retry: cf_ghapp::RetryPolicy) -> Rig {
+async fn rig_with(on: bool, retry: cf_ghapp::RetryPolicy) -> Rig {
     let github = FakeGithub::start(Options::default()).await;
     github.add_repo(REPO, true);
     github.set_variable(REPO, "RUNS_ON", "mac");
@@ -86,25 +80,9 @@ async fn rig_with(on: bool, key: bool, retry: cf_ghapp::RetryPolicy) -> Rig {
     assert!(console.set_broker(MACHINE, on));
     let clock = Arc::new(TestClock::default());
     let http = Http::new(Duration::from_secs(5), retry);
-    let fallback = key.then(|| {
-        let pem = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).expect("key");
-        Arc::new(KeyTokens::new(
-            "Iv23test",
-            pem,
-            &github.url(),
-            http.clone(),
-            clock.clone(),
-        )) as Arc<dyn TokenSource>
-    });
     let machine_token = enrolled.token.clone();
     let client = Client::new(&console.url(), enrolled.token, http.clone());
-    let tokens = Arc::new(ConsoleTokens::new(
-        client,
-        MACHINE,
-        fallback,
-        clock.clone(),
-        clock.clone(),
-    ));
+    let tokens = Arc::new(ConsoleTokens::new(client, MACHINE, clock.clone(), clock.clone()));
     let app = GitHubApp::with_source(tokens, &github.url(), http);
     Rig {
         github,
@@ -126,7 +104,7 @@ fn status_of(error: &GitHubError) -> Option<u16> {
 
 #[tokio::test]
 async fn read_tokens_from_the_console_read_github_and_are_asked_for_once() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let installations = rig.app.installations().await.expect("installations");
     assert_eq!(installations.iter().map(|i| i.id).collect::<Vec<_>>(), [1]);
     let repos = rig.app.repositories(1).await.expect("repositories");
@@ -141,36 +119,14 @@ async fn read_tokens_from_the_console_read_github_and_are_asked_for_once() {
         1,
         "one read serves every call while it is fresh"
     );
-    assert_eq!(rig.key_tokens(), 0);
     let sent = &rig.console.github_calls()[0];
     assert_eq!(sent.machine, MACHINE);
     assert_eq!(sent.body, json!({"protocol": 1}));
 }
 
 #[tokio::test]
-async fn a_registration_token_comes_from_the_console_and_is_its_kept_one() {
-    let rig = rig(true, false).await;
-    let first = rig.app.registration_token(1, REPO).await.expect("registration");
-    let second = rig.app.registration_token(1, REPO).await.expect("registration");
-    assert!(
-        first.expose().starts_with("AREG_"),
-        "a registration token of the fake GitHub"
-    );
-    assert_eq!(first, second, "the console hands out the token it keeps");
-    assert_eq!(
-        rig.calls("registration"),
-        2,
-        "not cached here: the console keeps it"
-    );
-    assert_eq!(
-        rig.console.github_calls()[0].body,
-        json!({"protocol": 1, "repo": REPO})
-    );
-}
-
-#[tokio::test]
 async fn a_one_job_runner_comes_from_the_console_with_exactly_its_name_and_labels() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let wanted = labels(&["self-hosted", "macOS", "cf.size-m"]);
     let jit = rig
         .app
@@ -189,7 +145,7 @@ async fn a_one_job_runner_comes_from_the_console_with_exactly_its_name_and_label
 
 #[tokio::test]
 async fn a_runner_name_that_is_not_the_machines_is_refused_unsent() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     for name in [
         "mac-b-j0a1b2c3",
         "mac-a-j0A1B2C3",
@@ -210,7 +166,7 @@ async fn a_runner_name_that_is_not_the_machines_is_refused_unsent() {
 
 #[tokio::test]
 async fn requests_the_console_would_refuse_are_not_sent() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let long = format!("org/{}", "a".repeat(101));
     for repo in [
         "org",
@@ -221,7 +177,13 @@ async fn requests_the_console_would_refuse_are_not_sent() {
         long.as_str(),
         "org/app/x",
     ] {
-        assert!(rig.app.registration_token(1, repo).await.is_err(), "{repo}");
+        assert!(
+            rig.app
+                .generate_jit_config(1, repo, RUNNER, &labels(&["self-hosted"]))
+                .await
+                .is_err(),
+            "{repo}"
+        );
     }
     let too_many: Vec<String> = (0..21).map(|n| format!("l{n}")).collect();
     for bad in [vec![], too_many, labels(&["a b"]), labels(&[&"x".repeat(101)])] {
@@ -237,7 +199,7 @@ async fn requests_the_console_would_refuse_are_not_sent() {
 
 #[tokio::test]
 async fn a_read_token_is_renewed_after_half_its_life_and_never_used_near_its_end() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let first = rig.app.installation_token(1).await.expect("token");
     rig.advance(Duration::from_secs(29 * 60));
     assert_eq!(rig.app.installation_token(1).await.expect("token"), first);
@@ -251,7 +213,7 @@ async fn a_read_token_is_renewed_after_half_its_life_and_never_used_near_its_end
 
 #[tokio::test]
 async fn many_callers_at_once_share_one_request() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..24 {
         let app = rig.app.clone();
@@ -281,7 +243,7 @@ async fn many_callers_at_once_share_one_request() {
 #[tokio::test]
 async fn retries_a_429_and_a_5xx_of_the_console() {
     for status in [429, 500, 502, 503] {
-        let rig = rig(true, false).await;
+        let rig = rig(true).await;
         let before = rig.console.calls();
         rig.console.fail_next(2, status);
         rig.app
@@ -298,7 +260,7 @@ async fn retries_a_429_and_a_5xx_of_the_console() {
 
 #[tokio::test]
 async fn a_console_outage_while_the_token_still_works_changes_nothing_until_it_ends() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let token = rig.app.installation_token(1).await.expect("token");
     rig.console.down(true);
     rig.advance(Duration::from_secs(31 * 60));
@@ -324,7 +286,7 @@ async fn a_console_outage_while_the_token_still_works_changes_nothing_until_it_e
 
 #[tokio::test]
 async fn an_outage_past_the_tokens_end_is_a_clear_error_and_asks_at_a_measured_pace() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.app.installation_token(1).await.expect("token");
     rig.console.down(true);
     // Past END_MARGIN before the end: the token is not used any more.
@@ -348,7 +310,7 @@ async fn an_outage_past_the_tokens_end_is_a_clear_error_and_asks_at_a_measured_p
 
 #[tokio::test]
 async fn the_wait_after_failures_doubles() {
-    let rig = rig_with(true, false, support::no_retry()).await;
+    let rig = rig_with(true, support::no_retry()).await;
     rig.console.down(true);
     assert!(rig.app.installations().await.is_err());
     let second = Duration::from_secs(1);
@@ -366,13 +328,13 @@ async fn the_wait_after_failures_doubles() {
 
 #[tokio::test]
 async fn a_console_that_dropped_the_machine_says_enroll_again() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let fresh = Client::new(
         &rig.console.url(),
         Secret::new(format!("cfr_{}", "A".repeat(43))),
         Http::new(Duration::from_secs(5), fast()),
     );
-    let tokens = ConsoleTokens::new(fresh, MACHINE, None, rig.clock.clone(), rig.clock.clone());
+    let tokens = ConsoleTokens::new(fresh, MACHINE, rig.clock.clone(), rig.clock.clone());
     let error = tokens.installations().await.expect_err("unknown token");
     assert_eq!(status_of(&error), Some(401));
     assert!(error.to_string().contains("enroll it again"), "{error}");
@@ -381,90 +343,62 @@ async fn a_console_that_dropped_the_machine_says_enroll_again() {
 // ---- the console's switch ----
 
 #[tokio::test]
-async fn with_the_switch_off_the_local_key_serves_and_the_console_is_asked_again_later() {
-    let rig = rig(false, true).await;
-    assert_eq!(rig.app.installations().await.expect("from the key").len(), 1);
-    assert!(rig.app.repositories(1).await.is_ok());
-    assert!(rig.app.registration_token(1, REPO).await.is_ok());
-    assert_eq!(rig.calls("read"), 1, "refused once");
-    assert!(rig.key_tokens() >= 1, "the key made the token");
-    assert_eq!(
-        rig.calls("registration"),
-        0,
-        "not asked while the console said off"
-    );
-    rig.console.set_broker(MACHINE, true);
-    rig.advance(GATE_RECHECK - Duration::from_secs(1));
-    rig.app.installations().await.expect("still the key");
-    assert_eq!(rig.calls("read"), 1);
-    rig.advance(Duration::from_secs(2));
-    let keyed = rig.key_tokens();
-    rig.app.repositories(1).await.expect("from the console again");
-    assert_eq!(rig.calls("read"), 2);
-    assert_eq!(rig.key_tokens(), keyed, "the console's token served");
-}
-
-#[tokio::test]
-async fn with_the_switch_off_and_no_key_every_call_says_why() {
-    let rig = rig(false, false).await;
+async fn with_the_switch_off_every_call_says_why_and_the_console_is_asked_again_later() {
+    let rig = rig(false).await;
     let error = rig.app.installations().await.expect_err("nothing serves");
     assert_eq!(status_of(&error), Some(403));
     assert!(!error.is_transient());
     assert!(error.to_string().contains("off for mac-a"), "{error}");
     let error = rig
         .app
-        .registration_token(1, REPO)
+        .generate_jit_config(1, REPO, RUNNER, &labels(&["self-hosted"]))
         .await
         .expect_err("nothing serves");
     assert_eq!(status_of(&error), Some(403));
+    assert!(
+        error.to_string().contains("off for mac-a"),
+        "the console's words: {error}"
+    );
     assert_eq!(
         rig.console.github_calls().len(),
         1,
         "asked again only after a while"
     );
     rig.console.set_broker(MACHINE, true);
-    rig.advance(GATE_RECHECK_ALONE);
+    rig.advance(GATE_RECHECK_ALONE - Duration::from_secs(1));
+    assert!(rig.app.installations().await.is_err(), "not asked yet");
+    assert_eq!(rig.console.github_calls().len(), 1);
+    rig.advance(Duration::from_secs(2));
     assert!(rig.app.installations().await.is_ok(), "on again");
+    assert_eq!(
+        rig.github.count("/access_tokens"),
+        0,
+        "the machine never makes a token of its own"
+    );
 }
 
 #[tokio::test]
-async fn a_switch_turned_off_meanwhile_moves_the_calls_to_the_key() {
-    let rig = rig(true, true).await;
+async fn a_switch_turned_off_meanwhile_fails_the_calls_with_the_consoles_words() {
+    let rig = rig(true).await;
     assert!(rig.app.repositories(1).await.is_ok());
-    assert_eq!(rig.key_tokens(), 0);
     // Turning it off revokes the read tokens at GitHub: the next call gets a 401, drops them, asks, hears 403.
     rig.console.set_broker(MACHINE, false);
-    assert!(
-        rig.app.repositories(1).await.is_ok(),
-        "the key took over in the same call"
-    );
+    let error = rig.app.repositories(1).await.expect_err("off");
+    assert_eq!(status_of(&error), Some(403), "{error}");
+    assert!(error.to_string().contains("off for mac-a"), "{error}");
     assert_eq!(rig.calls("read"), 2);
-    assert!(rig.key_tokens() >= 1);
-    // Writes go to the key too, without asking the console again.
-    rig.app.registration_token(1, REPO).await.expect("from the key");
-    rig.app
-        .generate_jit_config(1, REPO, RUNNER, &labels(&["self-hosted"]))
-        .await
-        .expect("from the key");
-    assert_eq!(rig.calls("registration") + rig.calls("jit"), 0);
-}
-
-#[tokio::test]
-async fn a_runner_asked_for_with_the_switch_off_comes_from_the_key() {
-    let rig = rig(false, true).await;
-    let jit = rig
+    // Runners too, without asking the console again while it said off.
+    let error = rig
         .app
         .generate_jit_config(1, REPO, RUNNER, &labels(&["self-hosted"]))
         .await
-        .expect("from the key");
-    assert!(jit.id > 0);
-    assert_eq!(rig.calls("jit"), 1, "the console refused it before asking GitHub");
-    assert_eq!(rig.console.github_calls()[0].status, 403);
-    rig.app
-        .generate_jit_config(1, REPO, "mac-a-j0a1b2c4", &labels(&["self-hosted"]))
-        .await
-        .expect("from the key");
-    assert_eq!(rig.calls("jit"), 1, "not asked again while it said off");
+        .expect_err("off");
+    assert_eq!(status_of(&error), Some(403), "{error}");
+    assert_eq!(rig.calls("jit"), 0);
+    assert_eq!(
+        rig.github.count("/access_tokens") - rig.github.count("POST /app/installations"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -483,7 +417,7 @@ async fn only_the_switchs_code_means_off_another_403_is_an_error_with_its_words(
         },
     ];
     for refusal in refusals {
-        let rig = rig(true, true).await;
+        let rig = rig(true).await;
         rig.console.answer_next(refusal.clone());
         let error = rig.app.installations().await.expect_err("refused");
         assert_eq!(status_of(&error), Some(403), "{error}");
@@ -493,33 +427,24 @@ async fn only_the_switchs_code_means_off_another_403_is_an_error_with_its_words(
             said.contains("Blocked by the firewall rule 7") || said.contains("no message from the console"),
             "{said}"
         );
-        assert_eq!(rig.key_tokens(), 0, "the local key is not turned to: {said}");
-        for (route, call) in [("registration", 0), ("jit", 1)] {
-            rig.console.answer_next(refusal.clone());
-            let error = match call {
-                0 => rig.app.registration_token(1, REPO).await.map(|_| ()),
-                _ => rig
-                    .app
-                    .generate_jit_config(1, REPO, RUNNER, &labels(&["self-hosted"]))
-                    .await
-                    .map(|_| ()),
-            }
-            .expect_err(route);
-            assert_eq!(status_of(&error), Some(403), "{route}: {error}");
-        }
-        assert_eq!(rig.key_tokens(), 0);
+        rig.console.answer_next(refusal.clone());
+        let error = rig
+            .app
+            .generate_jit_config(1, REPO, RUNNER, &labels(&["self-hosted"]))
+            .await
+            .expect_err("jit");
+        assert_eq!(status_of(&error), Some(403), "jit: {error}");
         assert!(rig.github.count("/generate-jitconfig") == 0 && rig.github.count("/registration-token") == 0);
         // Not taken as the switch: the console is asked again, after the wait a failure gets.
         rig.advance(FAILED_WAIT);
         assert!(rig.app.repositories(1).await.is_ok(), "the console serves again");
-        assert_eq!(rig.key_tokens(), 0);
     }
 }
 
 #[tokio::test]
 async fn a_runner_name_the_console_does_not_make_for_this_machine_is_its_403_not_the_key() {
     // The console knows this machine by another name than the Runner does (renamed there): its 403 names it.
-    let rig = rig(true, true).await;
+    let rig = rig(true).await;
     let elsewhere = ConsoleTokens::new(
         Client::new(
             &rig.console.url(),
@@ -527,7 +452,6 @@ async fn a_runner_name_the_console_does_not_make_for_this_machine_is_its_403_not
             Http::new(Duration::from_secs(5), fast()),
         ),
         "mac-b",
-        None,
         rig.clock.clone(),
         rig.clock.clone(),
     );
@@ -549,7 +473,7 @@ async fn a_runner_name_the_console_does_not_make_for_this_machine_is_its_403_not
 
 #[tokio::test]
 async fn the_switchs_403_carries_its_code_and_its_words() {
-    let rig = rig(false, false).await;
+    let rig = rig(false).await;
     let error = rig.app.installations().await.expect_err("off");
     assert!(
         error
@@ -572,7 +496,7 @@ async fn the_switchs_403_carries_its_code_and_its_words() {
 
 #[tokio::test]
 async fn installation_ids_of_the_other_app_are_mapped_by_repository() {
-    let rig = rig(true, true).await;
+    let rig = rig(true).await;
     rig.console.set_installations(&[(77, "ORG")]);
     let ids: Vec<i64> = rig
         .app
@@ -583,42 +507,11 @@ async fn installation_ids_of_the_other_app_are_mapped_by_repository() {
         .map(|i| i.id)
         .collect();
     assert_eq!(ids, [77]);
-    // An ID learned from the key's App, for a repository of the console's installation (owner compared without case).
-    assert!(rig.app.variables(1, REPO).await.is_ok());
+    assert!(rig.app.variables(77, REPO).await.is_ok());
     assert_eq!(rig.app.repo_installation(REPO).await.expect("installation"), 77);
-    // The console's ID once the key serves: looked up by repository, once.
-    rig.console.set_broker(MACHINE, false);
-    rig.github.revoke_installation_tokens();
-    assert!(rig.app.variables(77, REPO).await.is_ok());
-    assert!(rig.app.variables(77, REPO).await.is_ok());
-    assert_eq!(rig.github.count("/repos/org/app/installation"), 1);
     // A repository no installation of the console covers is said so, not guessed.
-    rig.console.set_broker(MACHINE, true);
-    rig.advance(GATE_RECHECK);
     let error = rig.app.variables(5, "other/app").await.expect_err("not covered");
     assert_eq!(status_of(&error), Some(404));
-}
-
-#[tokio::test]
-async fn an_installation_of_the_key_that_is_gone_is_looked_up_again() {
-    let rig = rig(true, true).await;
-    rig.console.set_installations(&[(77, "ORG")]);
-    rig.app.installations().await.expect("the console's");
-    rig.console.set_broker(MACHINE, false);
-    rig.github.revoke_installation_tokens();
-    // The key's App was installed again: the first lookup names an installation GitHub no longer has.
-    rig.github.fail(
-        "GET /repos/org/app/installation",
-        Reply::json(&json!({"id": 9})),
-        1,
-    );
-    let error = rig.app.registration_token(77, REPO).await.expect_err("gone");
-    assert_eq!(status_of(&error), Some(404), "{error}");
-    assert!(
-        rig.app.registration_token(77, REPO).await.is_ok(),
-        "looked up again"
-    );
-    assert_eq!(rig.github.count("/repos/org/app/installation"), 2);
 }
 
 // ---- answers that break the contract ----
@@ -640,7 +533,7 @@ async fn a_malformed_read_answer_is_refused_and_no_token_of_it_is_used() {
         json!({"installations": [{"id": 1, "token": "x".repeat(4097), "expiresInS": 3600}]}),
     ];
     for answer in bad {
-        let rig = rig(true, false).await;
+        let rig = rig(true).await;
         rig.console.answer_next(Reply::json(&answer));
         let error = rig.app.installations().await.expect_err(&answer.to_string());
         assert!(matches!(error, GitHubError::Decode { .. }), "{answer}: {error}");
@@ -655,7 +548,7 @@ async fn a_malformed_read_answer_is_refused_and_no_token_of_it_is_used() {
 
 #[tokio::test]
 async fn an_answer_that_is_not_json_is_refused() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console.answer_next(Reply::Response {
         status: 200,
         headers: vec![("content-type".into(), "text/html".into())],
@@ -668,7 +561,7 @@ async fn an_answer_that_is_not_json_is_refused() {
 
 #[tokio::test]
 async fn a_lifetime_over_an_hour_is_held_for_an_hour() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console.answer_next(Reply::json(
         &json!({"installations": [{"id": 1, "account": "org", "token": "ghs_long", "expiresInS": 86_400}]}),
     ));
@@ -686,7 +579,7 @@ async fn a_lifetime_over_an_hour_is_held_for_an_hour() {
 
 #[tokio::test]
 async fn an_empty_read_answer_lists_nothing_and_is_asked_again_later() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console
         .answer_next(Reply::json(&json!({"installations": []})));
     assert!(rig.app.installations().await.expect("none").is_empty());
@@ -699,21 +592,8 @@ async fn an_empty_read_answer_lists_nothing_and_is_asked_again_later() {
 }
 
 #[tokio::test]
-async fn malformed_registration_and_runner_answers_are_refused() {
-    let rig = rig(true, false).await;
-    for answer in [
-        json!({"token": "AREG_x"}),
-        json!({"token": "", "expiresInS": 3600}),
-        json!({"token": "AREG_x", "expiresInS": 10}),
-    ] {
-        rig.console.answer_next(Reply::json(&answer));
-        let error = rig
-            .app
-            .registration_token(1, REPO)
-            .await
-            .expect_err(&answer.to_string());
-        assert!(matches!(error, GitHubError::Decode { .. }), "{answer}: {error}");
-    }
+async fn malformed_runner_answers_are_refused() {
+    let rig = rig(true).await;
     for answer in [
         json!({"runnerId": 0, "encodedJitConfig": "abc"}),
         json!({"runnerId": 5, "encodedJitConfig": ""}),
@@ -733,7 +613,7 @@ async fn malformed_registration_and_runner_answers_are_refused() {
 
 #[tokio::test]
 async fn a_runner_is_asked_for_once_even_when_the_answer_fails() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     for status in [500, 502, 503] {
         let before = rig.console.calls();
         rig.console.fail_next(1, status);
@@ -756,7 +636,7 @@ async fn a_runner_is_asked_for_once_even_when_the_answer_fails() {
 
 #[tokio::test]
 async fn the_consoles_runner_limit_is_a_429_whose_wait_is_kept() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let other = "org/other";
     rig.github.add_repo(other, true);
     let names = ["mac-a-j0000001", "mac-a-j0000002", "mac-a-j0000003"];
@@ -819,7 +699,7 @@ async fn the_consoles_runner_limit_is_a_429_whose_wait_is_kept() {
 
 #[tokio::test]
 async fn a_runner_the_console_answers_503_with_a_wait_may_exist_and_waits() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console.fail_next_waiting(1, 503, 30);
     let error = rig
         .app
@@ -846,7 +726,7 @@ async fn a_runner_the_console_answers_503_with_a_wait_may_exist_and_waits() {
 
 #[tokio::test]
 async fn a_retry_after_past_an_hour_is_held_to_an_hour() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console.answer_next(
         Reply::status_json(429, &json!({"error": "Too many"}))
             .with_header("retry-after", &u64::MAX.to_string()),
@@ -866,7 +746,7 @@ async fn a_retry_after_past_an_hour_is_held_to_an_hour() {
 
 #[tokio::test]
 async fn a_read_the_console_answers_with_a_wait_is_not_asked_again_sooner() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console.fail_next_waiting(1, 503, 120);
     let error = rig.app.installations().await.expect_err("busy");
     assert!(error.is_transient(), "{error}");
@@ -884,7 +764,7 @@ async fn a_read_the_console_answers_with_a_wait_is_not_asked_again_sooner() {
 
 #[tokio::test]
 async fn a_runner_name_github_has_already_is_a_409() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.app
         .generate_jit_config(1, REPO, RUNNER, &labels(&["self-hosted"]))
         .await
@@ -899,7 +779,7 @@ async fn a_runner_name_github_has_already_is_a_409() {
 
 #[tokio::test]
 async fn a_read_token_from_the_console_cannot_register_a_runner() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let token = rig.app.installation_token(1).await.expect("token");
     let response = reqwest::Client::new()
         .post(format!(
@@ -919,7 +799,7 @@ async fn a_read_token_from_the_console_cannot_register_a_runner() {
 
 #[tokio::test]
 async fn an_empty_read_answer_stands_until_its_whole_life_has_passed() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console
         .answer_next(Reply::json(&json!({"installations": []})));
     assert!(rig.app.installations().await.expect("none").is_empty());
@@ -941,7 +821,7 @@ fn github_refuses_once(rig: &Rig) {
 
 #[tokio::test]
 async fn a_token_github_refuses_is_named_in_the_next_read_and_the_console_replaces_and_revokes_it() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let first = rig.app.installation_token(1).await.expect("token");
     github_refuses_once(&rig);
     assert!(
@@ -972,7 +852,7 @@ async fn a_token_github_refuses_is_named_in_the_next_read_and_the_console_replac
 
 #[tokio::test]
 async fn a_refused_token_is_named_again_after_a_read_that_failed() {
-    let rig = rig_with(true, false, support::no_retry()).await;
+    let rig = rig_with(true, support::no_retry()).await;
     let first = rig.app.installation_token(1).await.expect("token");
     rig.console.fail_next(1, 502);
     github_refuses_once(&rig);
@@ -990,7 +870,7 @@ async fn a_refused_token_is_named_again_after_a_read_that_failed() {
 
 #[tokio::test]
 async fn a_token_github_refuses_leaves_the_other_installations_tokens_serving() {
-    let rig = rig_with(true, false, support::no_retry()).await;
+    let rig = rig_with(true, support::no_retry()).await;
     rig.console.set_installations(&[(1, "org"), (2, "other")]);
     rig.app.installation_token(1).await.expect("token");
     let other = rig.app.installation_token(2).await.expect("token");
@@ -1009,7 +889,7 @@ async fn a_token_github_refuses_leaves_the_other_installations_tokens_serving() 
 
 #[tokio::test]
 async fn new_tokens_github_refuses_too_are_asked_for_at_a_doubling_pace() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.app.installation_token(1).await.expect("token");
     rig.github.fail(
         "GET /installation/repositories",
@@ -1040,7 +920,7 @@ async fn new_tokens_github_refuses_too_are_asked_for_at_a_doubling_pace() {
 
 #[tokio::test]
 async fn a_token_refused_while_a_read_is_on_its_way_is_named_in_the_next_one() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.console.set_installations(&[(1, "org"), (2, "other")]);
     let first = rig.app.installation_token(1).await.expect("token");
     let second = rig.app.installation_token(2).await.expect("token");
@@ -1081,7 +961,7 @@ async fn a_token_refused_while_a_read_is_on_its_way_is_named_in_the_next_one() {
 
 #[tokio::test]
 async fn a_wait_the_console_asks_for_past_the_tokens_end_stands() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     rig.app.installation_token(1).await.expect("token");
     rig.advance(Duration::from_secs(31 * 60));
     rig.console.fail_next_waiting(1, 503, 3600);
@@ -1099,7 +979,7 @@ async fn a_wait_the_console_asks_for_past_the_tokens_end_stands() {
 
 #[tokio::test]
 async fn a_read_names_at_most_twenty_refused_tokens_the_last_ones_and_none_too_long() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     let client = Client::new(
         &rig.console.url(),
         rig.machine_token.clone(),
@@ -1130,7 +1010,7 @@ async fn a_read_names_at_most_twenty_refused_tokens_the_last_ones_and_none_too_l
 async fn a_read_takes_tokens_of_256_and_4096_characters_and_refuses_a_longer_one() {
     for (len, taken) in [(256, true), (4096, true), (4097, false)] {
         // Its own console each time: one keeps the token it gave for the hour.
-        let rig = rig(true, false).await;
+        let rig = rig(true).await;
         rig.github.set_read_token_length(len);
         let client = Client::new(
             &rig.console.url(),
@@ -1150,7 +1030,7 @@ async fn a_read_takes_tokens_of_256_and_4096_characters_and_refuses_a_longer_one
 
 #[tokio::test]
 async fn a_token_github_refuses_that_a_console_hands_out_again_waits_and_is_named_each_time() {
-    let rig = rig(true, false).await;
+    let rig = rig(true).await;
     // A console that hands out the token it keeps whatever the machine names.
     rig.console.ignore_refused(true);
     let token = rig.app.installation_token(1).await.expect("token");

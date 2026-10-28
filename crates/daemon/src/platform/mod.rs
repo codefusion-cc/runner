@@ -151,6 +151,8 @@ pub struct HostSetup {
     /// The settings file the Runner started with, whose changes it takes up by starting again; none to take up
     /// none.
     pub settings: Option<Arc<dyn SettingsFile>>,
+    /// Where the GitHub App's key file was when the host held the key: the report names it while it is there.
+    pub app_key_file: Option<PathBuf>,
 }
 
 /// Builds the machines and the service of this host, and finds what a Runner before left: records, vm-hosts,
@@ -213,6 +215,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
 
     let mut service = ServiceConfig::new(&setup.machine, &hostname, &P::model(), &setup.version);
     service.policy = setup.policy;
+    service.app_key_file = setup.app_key_file;
     let service = Service::new(ServiceParts {
         app: setup.app,
         machines: machines.clone(),

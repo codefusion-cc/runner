@@ -1,6 +1,6 @@
 [package]
 name = "cf-ghapp"
-description = "The GitHub App client: installation tokens, repositories, workflow files and variables, and the registration tokens of Actions runners."
+description = "The GitHub App client: repositories, workflow files and variables, queues, and Actions runners for one job, with tokens from the console."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,6 @@ bytes = "1"
 cf-secret = { path = "../secret" }
 cf-workflows = { path = "../workflows" }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
-ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 rand = "0.9"
@@ -22,9 +21,10 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
+cf-console-client = { path = "../console-client" }
+cf-fake-console = { path = "../fake-console" }
 cf-fake-github = { path = "../fake-github" }
-tempfile.workspace = true
-proptest.workspace = true
+cf-harness = { path = "../harness" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [lints]

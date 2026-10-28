@@ -296,6 +296,10 @@ pub struct Status {
     /// Why the host serves no repository, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_serving: Option<String>,
+    /// A GitHub App key file this host still holds (an absolute path, at most 1024 characters): the console holds the
+    /// key, and the owner deletes the file. Left out when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_key_file: Option<String>,
     /// Whether the Runner's first look at GitHub since it started has not ended yet: its scale sets are not listed
     /// yet, so serving none says nothing. Left out once it ended, and by a Runner from before it said it; a console
     /// from before ignores it.

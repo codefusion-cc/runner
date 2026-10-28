@@ -385,7 +385,8 @@ async fn a_registration_failure_starts_no_machine() {
         .scale(Some(&stats(1)))
         .await
         .expect_err("a failed registration fails the poll");
-    assert_eq!(err.status(), Some(500));
+    // GitHub's 5xx reaches the Runner as the console's 503 `github_busy`.
+    assert_eq!(err.status(), Some(503));
     assert!(h.hosts.started().is_empty());
     assert_eq!(h.slots.used(), 0, "slot held after a failed registration");
 }

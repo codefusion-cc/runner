@@ -1,10 +1,12 @@
 use std::time::Duration;
 
-use cf_ghapp::Error as HttpError;
+use cf_ghapp::{Error as HttpError, StatusError};
 
 /// The code of the console's 403 while the owner has not turned GitHub through the console on for the machine, or
 /// turned it off (`brokerOff` in its `worker/runners/github.ts`).
 pub const BROKER_OFF: &str = "broker_off";
+/// The code of the console's 502 when GitHub named a message queue that is not GitHub's: nothing to try again.
+pub const BAD_ADDRESS: &str = "bad_address";
 /// The longest `Retry-After` taken from the console, an hour (the most it asks for); a longer one is held to this.
 pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(3600);
 
@@ -15,14 +17,18 @@ pub enum Error {
     /// know. The Mac enrols again.
     #[error("the console does not accept this token or code")]
     Unauthorized,
-    /// The console refused the request with a 4xx other than 401: a message of its own, or one for the owner to read.
-    /// Sending the same request again gets the same answer. A 403 that says [`BROKER_OFF`] is [`Error::GithubOff`].
+    /// The console refused the request with a 4xx other than 401 (or a 502 [`BAD_ADDRESS`]): a message of its own, or
+    /// one for the owner to read. Sending the same request again gets the same answer. A 403 that says [`BROKER_OFF`]
+    /// is [`Error::GithubOff`].
     #[error("the console refused ({status}): {message}")]
     Refused {
         /// The HTTP status.
         status: u16,
         /// The console's `error` text, cleaned and cut to 300 characters.
         message: String,
+        /// The console's `code`, which tells one refusal of a status from another (`session_lost`, `name_taken`,
+        /// `not_yours`, …); none when it named none. At most 64 characters of `a-z 0-9 _`.
+        code: Option<String>,
     },
     /// GitHub through the console is off for this machine: the console answered 403 with the code [`BROKER_OFF`].
     /// The owner turns it on on the machine's page; until then the same call gets the same answer.
@@ -55,6 +61,53 @@ impl Error {
         matches!(self, Error::Unavailable(_) | Error::Busy { .. })
     }
 
+    /// The console's code of a refusal, when it named one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Error::Refused { code, .. } => code.as_deref(),
+            Error::GithubOff(_) => Some(BROKER_OFF),
+            _ => None,
+        }
+    }
+
+    /// The error as the App client's, for a call to the console's `path`: what can work later stays transient, a
+    /// refusal keeps its status, a wait the console asked for is kept, and none carries a token.
+    pub fn to_github(self, path: &str) -> HttpError {
+        let status = |status: u16, body: String, retry_after: Option<Duration>| {
+            HttpError::Status(StatusError {
+                method: "POST".into(),
+                path: path.into(),
+                status,
+                body,
+                retry_after,
+                server_time: None,
+            })
+        };
+        match self {
+            Error::Unauthorized => status(
+                401,
+                "the console does not take this machine's token: enroll it again".into(),
+                None,
+            ),
+            Error::Refused {
+                status: code,
+                message,
+                ..
+            } => status(code, message, None),
+            Error::GithubOff(message) => status(403, message, None),
+            Error::Busy {
+                status: code,
+                message,
+                retry_after,
+            } => status(code, message, Some(retry_after)),
+            Error::Unavailable(why) => HttpError::Transport(format!("the console: {why}")),
+            Error::Protocol(why) => HttpError::Decode {
+                what: format!("the console's answer to {path}"),
+                why,
+            },
+        }
+    }
+
     /// How long the console asked to be left alone, when it said.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -69,9 +122,18 @@ fn json_of(body: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(body).ok()
 }
 
-/// The console's `code` from a refusal's body: what tells one 403 from another. None when it names none.
+/// The console's `code` from a refusal's body: what tells one 403 from another. None when it names none, or one that
+/// is not a code (over 64 characters, or not `a-z 0-9 _`).
 fn code_of(body: &str) -> Option<String> {
-    json_of(body)?.get("code")?.as_str().map(str::to_owned)
+    json_of(body)?
+        .get("code")?
+        .as_str()
+        .filter(|c| {
+            (1..=64).contains(&c.len())
+                && c.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+        .map(str::to_owned)
 }
 
 /// The console's `error` text from a refusal's body (at most the first 512 bytes), without control characters and
@@ -92,6 +154,11 @@ impl From<HttpError> for Error {
                 403 if code_of(&s.body).as_deref() == Some(BROKER_OFF) => {
                     Error::GithubOff(message_of(&s.body))
                 }
+                502 if code_of(&s.body).as_deref() == Some(BAD_ADDRESS) => Error::Refused {
+                    status: s.status,
+                    message: message_of(&s.body),
+                    code: code_of(&s.body),
+                },
                 429 | 500..=599 => match s.retry_after {
                     Some(wait) => Error::Busy {
                         status: s.status,
@@ -108,13 +175,13 @@ impl From<HttpError> for Error {
                 400..=499 => Error::Refused {
                     status: s.status,
                     message: message_of(&s.body),
+                    code: code_of(&s.body),
                 },
                 other => Error::Protocol(format!("{} answered {other}", s.path)),
             },
             HttpError::Transport(why) => Error::Unavailable(why),
             HttpError::Refused(why) => Error::Protocol(why),
             HttpError::Decode { what, why } => Error::Protocol(format!("{what}: {why}")),
-            HttpError::Key(_) => Error::Protocol("a key was asked for".into()),
         }
     }
 }
