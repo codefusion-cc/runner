@@ -58,18 +58,29 @@ while (($#)); do
     --repo) repo=${2-} ;;
     --github-api) github_api=${2-} ;;
     --check) check=1; shift; continue ;;
-    *) fail "unknown argument $1" ;;
+    # A stray word may be the code itself, so only an option's name is repeated.
+    --*) fail "unknown option $1" ;;
+    *) fail "an argument that is no option" ;;
   esac
   (($# >= 2)) || fail "$1 needs a value"
   shift 2
 done
 [[ $machine =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#machine} -le 24 ]] || fail "--machine: lowercase letters, digits and dashes, at most 24"
-[[ $console =~ ^https?://[A-Za-z0-9.:-]+(/[A-Za-z0-9._/-]*)?$ ]] || fail "--console: an http(s) address"
+# As the Runner has it: https, or http only to this host.
+[[ $console =~ ^(https://[A-Za-z0-9.:-]+|http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?)(/[A-Za-z0-9._/-]*)?$ ]] ||
+  fail "--console: an https address, or http to this host"
 [[ -z $github_api || $github_api =~ ^https?://[A-Za-z0-9.:-]+/?$ ]] || fail "--github-api: an http(s) address"
 [[ $home == /* && $home != *[[:space:]\"\\\$\`\']* ]] || fail "--home: an absolute path without spaces or quotes"
 [[ $repo != *[[:space:]\"\\\$\`\']* ]] || fail "--repo: an address or path without spaces or quotes"
 if ((!check)); then
   [[ -n $code_file ]] || fail "--code-file is needed (or --check)"
+fi
+# The code gives GitHub tokens until it is spent: a file of root's alone, never a link, as the minutes of the build
+# would leave it open to every user of the host.
+if [[ -n $code_file && ( -e $code_file || -L $code_file ) ]]; then
+  [[ ! -L $code_file && -f $code_file ]] || fail "--code-file: $code_file is a link or no file"
+  [[ $(stat -c %u -- "$code_file") == 0 && $(stat -c %a -- "$code_file") =~ ^[0-7]00$ ]] ||
+    fail "--code-file: $code_file must be root's, readable by root alone (chmod 600)"
 fi
 ((EUID == 0)) || fail "run it as root"
 if [[ -z $ref ]]; then
@@ -111,10 +122,11 @@ start_service() {
 }
 
 # The Runner updates itself and its image from the console once it is enrolled, so a run again leaves all that be,
-# and a code given again is left unused.
+# and a code given again is deleted unused.
 if ((!check)) && [[ -e $state/console-token ]]; then
   step=enrolled
   say "$machine is enrolled already"
+  [[ -z $code_file ]] || rm -f -- "$code_file"
   start_service
   step=finished
   say "$machine runs the Runner"
@@ -172,7 +184,7 @@ fi
 step=checkout
 if [[ ! -d $checkout/.git ]]; then
   say "cloning $repo"
-  as_user "git clone -q '$repo' runner"
+  as_user "git clone -q -- '$repo' runner"
 fi
 # The checkout is the Runner's build folder: at a commit, never on a branch, and an update fetches GitHub's main.
 if [[ $(as_user 'git -C runner rev-parse HEAD') != "$ref"* ]]; then
@@ -241,7 +253,7 @@ step=enroll
 say "enrolling $machine at $console"
 # The code goes to enroll on standard input, never on a command line.
 as_user "'$program' enroll --config '$config'" <"$code_file"
-rm -f "$code_file"
+rm -f -- "$code_file"
 
 step=check
 as_user "'$program' check --config '$config'"
