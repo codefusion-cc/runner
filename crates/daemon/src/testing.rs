@@ -179,6 +179,14 @@ impl FakeVms {
         });
     }
 
+    /// The job's machines read and wrote this much of the host's disks so far.
+    pub fn disk(&self, job: &str, read_bytes: u64, written_bytes: u64) {
+        self.with(job, |vm| {
+            vm.state.disk_read_bytes = Some(read_bytes);
+            vm.state.disk_written_bytes = Some(written_bytes);
+        });
+    }
+
     /// The job's machine holds this much of the Mac's memory now, as its vm-host read it (`None`: it could not).
     pub fn resident(&self, job: &str, bytes: Option<u64>) {
         self.with(job, |vm| vm.state.resident_bytes = bytes);
@@ -367,6 +375,8 @@ impl Vms for FakeVms {
                 pressure_peak: None,
                 host_cpu: None,
                 host_cpu_peak: None,
+                disk_read_bytes: None,
+                disk_written_bytes: None,
                 oom: None,
                 end: None,
             },

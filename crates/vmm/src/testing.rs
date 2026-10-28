@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{Channel, ExitCell, Psi, Vm, VmExit, VmSpec, Vmm, VmmError};
+use crate::{Channel, DiskIo, ExitCell, Psi, Vm, VmExit, VmSpec, Vmm, VmmError};
 
 /// What the guest of one scripted machine does with its end of the channel. When it returns, the machine has
 /// powered itself off.
@@ -77,6 +77,7 @@ pub struct FakeVmm {
     stops: Arc<Mutex<usize>>,
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
+    disks: Arc<Mutex<Option<DiskIo>>>,
 }
 
 impl FakeVmm {
@@ -109,6 +110,12 @@ impl FakeVmm {
     pub fn stall(&self, share: Option<Psi>) {
         *self.stalls.lock().unwrap() = share;
     }
+
+    /// What each machine of this monitor read and wrote since it started, from now on ([`Vm::disk_io`]); `None`,
+    /// the start, when it cannot be told.
+    pub fn disk(&self, io: Option<DiskIo>) {
+        *self.disks.lock().unwrap() = io;
+    }
 }
 
 impl Vmm for FakeVmm {
@@ -135,6 +142,7 @@ impl Vmm for FakeVmm {
                 stops: self.stops.clone(),
                 resident: self.resident.clone(),
                 stalls: self.stalls.clone(),
+                disks: self.disks.clone(),
             })),
         }
     }
@@ -148,6 +156,7 @@ struct FakeVm {
     stops: Arc<Mutex<usize>>,
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
+    disks: Arc<Mutex<Option<DiskIo>>>,
 }
 
 impl Vm for FakeVm {
@@ -210,6 +219,13 @@ impl Vm for FakeVm {
             return None;
         }
         *self.stalls.lock().unwrap()
+    }
+
+    fn disk_io(&self) -> Option<DiskIo> {
+        if self.power.wait(Duration::ZERO).is_some() {
+            return None;
+        }
+        *self.disks.lock().unwrap()
     }
 }
 

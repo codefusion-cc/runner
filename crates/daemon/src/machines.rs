@@ -1181,6 +1181,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             wall_ms: summary.map(|s| s.wall_ms),
             pressure_peak: job.last.as_ref().and_then(|s| s.pressure_peak),
             host_cpu_peak: job.last.as_ref().and_then(|s| s.host_cpu_peak),
+            disk_read_bytes: job.last.as_ref().and_then(|s| s.disk_read_bytes),
+            disk_written_bytes: job.last.as_ref().and_then(|s| s.disk_written_bytes),
             message: vm_end.and_then(|e| e.message.clone()),
         });
         job.record.slot = Some(job.life.saved().into());
@@ -1215,7 +1217,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         };
         let oom = job.record.oom;
         let runner = job.record.runner.clone();
-        tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
+        let ended = job.record.ended.as_ref();
+        tracing::info!(
+            %runner,
+            job = %name,
+            end = kind.name(),
+            ran_job,
+            disk_read_bytes = ended.and_then(|e| e.disk_read_bytes),
+            disk_written_bytes = ended.and_then(|e| e.disk_written_bytes),
+            "machine gone"
+        );
         self.roster.remove(&runner);
         self.store.save(&job.record);
         self.vms.clean(name);
