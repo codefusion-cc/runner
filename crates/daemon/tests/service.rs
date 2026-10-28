@@ -511,6 +511,7 @@ fn service_with(
         }),
         updates: updates.map(|updates| updates.clone() as Arc<dyn cf_daemon::update::SelfUpdate>),
         results: Some(folder.join("results.json")),
+        pause: Some(folder.join("pause")),
         settings: Some(settings.clone()),
     })
 }
@@ -1027,6 +1028,58 @@ async fn while_the_console_is_away_reports_wait_and_arrive_later_in_order_each_o
             && ends.contains(&json!("cancelled"))
     );
     rig.nothing_left().await;
+}
+
+// added: a Runner that starts again (an update, a crash) on a host the console paused takes no job before the console
+// answers: until then it goes by the pause it kept. Once the console says the pause is over, jobs start again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.console.pause(true);
+    until("the Mac says it is paused", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["paused"] == json!(true))
+    })
+    .await;
+    rig.console.down(true);
+    rig.restart().await;
+    for set in rig.github.scale_sets() {
+        // GitHub lets a session that nobody polls expire.
+        rig.github.lose_session(set.id);
+    }
+    rig.service.discover().await;
+    rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    rig.settles("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    for _ in 0..3 {
+        rig.later(Duration::from_secs(150));
+        rig.service.look_at_queue().await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.github.offers_room(REPO), "a paused host offers no room");
+    assert_eq!(own_runners(&rig), Vec::<String>::new());
+    assert!(
+        rig.standing().is_empty(),
+        "a paused host that started again starts nothing before the console answers"
+    );
+
+    rig.console.pause(false);
+    rig.console.down(false);
+    rig.settles("room offered again", || rig.github.offers_room(REPO))
+        .await;
+    // The job was queued while the Mac offered no room: it is held until the Runner looks at the queue again.
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    until(
+        "the job gets a machine once the console says the pause is over",
+        || !rig.standing().is_empty(),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
