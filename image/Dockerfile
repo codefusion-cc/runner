@@ -18,6 +18,9 @@ ARG PLAYWRIGHT_VERSION=1.63.0
 ARG COMPOSE_VERSION=5.6.0
 ARG COMPOSE_SHA256_arm64=733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2
 ARG COMPOSE_SHA256_amd64=40343e21ca777173e69cff5dbafeb37c6f81f3b0d57d9e597f036e95eb63e76a
+# Every download tries again: nodejs.org once dropped an HTTP/2 stream 13 minutes in and failed the build. A transfer
+# that stalls under 1 kB/s for a minute counts as failed, so it is tried again rather than waited on.
+ARG CURL="curl --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 --speed-limit 1024 --speed-time 60"
 
 USER root
 
@@ -33,7 +36,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential ca-certificates gnupg lsof procps psmisc xz-utils zip zstd \
  && mkdir -p -m 755 /etc/apt/keyrings \
- && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && $CURL -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
  && echo "deb [arch=${TARGETARCH} signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends gh \
@@ -45,7 +48,7 @@ RUN apt-get update \
 ENV RUNNER_TOOL_CACHE=/opt/hostedtoolcache AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 RUN . /tmp/arch.env \
  && node=/opt/hostedtoolcache/node/${NODE_VERSION}/${NODE_ARCH} \
- && curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+ && $CURL -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
  && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
  && mkdir -p "$node" \
  && tar -xJf /tmp/node.tar.xz -C "$node" --strip-components=1 --exclude CHANGELOG.md --exclude LICENSE --exclude README.md \
@@ -66,7 +69,7 @@ RUN . /tmp/arch.env \
  && apt-get update \
  && apt-get install -y --no-install-recommends iptables passt \
  && rm -rf /var/lib/apt/lists/* \
- && curl -fsSLo /usr/local/lib/docker/cli-plugins/docker-compose \
+ && $CURL -fsSLo /usr/local/lib/docker/cli-plugins/docker-compose \
       "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
  && echo "${COMPOSE_SHA256}  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum -c - \
  && chmod 755 /usr/local/lib/docker/cli-plugins/docker-compose \
