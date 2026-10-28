@@ -293,6 +293,15 @@ impl Config {
             };
         };
         let repository = policy.repository().map_err(|why| format!("trusted: {why}"))?;
+        // The App's key mints tokens for every repository it is installed on, and with it the Runner registers
+        // Actions runners itself whenever the console's tokens are off, past the console's word on which job waits.
+        if self.app_dir.is_some() || self.console.is_none() {
+            return Err(
+                "app_dir: a trusted host keeps no GitHub App key and registers through the console alone; leave \
+                 app_dir out and name `console`"
+                    .into(),
+            );
+        }
         if self.max_jobs.is_some_and(|jobs| jobs != 1) {
             return Err("max_jobs: a trusted host runs one job at a time; say 1 or leave it out".into());
         }
@@ -460,15 +469,50 @@ mod tests {
         );
     }
 
+    /// A trusted host's file: the console's, with no App key.
+    fn trusted_with(change: impl FnOnce(&mut serde_json::Value)) -> Result<Config, String> {
+        with(|v| {
+            v.as_object_mut().expect("object").remove("app_dir");
+            v["console"] = "https://console.example".into();
+            v["class"] = "trusted".into();
+            change(v);
+        })
+    }
+
+    #[test]
+    fn a_trusted_host_keeps_no_app_key_and_registers_through_the_console() {
+        assert!(trusted_with(|_| {}).is_ok());
+        for (change, why) in [
+            (
+                (|v: &mut serde_json::Value| {
+                    v["app_dir"] = "/Users/someone/.config/codefusion-runners".into()
+                }) as fn(&mut serde_json::Value),
+                "the App's key beside the console",
+            ),
+            (
+                |v| {
+                    v.as_object_mut().expect("object").remove("console");
+                    v["app_dir"] = "/Users/someone/.config/codefusion-runners".into();
+                },
+                "the App's key alone",
+            ),
+        ] {
+            let error = trusted_with(change).expect_err(why);
+            assert!(
+                error.starts_with("app_dir:") && error.contains("console"),
+                "{why}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn a_trusted_host_runs_one_job_of_one_repository_by_default_rules() {
         let shared = Config::parse(WHOLE).expect("shared");
         assert_eq!((shared.class, shared.trusted_policy()), (Class::Shared, None));
-        let config = with(|v| v["class"] = "trusted".into()).expect("trusted");
+        let config = trusted_with(|_| {}).expect("trusted");
         assert_eq!(config.trusted_policy(), Some(cf_trusted::Policy::defaults()));
         assert_eq!(config.limits().max_machines, Some(1));
-        let one = with(|v| {
-            v["class"] = "trusted".into();
+        let one = trusted_with(|v| {
             v["max_jobs"] = 1.into();
             v["repos"] = serde_json::json!(["CodeFusion-cc/codefusion"]);
         })
@@ -480,12 +524,6 @@ mod tests {
 
     #[test]
     fn a_trusted_host_takes_nothing_that_would_serve_more() {
-        let trusted = |change: fn(&mut serde_json::Value)| {
-            with(|v| {
-                v["class"] = "trusted".into();
-                change(v);
-            })
-        };
         for (change, says) in [
             (
                 (|v| v["max_jobs"] = 2.into()) as fn(&mut serde_json::Value),
@@ -513,7 +551,7 @@ mod tests {
                 "not an object",
             ),
         ] {
-            let error = trusted(change).expect_err(says);
+            let error = trusted_with(change).expect_err(says);
             assert!(error.contains(says), "{says}: {error}");
         }
         // Rules on a shared host would read as if it were guarded.
@@ -529,8 +567,7 @@ mod tests {
             serde_json::json!({ "../x.yml": ["push"] }),
             serde_json::json!(null),
         ] {
-            let config = with(|v| {
-                v["class"] = "trusted".into();
+            let config = trusted_with(|v| {
                 v["trusted"] = serde_json::json!({ "repository": "org/app", "allow": allow });
             })
             .expect("starts");

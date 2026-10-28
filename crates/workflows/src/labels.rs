@@ -21,6 +21,13 @@ pub const DOCKER_LABEL: &str = "cf-docker";
 /// host registers its Actions runners with this label alone, one job at a time.
 pub const TRUSTED_LABEL: &str = "trusted";
 
+/// Whether a label is [`TRUSTED_LABEL`] to GitHub, which compares labels without regard to case: any spelling whose
+/// letters case mapping turns into it, `TRUSTED` and also `truſted` (a long s, whose capital is `S`), which lowercasing
+/// alone leaves apart.
+pub fn is_trusted_label(label: &str) -> bool {
+    label.trim().to_uppercase().to_lowercase() == TRUSTED_LABEL
+}
+
 /// A workflow file bigger than this is not read, and whoever fetches the files need not fetch it. GitHub's own limit
 /// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
@@ -81,7 +88,7 @@ impl LabelSet {
             if !plain
                 || label.len() > MAX_LABEL_BYTES
                 || FOREIGN.contains(&label.as_str())
-                || label == TRUSTED_LABEL
+                || is_trusted_label(&label)
             {
                 return None;
             }
@@ -217,7 +224,7 @@ fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> Vec<String> {
         .filter(|labels| {
             labels
                 .iter()
-                .any(|label| is_ours(label) || label == TRUSTED_LABEL)
+                .any(|label| is_ours(label) || is_trusted_label(label))
         })
         .unwrap_or_else(|| vec![POOL_LABEL.to_string()])
 }
