@@ -269,7 +269,7 @@ impl Client {
     /// is a 409 with the code [`SESSION_EXISTS`].
     pub async fn scaleset_session_open(&self, repo: &str, set_id: i64) -> Result<OpenedSession, Error> {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        #[serde(rename_all = "camelCase")]
         struct Wire {
             session_id: String,
             message_queue_url: String,

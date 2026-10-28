@@ -398,8 +398,10 @@ async fn answers_that_break_the_contract_are_refused_without_their_tokens() {
     };
     let mut no_counts = opened();
     no_counts.as_object_mut().unwrap().remove("statistics");
+    // A key a newer console adds is dropped, as the console drops what a newer Runner sends.
+    rig.console.answer_next(Reply::json(&with("extra", json!(1))));
+    assert!(rig.client.scaleset_session_open(REPO, id).await.is_ok(), "an extra key is no breach");
     for answer in [
-        with("extra", json!(1)),
         no_counts,
         with("sessionId", json!("a_b")),
         with("sessionId", json!("")),
