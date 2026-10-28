@@ -20,6 +20,12 @@ pub const IDLE_GRACE: Duration = Duration::from_secs(2 * 60);
 /// ran out after the same two minutes.
 pub const PROMISE_TTL: Duration = Duration::from_secs(2 * 60);
 
+/// How long a job GitHub assigned here may wait in line before its scale set offers it no more room. GitHub takes a
+/// job no Actions runner took back after five minutes and hands it to a scale set whose polls have room; past this,
+/// those of this machine have none for it, so it goes to another machine if one has room, and runs here only if room
+/// comes before.
+pub const PLACE_LIMIT: Duration = Duration::from_secs(10 * 60);
+
 /// How often an Actions runner whose name is taken is registered again under another.
 const NAME_TRIES: usize = 3;
 
@@ -78,6 +84,9 @@ pub struct Scaler<J, R, H> {
     /// in line stands for. GitHub hands a scale set's jobs to its Actions runners itself, so this is the scaler's
     /// best guess of which job a machine started next will run, assuming the order they were assigned in.
     pending: Vec<JobBase>,
+    /// When each job was first assigned here, whether GitHub took it back and handed it here again since: a job that
+    /// waited [`PLACE_LIMIT`] is offered no more room. The oldest go past [`OFFERS_KEPT`].
+    assigned_since: Vec<Assigned>,
     /// Offered jobs by request ID, with when they were first offered: one passed over goes first after
     /// [`DEFER_LIMIT`].
     offered: Vec<(i64, SystemTime)>,
@@ -114,6 +123,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             promised: vec![],
             waiting: vec![],
             pending: vec![],
+            assigned_since: vec![],
             offered: vec![],
             never: Arc::new(Mutex::new(None)),
             last: Arc::new(Mutex::new(None)),
@@ -194,12 +204,47 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
 
     async fn handle(&mut self, message: &Message) -> Result<(), Error> {
         self.acquire(message).await?;
+        let now = self.clock.now();
+        // GitHub hands a job it took back to a scale set again within minutes. One away for longer ran elsewhere, and
+        // what comes under its run and name is a re-run, which waited nowhere.
+        self.assigned_since.retain(|assigned| {
+            assigned
+                .left
+                .is_none_or(|left| now.duration_since(left).unwrap_or(Duration::ZERO) < PLACE_LIMIT)
+        });
         for job in &message.assigned {
             // A message that comes again after a failure names the same jobs again.
             if !self.pending.iter().any(|p| same_job(p, job)) {
                 self.pending.push(job.clone());
             }
+            match self
+                .assigned_since
+                .iter_mut()
+                .find(|assigned| same_job(&assigned.job, job))
+            {
+                Some(assigned) => assigned.left = None,
+                None => self.assigned_since.push(Assigned {
+                    job: job.clone(),
+                    since: now,
+                    left: None,
+                }),
+            }
         }
+        // A job an Actions runner took, here or elsewhere, waits in no line. One taken back (a cancel with no Actions
+        // runner) keeps its age, should it come here again.
+        let ran = message.started.iter().map(|s| (&s.job, s.runner_name.as_str()));
+        for (job, runner) in ran.chain(message.completed.iter().map(|c| (&c.job, c.runner_name.as_str()))) {
+            if runner.is_empty() {
+                for assigned in self.assigned_since.iter_mut().filter(|a| same_job(&a.job, job)) {
+                    assigned.left = Some(now);
+                }
+            } else {
+                self.assigned_since
+                    .retain(|assigned| !same_job(&assigned.job, job));
+            }
+        }
+        let excess = self.assigned_since.len().saturating_sub(OFFERS_KEPT);
+        self.assigned_since.drain(..excess);
         let ended = message.started.iter().map(|s| &s.job);
         for job in ended.chain(message.completed.iter().map(|c| &c.job)) {
             if let Some(at) = self.pending.iter().position(|p| same_job(p, job)) {
@@ -533,12 +578,20 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// every number it is given before any reports back, so offering all free slots to every scale set would let it
     /// assign this machine several times the jobs it can run while other machines stay idle. One at a time, a burst
     /// still fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
+    ///
+    /// A paused machine, or one that waits for its machines to end, offers only what runs and what it promised: GitHub
+    /// takes a job in line back after five minutes and then hands it to a machine that runs it. A job in line past
+    /// [`PLACE_LIMIT`] gets no room either, nor does any new job while it waits.
     pub fn capacity(&self) -> usize {
-        self.active()
-            + self.waiting.len()
-            + self.promised.len()
-            + self
-                .slots
+        let held = self.active() + self.promised.len();
+        if self.slots.held() {
+            return held;
+        }
+        let overdue = self.overdue();
+        let open = if overdue > 0 {
+            0
+        } else {
+            self.slots
                 .open_slots(self.config.size)
                 .min(1)
                 .min(if self.config.docker {
@@ -546,6 +599,22 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
                 } else {
                     usize::MAX
                 })
+        };
+        held + self.waiting.len() - overdue + open
+    }
+
+    /// How many of the jobs the places in line stand for were first assigned here [`PLACE_LIMIT`] ago or more.
+    fn overdue(&self) -> usize {
+        let now = self.clock.now();
+        let stood_for = self.pending.iter().skip(self.idle()).take(self.waiting.len());
+        stood_for
+            .filter(|job| {
+                self.assigned_since.iter().any(|assigned| {
+                    same_job(&assigned.job, job)
+                        && now.duration_since(assigned.since).unwrap_or(Duration::ZERO) >= PLACE_LIMIT
+                })
+            })
+            .count()
     }
 }
 
@@ -660,6 +729,15 @@ pub async fn start_runner<R: Registry, H: Hosts>(
     });
     tracing::info!(runner = %name, "Actions runner started");
     Ok(name)
+}
+
+/// A job GitHub assigned here, for [`PLACE_LIMIT`].
+struct Assigned {
+    job: JobBase,
+    /// When it was first assigned here.
+    since: SystemTime,
+    /// When GitHub took it back, while it is away.
+    left: Option<SystemTime>,
 }
 
 /// Whether two messages speak of the same job: by its request ID when both carry one, else by its run and name. The

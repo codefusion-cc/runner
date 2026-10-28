@@ -7,3 +7,4 @@
 cc 231d76af6ad81eda7d0b5fcfcaa0fba7445cd7859a3fdec181aea8a25d9e5fd5 # shrinks to total_mib = 1100, cores = 1, fast = 0, sizes = [G2]
 cc 272a004e1aa5e7d1bd3e1afacea9fe0cb12151c5f4aa5de1900da1552f95fa52 # shrinks to total_mib = 7928, cores = 6, fast = 4, sizes = [G6]
 cc d682cd6f2cd6bb5bb80c6120bdea147b5294707428e4e7eba952de378ec409b7 # shrinks to total_mib = 1100, cores = 46, fast = 47, sizes = []
+cc 1362cf393f127d91c86b38d6f73d67e413807f48bc50565cdc9c029a285b1603 # shrinks to total_mib = 64744, cores = 14, fast = 12, vcpus = 1, sizes = [G4, G8, G4, G8, G4, G8, G2, G2, G6, G6, G2, G4]

@@ -173,14 +173,15 @@ async fn a_paused_machine_acquires_nothing_and_an_assigned_job_waits_in_line() {
         "the refused job stays offered at GitHub"
     );
     assert_eq!(h.slots.used(), 0);
-    // A job GitHub assigned all the same holds a place in line: a hold keeps every job out.
+    // A job GitHub assigned all the same holds a place in line: a hold keeps every job out. The polls offer it no
+    // room, so that GitHub, once it takes the job back, hands it to a machine that runs it.
     let capacity = h.scaler.scale(Some(&stats(1))).await.unwrap();
     assert!(
         h.hosts.started().is_empty(),
         "a machine was started on a paused Mac"
     );
     assert_eq!(h.machines.snapshot().waiting, 1);
-    assert_eq!(capacity, 1, "the job in line counts, no free slot is offered");
+    assert_eq!(capacity, 0, "a paused Mac offered room for the job in line");
     // Asked again, the same job does not take a second place.
     h.scaler.scale(None).await.unwrap();
     assert_eq!(h.machines.snapshot().waiting, 1);
@@ -195,6 +196,97 @@ async fn a_paused_machine_acquires_nothing_and_an_assigned_job_waits_in_line() {
     h.scaler.scale(None).await.unwrap();
     assert_eq!(h.hosts.started().len(), 1);
     assert_eq!((h.machines.snapshot().waiting, h.slots.used()), (0, 1));
+}
+
+#[tokio::test]
+async fn a_mac_held_for_an_update_or_stopping_offers_github_only_the_jobs_it_runs() {
+    for hold in ["update", "stop"] {
+        let (mut h, _running) = busy_mac().await;
+        h.scaler
+            .scale(Some(&assigned(vec![pull_job(REPO, 2)], 2)))
+            .await
+            .unwrap();
+        assert_eq!(h.machines.snapshot().waiting, 1);
+        match hold {
+            "update" => h.machines.hold_for_restart(true),
+            _ => h.machines.drain(),
+        }
+        let capacity = h.scaler.scale(None).await.unwrap();
+        assert_eq!(
+            capacity, 1,
+            "held for {hold}: the running job only, not the one in line"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_job_in_line_for_ten_minutes_is_offered_no_more_room_even_when_github_hands_it_here_again() {
+    let (mut h, _running) = busy_mac().await;
+    let waits = pull_job(REPO, 2);
+    let capacity = h
+        .scaler
+        .scale(Some(&assigned(vec![waits.clone()], 2)))
+        .await
+        .unwrap();
+    assert_eq!(capacity, 2, "the running job and the one in line");
+    h.clock.advance(cf_daemon::PLACE_LIMIT - Duration::from_secs(1));
+    assert_eq!(
+        h.scaler.scale(None).await.unwrap(),
+        2,
+        "given up before ten minutes"
+    );
+    h.clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        h.scaler.scale(None).await.unwrap(),
+        1,
+        "a job that waited ten minutes still had room offered: GitHub hands it back here at each take-back"
+    );
+    // GitHub takes it back (a cancel with no Actions runner) and, with room offered elsewhere none, hands it here
+    // again: it keeps the age it had, so the polls still offer it nothing.
+    let taken_back = Message {
+        completed: vec![completed("", "canceled", waits.clone())],
+        statistics: counts(1),
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&taken_back)).await.unwrap();
+    let capacity = h.scaler.scale(Some(&assigned(vec![waits], 2))).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 1, "it still waits here for room");
+    assert_eq!(capacity, 1, "handed here again, it was offered room as a new job");
+    // Another job assigned now is new: its place counts.
+    let capacity = h
+        .scaler
+        .scale(Some(&assigned(vec![pull_job(REPO, 3)], 3)))
+        .await
+        .unwrap();
+    assert_eq!(capacity, 2);
+}
+
+/// GitHub's assignments name no request ID, so a re-run of a job (the same run, the same name) reads as that job: one
+/// that went elsewhere and came back as a re-run long after has waited in no line here.
+#[tokio::test]
+async fn a_re_run_of_a_job_that_waited_ten_minutes_and_ran_elsewhere_is_offered_room_as_a_new_job() {
+    let (mut h, _running) = busy_mac().await;
+    let waits = pull_job(REPO, 2);
+    h.scaler
+        .scale(Some(&assigned(vec![waits.clone()], 2)))
+        .await
+        .unwrap();
+    h.clock.advance(cf_daemon::PLACE_LIMIT);
+    assert_eq!(h.scaler.scale(None).await.unwrap(), 1, "it waited ten minutes");
+    // GitHub takes it back and another machine runs it, which this scale set never hears of.
+    let taken_back = Message {
+        completed: vec![completed("", "canceled", waits.clone())],
+        statistics: counts(1),
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&taken_back)).await.unwrap();
+    h.clock.advance(Duration::from_secs(60 * 60));
+    let capacity = h.scaler.scale(Some(&assigned(vec![waits], 2))).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 1);
+    assert_eq!(
+        capacity, 2,
+        "a re-run an hour later was offered no room, as if it had waited ten minutes"
+    );
 }
 
 #[tokio::test]

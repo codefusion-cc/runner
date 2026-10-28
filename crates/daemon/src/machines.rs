@@ -1996,6 +1996,11 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         0
     }
 
+    fn held(&self) -> bool {
+        let inner = self.lock();
+        inner.paused || inner.draining || inner.holding
+    }
+
     fn state(&self) -> (bool, String) {
         let mut inner = self.lock();
         let now = inner.host.now();

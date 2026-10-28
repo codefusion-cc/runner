@@ -265,6 +265,10 @@ impl Slots for Spy {
         self.machines.state()
     }
 
+    fn held(&self) -> bool {
+        self.machines.held()
+    }
+
     fn reserve_docker(&self, size: Size) -> Result<Ticket, Refusal> {
         self.machines.reserve_docker(size)
     }

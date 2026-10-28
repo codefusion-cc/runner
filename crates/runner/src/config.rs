@@ -1,10 +1,11 @@
 //! The Runner's configuration file: where its state is, which GitHub App and console it talks to, what the host
 //! is for. One JSON file that the service manager's entry names; nothing in it is a secret.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cf_budget::{Limits, Millis, Mode, Settings};
+use cf_budget::{Limits, Millis, Mode, Settings, Size};
 use cf_console_client::Os;
 use cf_daemon::names::slug;
 use serde::Deserialize;
@@ -77,6 +78,10 @@ pub struct Config {
     /// for the default, 2 GB on a 16 GB Mac nobody works at.
     #[serde(default)]
     pub min_free_memory_percent: Option<u32>,
+    /// vCPUs of a machine of each size named, by its label (`{"cf-4g": 3}`), 1 to 64 and no more than CI may use;
+    /// the sizes left out keep the host's defaults.
+    #[serde(default)]
+    pub vcpus: BTreeMap<String, u32>,
     /// The git checkout that belongs to the Runner alone, which the console's `update` fetches, checks out at a
     /// commit and builds in. Without it the Runner is updated by hand: a person's checkout is never touched.
     #[serde(default)]
@@ -231,6 +236,14 @@ impl Config {
                 return Err(format!("labels: `{label}` is listed twice"));
             }
         }
+        for (label, vcpus) in &self.vcpus {
+            if Size::from_label(label).is_none() {
+                return Err(format!("vcpus: `{label}` is no size"));
+            }
+            if !(1..=64).contains(vcpus) {
+                return Err(format!("vcpus: {label} between 1 and 64"));
+            }
+        }
         if !(1..=8).contains(&self.docker_max_jobs) {
             return Err("docker_max_jobs: between 1 and 8".into());
         }
@@ -264,6 +277,7 @@ impl Config {
             max_machines: self.max_jobs,
             idle_after: self.idle_minutes.map(|minutes| Millis::mins(minutes.into())),
             floor_percent: self.min_free_memory_percent,
+            vcpus: Size::ALL.map(|size| self.vcpus.get(size.label()).copied()),
         }
     }
 
@@ -632,6 +646,24 @@ mod tests {
     }
 
     #[test]
+    fn the_vcpus_of_a_size_are_set_by_its_label_and_only_for_a_size_there_is() {
+        let set = with(|v| v["vcpus"] = serde_json::json!({"cf-4g": 3, "cf-6g": 3}))
+            .expect("config")
+            .limits();
+        assert_eq!(set.vcpus, [None, Some(3), Some(3), None]);
+        for (vcpus, why) in [
+            (serde_json::json!({"cf-5g": 3}), "cf-5g"),
+            (serde_json::json!({"cf-4g": 0}), "between 1 and 64"),
+            (serde_json::json!({"cf-4g": 65}), "between 1 and 64"),
+        ] {
+            let error = with(|v| v["vcpus"] = vcpus.clone()).expect_err("refused");
+            assert!(error.contains(why), "{vcpus}: {error}");
+        }
+        assert!(with(|v| v["vcpus"] = serde_json::json!({"cf-4g": -1})).is_err());
+        assert!(with(|v| v["vcpus"] = serde_json::json!([3])).is_err());
+    }
+
+    #[test]
     fn the_limits_for_jobs_are_the_defaults_unless_set_and_set_only_within_reason() {
         assert_eq!(Config::parse(WHOLE).expect("config").limits(), Limits::default());
         assert_eq!(
@@ -644,6 +676,7 @@ mod tests {
                 max_machines: Some(2),
                 idle_after: None,
                 floor_percent: Some(8),
+                ..Limits::default()
             })
         );
         // Idle minutes are a workstation's, and only a Mac is one.

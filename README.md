@@ -207,7 +207,16 @@ cloud-hypervisor for it. On a cloud VM KVM means nested virtualization: on Googl
 made with `--enable-nested-virtualization` (AMD and Arm machines there offer none), and `check` says so when
 `/dev/kvm` is missing.
 
-Once, as root (Ubuntu 24.04 also needs the line about user namespaces):
+A fresh host does all of this unattended with `scripts/host-setup.sh`, as root from a clone of this repository, with
+the one-time code the console's Add a machine shows in a file only root reads. It takes its GitHub tokens from the
+console, so no App key goes on it; run again (a reboot's startup script), it only makes sure the service runs.
+
+```sh
+sudo scripts/host-setup.sh --machine <name> --console <url> --code-file <file>
+```
+
+The script's head lists its options (`--home`, `--image`, `--ref`, `--check`). By hand, once, as root (Ubuntu 24.04
+also needs the line about user namespaces):
 
 ```sh
 sudo apt install passt git curl build-essential pkg-config libssl-dev
