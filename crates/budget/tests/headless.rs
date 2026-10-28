@@ -395,3 +395,36 @@ fn a_sizes_vcpus_are_at_least_one_and_no_more_than_ci_may_use() {
         assert_eq!(settings.clone().limited(&limits).is_ok(), ok, "{vcpus} vCPUs");
     }
 }
+
+proptest! {
+    /// vCPUs the owner sets let more machines run side by side than the defaults: their overheads still fit beside
+    /// the floor and the host's own share.
+    #[test]
+    fn the_machines_fewer_vcpus_let_in_fit_with_their_overheads(
+        total_mib in 1100..96 * 1024u64,
+        cores in 1..64u32,
+        fast in 0..72u32,
+        vcpus in 1..=4u32,
+        sizes in prop::collection::vec(prop::sample::select(Size::ALL.to_vec()), 0..40),
+    ) {
+        let defaults = Settings::for_headless(host(total_mib * MIB, cores), fast);
+        let limits = Limits { vcpus: [Some(vcpus.min(defaults.away.cpus)); 4], ..Limits::default() };
+        let settings = defaults.limited(&limits).expect("vCPUs within what CI may use");
+        let mut charges: Vec<Charge> = Vec::new();
+        for size in sizes {
+            if admit(&settings, &settings.away, settings.total_bytes, &charges, size).is_ok() {
+                charges.push(Charge {
+                    vm_bytes: size.vm_bytes(),
+                    host_bytes: settings.host_bytes(size),
+                    resident_bytes: 0,
+                    cpus: settings.vcpus_of(size),
+                });
+            }
+            let held: u64 = charges.iter().map(|charge| charge.host_bytes).sum();
+            prop_assert!(
+                held == 0 || held + settings.away.floor_bytes + Settings::HEADLESS_HOST_USE <= settings.total_bytes,
+                "{} MiB held of {} MiB with {} vCPUs a machine", held / MIB, total_mib, vcpus
+            );
+        }
+    }
+}

@@ -323,7 +323,8 @@ impl Settings {
     ///
     /// - The most machines at once, when set.
     /// - The vCPUs of a size, when set: at least 1, and no more than CI may use. A floor set beside them changes the
-    ///   other sizes' only.
+    ///   other sizes' only. On a headless host, a cap that kept the overhead of fewer machines than the CPUs now run
+    ///   side by side is lowered by theirs.
     /// - The time without the person, which only a workstation waits for.
     /// - The floor as a share of the memory, 1% to 90%, and never under [`Settings::LEAST_FLOOR`]. It is the floor
     ///   on a dedicated host and on a workstation whose person is away; while a workstation's person is there the
@@ -354,6 +355,7 @@ impl Settings {
                 self.in_use = self.away;
             }
         }
+        let side_by_side = self.most_side_by_side();
         for (size, vcpus) in Size::ALL.into_iter().zip(limits.vcpus) {
             let Some(vcpus) = vcpus else { continue };
             if vcpus > self.away.cpus {
@@ -364,6 +366,13 @@ impl Settings {
                 });
             }
             self.vcpus[size.index()] = vcpus;
+        }
+        // A headless host's cap keeps the overhead of as many machines as its CPUs run: fewer vCPUs run more.
+        let more = self.most_side_by_side().saturating_sub(side_by_side);
+        if self.headless && more > 0 {
+            let overheads = u64::from(more).saturating_mul(self.vm_host_overhead_bytes);
+            self.away.cap_bytes = self.away.cap_bytes.saturating_sub(overheads);
+            self.in_use.cap_bytes = self.in_use.cap_bytes.min(self.away.cap_bytes);
         }
         self.check()?;
         Ok(self)
@@ -456,6 +465,11 @@ impl Settings {
         by_cap
             .min(limits.cpus / self.vcpus_of(size).max(1))
             .min(self.max_machines.unwrap_or(u32::MAX))
+    }
+
+    /// The most machines the CPUs CI may use run side by side: as many as of the size with the fewest vCPUs.
+    fn most_side_by_side(&self) -> u32 {
+        self.away.cpus / self.vcpus.iter().copied().min().unwrap_or(1).max(1)
     }
 
     /// vCPUs of a VM of this size.
