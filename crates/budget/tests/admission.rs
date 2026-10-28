@@ -306,6 +306,18 @@ fn the_cap_is_met_exactly_and_missed_by_one_size() {
 }
 
 #[test]
+fn room_offered_for_jobs_not_assigned_yet_counts_as_held() {
+    // 10 cores, 8 for CI: a cf-4g offered takes half the vCPUs, so two cf-2g or one larger machine fit beside it.
+    let budget = open(dedicated());
+    let now = secs(60);
+    assert_eq!(budget.free_beside(now, &[]), budget.free(now));
+    assert_eq!(budget.free_beside(now, &[Size::G4]), Free([2, 1, 1, 1]));
+    assert_eq!(budget.free_beside(now, &[Size::G4, Size::G4]), Free::default());
+    // Nothing is held by it: the budget grants what it did before.
+    assert_eq!(budget.free(now), Free([4, 2, 2, 1]));
+}
+
+#[test]
 fn vcpus_are_never_overcommitted() {
     // 10 cores, 8 for CI: two cf-4g take them all, whatever memory is left.
     let mut budget = open(dedicated());

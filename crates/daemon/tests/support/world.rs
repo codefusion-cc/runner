@@ -49,6 +49,8 @@ pub async fn mini_with_one(peak: u64, held: Option<u64>) -> (World, String) {
 /// One Mac with its machines, and GitHub's list of the Actions runners registered from it.
 pub struct World {
     pub parts: TestParts,
+    /// The wall clock, `parts.clock`.
+    pub clock: Arc<TestClock>,
     pub m: Arc<TestMachines>,
     /// The Actions runners GitHub has registered.
     pub registered: BTreeSet<String>,
@@ -73,11 +75,12 @@ impl World {
 
     /// A Mac with these numbers whose records are kept there.
     pub fn keeping(settings: cf_budget::Settings, store: Arc<dyn Store>) -> World {
+        let clock = Arc::new(TestClock::default());
         let parts = TestParts {
             vms: FakeVms::default(),
             store,
             roster: Arc::new(Roster::new()),
-            clock: Arc::new(TestClock::default()),
+            clock: clock.clone(),
             reports: Arc::new(ReportLog::default()),
             settings,
             nudges: Arc::new(AtomicUsize::new(0)),
@@ -87,6 +90,7 @@ impl World {
         let m = parts.machines(None);
         World {
             parts,
+            clock,
             m,
             registered: BTreeSet::new(),
             next: 0,

@@ -1772,8 +1772,9 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
         sets.len() == 2 && sets.iter().all(|s| s.has_session)
     })
     .await;
-    // Polls that stand for seconds, as GitHub's do: only the Runner ends one early.
-    rig.github.set_poll_timeout(Duration::from_secs(4));
+    // Polls that stand longer than the checks below, as GitHub's do: only the Runner ends one early. The two scale
+    // sets take turns at the one slot, two polls each, so a poll stands no longer than a turn fits the wait for room.
+    rig.github.set_poll_timeout(Duration::from_secs(1));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     rig.queue().await;

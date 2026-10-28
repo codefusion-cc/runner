@@ -72,6 +72,18 @@ pub trait Slots: Send + Sync {
     /// How many more slots of this size would open now; 0 while the machine takes no new jobs.
     fn open_slots(&self, size: Size) -> usize;
 
+    /// Whether the poll scale set `set` is about to send may offer GitHub room for one more job of `size`: 1 or 0.
+    /// The machine's scale sets share its room: a slot one poll in flight offers is offered by no other until that
+    /// poll ends, so GitHub never assigns the machine more jobs than it can start. Scale sets with jobs queued go
+    /// before those without.
+    fn offer_room(&self, _set: i64, size: Size) -> usize {
+        self.open_slots(size).min(1)
+    }
+
+    /// The poll scale set `set` is about to send offers no room, for its own reasons, or none follows: the room its
+    /// last poll offered is the others' again.
+    fn withdraw_offer(&self, _set: i64) {}
+
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
 
