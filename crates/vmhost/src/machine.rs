@@ -2,7 +2,7 @@
 //! forever. No clock, no thread and no file here: [`crate::run`] feeds it and does what it says.
 
 use crate::state::{End, Ended, Stage};
-use cf_guest_proto::{GuestEnd, GuestMessage, OomEvent, PROTOCOL, StopReason, Summary, Usage};
+use cf_guest_proto::{GuestEnd, GuestMessage, OomEvent, PROTOCOL, Pressure, StopReason, Summary, Usage};
 use std::time::Duration;
 
 /// How long a vm-host waits at each stage.
@@ -128,6 +128,10 @@ pub struct Machine {
     stop: Option<(StopReason, Duration)>,
     boot_ms: Option<u64>,
     usage: Option<Usage>,
+    /// The guest's CPU time at its last heartbeat, and when that came.
+    cpu_at: Option<(u64, Duration)>,
+    cpu_load: Option<u32>,
+    pressure_peak: Option<Pressure>,
     oom: Option<OomEvent>,
     end: Option<(End, Option<String>, Option<Summary>)>,
 }
@@ -146,6 +150,9 @@ impl Machine {
             stop: None,
             boot_ms: None,
             usage: None,
+            cpu_at: None,
+            cpu_load: None,
+            pressure_peak: None,
             oom: None,
             end: None,
         };
@@ -170,6 +177,17 @@ impl Machine {
     /// What the job used at the guest's last heartbeat.
     pub fn usage(&self) -> Option<&Usage> {
         self.usage.as_ref()
+    }
+
+    /// The CPUs the job kept busy over the last [`Limits::publish`] or a little more, in hundredths of a CPU: 150 is
+    /// one and a half. `None` until the guest's heartbeats span that long.
+    pub fn cpu_load(&self) -> Option<u32> {
+        self.cpu_load
+    }
+
+    /// The worst of each stall the guest reported over the job.
+    pub fn pressure_peak(&self) -> Option<Pressure> {
+        self.pressure_peak
     }
 
     /// The first out-of-memory stop the guest reported.
@@ -249,8 +267,31 @@ impl Machine {
         }
     }
 
+    /// Keeps what the job uses, the CPUs it kept busy and its worst stalls. The load is over at least
+    /// [`Limits::publish`], as long as each state file lasts and the kernel's own 10 s averages of the stalls: a
+    /// heartbeat's 2 s would show a burst or a pause as the whole picture.
+    fn heartbeat(&mut self, usage: Usage, now: Duration) {
+        match self.cpu_at {
+            // A fresh guest after a reboot counts its CPU time from zero again: a window starts there.
+            Some((before, _)) if usage.cpu_usec < before => self.cpu_at = Some((usage.cpu_usec, now)),
+            Some((before, at)) => {
+                let elapsed = now.saturating_sub(at);
+                if elapsed >= self.limits.publish && !elapsed.is_zero() {
+                    let used = u128::from(usage.cpu_usec - before);
+                    self.cpu_load = u32::try_from(used * 100 / elapsed.as_micros()).ok();
+                    self.cpu_at = Some((usage.cpu_usec, now));
+                }
+            }
+            None => self.cpu_at = Some((usage.cpu_usec, now)),
+        }
+        if let Some(pressure) = usage.pressure {
+            self.pressure_peak = Some(self.pressure_peak.map_or(pressure, |peak| peak.max(pressure)));
+        }
+        self.usage = Some(usage);
+    }
+
     fn summary(&mut self, summary: Summary, now: Duration) -> Vec<Action> {
-        self.usage = Some(summary.usage);
+        self.heartbeat(summary.usage, now);
         if self.oom.is_none() {
             self.oom = summary.oom.clone();
         }
@@ -369,7 +410,7 @@ impl Machine {
             }
             GuestMessage::Ready { .. } => Vec::new(),
             GuestMessage::Heartbeat(usage) => {
-                self.usage = Some(usage);
+                self.heartbeat(usage, now);
                 if now.saturating_sub(self.published) >= self.limits.publish {
                     self.published = now;
                     vec![Action::Publish]

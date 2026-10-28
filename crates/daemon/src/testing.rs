@@ -7,7 +7,7 @@ use std::time::Duration;
 use cf_budget::FakeHost;
 use cf_budget::{GIB, HostFacts, Millis, Mode, Settings, Size};
 use cf_ghapp::Clock;
-use cf_guest_proto::{GuestEnd, OomEvent, Process, StopReason, Summary, Usage};
+use cf_guest_proto::{GuestEnd, OomEvent, Pressure, Process, Psi, StopReason, Summary, Usage};
 use cf_vmhost::{End, Ended, JobRequest, JobState, Stage};
 
 use crate::machines::{JobReport, MachineConfig, MachineParts, Machines, Reports};
@@ -159,7 +159,23 @@ impl FakeVms {
                 cpu_usec: 1_000_000,
                 disk_bytes,
                 pids: 3,
+                memory_file_bytes: 0,
+                pressure: None,
             });
+        });
+    }
+
+    /// The job keeps this load busy (hundredths of a CPU) and stalls this much inside its machine, while the machine's
+    /// CPUs wait this much for the host's; the vm-host keeps the worst of each, as the real one does. After
+    /// [`FakeVms::usage`].
+    pub fn strain(&self, job: &str, load: u32, pressure: Pressure, host_cpu: Psi) {
+        self.with(job, |vm| {
+            let state = &mut vm.state;
+            state.usage.as_mut().expect("usage first").pressure = Some(pressure);
+            state.cpu_load = Some(load);
+            state.pressure_peak = Some(state.pressure_peak.map_or(pressure, |peak| peak.max(pressure)));
+            state.host_cpu = Some(host_cpu);
+            state.host_cpu_peak = Some(state.host_cpu_peak.map_or(host_cpu, |peak| peak.max(host_cpu)));
         });
     }
 
@@ -286,6 +302,8 @@ fn finish(vm: &mut FakeVm, end: End) {
         cpu_usec: 2_000_000,
         disk_bytes: 0,
         pids: 0,
+        memory_file_bytes: 0,
+        pressure: None,
     });
     let heard = !matches!(end, End::GuestLost | End::BootFailed);
     vm.state.end = Some(Ended {
@@ -302,6 +320,8 @@ fn finish(vm: &mut FakeVm, end: End) {
         }),
         at: 0,
     });
+    // A machine that is gone waits for nothing; its worst wait stays.
+    vm.state.host_cpu = None;
     vm.state.stage = Stage::Ended;
     vm.alive = false;
 }
@@ -343,6 +363,10 @@ impl Vms for FakeVms {
                 boot_ms: ready.then_some(1200),
                 usage: None,
                 resident_bytes: None,
+                cpu_load: None,
+                pressure_peak: None,
+                host_cpu: None,
+                host_cpu_peak: None,
                 oom: None,
                 end: None,
             },

@@ -8,7 +8,7 @@ use crate::events::{Event, Events};
 use crate::sandbox::{self, Access, Sandbox};
 use crate::{programs, vsock};
 use cf_nft::Ip;
-use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
+use cf_vmm::{Channel, ExitCell, Network, Psi, Vm, VmExit, VmSpec, Vmm, VmmError};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
@@ -556,6 +556,13 @@ impl Vm for ChVm {
             return None;
         }
         self.shared.group.resident()
+    }
+
+    fn cpu_pressure(&self) -> Option<Psi> {
+        if self.shared.ended() {
+            return None;
+        }
+        self.shared.group.cpu_pressure()
     }
 }
 

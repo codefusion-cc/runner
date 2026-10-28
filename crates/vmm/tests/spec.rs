@@ -184,6 +184,12 @@ fn an_arm64_guest_is_told_to_hide_sme_from_its_programs_and_no_other_guest_is() 
 }
 
 #[test]
+fn the_guest_kernel_keeps_the_pressure_accounts_a_jobs_stalls_are_read_from() {
+    // Alpine's linux-virt has CONFIG_PSI_DEFAULT_DISABLED: without the word, no cgroup has a pressure file.
+    assert!(cf_vmm::COMMAND_LINE.split(' ').any(|word| word == "psi=1"));
+}
+
+#[test]
 fn a_panicking_guest_kernel_restarts_at_once_rather_than_hanging() {
     assert!(cf_vmm::COMMAND_LINE.split(' ').any(|word| word == "panic=-1"));
 }

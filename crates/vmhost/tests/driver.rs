@@ -8,7 +8,7 @@ use cf_guest_proto::{
 use cf_vmhost::control::{self, Request};
 use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run};
 use cf_vmm::testing::{FakeVmm, PowerSwitch, Script, Stop};
-use cf_vmm::{Network, VmmError};
+use cf_vmm::{Network, Psi, VmmError};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -85,6 +85,8 @@ fn usage() -> Usage {
         cpu_usec: 300,
         disk_bytes: 400,
         pids: 5,
+        memory_file_bytes: 0,
+        pressure: None,
     }
 }
 
@@ -436,9 +438,16 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
     ]);
     // A guest that touched more than its job ever held: the Mac holds what the guest touched.
     vmm.hold(Some(4061 << 20));
-    let asker = {
-        let layout = layout.clone();
-        std::thread::spawn(move || {
+    // Its vCPUs wait for the host's cores a quarter of the time.
+    let stalled = Psi {
+        some: 2500,
+        full: 300,
+    };
+    vmm.stall(Some(stalled));
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(30);
+    let (state, running) = std::thread::scope(|scope| {
+        let asker = scope.spawn(|| {
             // The daemon's side: wait until the job runs, look at it, then evict it.
             let running = loop {
                 match control::ask(&layout, "a", &Request::State, Duration::from_secs(2)) {
@@ -446,6 +455,8 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
                     _ => std::thread::sleep(Duration::from_millis(10)),
                 }
             };
+            // The wait eases before the stop: the job's worst stays what it was.
+            vmm.stall(Some(Psi { some: 100, full: 0 }));
             control::ask(
                 &layout,
                 "a",
@@ -457,17 +468,32 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
             )
             .unwrap();
             running
-        })
-    };
-    let mut limits = quick();
-    limits.heartbeat = Duration::from_secs(30);
-    let state = go(&vmm, &layout, request("a"), limits).unwrap();
-    let running = asker.join().unwrap();
+        });
+        let state = go(&vmm, &layout, request("a"), limits).unwrap();
+        (state, asker.join().unwrap())
+    });
     assert_eq!(
-        (running.pid, running.usage, running.resident_bytes, running.end),
-        (std::process::id(), Some(usage()), Some(4061 << 20), None)
+        (
+            running.pid,
+            running.usage,
+            running.resident_bytes,
+            running.host_cpu,
+            running.end
+        ),
+        (
+            std::process::id(),
+            Some(usage()),
+            Some(4061 << 20),
+            Some(stalled),
+            None
+        )
     );
     assert_eq!(state.resident_bytes, None, "a machine that is gone holds nothing");
+    assert_eq!(
+        (state.host_cpu, state.host_cpu_peak),
+        (None, Some(stalled)),
+        "the job's end keeps its worst wait"
+    );
     assert_eq!(JobState::read(&layout, "a").unwrap().resident_bytes, None);
     let stop = stops.recv().unwrap();
     assert_eq!((stop.reason, stop.grace_ms), (StopReason::EvictedMemory, 20_000));

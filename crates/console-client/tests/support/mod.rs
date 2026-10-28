@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cf_console_client::{
     Activity, Client, Enroll, Enrolled, HostStatus, JobEvent, JobKind, MachineInfo, Report, ScaleSetStatus,
-    Status, enroll,
+    Share, Stalls, Status, enroll,
 };
 use cf_fake_console::FakeConsole;
 use cf_ghapp::{Http, RetryPolicy};
@@ -180,6 +180,15 @@ pub fn event(n: usize) -> JobEvent {
             disk_peak_bytes: None,
             cpu_usec: None,
             wall_ms: None,
+            stalls_peak: Some(Stalls {
+                memory: Share {
+                    some: 4210,
+                    full: 3010,
+                },
+                cpu: Share { some: 120, full: 0 },
+                io: Share { some: 0, full: 0 },
+            }),
+            host_cpu_peak: Some(Share { some: 1550, full: 0 }),
         }),
     }
 }

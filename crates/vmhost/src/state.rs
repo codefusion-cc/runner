@@ -1,7 +1,7 @@
 //! What a vm-host says about its job, in `run/<job>.json`.
 
 use crate::Layout;
-use cf_guest_proto::{GuestEnd, OomEvent, StopReason, Summary, Usage};
+use cf_guest_proto::{GuestEnd, OomEvent, Pressure, Psi, StopReason, Summary, Usage};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -122,6 +122,20 @@ pub struct JobState {
     /// or when its process could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident_bytes: Option<u64>,
+    /// The CPUs the job kept busy over about the last 10 s, in hundredths of a CPU (150 is one and a half); of
+    /// [`JobState::cpus`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_load: Option<u32>,
+    /// The worst of each stall the job's guest reported, over the whole job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_peak: Option<Pressure>,
+    /// How long the machine's vCPUs waited for one of the host's CPUs, when this state was written
+    /// ([`cf_vmm::Vm::cpu_pressure`]): the guest cannot see this, it only finds its time gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu: Option<Psi>,
+    /// The worst of [`JobState::host_cpu`] over the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu_peak: Option<Psi>,
     /// The first process the kernel stopped for memory, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oom: Option<OomEvent>,

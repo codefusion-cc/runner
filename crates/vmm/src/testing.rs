@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{Channel, ExitCell, Vm, VmExit, VmSpec, Vmm, VmmError};
+use crate::{Channel, ExitCell, Psi, Vm, VmExit, VmSpec, Vmm, VmmError};
 
 /// What the guest of one scripted machine does with its end of the channel. When it returns, the machine has
 /// powered itself off.
@@ -76,6 +76,7 @@ pub struct FakeVmm {
     started: Mutex<Vec<VmSpec>>,
     stops: Arc<Mutex<usize>>,
     resident: Arc<Mutex<Option<u64>>>,
+    stalls: Arc<Mutex<Option<Psi>>>,
 }
 
 impl FakeVmm {
@@ -102,6 +103,12 @@ impl FakeVmm {
     pub fn hold(&self, bytes: Option<u64>) {
         *self.resident.lock().unwrap() = bytes;
     }
+
+    /// How long each machine of this monitor waits for the host's CPUs from now on ([`Vm::cpu_pressure`]); `None`,
+    /// the start, when it cannot be told.
+    pub fn stall(&self, share: Option<Psi>) {
+        *self.stalls.lock().unwrap() = share;
+    }
 }
 
 impl Vmm for FakeVmm {
@@ -127,6 +134,7 @@ impl Vmm for FakeVmm {
                 stop,
                 stops: self.stops.clone(),
                 resident: self.resident.clone(),
+                stalls: self.stalls.clone(),
             })),
         }
     }
@@ -139,6 +147,7 @@ struct FakeVm {
     stop: Stop,
     stops: Arc<Mutex<usize>>,
     resident: Arc<Mutex<Option<u64>>>,
+    stalls: Arc<Mutex<Option<Psi>>>,
 }
 
 impl Vm for FakeVm {
@@ -194,6 +203,13 @@ impl Vm for FakeVm {
             return None;
         }
         *self.resident.lock().unwrap()
+    }
+
+    fn cpu_pressure(&self) -> Option<Psi> {
+        if self.power.wait(Duration::ZERO).is_some() {
+            return None;
+        }
+        *self.stalls.lock().unwrap()
     }
 }
 

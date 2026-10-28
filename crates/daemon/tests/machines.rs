@@ -13,7 +13,7 @@ use cf_daemon::testing::pass;
 use cf_daemon::{
     Answer, Claim, EndKind, EventKind, Events, Hosts, JobEvent, RESULT_WAIT, SizeRoom, Slots, Ticket,
 };
-use cf_guest_proto::StopReason;
+use cf_guest_proto::{Pressure as Stalls, Psi, StopReason};
 use cf_vmhost::{End, OutOfMemory};
 use support::Log;
 use support::world::{REPO, SET, SIZE, World, ids};
@@ -130,6 +130,71 @@ async fn a_job_that_succeeds_is_reported_once_with_what_was_measured_and_leaves_
     // Nothing is said twice, however long the daemon goes on.
     pass(&w.m, 300);
     assert_eq!(w.reports().len(), 2);
+}
+
+#[tokio::test]
+async fn a_jobs_load_and_stalls_show_while_it_runs_and_its_worst_stalls_at_its_end() {
+    let mut settings = cf_daemon::testing::settings_for(2);
+    settings.vcpus[Size::G4.index()] = 2;
+    let mut w = World::on(settings);
+    let runner = w.running_sized(Size::G4).await;
+    let job = job_name(&runner).to_string();
+    let psi = |some, full| Psi { some, full };
+    let frozen = Stalls {
+        memory: psi(9000, 6500),
+        cpu: psi(1200, 0),
+        io: psi(300, 100),
+    };
+    let calm = Stalls {
+        memory: psi(50, 0),
+        cpu: psi(4000, 10),
+        io: psi(0, 0),
+    };
+    w.parts.vms.usage(&job, 3 * GIB, 3 * MIB);
+    w.parts.vms.strain(&job, 150, frozen, psi(2500, 300));
+    pass(&w.m, 1);
+    let snapshot = w.m.snapshot();
+    let machine = snapshot
+        .machines
+        .iter()
+        .find(|m| m.runner == runner)
+        .expect("the machine");
+    assert_eq!(
+        machine.cpu_percent,
+        Some(75),
+        "one and a half of a cf-4g's two CPUs"
+    );
+    assert_eq!(
+        (machine.pressure, machine.host_cpu),
+        (Some(frozen), Some(psi(2500, 300)))
+    );
+
+    // A late heartbeat makes a little more than the machine's two CPUs, which no machine has.
+    w.parts.vms.strain(&job, 206, calm, psi(100, 0));
+    pass(&w.m, 1);
+    let snapshot = w.m.snapshot();
+    let machine = snapshot
+        .machines
+        .iter()
+        .find(|m| m.runner == runner)
+        .expect("the machine");
+    assert_eq!(machine.cpu_percent, Some(100));
+
+    w.parts.vms.end(&job, End::Ok);
+    w.github(EventKind::Completed, &runner, "succeeded");
+    pass(&w.m, 2);
+    let reports = w.reports();
+    let done = &reports.last().expect("the end").machine;
+    assert_eq!(
+        done.pressure_peak,
+        Some(Stalls {
+            memory: psi(9000, 6500),
+            cpu: psi(4000, 10),
+            io: psi(300, 100),
+        })
+    );
+    assert_eq!(done.host_cpu_peak, Some(psi(2500, 300)));
+    w.assert_nothing_left();
 }
 
 #[tokio::test]

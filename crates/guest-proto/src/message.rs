@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use cf_secret::Secret;
 
+use crate::Pressure;
+
 /// What the host sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -226,6 +228,12 @@ pub struct Usage {
     pub disk_bytes: u64,
     /// Processes and threads of the job.
     pub pids: u32,
+    /// The part of `memory_bytes` that is page cache, which the kernel takes back before it stalls the job.
+    #[serde(default)]
+    pub memory_file_bytes: u64,
+    /// What the job stalled on; `None` from a kernel without pressure stall information.
+    #[serde(default)]
+    pub pressure: Option<Pressure>,
 }
 
 /// One process stopped for memory, and who held the memory at that moment.

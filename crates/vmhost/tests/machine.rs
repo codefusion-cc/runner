@@ -1,6 +1,8 @@
 //! A job's state machine against the Runner's waits and the ways a job goes wrong.
 
-use cf_guest_proto::{GuestEnd, GuestMessage, OomEvent, PROTOCOL, Process, StopReason, Summary, Usage};
+use cf_guest_proto::{
+    GuestEnd, GuestMessage, OomEvent, PROTOCOL, Pressure, Process, Psi, StopReason, Summary, Usage,
+};
 use cf_vmhost::{Action, End, Event, Limits, Machine, Stage};
 use proptest::prelude::*;
 use std::time::Duration;
@@ -20,6 +22,8 @@ fn usage(memory: u64) -> Usage {
         cpu_usec: 1,
         disk_bytes: 2,
         pids: 3,
+        memory_file_bytes: 0,
+        pressure: None,
     }
 }
 
@@ -72,6 +76,77 @@ fn running(limits: Limits) -> Machine {
 
 fn end_of(machine: &Machine) -> Option<End> {
     machine.ended(0).map(|ended| ended.end)
+}
+
+fn beat(cpu_usec: u64, pressure: Option<Pressure>) -> Event {
+    Event::Guest(GuestMessage::Heartbeat(Usage {
+        cpu_usec,
+        pressure,
+        ..usage(1)
+    }))
+}
+
+fn stalls(memory: u32, cpu: u32, io: u32) -> Pressure {
+    let psi = |some| Psi { some, full: some / 2 };
+    Pressure {
+        memory: psi(memory),
+        cpu: psi(cpu),
+        io: psi(io),
+    }
+}
+
+#[test]
+fn the_cpu_load_is_the_cpu_time_used_over_ten_seconds_of_heartbeats() {
+    let mut machine = running(limits());
+    machine.handle(beat(10_000_000, None), s(2));
+    // Heartbeats 2 s apart do not make a load yet: a moment's burst is not how busy a job is.
+    machine.handle(beat(14_000_000, None), s(4));
+    assert_eq!(machine.cpu_load(), None);
+    machine.handle(beat(25_000_000, None), s(12));
+    assert_eq!(machine.cpu_load(), Some(150), "15 s of CPU over 10 s");
+    machine.handle(beat(25_000_000, None), s(22));
+    assert_eq!(machine.cpu_load(), Some(0));
+    // A fresh guest after a reboot counts from zero again: the drop makes no load, the next ten seconds do.
+    machine.handle(beat(500_000, None), s(24));
+    assert_eq!(machine.cpu_load(), Some(0));
+    machine.handle(beat(10_500_000, None), s(30));
+    assert_eq!(machine.cpu_load(), Some(0));
+    machine.handle(beat(20_500_000, None), s(34));
+    assert_eq!(machine.cpu_load(), Some(200));
+}
+
+#[test]
+fn the_pressure_peak_is_the_worst_of_each_stall_over_the_heartbeats_and_the_summary() {
+    let mut machine = running(limits());
+    assert_eq!(machine.pressure_peak(), None);
+    machine.handle(beat(1, Some(stalls(4000, 100, 7))), s(2));
+    machine.handle(beat(2, None), s(4));
+    machine.handle(beat(3, Some(stalls(10, 2500, 3))), s(6));
+    assert_eq!(
+        machine.pressure_peak(),
+        Some(Pressure {
+            memory: Psi {
+                some: 4000,
+                full: 2000
+            },
+            cpu: Psi {
+                some: 2500,
+                full: 1250
+            },
+            io: Psi { some: 7, full: 3 },
+        })
+    );
+    let mut last = summary(GuestEnd::Exited, Some(0), false);
+    last.usage.pressure = Some(stalls(0, 0, 9000));
+    machine.handle(Event::Guest(GuestMessage::Exited(last)), s(8));
+    assert_eq!(
+        machine.pressure_peak().map(|peak| peak.io),
+        Some(Psi {
+            some: 9000,
+            full: 4500
+        })
+    );
+    assert_eq!(machine.pressure_peak().map(|peak| peak.memory.some), Some(4000));
 }
 
 #[test]

@@ -2,6 +2,7 @@
 //! machine, each registration and each job it still has to report.
 
 use cf_budget::Size;
+use cf_guest_proto::{Pressure, Psi};
 use cf_lifecycle::{End, Event, Limits, Phase, Saved, Slot};
 
 use crate::EndKind;
@@ -55,6 +56,12 @@ pub struct Ending {
     pub cpu_usec: Option<u64>,
     /// From the workload's start to its end, in milliseconds.
     pub wall_ms: Option<u64>,
+    /// The worst of each stall the job had inside its machine.
+    #[serde(default)]
+    pub pressure_peak: Option<Pressure>,
+    /// The worst wait of the machine's vCPUs for the host's CPUs.
+    #[serde(default)]
+    pub host_cpu_peak: Option<Psi>,
     /// What the vm-host said about the end, when it said something.
     pub message: Option<String>,
 }

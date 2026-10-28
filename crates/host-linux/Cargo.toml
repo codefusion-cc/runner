@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 cf-budget = { path = "../budget" }
 cf-clock = { path = "../clock" }
+cf-guest-proto = { path = "../guest-proto" }
 libc.workspace = true
 
 [dev-dependencies]

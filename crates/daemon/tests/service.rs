@@ -25,7 +25,7 @@ use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Clock as _, Http, RetryPolicy};
-use cf_guest_proto::StopReason;
+use cf_guest_proto::{Pressure as Stalls, Psi, StopReason};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 use cf_vmhost::End;
@@ -566,6 +566,38 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
         json!("2026-09-21T14:13:20Z")
     );
     assert_eq!(report["activity"]["cpuPercent"], json!(12.0));
+    // What the job uses and stalls on reaches the page, page cache and the host's wait for its CPUs included.
+    let job = job_name(&runner).to_string();
+    rig.parts.vms.usage(&job, 700 << 20, 3 << 20);
+    let psi = |some, full| Psi { some, full };
+    let strained = Stalls {
+        memory: psi(4210, 1300),
+        cpu: psi(800, 5),
+        io: psi(60, 20),
+    };
+    rig.parts.vms.strain(&job, 40, strained, psi(2500, 300));
+    until("the job's stalls in a report", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|report| report["status"]["runners"][0]["usage"]["stalls"].is_object())
+    })
+    .await;
+    let report = rig.console.reports().last().cloned().expect("report");
+    assert_eq!(
+        report["status"]["runners"][0]["usage"],
+        json!({
+            "cpuPercent": 40.0,
+            "memoryBytes": 700u64 << 20,
+            "fileBytes": 0,
+            "stalls": {
+                "memory": {"some": 4210, "full": 1300},
+                "cpu": {"some": 800, "full": 5},
+                "io": {"some": 60, "full": 20},
+            },
+            "hostCpu": {"some": 2500, "full": 300},
+        })
+    );
     // Beside the machine that runs, its 4 GB of machines take one more cf-2g and no cf-4g; larger sizes, never.
     assert_eq!(
         report["status"]["sizes"],
@@ -591,6 +623,18 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
     );
     assert_eq!(completed["machine"]["wallMs"], json!(4200));
     assert_eq!(completed["machine"]["bootMs"], json!(1200));
+    assert_eq!(
+        completed["machine"]["stallsPeak"],
+        json!({
+            "memory": {"some": 4210, "full": 1300},
+            "cpu": {"some": 800, "full": 5},
+            "io": {"some": 60, "full": 20},
+        })
+    );
+    assert_eq!(
+        completed["machine"]["hostCpuPeak"],
+        json!({"some": 2500, "full": 300})
+    );
     rig.nothing_left().await;
     assert_eq!(rig.events().len(), 2, "each once");
 }

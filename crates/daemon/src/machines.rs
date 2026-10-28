@@ -15,7 +15,7 @@ use cf_budget::{
     Turn, Usage,
 };
 use cf_ghapp::Clock;
-use cf_guest_proto::{StopReason, Workload};
+use cf_guest_proto::{Pressure, Psi, StopReason, Workload};
 use cf_lifecycle::{BreakerLimits, Effect, End, Event, Limits, Phase, Slot, StartBreaker};
 use cf_vmhost::{JobRequest, JobState, OutOfMemory, Stage};
 
@@ -137,6 +137,10 @@ pub struct MachineFacts {
     pub cpu_usec: Option<u64>,
     /// From the workload's start to its end, in milliseconds.
     pub wall_ms: Option<u64>,
+    /// The worst of each stall the job had inside its machine.
+    pub pressure_peak: Option<Pressure>,
+    /// The worst wait of the machine's vCPUs for the host's CPUs.
+    pub host_cpu_peak: Option<Psi>,
 }
 
 /// Where job reports go: the console's queue.
@@ -192,6 +196,14 @@ pub struct MachineStatus {
     pub counted_bytes: Option<u64>,
     /// The memory the job holds now.
     pub used_bytes: Option<u64>,
+    /// The part of it that is page cache.
+    pub file_bytes: Option<u64>,
+    /// The share of its CPUs the job kept busy over about the last 10 s, in percent.
+    pub cpu_percent: Option<u32>,
+    /// What the job stalled on over the last 10 s, inside its machine.
+    pub pressure: Option<Pressure>,
+    /// How long the machine's vCPUs waited for the host's CPUs over the last 10 s.
+    pub host_cpu: Option<Psi>,
     /// GitHub's job, once it took one.
     pub github: Option<GithubJob>,
 }
@@ -1121,6 +1133,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             disk_peak_bytes: summary.map(|s| s.disk_peak_bytes),
             cpu_usec: usage.map(|u| u.cpu_usec),
             wall_ms: summary.map(|s| s.wall_ms),
+            pressure_peak: job.last.as_ref().and_then(|s| s.pressure_peak),
+            host_cpu_peak: job.last.as_ref().and_then(|s| s.host_cpu_peak),
             message: vm_end.and_then(|e| e.message.clone()),
         });
         job.record.slot = Some(job.life.saved().into());
@@ -1701,6 +1715,20 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                         .as_ref()
                         .and_then(|s| s.usage.as_ref())
                         .map(|u| u.memory_bytes),
+                    file_bytes: job
+                        .last
+                        .as_ref()
+                        .and_then(|s| s.usage.as_ref())
+                        .map(|u| u.memory_file_bytes),
+                    // A load in hundredths of a CPU over the CPUs is the percent of them; a heartbeat that came late
+                    // can make it a little more, which no machine has.
+                    cpu_percent: job
+                        .last
+                        .as_ref()
+                        .and_then(|s| s.cpu_load?.checked_div(s.cpus))
+                        .map(|percent| percent.min(100)),
+                    pressure: job.last.as_ref().and_then(|s| s.usage.as_ref()?.pressure),
+                    host_cpu: job.last.as_ref().and_then(|s| s.host_cpu),
                     github: reported_job(&job.record),
                 })
                 .collect(),
@@ -1806,6 +1834,8 @@ fn facts(record: &Record) -> MachineFacts {
         disk_peak_bytes: ended.and_then(|e| e.disk_peak_bytes),
         cpu_usec: ended.and_then(|e| e.cpu_usec),
         wall_ms: ended.and_then(|e| e.wall_ms),
+        pressure_peak: ended.and_then(|e| e.pressure_peak),
+        host_cpu_peak: ended.and_then(|e| e.host_cpu_peak),
     }
 }
 

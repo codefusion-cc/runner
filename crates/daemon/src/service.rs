@@ -14,7 +14,7 @@ use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, DockerStatus, HeldJobs, HostStatus, JobKind, JobLimits,
     MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
-    RunnerUsage, ScaleSetStatus, SizeStatus, Status, Update,
+    RunnerUsage, ScaleSetStatus, Share, SizeStatus, Stalls, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -471,7 +471,26 @@ pub fn job_event(report: &JobReport) -> cf_console_client::JobEvent {
             disk_peak_bytes: machine.disk_peak_bytes,
             cpu_usec: machine.cpu_usec,
             wall_ms: machine.wall_ms,
+            stalls_peak: machine.pressure_peak.map(stalls),
+            host_cpu_peak: machine.host_cpu_peak.map(share),
         }),
+    }
+}
+
+/// A pressure share as the console takes it.
+fn share(psi: cf_guest_proto::Psi) -> Share {
+    Share {
+        some: psi.some,
+        full: psi.full,
+    }
+}
+
+/// A job's stalls as the console takes them.
+fn stalls(pressure: cf_guest_proto::Pressure) -> Stalls {
+    Stalls {
+        memory: share(pressure.memory),
+        cpu: share(pressure.cpu),
+        io: share(pressure.io),
     }
 }
 
@@ -1770,9 +1789,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                             started: iso(job.started_at.unwrap_or(machine.started)),
                         }),
                         usage: machine.used_bytes.map(|memory_bytes| RunnerUsage {
-                            // A machine's share of the CPUs is not measured.
-                            cpu_percent: -1.0,
+                            cpu_percent: machine.cpu_percent.map_or(-1.0, f64::from),
                             memory_bytes,
+                            file_bytes: machine.file_bytes,
+                            stalls: machine.pressure.map(stalls),
+                            host_cpu: machine.host_cpu.map(share),
                         }),
                         size: machine.size.map(|size| size.label().to_string()),
                         counted_bytes: machine.counted_bytes,
