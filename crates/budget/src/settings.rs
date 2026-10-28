@@ -290,7 +290,7 @@ impl Settings {
     ///   its overhead) or two cf-2g (4.4 GB) at a time; a cf-4g beside a cf-2g (6.4 GB) never, nor a cf-6g (6.2 GB
     ///   alone would leave the host 1.5 GB). A board of the same kind with 8.13 GB or more takes either.
     /// - CPUs: the fast cores, with the slow ones left to the host; on a host whose cores are all alike, all but
-    ///   two. 2 vCPUs for cf-2g, half the CPUs for cf-4g but no more than its share among as many cf-4g as the
+    ///   two, and at least four where the memory holds two cf-4g: a 4-vCPU cloud VM with 16 GB runs two of 2. 2 vCPUs for cf-2g, half the CPUs for cf-4g but no more than its share among as many cf-4g as the
     ///   cap holds (at least 2, at most 4), 4 for the larger sizes: on 4 fast cores, two machines of 2 vCPUs; on
     ///   a 16 GB cloud VM with 8 vCPUs, three cf-4g of 2. A cf-4g with no room beside it under the cap takes up to
     ///   4 ([`vcpus_for`]): on 7.75 GB, the four fast cores, which no other machine could use while it runs.
@@ -298,8 +298,19 @@ impl Settings {
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
         let total = facts.total_bytes;
         let mut settings = Settings::for_host(facts, Mode::Dedicated).on_fast_cores(fast_cores);
-        let cpus = settings.away.cpus;
         let floor = GIB + total / 32;
+        // Where the cores are alike and the memory holds two cf-4g, two of 2 vCPUs on four cores: nobody sits at the
+        // host, so it needs no two cores of its own.
+        let alike = !(2..facts.cores).contains(&fast_cores);
+        let two_cf_4g = 2 * (Size::G4.vm_bytes() + settings.vm_host_overhead_bytes);
+        let room = total
+            .saturating_sub(floor)
+            .saturating_sub(Self::HEADLESS_HOST_USE);
+        let cpus = if alike && facts.cores >= 4 && room >= two_cf_4g {
+            settings.away.cpus.max(4)
+        } else {
+            settings.away.cpus
+        };
         let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
         let limits = Profile {
             cap_bytes: total
