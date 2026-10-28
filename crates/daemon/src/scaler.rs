@@ -86,7 +86,7 @@ pub struct Scaler<J, R, H> {
     pending: Vec<JobBase>,
     /// When each job was first assigned here, whether GitHub took it back and handed it here again since: a job that
     /// waited [`PLACE_LIMIT`] is offered no more room. The oldest go past [`OFFERS_KEPT`].
-    assigned_since: Vec<(JobBase, SystemTime)>,
+    assigned_since: Vec<Assigned>,
     /// Offered jobs by request ID, with when they were first offered: one passed over goes first after
     /// [`DEFER_LIMIT`].
     offered: Vec<(i64, SystemTime)>,
@@ -205,21 +205,42 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     async fn handle(&mut self, message: &Message) -> Result<(), Error> {
         self.acquire(message).await?;
         let now = self.clock.now();
+        // GitHub hands a job it took back to a scale set again within minutes. One away for longer ran elsewhere, and
+        // what comes under its run and name is a re-run, which waited nowhere.
+        self.assigned_since.retain(|assigned| {
+            assigned
+                .left
+                .is_none_or(|left| now.duration_since(left).unwrap_or(Duration::ZERO) < PLACE_LIMIT)
+        });
         for job in &message.assigned {
             // A message that comes again after a failure names the same jobs again.
             if !self.pending.iter().any(|p| same_job(p, job)) {
                 self.pending.push(job.clone());
             }
-            if !self.assigned_since.iter().any(|(seen, _)| same_job(seen, job)) {
-                self.assigned_since.push((job.clone(), now));
+            match self
+                .assigned_since
+                .iter_mut()
+                .find(|assigned| same_job(&assigned.job, job))
+            {
+                Some(assigned) => assigned.left = None,
+                None => self.assigned_since.push(Assigned {
+                    job: job.clone(),
+                    since: now,
+                    left: None,
+                }),
             }
         }
         // A job an Actions runner took, here or elsewhere, waits in no line. One taken back (a cancel with no Actions
         // runner) keeps its age, should it come here again.
         let ran = message.started.iter().map(|s| (&s.job, s.runner_name.as_str()));
         for (job, runner) in ran.chain(message.completed.iter().map(|c| (&c.job, c.runner_name.as_str()))) {
-            if !runner.is_empty() {
-                self.assigned_since.retain(|(seen, _)| !same_job(seen, job));
+            if runner.is_empty() {
+                for assigned in self.assigned_since.iter_mut().filter(|a| same_job(&a.job, job)) {
+                    assigned.left = Some(now);
+                }
+            } else {
+                self.assigned_since
+                    .retain(|assigned| !same_job(&assigned.job, job));
             }
         }
         let excess = self.assigned_since.len().saturating_sub(OFFERS_KEPT);
@@ -588,8 +609,9 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         let stood_for = self.pending.iter().skip(self.idle()).take(self.waiting.len());
         stood_for
             .filter(|job| {
-                self.assigned_since.iter().any(|(seen, since)| {
-                    same_job(seen, job) && now.duration_since(*since).unwrap_or(Duration::ZERO) >= PLACE_LIMIT
+                self.assigned_since.iter().any(|assigned| {
+                    same_job(&assigned.job, job)
+                        && now.duration_since(assigned.since).unwrap_or(Duration::ZERO) >= PLACE_LIMIT
                 })
             })
             .count()
@@ -707,6 +729,15 @@ pub async fn start_runner<R: Registry, H: Hosts>(
     });
     tracing::info!(runner = %name, "Actions runner started");
     Ok(name)
+}
+
+/// A job GitHub assigned here, for [`PLACE_LIMIT`].
+struct Assigned {
+    job: JobBase,
+    /// When it was first assigned here.
+    since: SystemTime,
+    /// When GitHub took it back, while it is away.
+    left: Option<SystemTime>,
 }
 
 /// Whether two messages speak of the same job: by its request ID when both carry one, else by its run and name. The

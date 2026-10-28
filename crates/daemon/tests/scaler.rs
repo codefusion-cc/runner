@@ -261,6 +261,34 @@ async fn a_job_in_line_for_ten_minutes_is_offered_no_more_room_even_when_github_
     assert_eq!(capacity, 2);
 }
 
+/// GitHub's assignments name no request ID, so a re-run of a job (the same run, the same name) reads as that job: one
+/// that went elsewhere and came back as a re-run long after has waited in no line here.
+#[tokio::test]
+async fn a_re_run_of_a_job_that_waited_ten_minutes_and_ran_elsewhere_is_offered_room_as_a_new_job() {
+    let (mut h, _running) = busy_mac().await;
+    let waits = pull_job(REPO, 2);
+    h.scaler
+        .scale(Some(&assigned(vec![waits.clone()], 2)))
+        .await
+        .unwrap();
+    h.clock.advance(cf_daemon::PLACE_LIMIT);
+    assert_eq!(h.scaler.scale(None).await.unwrap(), 1, "it waited ten minutes");
+    // GitHub takes it back and another machine runs it, which this scale set never hears of.
+    let taken_back = Message {
+        completed: vec![completed("", "canceled", waits.clone())],
+        statistics: counts(1),
+        ..Message::default()
+    };
+    h.scaler.scale(Some(&taken_back)).await.unwrap();
+    h.clock.advance(Duration::from_secs(60 * 60));
+    let capacity = h.scaler.scale(Some(&assigned(vec![waits], 2))).await.unwrap();
+    assert_eq!(h.machines.snapshot().waiting, 1);
+    assert_eq!(
+        capacity, 2,
+        "a re-run an hour later was offered no room, as if it had waited ten minutes"
+    );
+}
+
 #[tokio::test]
 async fn a_mac_someone_works_on_acquires_nothing_but_runs_what_it_has() {
     use cf_budget::{Mode, Settings};
