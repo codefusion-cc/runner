@@ -13,6 +13,7 @@
 
 mod frame;
 mod message;
+mod pressure;
 
 /// A value that must not reach a log: `Debug` prints no part of it. A one-job configuration of the Actions runner
 /// travels in one, as a plain string on the wire, since the other end needs it.
@@ -25,6 +26,7 @@ pub use message::{
     GuestEnd, GuestMessage, HostMessage, Job, LARGEST_PROCESSES, Limits, MESSAGE_CHARS, NAME_CHARS, OomEvent,
     Process, STAGE_CHARS, Start, Stop, StopReason, Summary, Task, Usage, Workload, clip, secret_env,
 };
+pub use pressure::{Pressure, Psi, psi};
 
 /// The protocol's version. A supervisor that hears another one refuses to start a task.
 pub const PROTOCOL: u32 = 1;

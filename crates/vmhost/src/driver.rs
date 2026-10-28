@@ -203,6 +203,10 @@ fn run_in(
         boot_ms: machine.and_then(Machine::boot_ms),
         usage: machine.and_then(Machine::usage).cloned(),
         resident_bytes: None,
+        cpu_load: machine.and_then(Machine::cpu_load),
+        pressure_peak: machine.and_then(Machine::pressure_peak),
+        host_cpu: None,
+        host_cpu_peak: None,
         oom: machine.and_then(Machine::oom).cloned(),
         end: machine
             .filter(|_| stage == Stage::Ended)
@@ -292,6 +296,8 @@ fn run_in(
     );
     // The job's clock starts here: the wait for a guest's `ready` is for the boot, not for a disk made before it.
     let (mut machine, first) = Machine::new(limits, started.elapsed());
+    // The worst wait of the machine's vCPUs for the host's CPUs: only the host sees it, so the guest's peaks have it not.
+    let mut host_cpu_peak: Option<cf_vmm::Psi> = None;
     let generation = Arc::new(AtomicU32::new(0));
     let mut vm: Option<Arc<dyn Vm>> = None;
     let mut channel: Option<Box<dyn Channel>> = None;
@@ -361,10 +367,18 @@ fn run_in(
                         vm.kill();
                     }
                 }
-                Action::Publish => publish(&JobState {
-                    resident_bytes: vm.as_ref().and_then(|vm| vm.resident()),
-                    ..snapshot(Some(&machine), machine.stage())
-                }),
+                Action::Publish => {
+                    let host_cpu = vm.as_ref().and_then(|vm| vm.cpu_pressure());
+                    host_cpu_peak = host_cpu
+                        .map(|now| host_cpu_peak.map_or(now, |peak| peak.max(now)))
+                        .or(host_cpu_peak);
+                    publish(&JobState {
+                        resident_bytes: vm.as_ref().and_then(|vm| vm.resident()),
+                        host_cpu,
+                        host_cpu_peak,
+                        ..snapshot(Some(&machine), machine.stage())
+                    })
+                }
                 Action::Finish => {
                     generation.fetch_add(1, Ordering::SeqCst);
                     done.store(true, Ordering::Relaxed);
@@ -374,7 +388,10 @@ fn run_in(
                     if let Some(vm) = vm.take() {
                         put_down(vm.as_ref(), Duration::from_secs(2));
                     }
-                    let state = snapshot(Some(&machine), Stage::Ended);
+                    let state = JobState {
+                        host_cpu_peak,
+                        ..snapshot(Some(&machine), Stage::Ended)
+                    };
                     publish(&state);
                     return Ok(state);
                 }

@@ -6,7 +6,8 @@ use super::init::{Event, Failure, Host, spawn_self};
 use super::net::Network;
 use super::sys::{self, context, say};
 use cf_guest_proto::{
-    GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Process as Used, StopReason, Summary, Usage, Workload,
+    GuestEnd, GuestMessage, HostMessage, Job, OomEvent, Pressure, Process as Used, StopReason, Summary,
+    Usage, Workload,
 };
 use cf_supervisor::disks::overlay_options;
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
@@ -127,7 +128,26 @@ fn usage() -> Usage {
             .unwrap_or(0),
         disk_bytes: sys::disk_used(SCRATCH),
         pids: sys::number(format!("{CGROUP}/pids.current")) as u32,
+        memory_file_bytes: fs::read_to_string(format!("{CGROUP}/memory.stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.lines()
+                    .find_map(|line| line.strip_prefix("file ")?.trim().parse().ok())
+            })
+            .unwrap_or(0),
+        pressure: pressure(),
     }
+}
+
+/// What the job's cgroup stalled on, from its pressure files; `None` when the kernel keeps no such account.
+fn pressure() -> Option<Pressure> {
+    let read =
+        |name: &str| cf_guest_proto::psi(&fs::read_to_string(format!("{CGROUP}/{name}.pressure")).ok()?);
+    Some(Pressure {
+        memory: read("memory")?,
+        cpu: read("cpu")?,
+        io: read("io")?,
+    })
 }
 
 fn limits(job: &Job) -> Result<(), String> {

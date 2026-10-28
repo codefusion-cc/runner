@@ -252,6 +252,7 @@ version = "0.1.0"
 dependencies = [
  "cf-budget",
  "cf-clock",
+ "cf-guest-proto",
  "libc",
  "proptest",
  "tempfile",
@@ -365,6 +366,7 @@ dependencies = [
 name = "cf-vmm"
 version = "0.1.0"
 dependencies = [
+ "cf-guest-proto",
  "thiserror",
 ]
 

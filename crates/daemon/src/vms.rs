@@ -797,6 +797,10 @@ mod tests {
             boot_ms: None,
             usage: None,
             resident_bytes: None,
+            cpu_load: None,
+            pressure_peak: None,
+            host_cpu: None,
+            host_cpu_peak: None,
             oom: None,
             end: None,
         }

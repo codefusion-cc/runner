@@ -152,42 +152,11 @@ pub fn swaps(text: &str) -> Option<Vec<Swap>> {
         .collect()
 }
 
-/// A share of time over the last 10 s from a pressure file (PSI), in hundredths of a percent: 1234 is 12.34%.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Psi {
-    /// `some avg10`: at least one task was stalled on the resource.
-    pub some: u32,
-    /// `full avg10`: every task that wanted to run was stalled on it at once.
-    pub full: u32,
-}
-
-/// `12.34` as 1234; at most 100.00.
-fn hundredths(text: &str) -> Option<u32> {
-    let (whole, part) = text.split_once('.').unwrap_or((text, "0"));
-    if whole.len() > 3 || part.is_empty() || part.len() > 2 {
-        return None;
-    }
-    let part = number(part)? * if part.len() == 1 { 10 } else { 1 };
-    let value = number(whole)? * 100 + part;
-    u32::try_from(value).ok().filter(|value| *value <= 10_000)
-}
+pub use cf_guest_proto::Psi;
 
 /// A pressure file, such as `/proc/pressure/memory`: the `avg10` of its `some` and `full` lines.
 pub fn psi(text: &str) -> Result<Psi, HostError> {
-    let avg10 = |kind: &'static str| {
-        let line = text
-            .lines()
-            .find_map(|line| line.strip_prefix(kind)?.strip_prefix(' '))
-            .ok_or_else(|| implausible(kind, "missing"))?;
-        line.split_whitespace()
-            .find_map(|pair| pair.strip_prefix("avg10="))
-            .and_then(hundredths)
-            .ok_or_else(|| implausible(kind, line))
-    };
-    Ok(Psi {
-        some: avg10("some")?,
-        full: avg10("full")?,
-    })
+    cf_guest_proto::psi(text).ok_or_else(|| implausible("pressure", text))
 }
 
 /// A list of CPUs as the kernel writes it, such as `0-3,6,8-9`, in order with none twice; `None` for anything else

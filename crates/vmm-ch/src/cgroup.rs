@@ -452,6 +452,12 @@ mod linux {
             Some(super::resident(current, &stat))
         }
 
+        /// How long its vCPUs waited for the host's CPUs, from its `cpu.pressure`; `None` on a kernel without
+        /// pressure stall information.
+        pub fn cpu_pressure(&self) -> Option<cf_vmm::Psi> {
+            cf_host_linux::parse::psi(&fs::read_to_string(self.path.join("cpu.pressure")).ok()?).ok()
+        }
+
         /// The most memory it held since it was made, `memory.peak` (kernel 5.19 and later).
         pub fn peak(&self) -> Option<u64> {
             fs::read_to_string(self.path.join("memory.peak"))

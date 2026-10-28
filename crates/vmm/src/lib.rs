@@ -14,6 +14,8 @@ pub mod testing;
 use std::io::{Read, Write};
 use std::time::Duration;
 
+/// A pressure file's share of the last 10 s ([`Vm::cpu_pressure`]).
+pub use cf_guest_proto::Psi;
 pub use exit::ExitCell;
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 
@@ -24,11 +26,12 @@ pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 /// the guest's programs (the kernel clears the SME and SME2 feature registers, so `/proc/cpuinfo` and `getauxval`
 /// stop listing them): on an M5 the guest's CPU reports it, but Chromium's code that uses it dies with SIGILL (a
 /// camera in Playwright's Chromium crashed its video capture). The guest reports no SVE, so `arm64.nosve` is not
-/// needed. The option means nothing to an x86_64 kernel, so its line leaves it out.
+/// needed. The option means nothing to an x86_64 kernel, so its line leaves it out. `psi=1` turns on the pressure
+/// stall accounts the supervisor reports a job's stalls from: Alpine's `linux-virt` builds them off by default.
 #[cfg(target_arch = "aarch64")]
-pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 arm64.nosme";
+pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 psi=1 arm64.nosme";
 #[cfg(not(target_arch = "aarch64"))]
-pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1";
+pub const COMMAND_LINE: &str = "console=hvc0 quiet panic=-1 psi=1";
 
 /// The longest a write to the guest's connection waits for the guest to read, under either monitor.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -104,6 +107,12 @@ pub trait Vm: Send + Sync {
     /// or swapped out of it; on Linux what the machine's cgroup holds less the page cache the host takes back at will.
     /// `None` when that cannot be told apart or read.
     fn resident(&self) -> Option<u64>;
+
+    /// How long the machine's vCPUs waited for one of the host's CPUs over the last 10 s: the machine's cgroup's
+    /// `cpu.pressure` on Linux. `None` where the host keeps no such account, as on a Mac.
+    fn cpu_pressure(&self) -> Option<Psi> {
+        None
+    }
 }
 
 /// A byte stream between the host and one port of the guest.

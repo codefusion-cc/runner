@@ -170,10 +170,40 @@ pub struct RunnerJob {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerUsage {
-    /// CPU in percent, -1 when unknown.
+    /// CPU in percent of one CPU (250 is two and a half), -1 when unknown.
     pub cpu_percent: f64,
     /// Memory in bytes.
     pub memory_bytes: u64,
+    /// The part of `memory_bytes` that is page cache, which the guest's kernel takes back before the job stalls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<u64>,
+    /// What the job stalled on, inside its machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalls: Option<Stalls>,
+    /// How long the machine's CPUs waited for the host's, which the job cannot see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu: Option<Share>,
+}
+
+/// A share of the last 10 s a resource stalled work, from the kernel's pressure stall information, in hundredths of a
+/// percent: 1234 is 12.34%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    /// At least one task waited.
+    pub some: u32,
+    /// Every task that wanted to run waited at once: the job made no progress.
+    pub full: u32,
+}
+
+/// What a job stalled on: memory (reclaim and pages read back in), its CPUs and the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stalls {
+    /// Memory.
+    pub memory: Share,
+    /// CPUs.
+    pub cpu: Share,
+    /// The disk.
+    pub io: Share,
 }
 
 /// An Actions runner of this host and its machine.
@@ -463,6 +493,12 @@ pub struct MachineInfo {
     /// Milliseconds from the workload's start to its end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wall_ms: Option<u64>,
+    /// The worst of each stall the job had inside its machine, each over 10 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalls_peak: Option<Stalls>,
+    /// The worst wait of the machine's CPUs for the host's, over 10 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cpu_peak: Option<Share>,
 }
 
 /// One thing that happened to a job, kept until the console has it.

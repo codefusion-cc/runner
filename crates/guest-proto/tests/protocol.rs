@@ -4,8 +4,8 @@ use std::io::{Cursor, Read};
 
 use cf_guest_proto::{
     GuestEnd, GuestMessage, HostMessage, Job, Limits, MAX_FRAME, MAX_GUEST_FRAME, OomEvent, PROTOCOL,
-    Process, ProtoError, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload, encode,
-    read_guest_message, read_message, read_message_within, write_message,
+    Pressure, Process, ProtoError, Psi, Secret, Start, Stop, StopReason, Summary, Task, Usage, Workload,
+    encode, psi, read_guest_message, read_message, read_message_within, write_message,
 };
 use proptest::prelude::*;
 
@@ -46,21 +46,33 @@ impl Read for Trickle<'_> {
     }
 }
 
+fn psi_share() -> impl Strategy<Value = Psi> {
+    (0..=10_000u32, 0..=10_000u32).prop_map(|(some, full)| Psi { some, full })
+}
+
 fn usage() -> impl Strategy<Value = Usage> {
     (
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u32>(),
+        ),
         any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u32>(),
+        proptest::option::of((psi_share(), psi_share(), psi_share())),
     )
         .prop_map(
-            |(memory_bytes, memory_peak_bytes, cpu_usec, disk_bytes, pids)| Usage {
-                memory_bytes,
-                memory_peak_bytes,
-                cpu_usec,
-                disk_bytes,
-                pids,
+            |((memory_bytes, memory_peak_bytes, cpu_usec, disk_bytes, pids), memory_file_bytes, pressure)| {
+                Usage {
+                    memory_bytes,
+                    memory_peak_bytes,
+                    cpu_usec,
+                    disk_bytes,
+                    pids,
+                    memory_file_bytes,
+                    pressure: pressure.map(|(memory, cpu, io)| Pressure { memory, cpu, io }),
+                }
             },
         )
 }
@@ -486,4 +498,67 @@ fn an_environment_value_goes_as_a_plain_pair_and_shows_in_no_debug_print() {
     let back: Job = serde_json::from_value(wire).expect("read back");
     assert_eq!(back.env[0].1.expose(), "cfrt_value");
     assert!(!format!("{job:?}").contains("cfrt_value"));
+}
+
+#[test]
+fn usage_from_a_guest_before_pressure_has_none_and_no_page_cache() {
+    let old = r#"{"memory_bytes":5,"memory_peak_bytes":6,"cpu_usec":7,"disk_bytes":8,"pids":9}"#;
+    let read: Usage = serde_json::from_str(old).unwrap();
+    assert_eq!(
+        read,
+        Usage {
+            memory_bytes: 5,
+            memory_peak_bytes: 6,
+            cpu_usec: 7,
+            disk_bytes: 8,
+            pids: 9,
+            memory_file_bytes: 0,
+            pressure: None,
+        }
+    );
+}
+
+#[test]
+fn a_cgroups_pressure_file_is_read_like_the_hosts() {
+    // A cgroup's cpu.pressure has a full line too since Linux 5.13, and the same fields.
+    let text = "some avg10=37.25 avg60=12.00 avg300=3.10 total=88123456\nfull avg10=4.5 avg60=1.00 avg300=0.20 total=1234\n";
+    assert_eq!(
+        psi(text),
+        Some(Psi {
+            some: 3725,
+            full: 450
+        })
+    );
+    assert_eq!(
+        psi("some avg10=100.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=100.01 avg60=0 avg300=0 total=1\n"),
+        None
+    );
+    assert_eq!(psi("full avg10=1.00 avg60=0 avg300=0 total=1\n"), None);
+}
+
+#[test]
+fn the_worst_of_two_readings_takes_each_share_on_its_own() {
+    let a = Pressure {
+        memory: Psi { some: 10, full: 90 },
+        cpu: Psi { some: 5, full: 0 },
+        io: Psi { some: 0, full: 0 },
+    };
+    let b = Pressure {
+        memory: Psi { some: 20, full: 1 },
+        cpu: Psi { some: 4, full: 3 },
+        io: Psi {
+            some: 10_000,
+            full: 0,
+        },
+    };
+    let worst = Pressure {
+        memory: Psi { some: 20, full: 90 },
+        cpu: Psi { some: 5, full: 3 },
+        io: Psi {
+            some: 10_000,
+            full: 0,
+        },
+    };
+    assert_eq!(a.max(b), worst);
+    assert_eq!(b.max(a), worst);
 }

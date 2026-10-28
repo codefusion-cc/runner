@@ -284,6 +284,13 @@ async fn a_report_gets_the_answer_and_arrives_as_the_contract_has_it() {
         usage: Some(cf_console_client::RunnerUsage {
             cpu_percent: 12.5,
             memory_bytes: 1 << 30,
+            file_bytes: Some(300 << 20),
+            stalls: Some(cf_console_client::Stalls {
+                memory: cf_console_client::Share { some: 950, full: 410 },
+                cpu: cf_console_client::Share { some: 0, full: 0 },
+                io: cf_console_client::Share { some: 20, full: 10 },
+            }),
+            host_cpu: Some(cf_console_client::Share { some: 730, full: 0 }),
         }),
         size: Some("cf-4g".into()),
         counted_bytes: Some(4 << 30),
