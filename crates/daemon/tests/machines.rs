@@ -159,17 +159,13 @@ async fn a_jobs_load_and_stalls_show_while_it_runs_and_its_worst_stalls_at_its_e
         .iter()
         .find(|m| m.runner == runner)
         .expect("the machine");
-    assert_eq!(
-        machine.cpu_percent,
-        Some(75),
-        "one and a half of a cf-4g's two CPUs"
-    );
+    assert_eq!(machine.cpu_percent, Some(150), "one and a half CPUs");
     assert_eq!(
         (machine.pressure, machine.host_cpu),
         (Some(frozen), Some(psi(2500, 300)))
     );
 
-    // A late heartbeat makes a little more than the machine's two CPUs, which no machine has.
+    // A late heartbeat makes a little more than the machine's two CPUs, which it does not have.
     w.parts.vms.strain(&job, 206, calm, psi(100, 0));
     pass(&w.m, 1);
     let snapshot = w.m.snapshot();
@@ -178,7 +174,7 @@ async fn a_jobs_load_and_stalls_show_while_it_runs_and_its_worst_stalls_at_its_e
         .iter()
         .find(|m| m.runner == runner)
         .expect("the machine");
-    assert_eq!(machine.cpu_percent, Some(100));
+    assert_eq!(machine.cpu_percent, Some(200));
 
     w.parts.vms.end(&job, End::Ok);
     w.github(EventKind::Completed, &runner, "succeeded");

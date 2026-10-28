@@ -170,7 +170,7 @@ pub struct RunnerJob {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunnerUsage {
-    /// CPU in percent of the machine's CPUs, -1 when unknown.
+    /// CPU in percent of one CPU (250 is two and a half), -1 when unknown.
     pub cpu_percent: f64,
     /// Memory in bytes.
     pub memory_bytes: u64,

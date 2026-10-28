@@ -198,7 +198,7 @@ pub struct MachineStatus {
     pub used_bytes: Option<u64>,
     /// The part of it that is page cache.
     pub file_bytes: Option<u64>,
-    /// The share of its CPUs the job kept busy over about the last 10 s, in percent.
+    /// The CPUs the job kept busy over about the last 10 s, in percent of one CPU: 250 is two and a half.
     pub cpu_percent: Option<u32>,
     /// What the job stalled on over the last 10 s, inside its machine.
     pub pressure: Option<Pressure>,
@@ -1720,13 +1720,12 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                         .as_ref()
                         .and_then(|s| s.usage.as_ref())
                         .map(|u| u.memory_file_bytes),
-                    // A load in hundredths of a CPU over the CPUs is the percent of them; a heartbeat that came late
-                    // can make it a little more, which no machine has.
+                    // A load in hundredths of a CPU is a percent of one; a heartbeat that came late can make it a
+                    // little more than the machine's CPUs, which it does not have.
                     cpu_percent: job
                         .last
                         .as_ref()
-                        .and_then(|s| s.cpu_load?.checked_div(s.cpus))
-                        .map(|percent| percent.min(100)),
+                        .and_then(|s| Some(s.cpu_load?.min(s.cpus.saturating_mul(100)))),
                     pressure: job.last.as_ref().and_then(|s| s.usage.as_ref()?.pressure),
                     host_cpu: job.last.as_ref().and_then(|s| s.host_cpu),
                     github: reported_job(&job.record),
