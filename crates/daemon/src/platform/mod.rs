@@ -194,6 +194,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     let mut config = MachineConfig::new(&setup.machine, &setup.image, &boot, setup.deadline);
     config.stand_in = setup.stand_in;
     config.docker_max_jobs = setup.policy.docker_max_jobs;
+    config.trusted = setup.policy.trusted.clone();
     let rings = bell.clone();
     let machines = Machines::restore(MachineParts {
         host,

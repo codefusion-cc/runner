@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 564080291acaa5e20df5b717ad05410987f93a2d2a75756e2e322ba0653e9563 # shrinks to repository = "codefusion-cc/codefusion", git_ref = "refs/heads/main", workflow = "codefusion-cc/codefusion/.github/workflows/deploy-production.yml@refs/heads/main", event = "workflow_dispatch", attempt = "workflow_dispatch"
+cc fd224440afc4b993befc7d74a4327001102543bbe675797b132cf6c619e7109c # shrinks to repository = "refs/heads/main", git_ref = "refs/heads/main", workflow = "codefusion-cc/codefusion/.github/workflows/deploy-production.yml@refs/heads/main", event = "workflow_dispatch", attempt = "1"

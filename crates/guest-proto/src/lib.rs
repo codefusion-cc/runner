@@ -28,8 +28,9 @@ pub use message::{
 };
 pub use pressure::{Pressure, Psi, psi};
 
-/// The protocol's version. A supervisor that hears another one refuses to start a task.
-pub const PROTOCOL: u32 = 1;
+/// The protocol's version. A supervisor that hears another one refuses to start a task. 2: [`Job::trusted`], so a
+/// guest without the trusted gate never runs a trusted job.
+pub const PROTOCOL: u32 = 2;
 
 /// The vsock port the supervisor listens on.
 pub const PORT: u32 = 6000;

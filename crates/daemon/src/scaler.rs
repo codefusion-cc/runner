@@ -671,13 +671,19 @@ pub async fn start_runner<R: Registry, H: Hosts>(
                 // A refusal leaves nothing at GitHub; anything else may have registered the name before it
                 // failed. A taken name is no refusal: only this machine makes names that begin with its own,
                 // so the name is taken by a try of this call whose answer was lost on the way.
+                // A 409 that says when to ask again is no taken name but the console's word that no job waits for
+                // this one yet (a trusted host's `no_trusted_job`): nothing was made.
+                let no_job_yet = e.status() == Some(409) && e.retry_after().is_some();
                 let refused = e
                     .status()
-                    .is_some_and(|status| (400..500).contains(&status) && status != 409);
+                    .is_some_and(|status| (400..500).contains(&status) && (status != 409 || no_job_yet));
                 if refused {
                     hosts.not_registered(&name);
                 } else {
                     hosts.registration_unsure(&name);
+                }
+                if no_job_yet {
+                    return Err(e);
                 }
                 // The name is taken: names are random, another try uses another.
                 if e.status() == Some(409) && tries < NAME_TRIES {

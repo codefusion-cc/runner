@@ -171,6 +171,7 @@ dependencies = [
  "cf-lifecycle",
  "cf-scaleset",
  "cf-secret",
+ "cf-trusted",
  "cf-vmhost",
  "cf-vmm-ch",
  "cf-workflows",
@@ -240,6 +241,7 @@ name = "cf-guest-proto"
 version = "0.1.0"
 dependencies = [
  "cf-secret",
+ "cf-trusted",
  "proptest",
  "serde",
  "serde_json",
@@ -341,7 +343,17 @@ version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
  "cf-nft",
+ "cf-trusted",
  "libc",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cf-trusted"
+version = "0.1.0"
+dependencies = [
  "proptest",
  "serde",
  "serde_json",
@@ -353,6 +365,7 @@ version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
  "cf-image",
+ "cf-trusted",
  "cf-vmm",
  "libc",
  "proptest",
@@ -434,6 +447,7 @@ dependencies = [
  "cf-image",
  "cf-scaleset",
  "cf-secret",
+ "cf-trusted",
  "cf-vmhost",
  "cf-vmm",
  "cf-vmm-ch",

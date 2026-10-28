@@ -5457,3 +5457,150 @@ async fn a_failed_docker_check_holds_across_a_restart() {
         "{refused}"
     );
 }
+
+/// Lets the Mac's time pass, a second at a time, until `done`.
+async fn passes_until(machines: &TestMachines, what: &str, done: impl Fn() -> bool) {
+    for _ in 0..300 {
+        if done() {
+            return;
+        }
+        pass(machines, 1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what} never came");
+}
+
+/// A trusted host (`cf_trusted`): it makes no scale set whatever the workflows ask for, and asks for one Actions
+/// runner with the label `trusted` at a time, outside any scale set, in the largest machine it has, whose machine
+/// carries the rules each job is checked against before its first step. One that waited five minutes for a job is
+/// removed. It takes no test run and says its class; the shared host beside it never serves a set with `trusted`,
+/// from a list or a variable, and says no class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_carries_the_rules() {
+    // Room for two of its largest machines: one at a time is the trusted host's own rule.
+    let mut rig = Rig::new(20).await;
+    rig.stop_pump().await;
+    let rules = cf_trusted::Policy::new(
+        json!({ "repository": REPO, "allow": { "deploy.yml": ["workflow_dispatch"] } }),
+    );
+    rig.machines = rig
+        .parts
+        .machines_with(|config| config.trusted = Some(rules.clone()));
+    rig.github.set_workflow(
+        REPO,
+        "deploy.yml",
+        "on: workflow_dispatch\njobs:\n  image:\n    runs-on: [self-hosted, cf-2g, cf-docker]\n    steps: []\n  listed:\n    runs-on: [cf-8g, trusted]\n    steps: []\n  deploy:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED || 'ubuntu-latest' }}\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER_TRUSTED", "trusted");
+    let (shared, _) = rig.service.survey().await;
+    assert!(
+        !shared.is_empty() && shared.iter().all(|line| !line.contains("trusted")),
+        "{shared:?}"
+    );
+    let report = serde_json::to_value(rig.service.status()).expect("a report");
+    assert_eq!(report.get("class"), None, "a shared host says no class");
+
+    let trusted = service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |config| {
+            config.policy.trusted = Some(rules.clone());
+            // Left over from a shared host's file: a trusted one gives no Docker whatever it lists.
+            config.policy.docker_repos = vec![REPO.into()];
+        },
+    );
+    let (served, problems) = trusted.survey().await;
+    assert_eq!(served, Vec::<String>::new());
+    assert_eq!(problems, Vec::<String>::new());
+    trusted.discover().await;
+    trusted.look_at_queue().await;
+    assert_eq!(trusted.sets().len(), 0, "no scale set");
+
+    trusted.ask_trusted().await;
+    let registered = rig.github.plain_runners();
+    assert_eq!(registered.len(), 1, "{registered:?}");
+    let (name, repo, labels) = registered[0].clone();
+    assert_eq!((repo.as_str(), labels), (REPO, vec!["trusted".to_string()]));
+    passes_until(&rig.machines, "its machine", || {
+        !rig.parts.vms.started().is_empty()
+    })
+    .await;
+    let started = rig.parts.vms.started();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0].trusted, Some(rules));
+    assert!(!started[0].docker);
+    assert_eq!(
+        started[0].memory_bytes,
+        Size::G8.vm_bytes(),
+        "the largest machine this host has"
+    );
+
+    passes_until(&rig.machines, "its machine waiting for a job", || {
+        rig.machines
+            .snapshot()
+            .machines
+            .iter()
+            .any(|machine| machine.runner == name && machine.state == "idle")
+    })
+    .await;
+    trusted.ask_trusted().await;
+    assert_eq!(rig.github.plain_runners().len(), 1, "one at a time");
+    assert_eq!(rig.parts.vms.started().len(), 1, "one at a time");
+
+    let status = serde_json::to_value(trusted.status()).expect("a report");
+    assert_eq!(status["class"], json!("trusted"));
+    let commands = status["status"]["commands"].as_array().expect("commands");
+    assert!(!commands.contains(&json!("test-run")), "{commands:?}");
+    let id = rig.console.queue_command(
+        "test-run",
+        Some(test_run_args(&rig.console, "tr_tttttttttttttttttttttttttt", 0)),
+    );
+    let mut answer = None;
+    for _ in 0..50 {
+        pass(&rig.machines, 1);
+        trusted.report().await;
+        answer = results_of(&rig.console, &id).pop();
+        if answer.is_some() {
+            break;
+        }
+    }
+    let answer = answer.expect("the test run is answered");
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("never: a trusted host")),
+        "{answer}"
+    );
+    assert_eq!(rig.parts.vms.started().len(), 1, "no test run started");
+
+    // Its job went elsewhere or was cancelled: after five minutes of waiting it is removed.
+    rig.later(Duration::from_secs(4 * 60));
+    trusted.ask_trusted().await;
+    for _ in 0..5 {
+        pass(&rig.machines, 1);
+        trusted.sweep().await;
+    }
+    assert_eq!(rig.github.removed_at_request(), Vec::<String>::new());
+    rig.later(Duration::from_secs(60));
+    trusted.ask_trusted().await;
+    for _ in 0..100 {
+        if rig.github.removed_at_request() == [name.clone()] {
+            break;
+        }
+        pass(&rig.machines, 1);
+        trusted.sweep().await;
+    }
+    assert_eq!(rig.github.removed_at_request(), [name]);
+}

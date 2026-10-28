@@ -428,6 +428,44 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
         lookups
     );
 
+    // Nor a 409 that says when to ask again: the console's answer while no trusted job waits, which made nothing.
+    // A 409 without it is a name already taken, whose registration may be the one just made.
+    h.fake.fail(
+        "generate-jitconfig",
+        Reply::status_json(409, &serde_json::json!({"error": "no_trusted_job"}))
+            .with_header("Retry-After", "15"),
+        1,
+    );
+    let error = h
+        .client
+        .generate_plain_jit_config("mac-a-j0000002", &["trusted".to_string()])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status(), error.retry_after()),
+        (Some(409), Some(Duration::from_secs(15))),
+        "{error:?}"
+    );
+    assert_eq!(
+        h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
+        lookups
+    );
+    h.fake.fail(
+        "generate-jitconfig",
+        Reply::status_json(409, &serde_json::json!({"message": "taken"})),
+        1,
+    );
+    let error = h
+        .client
+        .generate_plain_jit_config("mac-a-j0000003", &["trusted".to_string()])
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), Some(409), "{error:?}");
+    assert_eq!(
+        h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
+        lookups + 1
+    );
+
     // And a name that works is found by its name.
     let jit = h
         .client

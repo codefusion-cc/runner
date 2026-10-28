@@ -484,6 +484,7 @@ mod tests {
             env: Vec::new(),
             deadline_s: 60,
             docker: false,
+            trusted: None,
         }
     }
 
@@ -837,6 +838,10 @@ mod tests {
             ["j1"],
             "a job with a note and nothing else is still a job to look at"
         );
+        // What its machine wrote, as a crashed vm-host leaves it: the next job never sees it.
+        let left = vms.layout.job_dir("j1");
+        std::fs::create_dir_all(&left).expect("the machine's folder");
+        std::fs::write(left.join("scratch.img"), b"the job's disk").expect("a disk");
         vms.kill("j1");
         assert!(within(Duration::from_secs(5), || matches!(
             vms.look("j1"),
@@ -844,6 +849,7 @@ mod tests {
         )));
         vms.clean("j1");
         assert!(!vms.spawned("j1").exists());
+        assert!(!left.exists(), "the machine's folder and its disk are gone");
         assert_eq!(vms.jobs(), Vec::<String>::new());
     }
 

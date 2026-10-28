@@ -21,6 +21,7 @@ cf-ghapp = { path = "../ghapp" }
 cf-guest-proto = { path = "../guest-proto" }
 cf-scaleset = { path = "../scaleset" }
 cf-secret = { path = "../secret" }
+cf-trusted = { path = "../trusted" }
 cf-vmhost = { path = "../vmhost" }
 cf-vmm = { path = "../vmm" }
 cf-workflows = { path = "../workflows" }

@@ -37,6 +37,7 @@ fn request(job: &str) -> JobRequest {
         env: vec![("CI".into(), String::from("true").into())],
         deadline_s: 3600,
         docker: false,
+        trusted: None,
     }
 }
 
@@ -586,6 +587,23 @@ fn a_request_no_job_can_have_starts_nothing() {
         (
             Box::new(|r| r.workload = Workload::Command { argv: vec![] }),
             "command",
+        ),
+        // A trusted job's gate stands in front of the Actions runner's Worker: nothing else, and no Docker beside it.
+        (
+            Box::new(|r| {
+                r.trusted = Some(cf_trusted::Policy::defaults());
+                r.workload = Workload::Command {
+                    argv: vec!["true".into()],
+                };
+            }),
+            "Actions runner only",
+        ),
+        (
+            Box::new(|r| {
+                r.trusted = Some(cf_trusted::Policy::defaults());
+                r.docker = true;
+            }),
+            "no Docker",
         ),
     ] {
         let mut bad = request("a");
@@ -1205,4 +1223,50 @@ fn a_request_names_an_image_by_any_version_the_store_takes() {
         assert_eq!(asked.check().is_ok(), fine, "{version:?}");
         assert_eq!(cf_image::store::is_version(version), fine, "{version:?}");
     }
+}
+
+/// A trusted job's machine is given the rules of its gate, and whatever its end, a success, a failure (the gate's
+/// refusal is one: the Actions runner fails the job), a machine that dies or a cancel, its folder with the disk it
+/// wrote is gone after it: the next job starts from the image and an empty disk.
+#[test]
+fn a_trusted_jobs_folder_is_gone_after_every_end() {
+    let rules = cf_trusted::Policy::defaults();
+    let trusted = |job: &str| JobRequest {
+        trusted: Some(rules.clone()),
+        ..request(job)
+    };
+    let (_dir, layout) = state_dir();
+    let (seen, tasks) = mpsc::channel();
+    let ends_with = |code: i32| {
+        let seen = seen.clone();
+        job(move |stream, _, task| {
+            seen.send(task).unwrap();
+            finish(stream, summary(GuestEnd::Exited, Some(code)));
+        })
+    };
+    let crash = job(|mut stream, power, _| {
+        say(&mut stream, GuestMessage::Heartbeat(usage()));
+        std::thread::sleep(Duration::from_millis(150));
+        power.crash("the hypervisor's process died")
+    });
+    let vmm = Arc::new(FakeVmm::new([formatter(), ends_with(0), ends_with(1), crash]));
+    for (job, end) in [("ok", End::Ok), ("failed", End::Failed), ("lost", End::GuestLost)] {
+        let state = go_within(&vmm, &layout, trusted(job), quick(), false).unwrap();
+        assert_eq!(state.end.unwrap().end, end, "{job}");
+        assert!(
+            !layout.job_dir(job).exists() && !layout.socket(job).exists(),
+            "{job}"
+        );
+    }
+    for _ in 0..2 {
+        let Task::Job(task) = tasks.recv().unwrap() else {
+            panic!("the guest was not given a job")
+        };
+        assert_eq!(task.trusted.as_ref(), Some(&rules));
+    }
+
+    let vmm = Arc::new(FakeVmm::new([stuck_formatter()]));
+    let state = go_within(&vmm, &layout, trusted("cancelled"), quick(), true).unwrap();
+    assert_eq!(state.end.unwrap().end, End::Cancelled);
+    assert!(!layout.job_dir("cancelled").exists() && !layout.socket("cancelled").exists());
 }

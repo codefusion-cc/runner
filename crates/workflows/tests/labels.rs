@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use cf_workflows::{
-    DOCKER_LABEL, LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS, POOL_LABEL, SizeError, is_host_label,
-    self_hosted, self_hosted_with, size_gb,
+    DOCKER_LABEL, LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS, POOL_LABEL, SizeError, TRUSTED_LABEL,
+    is_host_label, self_hosted, self_hosted_with, size_gb,
 };
 use proptest::prelude::*;
 
@@ -933,4 +933,27 @@ proptest! {
             }
         }
     }
+}
+
+// The trusted class: a pull request may write `runs-on: [trusted, cf-8g]` or set it through a variable; a shared
+// host must never take such a job, for a trusted host's job carries production tokens.
+#[test]
+fn no_shared_host_serves_a_set_with_the_trusted_label() {
+    for labels in [
+        &[TRUSTED_LABEL][..],
+        &["self-hosted", "trusted"],
+        &["cf-8g", "Trusted"],
+        &["cf-docker", " TRUSTED "],
+        &["cf-2g", "cf-linux", "trusted"],
+    ] {
+        assert_eq!(LabelSet::served(labels.iter().copied()), None, "{labels:?}");
+    }
+    let wf = files(&[(
+        "deploy.yml",
+        "jobs:\n  a:\n    runs-on: [self-hosted, trusted]\n  b:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED }}\n  c:\n    runs-on: [cf-4g]\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_TRUSTED", "trusted")]))),
+        ["cf-4g"]
+    );
 }
