@@ -32,11 +32,19 @@ here=''
 [[ -f ${BASH_SOURCE[0]:-} ]] && here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 step=arguments
+failed=0
 fail() {
   echo "host-setup: $step: $*" >&2
+  failed=1
   exit 1
 }
 trap 'fail "the command on line $LINENO failed"' ERR
+# A command that fails inside a function (as_user) ends the script without the ERR trap.
+ended() {
+  local status=$?
+  ((status == 0 || failed)) || echo "host-setup: $step: a command failed with status $status" >&2
+}
+trap ended EXIT
 say() { echo "host-setup: $step: $*"; }
 
 while (($#)); do
@@ -172,10 +180,12 @@ if [[ $(as_user 'git -C runner rev-parse HEAD') != "$ref"* ]]; then
   as_user "cd runner && (git cat-file -e '$ref^{commit}' 2>/dev/null || git fetch -q origin '$ref') && git checkout -q --detach '$ref'"
 fi
 as_user "git -C runner remote set-url origin '$GITHUB_REPO'"
+# The whole commit: `version` names twelve characters of it, which a shorter --ref is not.
+head=$(as_user 'git -C runner rev-parse HEAD')
 
 step=build
 built=$(as_user "[ -x '$program' ] && '$program' version || true")
-if [[ $built != "$USER_NAME "*"+${ref:0:12}" ]]; then
+if [[ $built != "$USER_NAME "*"+${head:0:12}" ]]; then
   say "building the Runner at $ref (some minutes)"
   as_user 'cd runner && cargo xtask build'
 fi
