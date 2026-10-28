@@ -266,6 +266,8 @@ impl CheckoutUpdate {
         let err = log
             .try_clone()
             .map_err(|error| format!("{}: {error}", self.log.display()))?;
+        // Held until the group is written down: an end that comes while the build starts waits for it, and finds it.
+        let mut building = self.building.lock().expect("building");
         // Behind the jobs: they run on the same cores.
         let mut child = Command::new("/usr/bin/nice")
             .args(["-n", "10"])
@@ -280,7 +282,8 @@ impl CheckoutUpdate {
             .process_group(0)
             .spawn()
             .map_err(|error| format!("{}: {error}", self.cargo.display()))?;
-        *self.building.lock().expect("building") = libc::pid_t::try_from(child.id()).ok();
+        *building = libc::pid_t::try_from(child.id()).ok();
+        drop(building);
         let status = wait_at_most(&mut child, self.build_limit);
         *self.building.lock().expect("building") = None;
         let status = status.map_err(|error| format!("the build: {error}"))?;

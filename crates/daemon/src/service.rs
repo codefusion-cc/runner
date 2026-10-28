@@ -286,6 +286,9 @@ pub struct ServiceParts<H, V> {
     /// The settings file the Runner started with, whose changes it takes up by starting again; none to take up
     /// none.
     pub settings: Option<Arc<dyn SettingsFile>>,
+    /// Where the console's last word on the pause is kept, so that a Runner that starts again (after an update, a
+    /// crash) takes no job on a paused host before the console says so again; none to keep it in memory only.
+    pub pause: Option<PathBuf>,
 }
 
 struct Shared<H, V> {
@@ -322,6 +325,7 @@ struct Shared<H, V> {
     held: Mutex<Held>,
     updates: Option<Arc<dyn SelfUpdate>>,
     results_file: Option<PathBuf>,
+    pause_file: Option<PathBuf>,
     update: Mutex<Updating>,
     settings: Option<Arc<dyn SettingsFile>>,
     applying: Mutex<Applying>,
@@ -428,6 +432,22 @@ fn kept_results(path: Option<&std::path::Path>) -> Vec<CommandResult> {
             tracing::warn!(%error, "the results kept for the console cannot be read");
             Vec::new()
         })
+}
+
+/// The console's last word on the pause, as a Runner before kept it. None kept, or a file that cannot be read, is no
+/// pause: the console's first answer says it again within a report.
+fn kept_pause(path: Option<&std::path::Path>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => bytes == b"paused",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(%error, "the pause kept for the console cannot be read");
+            false
+        }
+    }
 }
 
 /// A moment as the console reads it.
@@ -556,6 +576,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
 
     /// A service that does nothing until its rounds are called.
     pub fn new(parts: ServiceParts<H, V>) -> Service<H, V> {
+        // Only an enrolled Runner keeps the console's pause: one that left the console takes its own way.
+        let paused = parts.console.is_some() && kept_pause(parts.pause.as_deref());
+        // Before any listener opens: a host the console paused stays closed until the console answers.
+        parts.machines.pause(paused);
         Service {
             shared: Arc::new(Shared {
                 app: parts.app,
@@ -574,7 +598,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 queued: Mutex::new(Queued::default()),
                 queue_cursor: AtomicUsize::new(0),
                 refused: Mutex::new(BTreeMap::new()),
-                console_paused: Mutex::new(false),
+                console_paused: Mutex::new(paused),
                 told: Mutex::new((0, false)),
                 stall: Mutex::new(None),
                 held: Mutex::new(Held::default()),
@@ -591,6 +615,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 rediscover: Notify::new(),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
                 results_file: parts.results,
+                pause_file: parts.pause,
             }),
         }
     }
@@ -646,6 +671,18 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             at: iso(secs(shared.clock.now())),
         });
         self.keep(&results);
+    }
+
+    /// Writes the console's word on the pause to its file, when there is one. A write that fails is logged: a Runner
+    /// that starts again then takes jobs until the console's first answer.
+    fn keep_pause(&self, paused: bool) {
+        let Some(path) = &self.shared.pause_file else {
+            return;
+        };
+        let word: &[u8] = if paused { b"paused" } else { b"taking" };
+        if let Err(error) = cf_secret::replace_private(path, word) {
+            tracing::warn!(%error, "the pause could not be kept; a Runner that starts again takes jobs until the console answers");
+        }
     }
 
     /// Writes the results that wait for the console to their file, when there is one.
@@ -1894,7 +1931,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
 
     async fn answered(&self, answer: Answer) -> Duration {
         let shared = &self.shared;
-        *shared.console_paused.lock().expect("paused") = answer.paused;
+        let was = std::mem::replace(&mut *shared.console_paused.lock().expect("paused"), answer.paused);
+        if was != answer.paused {
+            self.keep_pause(answer.paused);
+        }
         // The console sends a command until it has its result, and stops for a test run that ended or was cancelled
         // there: one that waits for room and is not in this answer is not wanted any more.
         if let Some((id, wanted)) = shared.test_run.lock().expect("test run").as_ref()
