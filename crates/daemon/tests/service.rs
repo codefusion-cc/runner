@@ -1058,7 +1058,8 @@ async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers
             .is_some_and(|r| r["status"]["paused"] == json!(true))
     })
     .await;
-    rig.console.down(true);
+    // The console still makes the scale set calls (only it can now) but hears no report.
+    rig.console.reports_down(true);
     rig.restart().await;
     for set in rig.github.scale_sets() {
         // GitHub lets a session that nobody polls expire.
@@ -1083,7 +1084,7 @@ async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers
     );
 
     rig.console.pause(false);
-    rig.console.down(false);
+    rig.console.reports_down(false);
     rig.settles("room offered again", || rig.github.offers_room(REPO))
         .await;
     // The job was queued while the Mac offered no room: it is held until the Runner looks at the queue again.
