@@ -46,8 +46,8 @@ pub use records::{
 pub use roster::{JobInfo, Roster, Runner};
 pub use scaler::{IDLE_GRACE, PLACE_LIMIT, PROMISE_TTL, Scaler, ScalerConfig, WasOutOfMemory, reconcile};
 pub use service::{
-    Console, HostExtras, LoggedReports, Nudge, OutboxReports, STALL_WARN_AFTER, Service, ServiceConfig,
-    ServiceParts, SetState, iso, job_event,
+    Console, HeldKey, HostExtras, KEY_NOT_ASKED, LoggedReports, Nudge, OutboxReports, STALL_WARN_AFTER,
+    Service, ServiceConfig, ServiceParts, SetState, iso, job_event,
 };
 pub use traits::{
     Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,

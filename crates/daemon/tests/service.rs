@@ -17,15 +17,17 @@ use cf_daemon::testing::{
 };
 use cf_daemon::update::{SettingsChange, SettingsLook};
 use cf_daemon::{
-    Claim, Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
-    ServiceConfig, ServiceParts, Slots,
+    Claim, Console, HeldKey, HostExtras, JobReport, KEY_NOT_ASKED, Nudge, OutboxReports, RESULT_WAIT,
+    Reports, Roster, Service, ServiceConfig, ServiceParts, Slots,
 };
 use cf_fake_console::FakeConsole;
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Clock as _, Http, RetryPolicy};
 use cf_guest_proto::{Pressure as Stalls, Psi, StopReason};
-use cf_harness::{REPO, TestClock, Ticks, app_on, enrolled, fast, until};
+use cf_harness::{
+    REPO, TestClock, Ticks, admin_requests_from_machines, app_on, enrolled, fast, key_app, key_tokens, until,
+};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 use cf_vmhost::End;
@@ -468,7 +470,7 @@ fn service_with(
     // What stays across a daemon's starts: the outbox, the update it builds (none for a Runner with nowhere to
     // update from), its settings file, the folder of its files, how long an update waits for the machines that
     // stand.
-    (outbox, updates, settings, folder, update_limit): (
+    kept: (
         &Arc<Outbox>,
         Option<&Arc<FakeUpdate>>,
         &Arc<FakeSettings>,
@@ -477,6 +479,29 @@ fn service_with(
     ),
     tweak: impl FnOnce(&mut ServiceConfig),
 ) -> TestService {
+    Service::new(parts_with(
+        github, console, parts, machines, token, battery, kept, tweak,
+    ))
+}
+
+/// The parts of [`service_with`]'s service, for a test that changes more than its configuration.
+#[allow(clippy::too_many_arguments)]
+fn parts_with(
+    github: &FakeGithub,
+    console: &FakeConsole,
+    parts: &TestParts,
+    machines: &Arc<TestMachines>,
+    token: &Secret<String>,
+    battery: &Arc<Mutex<Option<Battery>>>,
+    (outbox, updates, settings, folder, update_limit): (
+        &Arc<Outbox>,
+        Option<&Arc<FakeUpdate>>,
+        &Arc<FakeSettings>,
+        &std::path::Path,
+        Duration,
+    ),
+    tweak: impl FnOnce(&mut ServiceConfig),
+) -> ServiceParts<FakeHost, FakeVms> {
     let battery = battery.clone();
     let mut config = ServiceConfig::new(
         MACHINE,
@@ -496,7 +521,7 @@ fn service_with(
     );
     tweak(&mut config);
     let client = Client::new(&console.url(), Secret::new(token.expose().clone()), http());
-    Service::new(ServiceParts {
+    ServiceParts {
         app: app_on(
             github,
             &client,
@@ -526,7 +551,8 @@ fn service_with(
         results: Some(folder.join("results.json")),
         pause: Some(folder.join("pause")),
         settings: Some(settings.clone()),
-    })
+        held_key: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3943,6 +3969,211 @@ async fn the_report_names_an_app_key_file_the_host_still_holds_until_it_is_gone(
     rig.service.report().await;
     let last = last_status(&rig.console);
     assert!(last.get("appKeyFile").is_none(), "{last}");
+}
+
+/// A Runner of the rig's host that still holds the Runners App's key, in a file of the rig's folder: it signs with
+/// the key, and its take-out deletes the file and counts, or fails with `fails`. Its console client gives up on a
+/// call after 300 ms.
+struct Holding {
+    service: TestService,
+    file: std::path::PathBuf,
+    taken: Arc<AtomicUsize>,
+}
+
+fn holding(rig: &Rig, fails: Option<&'static str>) -> Holding {
+    let file = rig.folder.path().join("app").join("app.pem");
+    std::fs::create_dir_all(file.parent().expect("a folder")).expect("the App's folder");
+    std::fs::write(&file, "a key file").expect("the key file");
+    let taken = Arc::new(AtomicUsize::new(0));
+    let mut parts = parts_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |_| {},
+    );
+    let tokens = key_tokens(&rig.github, http(), rig.parts.clock.clone());
+    parts.app = key_app(&rig.github, &tokens, http());
+    parts.console = Some(Console {
+        client: Client::new(
+            &rig.console.url(),
+            Secret::new(rig.token.expose().clone()),
+            Http::new(Duration::from_millis(300), fast()),
+        ),
+        outbox: rig.outbox.clone(),
+    });
+    let (deleted, counted) = (file.clone(), taken.clone());
+    parts.held_key = Some(HeldKey {
+        tokens,
+        file: file.clone(),
+        take_out: Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            match fails {
+                Some(why) => Err(why.into()),
+                None => std::fs::remove_file(&deleted)
+                    .map(|()| "deleted".into())
+                    .map_err(|error| error.to_string()),
+            }
+        }),
+    });
+    Holding {
+        service: Service::new(parts),
+        file,
+        taken,
+    }
+}
+
+/// The scale set calls of the console that answered `machine`.
+fn answered_scaleset_calls(console: &FakeConsole, machine: &str) -> usize {
+    console
+        .github_calls()
+        .iter()
+        .filter(|call| call.machine == machine && call.route.starts_with("scaleset/") && call.status == 200)
+        .count()
+}
+
+/// A host that still holds the key: once a scale set call of the console it made was answered, the key file is
+/// taken out and the Runner starts again, through the console; before, the report says why the key is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_holds_the_key_takes_it_out_once_the_consoles_scale_set_calls_answered_it() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let held = holding(&rig, None);
+    assert_eq!(held.service.key_kept().as_deref(), Some(KEY_NOT_ASKED));
+    held.service.report().await;
+    let status = last_status(&rig.console);
+    assert_eq!(status["appKeyKept"], json!(KEY_NOT_ASKED));
+    assert_eq!(status["appKeyFile"], json!(held.file.display().to_string()));
+    assert_eq!(
+        held.taken.load(Ordering::SeqCst),
+        0,
+        "not before the console answered"
+    );
+
+    held.service.discover().await;
+    assert!(
+        answered_scaleset_calls(&rig.console, MACHINE) >= 1,
+        "{:?}",
+        rig.console.github_calls()
+    );
+    assert_eq!(held.taken.load(Ordering::SeqCst), 1);
+    assert!(!held.file.exists(), "the key file is gone");
+    assert!(
+        held.service.restart_requested(),
+        "the Runner starts again through the console"
+    );
+    assert_eq!(held.service.key_kept(), None);
+    held.service.report().await;
+    let status = last_status(&rig.console);
+    assert!(status.get("appKeyKept").is_none(), "{status}");
+    assert!(status.get("appKeyFile").is_none(), "{status}");
+}
+
+/// A host that still holds the key, and a console whose scale set calls do not answer it (one from before them, one
+/// that answers what is not the contract's, one that fails, one that never answers, one where the owner has not
+/// turned GitHub through the console on): the key
+/// stays and serves the host's scale sets and jobs, and the report says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_whose_console_does_not_answer_its_scale_set_calls_keeps_the_key_and_serves_with_it() {
+    let failures: [(&str, Option<Reply>, &str); 5] = [
+        (
+            "older console",
+            Some(FakeConsole::no_scaleset_calls()),
+            "no such calls yet (404)",
+        ),
+        // A 200 is not an answer unless it is the contract's.
+        (
+            "console that answers nonsense",
+            Some(Reply::json(&json!({ "scaleSets": "none" }))),
+            "not the console's protocol",
+        ),
+        (
+            "failing console",
+            Some(Reply::status_json(500, &json!({ "error": "boom" }))),
+            "cannot be reached",
+        ),
+        ("silent console", Some(Reply::Hang), "cannot be reached"),
+        (
+            "broker off",
+            None,
+            "GitHub through the console is off for this host",
+        ),
+    ];
+    for (case, answer, why) in failures {
+        let mut rig = Rig::new(2).await;
+        rig.stop_pump().await;
+        match answer {
+            Some(answer) => rig.console.scaleset_answer(Some(answer)),
+            None => assert!(rig.console.set_broker(MACHINE, false)),
+        }
+        let held = holding(&rig, None);
+        rig.service = Arc::new(held.service);
+        rig.pump();
+        rig.service.discover().await;
+        let kept = rig.service.key_kept().unwrap_or_default();
+        assert!(
+            kept.starts_with("the console's scale set calls did not answer: ") && kept.contains(why),
+            "{case}: {kept}"
+        );
+        assert_eq!(held.taken.load(Ordering::SeqCst), 0, "{case}");
+        assert!(held.file.exists(), "{case}: the key stays");
+        assert!(!rig.service.restart_requested(), "{case}");
+        assert_eq!(answered_scaleset_calls(&rig.console, MACHINE), 0, "{case}");
+        // The key serves: the scale set and its session are made with it, and a job runs.
+        rig.settles("the scale set's session", || {
+            rig.github.scale_sets().iter().any(|s| s.has_session)
+        })
+        .await;
+        assert!(
+            !admin_requests_from_machines(&rig.github).is_empty(),
+            "{case}: the host's own admin token"
+        );
+        let runner = rig.job_running().await;
+        rig.finish(&runner, "succeeded");
+        rig.settles("the job's end on the console", || {
+            rig.events().iter().any(|(_, end)| !end.is_null())
+        })
+        .await;
+        rig.settles("a report that says why", || {
+            rig.console.reports().last().is_some_and(|report| {
+                report["status"]["appKeyKept"] == json!(kept)
+                    && report["status"]["appKeyFile"] == json!(held.file.display().to_string())
+            })
+        })
+        .await;
+        rig.stop_pump().await;
+    }
+}
+
+/// The console answered, and the key could not be taken out: it stays and serves, and the report says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_that_cannot_be_taken_out_stays_and_the_report_says_why() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let held = holding(&rig, Some("the settings file is read-only"));
+    held.service.discover().await;
+    assert_eq!(held.taken.load(Ordering::SeqCst), 1);
+    assert!(held.file.exists());
+    assert!(!held.service.restart_requested());
+    let kept = held.service.key_kept().unwrap_or_default();
+    assert_eq!(
+        kept,
+        "the console's scale set calls answer, and the key could not be taken out: the settings file is read-only"
+    );
+    held.service.report().await;
+    assert_eq!(last_status(&rig.console)["appKeyKept"], json!(kept));
+    // Asked again at the next look, and taken out once it can be.
+    held.service.discover().await;
+    assert_eq!(held.taken.load(Ordering::SeqCst), 2);
 }
 
 fn changed(id: &str) -> SettingsLook {

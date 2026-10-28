@@ -1,7 +1,9 @@
 use cf_secret::Secret;
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, IF_NONE_MATCH, LINK};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use time::OffsetDateTime;
 
 use crate::error::Error;
 use crate::http::{Http, Response};
@@ -16,6 +18,25 @@ pub(crate) fn decode<T: DeserializeOwned>(what: &str, response: &Response) -> Re
     serde_json::from_slice(&response.body).map_err(|e| Error::not_the_json(what, &e))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct TokenResponse {
+    pub(crate) token: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub(crate) expires_at: OffsetDateTime,
+}
+
+/// The token in an answer; one without a token is no answer.
+pub(crate) fn token_from(what: &str, response: &Response) -> Result<TokenResponse, Error> {
+    let parsed: TokenResponse = decode(what, response)?;
+    if parsed.token.is_empty() {
+        return Err(Error::Decode {
+            what: what.into(),
+            why: "GitHub returned an empty token".into(),
+        });
+    }
+    Ok(parsed)
+}
+
 /// Whose token a call takes: an installation's from a source, and the repository the call is about, when it is
 /// about one.
 #[derive(Clone, Copy)]
@@ -25,7 +46,7 @@ pub(crate) struct Installed<'a> {
     pub(crate) repo: Option<&'a str>,
 }
 
-/// GitHub's REST API at one root, through one [`Http`].
+/// GitHub's REST API at one root, through one [`Http`]: what the App client and the local key's source share.
 #[derive(Clone)]
 pub(crate) struct Rest {
     pub(crate) http: Http,
@@ -37,6 +58,14 @@ impl Rest {
         Rest {
             http,
             api: api.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// The same client, sending each call once: for a call GitHub may have acted on although the answer failed.
+    pub(crate) fn without_retries(&self) -> Rest {
+        Rest {
+            http: self.http.without_retries(),
+            api: self.api.clone(),
         }
     }
 

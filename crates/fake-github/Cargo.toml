@@ -1,6 +1,6 @@
 [package]
 name = "cf-fake-github"
-description = "A fake GitHub at the HTTP edge for tests: installation tokens, repositories, workflows and the Actions scale set service."
+description = "A fake GitHub at the HTTP edge for tests: App and installation tokens, repositories, workflows and the Actions scale set service."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+ring = "0.17"
+rsa = { version = "0.9", features = ["std"] }
 serde.workspace = true
 serde_json.workspace = true
 time = { version = "0.3", features = ["formatting"] }

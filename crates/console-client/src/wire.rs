@@ -300,6 +300,11 @@ pub struct Status {
     /// key, and the owner deletes the file. Left out when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_key_file: Option<String>,
+    /// Why this host still holds the GitHub App's key and signs with it: the console's scale set calls have not
+    /// answered it yet (an older console, GitHub through the console off for the host, a failure), or the key could
+    /// not be taken out. Left out on a host that goes through the console alone; a console from before ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_key_kept: Option<String>,
     /// Whether the Runner's first look at GitHub since it started has not ended yet: its scale sets are not listed
     /// yet, so serving none says nothing. Left out once it ended, and by a Runner from before it said it; a console
     /// from before ignores it.

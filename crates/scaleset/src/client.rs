@@ -5,7 +5,7 @@ use cf_console_client::{
     BAD_ADDRESS, Client as Console, Error as ConsoleError, NAME_TAKEN, OpenedSession, RefreshedSession,
     Removal, SESSION_EXISTS, SESSION_LOST,
 };
-use cf_ghapp::{Error as ApiError, GitHubApp, Response};
+use cf_ghapp::{Error as ApiError, GitHubApp, KeyTokens, Response};
 use cf_secret::Secret;
 use reqwest::header::AUTHORIZATION;
 use reqwest::{Method, Url};
@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::Error;
+use crate::key::KeyAdmin;
 use crate::session::MessageSession;
 use crate::types::{JitConfig, Label, RunnerRef, ScaleSet};
 
@@ -23,19 +24,28 @@ pub const ACTIONS_HOST: &str = "actions.githubusercontent.com";
 
 /// One repository's scale sets on the Actions service, reached through the CodeFusion Console.
 ///
-/// The console alone holds the Runners App's key, the registration tokens and the service's admin token: every
+/// The console holds the Runners App's key, the registration tokens and the service's admin token: every
 /// administrator's call (scale sets, sessions, Actions runners) is the console's `github/scaleset/*`, made for this
 /// machine and scoped to it. The machine holds only a session's message queue token, sent to GitHub's addresses
-/// only, and each Actions runner's configuration. Every call returns a `Result`; nothing here panics for what the
-/// console, the service or the network does.
+/// only, and each Actions runner's configuration. A host that still holds the App's key ([`ScaleSetClient::with_key`])
+/// makes these calls itself until the console's answered it. Every call returns a `Result`; nothing here panics for
+/// what the console, the service or the network does.
 #[derive(Clone)]
 pub struct ScaleSetClient {
     inner: Arc<Inner>,
 }
 
+/// Who makes the administrator's calls.
+enum Admin {
+    /// The console, for this machine.
+    Console(Console),
+    /// This host, with the App's key it still holds.
+    Key(KeyAdmin),
+}
+
 struct Inner {
     app: GitHubApp,
-    console: Console,
+    admin: Admin,
     machine: String,
     installation: i64,
     repo: String,
@@ -135,16 +145,68 @@ impl ScaleSetClient {
         repo: &str,
         poll_timeout: Duration,
     ) -> ScaleSetClient {
+        ScaleSetClient::of(
+            app,
+            Admin::Console(console),
+            machine,
+            installation,
+            repo,
+            poll_timeout,
+        )
+    }
+
+    /// A client for the scale sets of `repo` (`owner/name`, whose page is `config_url`) of a host that still holds the
+    /// Runners App's key, `tokens`: it buys the Actions service's admin token itself and makes every administrator's
+    /// call with it, as the machine `machine`. Only until the console's scale set calls answered the host, which then
+    /// deletes the key.
+    pub fn with_key(
+        app: GitHubApp,
+        tokens: Arc<KeyTokens>,
+        machine: &str,
+        installation: i64,
+        repo: &str,
+        config_url: &str,
+        poll_timeout: Duration,
+    ) -> ScaleSetClient {
+        let admin = Admin::Key(KeyAdmin::new(tokens, config_url));
+        ScaleSetClient::of(app, admin, machine, installation, repo, poll_timeout)
+    }
+
+    fn of(
+        app: GitHubApp,
+        admin: Admin,
+        machine: &str,
+        installation: i64,
+        repo: &str,
+        poll_timeout: Duration,
+    ) -> ScaleSetClient {
         ScaleSetClient {
             inner: Arc::new(Inner {
                 app,
-                console,
+                admin,
                 machine: machine.to_string(),
                 installation,
                 repo: repo.to_string(),
                 poll_timeout,
             }),
         }
+    }
+
+    /// Whether this client makes the administrator's calls with the App's key on this host, not through the console.
+    pub fn holds_key(&self) -> bool {
+        matches!(self.inner.admin, Admin::Key(_))
+    }
+
+    pub(crate) fn app(&self) -> &GitHubApp {
+        &self.inner.app
+    }
+
+    pub(crate) fn installation(&self) -> i64 {
+        self.inner.installation
+    }
+
+    pub(crate) fn repo(&self) -> &str {
+        &self.inner.repo
     }
 
     /// Refuses an address the service handed back that [`address_refusal`] names a reason against.
@@ -199,9 +261,14 @@ impl ScaleSetClient {
 
     /// The machine's scale sets of the repository (those named `<machine>--…` in the Default runner group).
     pub async fn list_scale_sets(&self) -> Result<Vec<ScaleSet>, Error> {
-        let sets = self
-            .inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => {
+                let mine = |set: &ScaleSet| cf_console_client::is_set_name_of(&self.inner.machine, &set.name);
+                return Ok(key.list(self).await?.into_iter().filter(mine).collect());
+            }
+        };
+        let sets = console
             .scaleset_list(&self.inner.repo)
             .await
             .map_err(|e| from_console("list", e))?;
@@ -215,9 +282,11 @@ impl ScaleSetClient {
 
     /// Finds the scale set of this name with exactly these labels, creating it or setting its labels when needed.
     pub async fn ensure_scale_set(&self, name: &str, labels: &[String]) -> Result<ScaleSet, Error> {
-        let entry = self
-            .inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.ensure(self, name, labels).await,
+        };
+        let entry = console
             .scaleset_create(&self.inner.machine, &self.inner.repo, name, labels)
             .await
             .map_err(|e| from_console("create", e))?;
@@ -226,8 +295,11 @@ impl ScaleSetClient {
 
     /// Deletes a scale set; its queued jobs wait for another Actions runner. Whether it was there to delete.
     pub async fn delete_scale_set(&self, id: i64) -> Result<bool, Error> {
-        self.inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.delete(self, id).await,
+        };
+        console
             .scaleset_delete(&self.inner.repo, id)
             .await
             .map_err(|e| from_console("delete", e))
@@ -236,12 +308,13 @@ impl ScaleSetClient {
     /// Opens the message session of a scale set, owned by this machine. A session that is still open makes this
     /// [`Error::SessionExists`]: it expires, and the call can be made again.
     pub async fn open_session(&self, scale_set_id: i64) -> Result<MessageSession, Error> {
-        let opened: OpenedSession = self
-            .inner
-            .console
-            .scaleset_session_open(&self.inner.repo, scale_set_id)
-            .await
-            .map_err(|e| from_console("session/open", e))?;
+        let opened: OpenedSession = match &self.inner.admin {
+            Admin::Console(console) => console
+                .scaleset_session_open(&self.inner.repo, scale_set_id)
+                .await
+                .map_err(|e| from_console("session/open", e))?,
+            Admin::Key(key) => key.open_session(self, scale_set_id, &self.inner.machine).await?,
+        };
         let checked = self
             .check_address("message session", &opened.queue_url)
             .and_then(|()| self.check_address("Actions service", &opened.service_url));
@@ -261,12 +334,13 @@ impl ScaleSetClient {
         scale_set_id: i64,
         session_id: &str,
     ) -> Result<RefreshedSession, Error> {
-        let refreshed = self
-            .inner
-            .console
-            .scaleset_session_refresh(&self.inner.repo, scale_set_id, session_id)
-            .await
-            .map_err(|e| from_console("session/refresh", e))?;
+        let refreshed = match &self.inner.admin {
+            Admin::Console(console) => console
+                .scaleset_session_refresh(&self.inner.repo, scale_set_id, session_id)
+                .await
+                .map_err(|e| from_console("session/refresh", e))?,
+            Admin::Key(key) => key.refresh_session(self, scale_set_id, session_id).await?,
+        };
         // A refresh may leave the queue's address out; the session then keeps the one it has.
         if let Some(queue) = &refreshed.queue_url {
             self.check_address("message session", queue)?;
@@ -277,8 +351,11 @@ impl ScaleSetClient {
 
     /// Ends a session.
     pub(crate) async fn delete_session(&self, scale_set_id: i64, session_id: &str) -> Result<(), Error> {
-        self.inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.delete_session(self, scale_set_id, session_id).await,
+        };
+        console
             .scaleset_session_close(&self.inner.repo, scale_set_id, session_id)
             .await
             .map(|_| ())
@@ -293,9 +370,14 @@ impl ScaleSetClient {
     /// such a registration, so it is removed here before the error comes back. Give this only names made for this
     /// call.
     pub async fn generate_jit_config(&self, scale_set_id: i64, name: &str) -> Result<JitConfig, Error> {
-        let answer = self
-            .inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => {
+                let answer = key.generate_jit(self, scale_set_id, name).await;
+                return self.registered(name, answer).await;
+            }
+        };
+        let answer = console
             .scaleset_jit(&self.inner.machine, &self.inner.repo, scale_set_id, name)
             .await
             .map(|jit| {
@@ -400,8 +482,11 @@ impl ScaleSetClient {
     /// Removes a registered Actions runner of this machine by GitHub's ID: whether it was there to remove. One with a
     /// job is refused (status 422); one of another machine too (403).
     pub async fn remove_runner(&self, runner_id: i64) -> Result<bool, Error> {
-        self.inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.remove_runner(self, runner_id).await,
+        };
+        console
             .scaleset_remove(&self.inner.machine, &self.inner.repo, Removal::Id(runner_id))
             .await
             .map_err(|e| from_console("remove", e))
@@ -409,8 +494,11 @@ impl ScaleSetClient {
 
     /// Removes a registered Actions runner of this machine by name, as [`ScaleSetClient::remove_runner`] does.
     pub async fn remove_runner_named(&self, name: &str) -> Result<bool, Error> {
-        self.inner
-            .console
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.remove_runner_named(self, name).await,
+        };
+        console
             .scaleset_remove(&self.inner.machine, &self.inner.repo, Removal::Name(name))
             .await
             .map_err(|e| from_console("remove", e))

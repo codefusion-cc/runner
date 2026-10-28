@@ -1,13 +1,13 @@
-//! The GitHub App's key file a host held before the console held the key. A Runner that starts on a settings file
-//! that still names the key's folder (`app_dir`) deletes the key file, takes `app_dir` out of the file and keeps
-//! everything else, and remembers where the file was, so that its report names a key file that is back or could
-//! not go. Without a console it gets its GitHub tokens from, it refuses to start: an update rolls back to the
-//! program before, which still has the key.
+//! The GitHub App's key file a host held before the console held the key. A Runner on a settings file that still
+//! names the key's folder (`app_dir`) signs with the key until the console's scale set calls answered this host
+//! (`cf_daemon::HeldKey`); then it deletes the key file, takes `app_dir` out of the file and keeps everything else,
+//! remembers where the file was, so that its report names a key file that is back or could not go, and starts again
+//! through the console. A Runner that starts on a file whose key file is already gone does the same at once.
 
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::{APP_DIR, APP_DIR_GONE, Config};
+use crate::config::{APP_DIR, Config};
 
 /// The key file's name in the App's folder.
 pub const KEY_FILE: &str = "app.pem";
@@ -27,6 +27,16 @@ pub struct TakenOut {
     pub key: Key,
 }
 
+/// When [`take_out`] takes the key out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// A call of the console's scale set calls this host made was answered: the key file goes.
+    Answered,
+    /// The Runner starts: only a key folder whose key file is gone is taken out of the file, and a key file that is
+    /// there stays and serves.
+    KeyGone,
+}
+
 /// What became of the key file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
@@ -43,11 +53,12 @@ pub enum Key {
 
 /// Takes the App's key out of the host: when the settings file at `path` names `app_dir`, the key file in it is
 /// deleted, the key is taken out of the file and the key file is remembered in the state folder. `None` when the
-/// file names no `app_dir`: nothing is done, and nothing is read but the file.
+/// file names no `app_dir`, or `when` is [`When::KeyGone`] and the key file is there: nothing is done, and nothing
+/// is read but the file.
 ///
 /// Refused, with nothing changed, when the file can be written by others, names no console, or the host holds no
 /// token for it: the Runner could not get its GitHub tokens.
-pub fn take_out(path: &Path) -> Result<Option<TakenOut>, String> {
+pub fn take_out(path: &Path, when: When) -> Result<Option<TakenOut>, String> {
     let said = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
     let text = crate::config::read_settings(path)?;
     let mut file: serde_json::Value = serde_json::from_str(&text).map_err(|error| said(&error))?;
@@ -62,18 +73,6 @@ pub fn take_out(path: &Path) -> Result<Option<TakenOut>, String> {
         .map(PathBuf::from)
         .filter(|state| state.is_absolute())
         .ok_or_else(|| said(&"state_dir: no absolute path"))?;
-    // `enroll` reads the file as a Runner does, so it comes after `app_dir` is out: the key stays until a person
-    // does both.
-    if console.is_none() {
-        return Err(said(&format!(
-            "{APP_DIR_GONE}. This file names no console, so the key file is left as it is"
-        )));
-    }
-    if !enrolled(&state_dir) {
-        return Err(said(&format!(
-            "{APP_DIR_GONE}. This host holds no token for the console, so the key file is left as it is"
-        )));
-    }
     let key_file = match &app_dir {
         serde_json::Value::Null => None,
         // A folder named through `..` could name a key file outside it; such a file is no Runner's.
@@ -87,6 +86,20 @@ pub fn take_out(path: &Path) -> Result<Option<TakenOut>, String> {
         }
         _ => return Err(said(&"app_dir: no absolute path without `..`")),
     };
+    // A link counts as there, whatever it names: the key loads through it or the Runner says why it cannot.
+    if when == When::KeyGone
+        && key_file
+            .as_deref()
+            .is_some_and(|key_file| std::fs::symlink_metadata(key_file).is_ok())
+    {
+        return Ok(None);
+    }
+    if console.is_none() {
+        return Err(said(&KEPT_NO_CONSOLE));
+    }
+    if !enrolled(&state_dir) {
+        return Err(said(&KEPT_NOT_ENROLLED));
+    }
 
     keys.remove(APP_DIR);
     // A file a Runner could not start on changes nothing, the key included.
@@ -121,6 +134,13 @@ pub fn take_out(path: &Path) -> Result<Option<TakenOut>, String> {
     write_settings(path, &file, |next| Config::load(next).map(|_| ()))?;
     Ok(Some(TakenOut { key_file, key }))
 }
+
+/// Why the key stays on a host whose file names no console.
+pub const KEPT_NO_CONSOLE: &str =
+    "the GitHub App's key stays: this file names no console (`console`) to give this host its GitHub tokens";
+/// Why the key stays on a host that holds no token for its console.
+pub const KEPT_NOT_ENROLLED: &str =
+    "the GitHub App's key stays: this host holds no token for the console; run `enroll`";
 
 /// Whether the host holds a token for its console, as `enroll` keeps it.
 fn enrolled(state_dir: &Path) -> bool {
@@ -242,7 +262,9 @@ mod tests {
         let host = Host::new();
         let mut expected = host.settings(true);
         expected.as_object_mut().expect("object").remove("app_dir");
-        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        let taken = take_out(&host.path(), When::Answered)
+            .expect("taken out")
+            .expect("there was one");
         assert_eq!(
             taken,
             TakenOut {
@@ -278,9 +300,15 @@ mod tests {
     #[test]
     fn taken_out_twice_is_taken_out_once() {
         let host = Host::new();
-        take_out(&host.path()).expect("first").expect("there was one");
+        take_out(&host.path(), When::Answered)
+            .expect("first")
+            .expect("there was one");
         let after = std::fs::read(host.path()).expect("read");
-        assert_eq!(take_out(&host.path()), Ok(None), "nothing left to do");
+        assert_eq!(
+            take_out(&host.path(), When::Answered),
+            Ok(None),
+            "nothing left to do"
+        );
         assert_eq!(
             std::fs::read(host.path()).expect("read"),
             after,
@@ -293,7 +321,9 @@ mod tests {
     fn a_runner_that_died_after_the_key_went_does_the_rest() {
         let host = Host::new();
         std::fs::remove_file(host.key()).expect("gone already");
-        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        let taken = take_out(&host.path(), When::Answered)
+            .expect("taken out")
+            .expect("there was one");
         assert_eq!(taken.key, Key::Missing);
         assert!(host.read().get("app_dir").is_none());
         // A folder that was named null holds no key.
@@ -302,7 +332,10 @@ mod tests {
         settings["app_dir"] = serde_json::Value::Null;
         host.write(&settings);
         assert_eq!(
-            take_out(&host.path()).expect("taken out").expect("named").key,
+            take_out(&host.path(), When::Answered)
+                .expect("taken out")
+                .expect("named")
+                .key,
             Key::Missing
         );
         assert!(host.key().exists(), "a key no folder names is not looked for");
@@ -314,26 +347,60 @@ mod tests {
         let host = Host::new();
         host.write(&host.settings(false));
         let before = std::fs::read(host.path()).expect("read");
-        let said = take_out(&host.path()).expect_err("refused");
-        assert!(
-            said.contains(APP_DIR_GONE)
-                && said.contains("names no console")
-                && said.contains("left as it is"),
-            "{said}"
-        );
+        let said = take_out(&host.path(), When::Answered).expect_err("refused");
+        assert_eq!(said, format!("{}: {KEPT_NO_CONSOLE}", host.path().display()));
         assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
         assert_eq!(std::fs::read(host.path()).expect("read"), before);
         assert_eq!(remembered(&host.state()), None);
 
         let host = Host::new();
         std::fs::remove_file(host.state().join("console-token")).expect("not enrolled");
-        let said = take_out(&host.path()).expect_err("refused");
-        assert!(said.contains("no token for the console"), "{said}");
+        let said = take_out(&host.path(), When::Answered).expect_err("refused");
+        assert_eq!(said, format!("{}: {KEPT_NOT_ENROLLED}", host.path().display()));
         assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
         assert!(host.read().get("app_dir").is_some());
 
         std::fs::write(host.state().join("console-token"), " \n").expect("an empty token");
-        assert!(take_out(&host.path()).is_err(), "an empty token is none");
+        assert!(
+            take_out(&host.path(), When::Answered).is_err(),
+            "an empty token is none"
+        );
+    }
+
+    #[test]
+    fn a_runner_that_starts_keeps_a_key_file_that_is_there_and_takes_out_a_folder_whose_key_is_gone() {
+        // The key file there: nothing changes, whether or not the host could go through the console.
+        for console in [true, false] {
+            let host = Host::new();
+            host.write(&host.settings(console));
+            let before = std::fs::read(host.path()).expect("read");
+            assert_eq!(take_out(&host.path(), When::KeyGone), Ok(None), "{console}");
+            assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
+            assert_eq!(std::fs::read(host.path()).expect("read"), before);
+            assert_eq!(remembered(&host.state()), None);
+        }
+        // A link counts as there, even one that names nothing: the Runner says why the key does not load.
+        let host = Host::new();
+        std::fs::remove_file(host.key()).expect("removed");
+        std::os::unix::fs::symlink("nowhere.pem", host.key()).expect("a link");
+        assert_eq!(take_out(&host.path(), When::KeyGone), Ok(None));
+        assert!(host.read().get("app_dir").is_some());
+        // The key file gone: the folder is taken out of the file, as once the console answered.
+        let host = Host::new();
+        std::fs::remove_file(host.key()).expect("gone");
+        let taken = take_out(&host.path(), When::KeyGone)
+            .expect("taken out")
+            .expect("there was one");
+        assert_eq!(taken.key, Key::Missing);
+        assert!(host.read().get("app_dir").is_none());
+        Config::load(&host.path()).expect("a Runner starts on it");
+        // Gone, without a console to go through: refused, and nothing changes.
+        let host = Host::new();
+        host.write(&host.settings(false));
+        std::fs::remove_file(host.key()).expect("gone");
+        let said = take_out(&host.path(), When::KeyGone).expect_err("refused");
+        assert!(said.ends_with(KEPT_NO_CONSOLE), "{said}");
+        assert!(host.read().get("app_dir").is_some());
     }
 
     #[test]
@@ -341,7 +408,7 @@ mod tests {
         let host = Host::new();
         std::fs::set_permissions(host.path(), std::fs::Permissions::from_mode(0o666)).expect("a mode");
         assert!(
-            take_out(&host.path())
+            take_out(&host.path(), When::Answered)
                 .expect_err("refused")
                 .contains("others can write it")
         );
@@ -356,7 +423,9 @@ mod tests {
         std::fs::write(&elsewhere, KEY).expect("a key elsewhere");
         std::fs::remove_file(host.key()).expect("removed");
         std::os::unix::fs::symlink("../elsewhere.pem", host.key()).expect("a link");
-        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        let taken = take_out(&host.path(), When::Answered)
+            .expect("taken out")
+            .expect("there was one");
         let to = host.app().join("../elsewhere.pem");
         assert_eq!(taken.key, Key::LinkDeleted { to: to.clone() });
         assert!(std::fs::symlink_metadata(host.key()).is_err(), "the link is gone");
@@ -367,7 +436,9 @@ mod tests {
         let host = Host::new();
         std::fs::remove_file(host.key()).expect("removed");
         std::fs::create_dir_all(host.key().join("inside")).expect("a folder");
-        let taken = take_out(&host.path()).expect("taken out").expect("there was one");
+        let taken = take_out(&host.path(), When::Answered)
+            .expect("taken out")
+            .expect("there was one");
         assert!(matches!(taken.key, Key::Kept { .. }), "{taken:?}");
         assert!(host.key().join("inside").exists());
         assert!(
@@ -387,7 +458,7 @@ mod tests {
             settings["app_dir"] = app_dir.clone();
             host.write(&settings);
             assert!(
-                take_out(&host.path())
+                take_out(&host.path(), When::Answered)
                     .expect_err("refused")
                     .contains("no absolute path"),
                 "{app_dir}"
@@ -401,7 +472,9 @@ mod tests {
         settings["app_dir"] = serde_json::json!(around);
         host.write(&settings);
         assert!(
-            take_out(&host.path()).expect_err("refused").contains("`..`"),
+            take_out(&host.path(), When::Answered)
+                .expect_err("refused")
+                .contains("`..`"),
             "a folder named through `..`"
         );
         assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);
@@ -414,7 +487,7 @@ mod tests {
         let mut settings = host.settings(true);
         settings["max_jobs"] = 0.into();
         host.write(&settings);
-        let said = take_out(&host.path()).expect_err("refused");
+        let said = take_out(&host.path(), When::Answered).expect_err("refused");
         assert!(said.contains("max_jobs") && !said.contains("json.next"), "{said}");
         assert!(host.read().get("app_dir").is_some());
         assert_eq!(std::fs::read_to_string(host.key()).expect("kept"), KEY);

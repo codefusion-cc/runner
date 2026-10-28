@@ -128,6 +128,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
             updates: None,
             settings: None,
             app_key_file: None,
+            held_key: None,
         })?
     };
     let service = Arc::new(service);

@@ -16,7 +16,7 @@ use cf_console_client::{
     MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
     RunnerUsage, ScaleSetStatus, Share, SizeStatus, Stalls, Status, Update,
 };
-use cf_ghapp::{Clock, GitHubApp, Repo};
+use cf_ghapp::{Clock, GitHubApp, KeyTokens, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
 use cf_workflows::{LabelSet, self_hosted_with};
 use time::OffsetDateTime;
@@ -144,6 +144,33 @@ impl ServiceConfig {
         }
     }
 }
+
+/// The Runners App's key a host still holds from before the console held it (rollout step 3 of the console's
+/// `docs/RUNNERS.md`). While it does, the Runner reads GitHub and makes its scale set calls with the key, as before
+/// the console made them, and asks the console's scale set calls at each discovery whether they answer this host:
+/// once one did, it takes the key out ([`HeldKey::take_out`]) and starts again, and from then on goes through the
+/// console. Until then its report says why it keeps the key (`appKeyKept`).
+pub struct HeldKey {
+    /// The key's tokens, which the service's GitHub App client signs for too.
+    pub tokens: Arc<KeyTokens>,
+    /// The key file, which the report names while the host holds it (`appKeyFile`).
+    pub file: PathBuf,
+    /// Deletes the key file and takes its folder out of the settings, so that the Runner that starts next goes
+    /// through the console: what it did, or why it could not. Called only right after a call of the console's scale
+    /// set calls that this host made was answered.
+    pub take_out: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for HeldKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldKey")
+            .field("file", &self.file)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the report says while a host keeps the key because the console's scale set calls were not asked yet.
+pub const KEY_NOT_ASKED: &str = "the console's scale set calls were not asked yet";
 
 /// The console and the job events that wait for it.
 pub struct Console {
@@ -289,6 +316,9 @@ pub struct ServiceParts<H, V> {
     /// Where the console's last word on the pause is kept, so that a Runner that starts again (after an update, a
     /// crash) takes no job on a paused host before the console says so again; none to keep it in memory only.
     pub pause: Option<PathBuf>,
+    /// The Runners App's key the host still holds, until the console's scale set calls answered it; none on a host
+    /// that goes through the console alone. `app` signs with it too.
+    pub held_key: Option<HeldKey>,
 }
 
 struct Shared<H, V> {
@@ -338,6 +368,9 @@ struct Shared<H, V> {
     looked: AtomicBool,
     /// Whether the last look at the Docker check found Docker refused: a change reads the label sets again.
     docker_refused: AtomicBool,
+    /// The key the host still holds, and why it keeps it (for the report): none once taken out.
+    held_key: Option<HeldKey>,
+    key_kept: Mutex<Option<String>>,
     /// Rung when the label sets are to be read again before the next discovery in its turn: the looks at GitHub
     /// take it one at a time with the others.
     rediscover: Notify,
@@ -542,26 +575,36 @@ impl Reports for LoggedReports {
 }
 
 impl<H, V> Shared<H, V> {
-    /// The scale set client of `repo` (`owner/name`) through the console, made once and kept for removing what is
-    /// left there; none on a Runner that is not enrolled, which has no scale sets.
-    fn client_of(&self, installation: i64, repo: &str) -> Option<ScaleSetClient> {
-        let console = self.console.as_ref()?;
-        let client = self
-            .clients
-            .lock()
-            .expect("clients")
-            .entry(repo.to_string())
-            .or_insert_with(|| {
-                ScaleSetClient::new(
-                    self.app.clone(),
-                    console.client.clone(),
-                    &self.config.machine,
-                    installation,
-                    repo,
-                    self.config.poll_timeout,
-                )
-            })
-            .clone();
+    /// The scale set client of `repo` (`owner/name`, whose page is `page`), made once and kept for removing what is
+    /// left there: through the console, or with the key a host still holds; none on a Runner that is neither enrolled
+    /// nor holds the key, which has no scale sets.
+    fn client_of(&self, installation: i64, repo: &str, page: &str) -> Option<ScaleSetClient> {
+        let make = || match (&self.held_key, &self.console) {
+            (Some(key), _) => Some(ScaleSetClient::with_key(
+                self.app.clone(),
+                key.tokens.clone(),
+                &self.config.machine,
+                installation,
+                repo,
+                page,
+                self.config.poll_timeout,
+            )),
+            (None, Some(console)) => Some(ScaleSetClient::new(
+                self.app.clone(),
+                console.client.clone(),
+                &self.config.machine,
+                installation,
+                repo,
+                self.config.poll_timeout,
+            )),
+            (None, None) => None,
+        };
+        let mut clients = self.clients.lock().expect("clients");
+        if let Some(client) = clients.get(repo) {
+            return Some(client.clone());
+        }
+        let client = make()?;
+        clients.insert(repo.to_string(), client.clone());
         Some(client)
     }
 }
@@ -612,6 +655,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 looked: AtomicBool::new(false),
                 test_run: Mutex::new(None),
                 docker_refused: AtomicBool::new(false),
+                key_kept: Mutex::new(parts.held_key.as_ref().map(|_| KEY_NOT_ASKED.to_string())),
+                held_key: parts.held_key,
                 rediscover: Notify::new(),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
                 results_file: parts.results,
@@ -726,6 +771,61 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// is left, deleted.
     pub async fn discover(&self) {
         self.look(true).await;
+        self.ask_for_the_key().await;
+    }
+
+    /// Why the host keeps the Runners App's key, while it holds one.
+    pub fn key_kept(&self) -> Option<String> {
+        self.shared.key_kept.lock().expect("key kept").clone()
+    }
+
+    /// On a host that still holds the Runners App's key: asks the console's scale set calls for this host's scale
+    /// sets of a repository it serves, and once they answered, takes the key out and starts again, through the
+    /// console. Otherwise the key stays and serves, and the report says why.
+    async fn ask_for_the_key(&self) {
+        let shared = &self.shared;
+        let Some(key) = &shared.held_key else {
+            return;
+        };
+        let keep = |why: String| {
+            // The console reads at most 300 characters of it.
+            let why = cut(why, 300);
+            let mut kept = shared.key_kept.lock().expect("key kept");
+            if kept.as_deref() != Some(why.as_str()) {
+                tracing::warn!(file = %key.file.display(), %why, "the GitHub App's key stays on this host and serves");
+            }
+            *kept = Some(why);
+        };
+        let Some(console) = &shared.console else {
+            return keep("this Runner is not enrolled with a console".into());
+        };
+        let repo = shared
+            .main
+            .lock()
+            .expect("main")
+            .as_ref()
+            .and_then(|read| read.repos.first().map(|(repo, _)| repo.full_name.clone()));
+        let Some(repo) = repo else {
+            return keep("no repository is served yet to ask the console's scale set calls about".into());
+        };
+        if let Err(error) = console.client.scaleset_list(&repo).await {
+            return keep(format!(
+                "the console's scale set calls did not answer: {}",
+                why_not(&error)
+            ));
+        }
+        let take_out = key.take_out.clone();
+        match tokio::task::spawn_blocking(move || take_out()).await {
+            Ok(Ok(done)) => {
+                tracing::warn!(%repo, %done, "the console's scale set calls answered: the GitHub App's key is taken out, and the Runner starts again through the console");
+                *shared.key_kept.lock().expect("key kept") = None;
+                self.restart();
+            }
+            Ok(Err(why)) => keep(format!(
+                "the console's scale set calls answer, and the key could not be taken out: {why}"
+            )),
+            Err(error) => keep(format!("the key's take-out stopped: {error}")),
+        }
     }
 
     /// Reads the jobs GitHub has queued and serves the label sets of those no workflow on a default branch names,
@@ -1180,7 +1280,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 served.push((repo.clone(), installation.id));
                 let name = repo.full_name.clone();
-                let Some(client) = shared.client_of(installation.id, &name) else {
+                let Some(client) = shared.client_of(installation.id, &name, &repo.html_url) else {
                     problems.push(format!(
                         "{name}: scale sets need the console, and this Runner is not enrolled"
                     ));
@@ -1293,7 +1393,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if let Some(client) = shared.clients.lock().expect("clients").get(repo) {
             return Some(client.clone());
         }
-        shared.console.as_ref()?;
+        if shared.console.is_none() && shared.held_key.is_none() {
+            return None;
+        }
         let installation = shared.app.repo_installation(repo).await.ok()?;
         let found = shared
             .app
@@ -1302,7 +1404,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .ok()?
             .into_iter()
             .find(|found| found.full_name.eq_ignore_ascii_case(repo))?;
-        shared.client_of(installation, &found.full_name)
+        shared.client_of(installation, &found.full_name, &found.html_url)
     }
 
     /// Finds the jobs GitHub holds back from this host's scale sets while they have room ([`crate::held`]), keeps
@@ -1755,7 +1857,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 update,
                 not_serving,
                 starting: !shared.looked.load(Ordering::SeqCst),
-                app_key_file: held_key_file(shared.config.app_key_file.as_deref()),
+                app_key_file: held_key_file(
+                    shared
+                        .held_key
+                        .as_ref()
+                        .map(|key| key.file.as_path())
+                        .or(shared.config.app_key_file.as_deref()),
+                ),
+                app_key_kept: self.key_kept(),
                 settings_error: settings_error
                     .as_ref()
                     .map(|(error, _)| cut(error.clone(), STATUS_TEXT_MAX)),
@@ -2692,6 +2801,21 @@ impl<S: cf_scaleset::Scaler, F: Fn(Option<usize>) + Send + Sync> cf_scaleset::Sc
         let capacity = self.0.scale(message).await;
         (self.1)(capacity.as_ref().ok().copied());
         capacity
+    }
+}
+
+/// Why the console's scale set calls did not answer, in words for the owner: an older console without them, GitHub
+/// through the console off for the host, or the console's own failure.
+fn why_not(error: &cf_console_client::Error) -> String {
+    use cf_console_client::Error;
+    match error {
+        Error::Refused {
+            status: 404,
+            code: None,
+            ..
+        } => "the console has no such calls yet (404)".into(),
+        Error::GithubOff(_) => "GitHub through the console is off for this host".into(),
+        other => other.to_string(),
     }
 }
 

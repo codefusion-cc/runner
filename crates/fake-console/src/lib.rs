@@ -73,6 +73,8 @@ struct Faults {
     drop_after: u32,
     /// As `drop_after`, for calls other than the `github/…` ones.
     drop_after_reports: u32,
+    /// What every scale set call is answered instead, while set.
+    scaleset: Option<Reply>,
 }
 
 #[derive(Default)]
@@ -373,6 +375,11 @@ impl FakeConsole {
                     None => reply,
                 };
             }
+            if let Some(reply) = &state.faults.scaleset
+                && request.path.starts_with(scaleset::PREFIX)
+            {
+                return reply.clone();
+            }
             match request.path.strip_prefix(scaleset::PREFIX) {
                 Some(route) if request.method == "POST" => state.scaleset_begin(route, &request),
                 _ => scaleset::Step::Done(state.route(&request)),
@@ -431,6 +438,19 @@ impl FakeConsole {
     /// still gives the host its GitHub tokens and makes its scale set calls.
     pub fn reports_down(&self, down: bool) {
         self.lock().faults.reports_down = down;
+    }
+
+    /// While `answer` is set, every scale set call (`github/scaleset/…`) is answered it, before anything else is
+    /// looked at: [`FakeConsole::no_scaleset_calls`] for a console from before them, a 5xx for one that fails,
+    /// [`Reply::Hang`] for one that never answers. `None` serves them again.
+    pub fn scaleset_answer(&self, answer: Option<Reply>) {
+        self.lock().faults.scaleset = answer;
+    }
+
+    /// What a console from before the scale set calls answers them: the 404 of a route it does not know, with no
+    /// code (agent.ts `handleAgent`).
+    pub fn no_scaleset_calls() -> Reply {
+        error(404, "Not found")
     }
 
     /// The next `n` calls are answered `status` with an `error` text, before anything else is looked at.

@@ -153,6 +153,9 @@ pub struct HostSetup {
     pub settings: Option<Arc<dyn SettingsFile>>,
     /// Where the GitHub App's key file was when the host held the key: the report names it while it is there.
     pub app_key_file: Option<PathBuf>,
+    /// The GitHub App's key the host still holds until the console's scale set calls answered it; `app` signs with
+    /// it too. None on a host that goes through the console alone.
+    pub held_key: Option<crate::HeldKey>,
 }
 
 /// Builds the machines and the service of this host, and finds what a Runner before left: records, vm-hosts,
@@ -229,6 +232,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
         results: Some(state.join("results.json")),
         pause: Some(state.join("pause")),
         settings: setup.settings,
+        held_key: setup.held_key,
     });
     Ok((machines, service))
 }

@@ -12,6 +12,7 @@
 
 mod client;
 mod error;
+mod key;
 mod listener;
 mod session;
 mod types;

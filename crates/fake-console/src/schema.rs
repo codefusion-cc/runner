@@ -371,6 +371,7 @@ fn status(v: &Value, path: &str) -> Check {
     field(o, path, "runners", Nullish, list(64, runner))
     // `appKeyFile`, a GitHub App key file the host still holds (an absolute path of at most 1024 characters), is read
     // with `.catch(undefined)`: a bad value is dropped, never refused, so nothing here refuses one.
+    // `appKeyKept`, why the host still holds and signs with the key (at most 300 characters), is read the same way.
     // `commands`, the console's commands this Runner does, is read with `.catch`: one the console cannot read is
     // dropped and the console assumes the commands of a Runner before it, so no value refuses a report.
     // `heldJobs`, the jobs GitHub holds back from scale sets with room, is not read: the schema drops keys it does not

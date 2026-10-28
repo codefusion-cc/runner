@@ -34,6 +34,11 @@ pub struct Config {
     /// The folder with everything the Runner keeps: images, job disks, records, the outbox, logs. On the
     /// internal disk: a launchd agent may not open an external volume.
     pub state_dir: PathBuf,
+    /// The folder with the GitHub App's `app.json` and `app.pem`, on a host that held the key before the console
+    /// held it. The Runner signs with it until the console's scale set calls answered this host, then deletes the key
+    /// file and takes this out of the file ([`crate::app_key`]). A new host leaves it out.
+    #[serde(default)]
+    pub app_dir: Option<PathBuf>,
     /// GitHub's API.
     #[serde(default = "github_api")]
     pub github_api: String,
@@ -53,8 +58,8 @@ pub struct Config {
     #[serde(default = "docker_max_jobs")]
     pub docker_max_jobs: usize,
     /// The console's address. It holds the GitHub App's key and gives the host its GitHub tokens, so a host that is
-    /// not enrolled with it (`enroll`) reaches nothing at GitHub. Required: `None` only inside the Runner, for a
-    /// look that reports to nobody.
+    /// not enrolled with it (`enroll`) reaches nothing at GitHub. Required unless the host still holds the key
+    /// (`app_dir`); `None` also inside the Runner, for a look that reports to nobody.
     #[serde(default)]
     pub console: Option<String>,
     /// Whether a person works on the Mac. Required on a Mac; on Linux, where nobody sits at the host, it is
@@ -125,10 +130,6 @@ impl Config {
 
     /// Reads and checks the file's text.
     pub fn parse(text: &str) -> Result<Config, String> {
-        let keys: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
-        if keys.get(APP_DIR).is_some() {
-            return Err(APP_DIR_GONE.into());
-        }
         let config: Config = serde_json::from_str(text).map_err(|error| error.to_string())?;
         config.check()?;
         Ok(config)
@@ -142,11 +143,20 @@ impl Config {
             ));
         }
         let build_folder = self.build_folder.iter().map(|folder| ("build_folder", folder));
-        let folders = std::iter::once(("state_dir", &self.state_dir));
+        let app_dir = self.app_dir.iter().map(|folder| (APP_DIR, folder));
+        let folders = std::iter::once(("state_dir", &self.state_dir)).chain(app_dir);
         for (what, folder) in folders.chain(build_folder.clone()) {
             if !folder.is_absolute() {
                 return Err(format!("{what}: `{}` is not an absolute path", folder.display()));
             }
+        }
+        // A key folder named through `..` could hold a key file outside it, which the Runner would delete.
+        if let Some(folder) = &self.app_dir
+            && folder
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err(format!("{APP_DIR}: `{}` goes through `..`", folder.display()));
         }
         // The service reads and writes the state folder, and `update` builds in the build folder.
         #[cfg(target_os = "macos")]
@@ -166,7 +176,7 @@ impl Config {
                     .into(),
             );
         }
-        if self.console.is_none() {
+        if self.console.is_none() && self.app_dir.is_none() {
             return Err(NO_CONSOLE.into());
         }
         if self.image.is_empty() {
@@ -291,14 +301,8 @@ impl Config {
     }
 }
 
-/// The key the GitHub App's folder had, when the host signed for its GitHub tokens itself.
+/// The key of the GitHub App's folder, on a host that still holds the key.
 pub const APP_DIR: &str = "app_dir";
-
-/// Why a file with [`APP_DIR`] is refused. An installed Runner takes the key out itself when it starts
-/// ([`crate::app_key`]); this is what a person who writes the file is told.
-pub const APP_DIR_GONE: &str = "app_dir: the console holds the GitHub App's key and gives this host its GitHub \
-     tokens; take `app_dir` out of this file, name the console (`console`) and run `enroll`, then delete the key \
-     file (`app.pem`) in that folder";
 
 const NO_CONSOLE: &str =
     "console: the console's address; it holds the GitHub App's key and gives this host its GitHub tokens";
@@ -443,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn github_tokens_come_from_the_console_alone() {
+    fn github_tokens_come_from_the_console_or_a_key_the_host_still_holds() {
         let no_console = with(|v| {
             v.as_object_mut().expect("object").remove("console");
         })
@@ -456,46 +460,36 @@ mod tests {
             with(|v| v["console"] = serde_json::Value::Null).is_err(),
             "null is no console"
         );
-        // A file from when the host held the App's key: refused with what to do, whatever the folder and whether
-        // or not a console is named beside it.
+        // A host that held the App's key before the console held it: taken, with a console or without one.
+        let folder = "/Users/someone/.config/codefusion-runners";
+        for console in [true, false] {
+            let config = with(|v| {
+                v["app_dir"] = folder.into();
+                if !console {
+                    v.as_object_mut().expect("object").remove("console");
+                }
+            })
+            .expect("a key folder");
+            assert_eq!(config.app_dir, Some(PathBuf::from(folder)), "{console}");
+            assert_eq!(config.console.is_some(), console);
+        }
+        assert_eq!(Config::parse(WHOLE).expect("whole").app_dir, None);
+        // Only an absolute folder that does not go through `..`: the Runner deletes `app.pem` in it.
         for app_dir in [
-            serde_json::Value::from("/Users/someone/.config/codefusion-runners"),
-            serde_json::Value::Null,
+            serde_json::Value::from("relative/app"),
             serde_json::Value::from(""),
+            serde_json::Value::from("/Users/someone/app/../../other"),
             serde_json::Value::from(7),
         ] {
-            for console in [true, false] {
-                let said = with(|v| {
-                    v["app_dir"] = app_dir.clone();
-                    if !console {
-                        v.as_object_mut().expect("object").remove("console");
-                    }
-                })
-                .expect_err("app_dir");
-                assert_eq!(said, APP_DIR_GONE, "{app_dir} {console}");
-            }
+            assert!(with(|v| v["app_dir"] = app_dir.clone()).is_err(), "{app_dir}");
         }
         assert!(
-            APP_DIR_GONE.contains("console holds the GitHub App's key")
-                && APP_DIR_GONE.contains("`enroll`")
-                && APP_DIR_GONE.contains("take `app_dir` out")
-                && APP_DIR_GONE.contains("delete the key file"),
-            "{APP_DIR_GONE}"
-        );
-    }
-
-    #[test]
-    fn a_file_with_app_dir_is_refused_by_load_naming_the_file() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let folder = tempfile::tempdir().expect("folder");
-        let path = folder.path().join("config.json");
-        let mut value: serde_json::Value = serde_json::from_str(WHOLE).expect("json");
-        value["app_dir"] = "/Users/someone/.config/codefusion-runners".into();
-        std::fs::write(&path, value.to_string()).expect("a file");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
-        assert_eq!(
-            Config::load(&path).expect_err("refused"),
-            format!("{}: {APP_DIR_GONE}", path.display())
+            with(|v| {
+                v["app_dir"] = serde_json::Value::Null;
+                v.as_object_mut().expect("object").remove("console");
+            })
+            .is_err(),
+            "null is no folder, and no console"
         );
     }
 

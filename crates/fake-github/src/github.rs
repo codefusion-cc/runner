@@ -8,10 +8,13 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use crate::httpd::{Handler, Reply, Request, Server};
+use crate::keys::test_key;
 
 /// How the fake behaves.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// The App's client ID, the `iss` of the tokens a host that holds the App's key signs.
+    pub client_id: String,
     /// How long a long poll waits before it answers 202.
     pub poll_timeout: Duration,
     /// How long an installation token lives.
@@ -46,6 +49,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
+            client_id: "Iv23test".into(),
             poll_timeout: Duration::from_millis(400),
             installation_token_ttl: Duration::from_secs(3600),
             admin_token_ttl: Duration::from_secs(3600),
@@ -1199,6 +1203,29 @@ impl FakeGithub {
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         let m = req.method.as_str();
         match (m, segs.as_slice()) {
+            ("GET", ["app", "installations"]) => self.with_jwt(&req, |_| Reply::json(&json!([{"id": 1, "account": {"login": "org"}}]))),
+            ("POST", ["app", "installations", id, "access_tokens"]) => {
+                let id = id.to_string();
+                self.with_jwt(&req, |st| {
+                    if id != "1" {
+                        return Reply::status_json(404, &json!({"message": "Not Found"}));
+                    }
+                    let token = st.token("ghs");
+                    let exp = st.now() + st.opts.installation_token_ttl.as_secs() as i64;
+                    st.installation_tokens.insert(token.clone(), exp);
+                    Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
+                })
+            }
+            ("GET", ["repos", owner, repo, "installation"]) => {
+                let name = format!("{owner}/{repo}");
+                self.with_jwt(&req, |st| {
+                    if st.repos.contains_key(&name) {
+                        Reply::json(&json!({"id": 1}))
+                    } else {
+                        Reply::status_json(404, &json!({"message": "Not Found"}))
+                    }
+                })
+            }
             ("GET", ["installation", "repositories"]) => self.with_installation(&req, |st| {
                 let repos: Vec<Value> = st
                     .repos
@@ -1373,6 +1400,21 @@ impl FakeGithub {
     fn unauthorized(&self, st: &State, message: &str) -> Reply {
         let _ = st;
         Reply::status_json(401, &json!({"message": message}))
+    }
+
+    /// Checks an App JWT as GitHub does: signature, issuer, not issued in its future, not valid for over ten minutes.
+    fn with_jwt(&self, req: &Request, f: impl FnOnce(&mut State) -> Reply) -> Reply {
+        let mut st = self.lock();
+        let Some(token) = req
+            .header("authorization")
+            .and_then(|h| h.strip_prefix("Bearer "))
+        else {
+            return self.unauthorized(&st, "A JSON web token could not be decoded");
+        };
+        match verify_jwt(token, &st.opts.client_id, st.now()) {
+            Ok(()) => f(&mut st),
+            Err(why) => self.unauthorized(&st, &why),
+        }
     }
 
     fn with_installation(&self, req: &Request, f: impl FnOnce(&mut State) -> Reply) -> Reply {
@@ -1687,6 +1729,46 @@ fn sha_of(content: &str) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}{:08x}", content.len())
+}
+
+fn verify_jwt(token: &str, client_id: &str, now: i64) -> Result<(), String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("A JSON web token could not be decoded".into());
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| "A JSON web token could not be decoded".to_string())?;
+    let key = ring::signature::UnparsedPublicKey::new(
+        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+        test_key().public_der.as_slice(),
+    );
+    key.verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| "Bad credentials: the JSON web token signature is not valid".to_string())?;
+    let header: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap_or_default()).unwrap_or_default();
+    if header["alg"] != "RS256" {
+        return Err("A JSON web token must be signed with RS256".into());
+    }
+    let claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap_or_default()).unwrap_or_default();
+    if claims["iss"] != client_id {
+        return Err("'Issuer' claim ('iss') does not name this App".into());
+    }
+    let (Some(iat), Some(exp)) = (claims["iat"].as_i64(), claims["exp"].as_i64()) else {
+        return Err("'iat' and 'exp' must be integers".into());
+    };
+    if iat > now {
+        return Err("'Issued at' claim ('iat') must be an Integer representing the time that the assertion was issued".into());
+    }
+    if exp <= now {
+        return Err("'Expiration time' claim ('exp') must be a numeric value representing the future time at which the assertion expires".into());
+    }
+    if exp - now > 600 {
+        return Err("'Expiration time' claim ('exp') is too far in the future".into());
+    }
+    Ok(())
 }
 
 fn scale_set_json(st: &State, s: &ScaleSet) -> Value {

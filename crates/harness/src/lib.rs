@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cf_console_client::{Client, ConsoleTokens, Enroll, enroll};
 use cf_fake_console::FakeConsole;
 use cf_fake_github::httpd::{Handler, Reply, Server};
-use cf_fake_github::{FakeGithub, Options};
-use cf_ghapp::{Clock, GitHubApp, Http, Monotonic, RetryPolicy};
+use cf_fake_github::{FakeGithub, Options, test_key};
+use cf_ghapp::{AppKey, Clock, GitHubApp, Http, KeyTokens, Monotonic, RetryPolicy};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 
@@ -99,6 +99,18 @@ pub fn app_on(
 ) -> GitHubApp {
     let tokens = ConsoleTokens::new(console.clone(), machine, clock, ticks);
     GitHubApp::with_source(Arc::new(tokens), &fake.url(), http)
+}
+
+/// The tokens of a host that still holds the Runners App's key (the test key, which `fake` checks the App's tokens
+/// against), signed for here, from `fake`.
+pub fn key_tokens(fake: &FakeGithub, http: Http, clock: Arc<dyn Clock>) -> Arc<KeyTokens> {
+    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).expect("the test key");
+    Arc::new(KeyTokens::new("Iv23test", key, &fake.url(), http, clock))
+}
+
+/// The GitHub App client of a host that still holds the key, its tokens from `tokens` ([`key_tokens`]).
+pub fn key_app(fake: &FakeGithub, tokens: &Arc<KeyTokens>, http: Http) -> GitHubApp {
+    GitHubApp::with_source(tokens.clone(), &fake.url(), http)
 }
 
 /// The monotonic clock that moves with a wall clock a test moves: now, plus however far `clock` is ahead of the real

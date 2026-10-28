@@ -173,11 +173,14 @@ and the console hears why; a start that ends as asked (a signal, `restart`) does
 at once and launchd (systemd on Linux) starts it again; machines that run go on and are adopted.
 
 A configuration written before the console held the App's key names `app_dir`, a folder with the key (`app.pem`)
-beside `app.json`. The Runner refuses such a file, except the first start after an update: there it deletes
-`<app_dir>/app.pem` (a link alone, not what it points to), takes `app_dir` out of the file and keeps the rest, and the
-log says so. A host whose file names no console, or that holds no token for it, is left as it is, and the update goes
-back to the program before. A key file still there afterwards (one that could not be deleted, or what a link pointed
-to) is named in the console's report (`appKeyFile`) until it is gone.
+beside `app.json`. While the key file is there the Runner signs with it and makes its scale set calls itself, as before,
+and at each look at GitHub asks the console's scale set calls for its scale sets of a repository it serves. Once one
+answered, it deletes `<app_dir>/app.pem` (a link alone, not what it points to), takes `app_dir` out of the file, keeps
+the rest, and starts again through the console. Until then the console's report says why the key stays
+(`appKeyKept`): a console from before those calls, GitHub through the console off for the host, a console that fails
+or does not answer. A host whose file names no console, or that holds no token for it, keeps the key. A key file still
+there afterwards (one that could not be deleted, or what a link pointed to) is named in the report (`appKeyFile`) until
+it is gone.
 
 `test-run` runs a developer's test suite in one machine of the image CI jobs get, instead of on their laptop. The Runner
 takes it like a main-branch job GitHub assigned: before the CI jobs that wait, never stopping one that runs, waiting for
