@@ -136,6 +136,13 @@ pub struct JobState {
     /// The worst of [`JobState::host_cpu`] over the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_cpu_peak: Option<Psi>,
+    /// What the job's machines read from their disks, in bytes, over the whole job: every boot's machine added up
+    /// ([`cf_vmm::Vm::disk_io`]). `None` where the host keeps no such account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_read_bytes: Option<u64>,
+    /// What they wrote to them, the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_written_bytes: Option<u64>,
     /// The first process the kernel stopped for memory, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oom: Option<OomEvent>,

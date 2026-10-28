@@ -62,6 +62,12 @@ pub struct Ending {
     /// The worst wait of the machine's vCPUs for the host's CPUs.
     #[serde(default)]
     pub host_cpu_peak: Option<Psi>,
+    /// What the job's machines read from the host's disks, in bytes.
+    #[serde(default)]
+    pub disk_read_bytes: Option<u64>,
+    /// What they wrote to them.
+    #[serde(default)]
+    pub disk_written_bytes: Option<u64>,
     /// What the vm-host said about the end, when it said something.
     pub message: Option<String>,
 }
