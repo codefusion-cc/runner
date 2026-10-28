@@ -33,8 +33,14 @@ impl Platform for Mac {
         MacHost::new(state_dir)
     }
 
-    fn settings(facts: HostFacts, mode: Mode) -> Settings {
-        Settings::for_host(facts, mode).on_fast_cores(performance_cores())
+    fn settings(facts: HostFacts, mode: Mode, trusted: bool) -> Settings {
+        let fast = performance_cores();
+        let settings = Settings::for_host(facts, mode).on_fast_cores(fast);
+        if trusted {
+            settings.one_at_a_time(fast)
+        } else {
+            settings
+        }
     }
 
     fn boot_session() -> Option<String> {

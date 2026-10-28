@@ -18,7 +18,7 @@ use cf_ghapp::{
 use cf_secret::Secret;
 
 use crate::commands::VERSION;
-use crate::config::Config;
+use crate::config::{Class, Config};
 use crate::hidden::{self, NoLine};
 use crate::manager::ServiceManager;
 use crate::update::{self, CheckoutUpdate, Started};
@@ -124,7 +124,7 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
 
 /// The budget's numbers on this host under the configuration: the defaults with what the file sets on top.
 fn budget_of(facts: HostFacts, config: &Config) -> Result<Settings, String> {
-    This::settings(facts, config.mode())
+    This::settings(facts, config.mode(), config.class == Class::Trusted)
         .limited(&config.limits())
         .map_err(|error| format!("the limits for jobs: {error}"))
 }

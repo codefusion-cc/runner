@@ -60,6 +60,18 @@ fn mains_production_deploy_by_hand_runs() {
 }
 
 #[test]
+fn the_console_makes_and_removes_machines_on_the_trusted_host_when_it_dispatches_them_only() {
+    let defaults = Policy::defaults();
+    assert!(decide(&defaults, &main_run("machines.yml", "workflow_dispatch")).is_ok());
+    for event in ["push", "schedule"] {
+        assert!(
+            decide(&defaults, &main_run("machines.yml", event)).is_err(),
+            "{event}"
+        );
+    }
+}
+
+#[test]
 fn every_default_workflow_runs_on_its_own_events_only() {
     for (file, events) in DEFAULT_ALLOW {
         for event in EVENTS {

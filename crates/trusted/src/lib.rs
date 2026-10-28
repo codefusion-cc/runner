@@ -31,14 +31,16 @@ const MAX_NAME: usize = 100;
 const QUOTE_MAX: usize = 120;
 
 /// The workflows (by file name) and events the trusted host runs when its configuration names none: codefusion's
-/// production deploy, its npm release and tags, and Magnetar's signing and publishing. A reusable workflow's jobs
-/// run under its caller's `github.workflow_ref`, so Magnetar's release on a push to main is `magnetar-main.yml`.
-pub const DEFAULT_ALLOW: [(&str, &[&str]); 5] = [
+/// production deploy, its npm release and tags, Magnetar's signing and publishing, and the console's making and
+/// removing of CI machines. A reusable workflow's jobs run under its caller's `github.workflow_ref`, so Magnetar's
+/// release on a push to main is `magnetar-main.yml`.
+pub const DEFAULT_ALLOW: [(&str, &[&str]); 6] = [
     ("deploy-production.yml", &["workflow_dispatch"]),
     ("release.yml", &["push", "workflow_dispatch"]),
     ("magnetar-main.yml", &["push"]),
     ("magnetar-release.yml", &["workflow_dispatch"]),
     ("magnetar-preview-app.yml", &["workflow_dispatch"]),
+    ("machines.yml", &["workflow_dispatch"]),
 ];
 
 /// The trusted class's rules as the configuration file has them: `{"repository": "owner/name", "allow": {"<file>":
