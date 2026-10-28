@@ -1320,6 +1320,16 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .unwrap_or_default(),
             })
             .collect();
+        // The room the polls offer goes first to the scale sets with jobs queued.
+        shared.machines.set_demand(
+            views
+                .iter()
+                .filter_map(|view| {
+                    let set = sets.iter().find(|set| set.name == view.name)?;
+                    (set.id != 0).then_some((set.id, !view.queued.is_empty()))
+                })
+                .collect(),
+        );
         let found = held::held(now, &views);
         // The slots are taken, and the tries counted, under the lock: a look at the same time starts none twice.
         let starts: Vec<(&SetState, &HeldSet, Ticket)> = {

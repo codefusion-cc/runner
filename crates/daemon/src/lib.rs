@@ -35,7 +35,7 @@ pub use ends::{EndKind, machine_end};
 pub use log::{Lines, ROLL_AT};
 pub use machines::{
     Answer, DOCKER_FULL, JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines,
-    RESULT_WAIT, Registration, Reports, SizeRoom, Snapshot,
+    OFFER_STANDS, RESULT_WAIT, Registration, Reports, SizeRoom, Snapshot,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use platform::{HostMachines, HostService, HostSetup, Platform, This, host_service, records_dir};

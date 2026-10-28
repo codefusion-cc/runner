@@ -574,7 +574,8 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     }
 
     /// How many Actions runners this scale set may have at once right now, which every wait carries to the service:
-    /// those it has, the jobs that wait in line, the slots promised to it, and one more while the machine has a free slot. The service may fill
+    /// those it has, the jobs that wait in line, the slots promised to it, and one more while the machine has a free
+    /// slot no other scale set's poll offers ([`Slots::offer_room`]). The service may fill
     /// every number it is given before any reports back, so offering all free slots to every scale set would let it
     /// assign this machine several times the jobs it can run while other machines stay idle. One at a time, a burst
     /// still fills the machine within a few polls: each assignment ends the wait and the next one offers the next slot.
@@ -584,21 +585,17 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// [`PLACE_LIMIT`] gets no room either, nor does any new job while it waits.
     pub fn capacity(&self) -> usize {
         let held = self.active() + self.promised.len();
+        let set = self.config.scale_set_id;
         if self.slots.held() {
+            self.slots.withdraw_offer(set);
             return held;
         }
         let overdue = self.overdue();
-        let open = if overdue > 0 {
+        let open = if overdue > 0 || (self.config.docker && self.slots.docker_room() == 0) {
+            self.slots.withdraw_offer(set);
             0
         } else {
-            self.slots
-                .open_slots(self.config.size)
-                .min(1)
-                .min(if self.config.docker {
-                    self.slots.docker_room()
-                } else {
-                    usize::MAX
-                })
+            self.slots.offer_room(set, self.config.size)
         };
         held + self.waiting.len() - overdue + open
     }
@@ -805,6 +802,7 @@ impl<J, R, H> Scaler<J, R, H> {
 
 impl<J, R, H> Drop for Scaler<J, R, H> {
     fn drop(&mut self) {
+        self.slots.withdraw_offer(self.config.scale_set_id);
         self.give_back(0..self.promised.len());
         for ticket in self.waiting.drain(..) {
             self.slots.withdraw(ticket);
