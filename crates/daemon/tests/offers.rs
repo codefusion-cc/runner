@@ -359,3 +359,23 @@ fn a_scale_set_that_stops_offering_gives_its_room_back_at_once() {
     w.m.withdraw_offer(&set(0));
     assert_eq!(w.m.offer_room(&set(1), SIZE), 1, "not a minute later");
 }
+
+#[test]
+fn room_offered_by_no_poll_that_reached_github_does_not_use_up_the_turn() {
+    let w = one_free();
+    // The first set's turn: two polls that offer the room; the second set, passed over, waits for it.
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 0);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 0, "the first set's turn is over");
+    // The second set's turn starts with a number a nudge replaced before any poll carried it.
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 1);
+    w.m.offer_not_sent(&set(1));
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 0);
+    assert_eq!(
+        w.m.offer_room(&set(1), SIZE),
+        1,
+        "GitHub saw one poll offer the room: the second is the set's too, or GitHub never assigns it"
+    );
+}

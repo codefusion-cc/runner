@@ -625,6 +625,11 @@ impl<J: Jobs, R: Registry, H: Hosts> cf_scaleset::Scaler for Scaler<J, R, H> {
         self.expire_promises();
         Ok(self.capacity())
     }
+
+    fn not_sent(&mut self) {
+        self.slots
+            .offer_not_sent(&(self.config.repo.clone(), self.config.scale_set_id));
+    }
 }
 
 /// Where an Actions runner is registered and what machine it gets.
