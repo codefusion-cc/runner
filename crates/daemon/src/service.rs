@@ -2043,6 +2043,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             wanted.store(false, Ordering::SeqCst);
         }
         shared.machines.pause(answer.paused);
+        shared
+            .machines
+            .make_room_for(answer.make_room_for.as_deref().and_then(Size::from_label));
         for command in answer.commands {
             // A result names its command by the id. One the console would not read back cannot be answered, and a
             // result it refuses would hold up every report after it: such a command is not done at all.

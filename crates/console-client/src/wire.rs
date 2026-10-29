@@ -638,6 +638,10 @@ pub struct Answer {
     pub report_every: u64,
     /// Commands to run. They come again with every answer until a report carries their result.
     pub commands: Vec<Command>,
+    /// The size (`cf-6g`) whose jobs no host has had room for, which the console names this host, one of many that
+    /// serve them, to make room for; left out for none. A label the Runner does not know names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub make_room_for: Option<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference

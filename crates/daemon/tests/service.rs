@@ -4613,6 +4613,8 @@ async fn the_queue_of_a_repository_the_runner_does_not_serve_is_not_read() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_jobs_this_host_must_not_take_get_no_set() {
     let rig = Rig::new(2).await;
+    // Queued first: the look at the queue reads the oldest runs.
+    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", "cf-macos", "fine"]);
     let long = "x".repeat(300);
     let many: Vec<String> = (0..40).map(|n| format!("l{n}")).collect();
     let mut many: Vec<&str> = many.iter().map(String::as_str).collect();
@@ -4637,7 +4639,6 @@ async fn queued_jobs_this_host_must_not_take_get_no_set() {
     ] {
         under_way_elsewhere(&rig, REPO, labels);
     }
-    under_way_elsewhere(&rig, REPO, &["self-hosted", "cf-2g", "cf-macos", "fine"]);
     rig.service.discover().await;
     rig.service.look_at_queue().await;
     let sets: Vec<Vec<String>> = rig.service.sets().into_iter().map(|s| s.labels).collect();
@@ -5682,4 +5683,39 @@ async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_ca
         trusted.sweep().await;
     }
     assert_eq!(rig.github.removed_at_request(), [name]);
+}
+
+// added: the size the console's answer names the host to make room for reaches its machines, the log says so once,
+// a label the Runner does not know names none, and an answer without one takes the name back.
+#[tokio::test]
+async fn the_size_the_console_names_to_make_room_for_reaches_the_machines() {
+    let log = support::Log::start();
+    let rig = Rig::new(2).await;
+    let named = "the console names this host to make room for a size no host has room for size=\"cf-6g\"";
+    let unnamed = "the console names this host to make room for no size";
+    let answered = async |size: Option<&str>| {
+        rig.console.make_room_for(size);
+        rig.service.report().await;
+    };
+    answered(Some("cf-6g")).await;
+    assert_eq!(log.lines("the console names"), [named]);
+    answered(Some("cf-6g")).await;
+    assert_eq!(
+        log.lines("the console names").len(),
+        1,
+        "said once while it stays"
+    );
+    answered(Some("cf-9g")).await;
+    assert_eq!(
+        log.lines("the console names"),
+        [named, unnamed],
+        "a size it does not know names none"
+    );
+    answered(Some("cf-6g")).await;
+    answered(None).await;
+    assert_eq!(
+        log.lines("the console names"),
+        [named, unnamed, named, unnamed],
+        "an answer without one"
+    );
 }
