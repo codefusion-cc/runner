@@ -34,6 +34,12 @@ impl Error {
         }
     }
 
+    /// Whether the console said no job waits for this Actions runner yet: a 409 that says when to ask again (a
+    /// trusted host's `no_trusted_job`). Nothing was made, and no name is taken.
+    pub fn is_no_job_yet(&self) -> bool {
+        self.status() == Some(409) && self.retry_after().is_some()
+    }
+
     /// Whether the thing asked about does not exist (404).
     pub fn is_not_found(&self) -> bool {
         self.status() == Some(404)

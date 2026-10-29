@@ -15,6 +15,7 @@ cf-image = { path = "../image" }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 cf-budget = { path = "../budget" }
+cf-fake-github = { path = "../fake-github" }
 cf-console-client = { path = "../console-client" }
 cf-daemon = { path = "../daemon" }
 cf-ghapp = { path = "../ghapp" }

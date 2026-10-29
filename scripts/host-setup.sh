@@ -225,8 +225,8 @@ if [[ ! -d $state/images/$image ]]; then
 fi
 
 step=config
-# No app_dir: the host takes its GitHub tokens from the console it enrols with. A trusted host's file names its class
-# and no rules, so the Runner's defaults apply.
+# The host takes its GitHub tokens from the console it enrols with, which holds the GitHub App's key. A trusted host's
+# file names its class and no rules, so the Runner's defaults apply.
 trusted_class=''
 [[ $class == trusted ]] && trusted_class='
   "class": "trusted",'

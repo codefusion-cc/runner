@@ -11,8 +11,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cf_fake_console::FakeConsole;
-use cf_fake_github::harness::REPO;
 use cf_fake_github::{FakeGithub, Options};
+use cf_harness::REPO;
 use serde_json::json;
 
 use crate::Result;

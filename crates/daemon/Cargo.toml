@@ -36,6 +36,7 @@ cf-host-linux = { path = "../host-linux" }
 [dev-dependencies]
 cf-fake-console = { path = "../fake-console" }
 cf-fake-github = { path = "../fake-github" }
+cf-harness = { path = "../harness" }
 proptest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

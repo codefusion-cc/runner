@@ -1,52 +1,54 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cf_ghapp::{DEFAULT_RUNNER_GROUP as RUNNER_GROUP, Error as ApiError, GitHubApp, Response};
+use cf_console_client::{
+    BAD_ADDRESS, Client as Console, Error as ConsoleError, NAME_TAKEN, OpenedSession, RefreshedSession,
+    Removal, SESSION_EXISTS, SESSION_LOST,
+};
+use cf_ghapp::{Error as ApiError, GitHubApp, KeyTokens, Response};
 use cf_secret::Secret;
 use reqwest::header::AUTHORIZATION;
 use reqwest::{Method, Url};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::error::Error;
+use crate::key::KeyAdmin;
 use crate::session::MessageSession;
-use crate::types::{JitConfig, JitResponse, Label, RunnerRef, ScaleSet, SessionInfo};
+use crate::types::{JitConfig, Label, RunnerRef, ScaleSet};
 
 pub(crate) const API_VERSION: &str = "6.0-preview";
-/// The Actions service's token is replaced this long before it expires.
-const ADMIN_MARGIN_SECS: i64 = 120;
-/// How long a token is trusted when its expiry cannot be read.
-const UNKNOWN_EXPIRY_SECS: i64 = 600;
 
 /// Where github.com's Actions service lives: the addresses it hands back are on this host or one below it.
 pub const ACTIONS_HOST: &str = "actions.githubusercontent.com";
 
-/// The Actions service's address and the token that administers scale sets on it.
-struct Admin {
-    url: String,
-    token: Secret<String>,
-    expires: i64,
-}
-
-/// One repository's scale sets on the Actions service, reached as the GitHub App that serves it.
+/// One repository's scale sets on the Actions service, reached through the CodeFusion Console.
 ///
-/// The App's installation token buys a registration token, which buys the service's own admin token. That token
-/// is kept until two minutes before it expires, and replaced once when the service refuses it. Every call returns
-/// a `Result`; nothing here panics for what the service or the network does.
+/// The console holds the Runners App's key, the registration tokens and the service's admin token: every
+/// administrator's call (scale sets, sessions, Actions runners) is the console's `github/scaleset/*`, made for this
+/// machine and scoped to it. The machine holds only a session's message queue token, sent to GitHub's addresses
+/// only, and each Actions runner's configuration. A host that still holds the App's key ([`ScaleSetClient::with_key`])
+/// makes these calls itself until the console's answered it. Every call returns a `Result`; nothing here panics for
+/// what the console, the service or the network does.
 #[derive(Clone)]
 pub struct ScaleSetClient {
     inner: Arc<Inner>,
 }
 
+/// Who makes the administrator's calls.
+enum Admin {
+    /// The console, for this machine.
+    Console(Console),
+    /// This host, with the App's key it still holds.
+    Key(KeyAdmin),
+}
+
 struct Inner {
     app: GitHubApp,
+    admin: Admin,
+    machine: String,
     installation: i64,
     repo: String,
-    config_url: String,
-    admin: tokio::sync::Mutex<Option<Admin>>,
     poll_timeout: Duration,
 }
 
@@ -54,37 +56,13 @@ impl std::fmt::Debug for ScaleSetClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScaleSetClient")
             .field("repo", &self.inner.repo)
+            .field("machine", &self.inner.machine)
             .finish_non_exhaustive()
     }
 }
 
-#[derive(Deserialize)]
-struct Registration {
-    url: String,
-    token: String,
-}
-
-#[derive(Deserialize)]
-#[serde(bound(deserialize = "T: Deserialize<'de>"))]
-struct Page<T> {
-    #[serde(default = "Vec::new", deserialize_with = "crate::types::null_default")]
-    value: Vec<T>,
-}
-
 pub(crate) fn decode<T: DeserializeOwned>(what: &str, response: &Response) -> Result<T, Error> {
     serde_json::from_slice(&response.body).map_err(|e| Error::Api(ApiError::not_the_json(what, &e)))
-}
-
-/// The `exp` claim of a token, without checking anything: the service decides whether the token is good.
-fn expiry_of(token: &str) -> Option<i64> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice::<Value>(&bytes).ok()?.get("exp")?.as_i64()
-}
-
-/// Whether a token that expires at `expires` is still good to use at `now`, whatever number the token named.
-fn is_fresh(expires: i64, now: i64) -> bool {
-    now < expires.saturating_sub(ADMIN_MARGIN_SECS)
 }
 
 /// Why no token may go to `address`, which the service handed back; `None` when one may. It must be an HTTPS address
@@ -110,27 +88,125 @@ fn address_refusal(api: &str, address: &str) -> Option<String> {
     }
 }
 
+/// The console's refusal of a scale set call (`route`) as this crate's error. Its codes keep their meaning: a session
+/// GitHub lost is [`Error::SessionLost`], one still open [`Error::SessionExists`], a queue that is not GitHub's a
+/// refusal for safety. A 404 without a code is a console without the route, never a thing that is gone. Everything
+/// else keeps its status and its wait (409 `name_taken`, 422 `runner_busy`, 429, 503).
+fn from_console(route: &str, error: ConsoleError) -> Error {
+    let path = format!("/agent/runners/github/scaleset/{route}");
+    match (&error, error.code()) {
+        (
+            ConsoleError::Refused {
+                status: 404, message, ..
+            },
+            Some(SESSION_LOST),
+        ) => Error::SessionLost(message.clone()),
+        (ConsoleError::Refused { status: 409, .. }, Some(SESSION_EXISTS)) => Error::SessionExists,
+        (ConsoleError::Refused { message, .. }, Some(BAD_ADDRESS)) => {
+            Error::Api(ApiError::Refused(format!("{route}: {message}")))
+        }
+        (
+            ConsoleError::Refused {
+                status: 404, message, ..
+            },
+            None,
+        ) => Error::Api(ApiError::Refused(format!(
+            "{route}: the console has no such route ({message}): it is older than this Runner"
+        ))),
+        _ => Error::Api(error.to_github(&path)),
+    }
+}
+
+fn set_of(entry: cf_console_client::ScaleSetEntry) -> ScaleSet {
+    ScaleSet {
+        id: entry.id,
+        name: entry.name,
+        labels: entry
+            .labels
+            .into_iter()
+            .map(|name| Label {
+                kind: "System".into(),
+                name,
+            })
+            .collect(),
+    }
+}
+
 impl ScaleSetClient {
-    /// A client for the scale sets of `repo` (`owner/name`, whose page is `config_url`), which the App serves through
+    /// A client for the scale sets of `repo` (`owner/name`) through `console`, for the machine named `machine` there.
+    /// `app` reads GitHub (an Actions runner's state) and registers Actions runners outside scale sets, through
     /// `installation`. `poll_timeout` is how long a long poll may take in all; the service ends it after about a
     /// minute.
     pub fn new(
         app: GitHubApp,
+        console: Console,
+        machine: &str,
+        installation: i64,
+        repo: &str,
+        poll_timeout: Duration,
+    ) -> ScaleSetClient {
+        ScaleSetClient::of(
+            app,
+            Admin::Console(console),
+            machine,
+            installation,
+            repo,
+            poll_timeout,
+        )
+    }
+
+    /// A client for the scale sets of `repo` (`owner/name`, whose page is `config_url`) of a host that still holds the
+    /// Runners App's key, `tokens`: it buys the Actions service's admin token itself and makes every administrator's
+    /// call with it, as the machine `machine`. Only until the console's scale set calls answered the host, which then
+    /// deletes the key.
+    pub fn with_key(
+        app: GitHubApp,
+        tokens: Arc<KeyTokens>,
+        machine: &str,
         installation: i64,
         repo: &str,
         config_url: &str,
         poll_timeout: Duration,
     ) -> ScaleSetClient {
+        let admin = Admin::Key(KeyAdmin::new(tokens, config_url));
+        ScaleSetClient::of(app, admin, machine, installation, repo, poll_timeout)
+    }
+
+    fn of(
+        app: GitHubApp,
+        admin: Admin,
+        machine: &str,
+        installation: i64,
+        repo: &str,
+        poll_timeout: Duration,
+    ) -> ScaleSetClient {
         ScaleSetClient {
             inner: Arc::new(Inner {
                 app,
+                admin,
+                machine: machine.to_string(),
                 installation,
                 repo: repo.to_string(),
-                config_url: config_url.to_string(),
-                admin: tokio::sync::Mutex::new(None),
                 poll_timeout,
             }),
         }
+    }
+
+    /// Whether this client makes the administrator's calls with the App's key on this host, not through the console.
+    pub fn holds_key(&self) -> bool {
+        matches!(self.inner.admin, Admin::Key(_))
+    }
+
+    pub(crate) fn app(&self) -> &GitHubApp {
+        &self.inner.app
+    }
+
+    pub(crate) fn installation(&self) -> i64 {
+        self.inner.installation
+    }
+
+    pub(crate) fn repo(&self) -> &str {
+        &self.inner.repo
     }
 
     /// Refuses an address the service handed back that [`address_refusal`] names a reason against.
@@ -145,59 +221,7 @@ impl ScaleSetClient {
         self.inner.poll_timeout
     }
 
-    /// Trades the App's token for the service's.
-    async fn register(&self) -> Result<Admin, Error> {
-        let reg = self
-            .inner
-            .app
-            .registration_token(self.inner.installation, &self.inner.repo)
-            .await?;
-        let url = format!("{}/actions/runner-registration", self.inner.app.api());
-        let auth = format!("RemoteAuth {}", reg.expose());
-        let body = json!({"url": self.inner.config_url, "runner_event": "register"}).to_string();
-        let response = self
-            .inner
-            .app
-            .http()
-            .send(|c| {
-                c.post(&url)
-                    .header(AUTHORIZATION, &auth)
-                    .header("Content-Type", "application/json")
-                    .body(body.clone())
-            })
-            .await?;
-        let parsed: Registration = decode("Actions runner registration", &response)?;
-        if parsed.token.is_empty() || parsed.url.is_empty() {
-            return Err(Error::Api(ApiError::Decode {
-                what: "Actions runner registration".into(),
-                why: "the answer has no service address or no token".into(),
-            }));
-        }
-        self.check_address("Actions runner registration", &parsed.url)?;
-        let expires = expiry_of(&parsed.token).unwrap_or(self.inner.app.now_epoch() + UNKNOWN_EXPIRY_SECS);
-        Ok(Admin {
-            url: parsed.url.trim_end_matches('/').to_string(),
-            token: Secret::new(parsed.token),
-            expires,
-        })
-    }
-
-    /// The service's address and a token that is good for a while, asking for a new one when needed. `refused` is
-    /// a token the service just turned down: it is replaced, unless another caller has replaced it already. One
-    /// caller at a time asks; the others wait for its answer.
-    async fn admin(&self, refused: Option<&Secret<String>>) -> Result<(String, Secret<String>), Error> {
-        let mut slot = self.inner.admin.lock().await;
-        let fresh = slot
-            .as_ref()
-            .is_some_and(|a| refused != Some(&a.token) && is_fresh(a.expires, self.inner.app.now_epoch()));
-        if !fresh {
-            *slot = Some(self.register().await?);
-        }
-        let a = slot.as_ref().expect("just set");
-        Ok((a.url.clone(), a.token.clone()))
-    }
-
-    /// One call with a token: the administrator's, or a session's to the session's own address.
+    /// One call with a session's token to GitHub's queue or service.
     pub(crate) async fn send(
         &self,
         method: Method,
@@ -207,8 +231,8 @@ impl ScaleSetClient {
         timeout: Option<Duration>,
         max_capacity: Option<usize>,
     ) -> Result<Response, Error> {
-        // Every request with one of the service's tokens passes here, so whatever address a caller was handed, the
-        // token goes to GitHub only.
+        // Every request with a session's token passes here, so whatever address a caller was handed, the token goes
+        // to GitHub only.
         self.check_address("request", url)?;
         let bearer = format!("Bearer {}", token.expose());
         let payload = body.map(Value::to_string);
@@ -235,187 +259,149 @@ impl ScaleSetClient {
             .await?)
     }
 
-    /// A call to the scale set API as the administrator; a 401 gets a new admin token once.
-    async fn admin_call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Response, Error> {
-        let mut refused: Option<Secret<String>> = None;
-        loop {
-            let (base, token) = self.admin(refused.as_ref()).await?;
-            let sep = if path.contains('?') { '&' } else { '?' };
-            let url = format!("{base}/_apis/{path}{sep}api-version={API_VERSION}");
-            match self
-                .send(method.clone(), &url, &token, body.as_ref(), None, None)
-                .await
-            {
-                Err(e) if e.status() == Some(401) && refused.is_none() => refused = Some(token),
-                other => return other,
-            }
-        }
-    }
-
-    /// Every scale set of the repository's Actions runner group.
+    /// The machine's scale sets of the repository (those named `<machine>--…` in the Default runner group).
     pub async fn list_scale_sets(&self) -> Result<Vec<ScaleSet>, Error> {
-        let response = self
-            .admin_call(
-                Method::GET,
-                &format!("runtime/runnerscalesets?runnerGroupId={RUNNER_GROUP}"),
-                None,
-            )
-            .await?;
-        Ok(decode::<Page<ScaleSet>>("scale sets", &response)?.value)
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => {
+                let mine = |set: &ScaleSet| cf_console_client::is_set_name_of(&self.inner.machine, &set.name);
+                return Ok(key.list(self).await?.into_iter().filter(mine).collect());
+            }
+        };
+        let sets = console
+            .scaleset_list(&self.inner.repo)
+            .await
+            .map_err(|e| from_console("list", e))?;
+        Ok(sets.into_iter().map(set_of).collect())
     }
 
-    /// The scale set of this name, if there is one.
+    /// The machine's scale set of this name, if there is one.
     pub async fn find_scale_set(&self, name: &str) -> Result<Option<ScaleSet>, Error> {
-        let path = format!(
-            "runtime/runnerscalesets?runnerGroupId={RUNNER_GROUP}&name={}",
-            encode(name)
-        );
-        let response = self.admin_call(Method::GET, &path, None).await?;
-        Ok(decode::<Page<ScaleSet>>("scale sets", &response)?
-            .value
-            .into_iter()
-            .find(|s| s.name == name))
-    }
-
-    fn scale_set_body(name: &str, labels: &[String]) -> Value {
-        let labels: Vec<Label> = labels
-            .iter()
-            .map(|l| Label {
-                kind: "System".into(),
-                name: l.clone(),
-            })
-            .collect();
-        // The Actions runner is rebuilt with each release; one updating itself in a one-job machine would only
-        // download the update again for every job.
-        json!({"name": name, "runnerGroupId": RUNNER_GROUP, "labels": labels, "RunnerSetting": {"disableUpdate": true}, "enabled": true})
+        Ok(self.list_scale_sets().await?.into_iter().find(|s| s.name == name))
     }
 
     /// Finds the scale set of this name with exactly these labels, creating it or setting its labels when needed.
     pub async fn ensure_scale_set(&self, name: &str, labels: &[String]) -> Result<ScaleSet, Error> {
-        let mut want: Vec<String> = labels.iter().map(|l| l.to_lowercase()).collect();
-        want.sort();
-        want.dedup();
-        let body = Self::scale_set_body(name, &want);
-        match self.find_scale_set(name).await? {
-            None => {
-                let response = self
-                    .admin_call(Method::POST, "runtime/runnerscalesets", Some(body))
-                    .await?;
-                decode("scale set", &response)
-            }
-            Some(existing) if existing.label_names() != want => {
-                let response = self
-                    .admin_call(
-                        Method::PATCH,
-                        &format!("runtime/runnerscalesets/{}", existing.id),
-                        Some(body),
-                    )
-                    .await?;
-                decode("scale set", &response)
-            }
-            Some(existing) => Ok(existing),
-        }
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.ensure(self, name, labels).await,
+        };
+        let entry = console
+            .scaleset_create(&self.inner.machine, &self.inner.repo, name, labels)
+            .await
+            .map_err(|e| from_console("create", e))?;
+        Ok(set_of(entry))
     }
 
-    /// Deletes a scale set; its queued jobs wait for another Actions runner.
-    pub async fn delete_scale_set(&self, id: i64) -> Result<(), Error> {
-        self.admin_call(Method::DELETE, &format!("runtime/runnerscalesets/{id}"), None)
+    /// Deletes a scale set; its queued jobs wait for another Actions runner. Whether it was there to delete.
+    pub async fn delete_scale_set(&self, id: i64) -> Result<bool, Error> {
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.delete(self, id).await,
+        };
+        console
+            .scaleset_delete(&self.inner.repo, id)
             .await
-            .map(|_| ())
+            .map_err(|e| from_console("delete", e))
     }
 
-    /// Opens the message session of a scale set for `owner` (the machine's name). A session of the same owner that
-    /// is still open makes this [`Error::SessionExists`]: it expires, and the call can be made again.
-    pub async fn open_session(&self, scale_set_id: i64, owner: &str) -> Result<MessageSession, Error> {
-        let body = json!({"ownerName": owner});
-        let response = self
-            .admin_call(
-                Method::POST,
-                &format!("runtime/runnerscalesets/{scale_set_id}/sessions"),
-                Some(body),
-            )
-            .await
-            .map_err(|e| match e.status() {
-                Some(409) => Error::SessionExists,
-                _ => e,
-            })?;
-        let info: SessionInfo = decode("message session", &response)?;
-        if let Err(refused) = self.check_address("message session", &info.message_queue_url) {
+    /// Opens the message session of a scale set, owned by this machine. A session that is still open makes this
+    /// [`Error::SessionExists`]: it expires, and the call can be made again.
+    pub async fn open_session(&self, scale_set_id: i64) -> Result<MessageSession, Error> {
+        let opened: OpenedSession = match &self.inner.admin {
+            Admin::Console(console) => console
+                .scaleset_session_open(&self.inner.repo, scale_set_id)
+                .await
+                .map_err(|e| from_console("session/open", e))?,
+            Admin::Key(key) => key.open_session(self, scale_set_id, &self.inner.machine).await?,
+        };
+        let checked = self
+            .check_address("message session", &opened.queue_url)
+            .and_then(|()| self.check_address("Actions service", &opened.service_url));
+        if let Err(refused) = checked {
             // The service holds a session nobody will use: the next one would be refused until it ran out.
-            if let Err(e) = self.delete_session(scale_set_id, &info.session_id).await {
+            if let Err(e) = self.delete_session(scale_set_id, &opened.session_id).await {
                 tracing::warn!(error = %e, "could not end a session whose address was refused");
             }
             return Err(refused);
         }
-        Ok(MessageSession::new(self.clone(), scale_set_id, info))
+        Ok(MessageSession::new(self.clone(), scale_set_id, opened))
     }
 
-    /// Asks the service for a new token for a session.
+    /// Asks for a new token for a session. The addresses that come with it are checked as an opening's are.
     pub(crate) async fn refresh_session(
         &self,
         scale_set_id: i64,
         session_id: &str,
-    ) -> Result<SessionInfo, Error> {
-        let path = format!(
-            "runtime/runnerscalesets/{scale_set_id}/sessions/{}",
-            encode(session_id)
-        );
-        let response = self
-            .admin_call(Method::PATCH, &path, None)
-            .await
-            .map_err(|e| match e.status() {
-                Some(404) => Error::SessionLost("the service no longer has the session".into()),
-                _ => e,
-            })?;
-        let info: SessionInfo = decode("message session", &response)?;
-        // A refresh may leave the address out; the session then keeps the one it has.
-        if !info.message_queue_url.is_empty() {
-            self.check_address("message session", &info.message_queue_url)?;
+    ) -> Result<RefreshedSession, Error> {
+        let refreshed = match &self.inner.admin {
+            Admin::Console(console) => console
+                .scaleset_session_refresh(&self.inner.repo, scale_set_id, session_id)
+                .await
+                .map_err(|e| from_console("session/refresh", e))?,
+            Admin::Key(key) => key.refresh_session(self, scale_set_id, session_id).await?,
+        };
+        // A refresh may leave the queue's address out; the session then keeps the one it has.
+        if let Some(queue) = &refreshed.queue_url {
+            self.check_address("message session", queue)?;
         }
-        Ok(info)
+        self.check_address("Actions service", &refreshed.service_url)?;
+        Ok(refreshed)
     }
 
     /// Ends a session.
     pub(crate) async fn delete_session(&self, scale_set_id: i64, session_id: &str) -> Result<(), Error> {
-        let path = format!(
-            "runtime/runnerscalesets/{scale_set_id}/sessions/{}",
-            encode(session_id)
-        );
-        self.admin_call(Method::DELETE, &path, None).await.map(|_| ())
-    }
-
-    /// The Actions service's address for this repository.
-    pub(crate) async fn service_url(&self) -> Result<String, Error> {
-        Ok(self.admin(None).await?.0)
-    }
-
-    /// Registers an Actions runner that takes one job and unregisters itself after it. A name that is taken is a
-    /// conflict (409 in the error): names are random, so another try uses another name.
-    ///
-    /// The service may register the Actions runner although its answer never arrives; the call is then tried again
-    /// and meets its own registration (409), or fails for good. Nobody holds the configuration of such a
-    /// registration, so it is removed here before the error comes back. Give this only names made for this call.
-    pub async fn generate_jit_config(
-        &self,
-        scale_set_id: i64,
-        name: &str,
-        work_folder: &str,
-    ) -> Result<JitConfig, Error> {
-        let body = json!({"name": name, "workFolder": work_folder});
-        let answer = match self
-            .admin_call(
-                Method::POST,
-                &format!("runtime/runnerscalesets/{scale_set_id}/generatejitconfig"),
-                Some(body),
-            )
-            .await
-        {
-            Ok(response) => {
-                let parsed: JitResponse = decode("Actions runner configuration", &response)?;
-                Ok((parsed.runner, Secret::new(parsed.encoded_jit_config)))
-            }
-            Err(e) => Err(e),
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.delete_session(self, scale_set_id, session_id).await,
         };
+        console
+            .scaleset_session_close(&self.inner.repo, scale_set_id, session_id)
+            .await
+            .map(|_| ())
+            .map_err(|e| from_console("session/close", e))
+    }
+
+    /// Registers an Actions runner of the scale set that takes one job and unregisters itself after it. A name that
+    /// is taken is a conflict (409 in the error): names are random, so another try uses another name. The console
+    /// sends it to GitHub once.
+    ///
+    /// GitHub may register the Actions runner although the answer never arrives. Nobody holds the configuration of
+    /// such a registration, so it is removed here before the error comes back. Give this only names made for this
+    /// call.
+    pub async fn generate_jit_config(&self, scale_set_id: i64, name: &str) -> Result<JitConfig, Error> {
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => {
+                let answer = key.generate_jit(self, scale_set_id, name).await;
+                return self.registered(name, answer).await;
+            }
+        };
+        let answer = console
+            .scaleset_jit(&self.inner.machine, &self.inner.repo, scale_set_id, name)
+            .await
+            .map(|jit| {
+                let runner = RunnerRef {
+                    id: jit.runner_id,
+                    name: name.to_string(),
+                };
+                (Some(runner), jit.encoded)
+            })
+            .map_err(|e| {
+                // The console answers every refusal of GitHub's with a 409; only `name_taken` says one is there. Its
+                // 503 (GitHub busy or gone mid-call) and a dropped answer may follow a registration GitHub made; its
+                // 429 is its own limit, which refused the call before GitHub was asked, and its 409 that says when to
+                // ask again (no job for a trusted machine yet) made nothing either.
+                let own_limit = matches!(
+                    e,
+                    ConsoleError::Busy {
+                        status: 429 | 409,
+                        ..
+                    }
+                );
+                let leftover = e.code() == Some(NAME_TAKEN) || (e.is_transient() && !own_limit);
+                (from_console("jit", e), leftover)
+            });
         self.registered(name, answer).await
     }
 
@@ -437,26 +423,31 @@ impl ScaleSetClient {
                 };
                 (Some(runner), jit.encoded)
             })
-            .map_err(Error::from);
+            .map_err(|e| {
+                // A 429 is a limit that refused the call before anything was made (GitHub's, or the console's own, or
+                // a wait the console asked for that kept it unsent), and so is a 409 that says when to ask again (the
+                // console has no job for a trusted machine yet): there is nothing to look for.
+                let e = Error::from(e);
+                let leftover = !e.is_no_job_yet()
+                    && (e.status() == Some(409) || (e.is_transient() && e.status() != Some(429)));
+                (e, leftover)
+            });
         self.registered(name, answer).await
     }
 
-    /// The configuration of a registration the service answered, or the error. One that may have been registered
+    /// The configuration of a registration the console answered, or the error with whether the call may have
+    /// registered one anyway. One that may have been registered
     /// although the answer never arrived or was refused as taken is removed before the error comes back, and so is
     /// one whose ID is unknown, which could never be removed again, or that has no configuration and never starts.
     async fn registered(
         &self,
         name: &str,
-        answer: Result<(Option<RunnerRef>, Secret<String>), Error>,
+        answer: Result<(Option<RunnerRef>, Secret<String>), (Error, bool)>,
     ) -> Result<JitConfig, Error> {
         let (runner, encoded) = match answer {
             Ok(answer) => answer,
-            Err(e) => {
-                // A 429 is a limit that refused the call before anything was made (GitHub's, or the console's own,
-                // or a wait the console asked for that kept it unsent), and so is a 409 that says when to ask again
-                // (the console has no job for a trusted machine yet): there is nothing to look for.
-                let no_job_yet = e.status() == Some(409) && e.retry_after().is_some();
-                if !no_job_yet && (e.status() == Some(409) || (e.is_transient() && e.status() != Some(429))) {
+            Err((e, leftover)) => {
+                if leftover {
                     self.remove_leftover(name).await;
                 }
                 return Err(e);
@@ -477,32 +468,15 @@ impl ScaleSetClient {
     /// Removes the registration a failed [`ScaleSetClient::generate_jit_config`] may have left, as far as the
     /// service lets it: one that took a job in the meantime stays.
     async fn remove_leftover(&self, name: &str) {
-        let found = match self.runner_by_name(name).await {
-            Ok(found) => found,
-            Err(e) => {
-                tracing::warn!(runner = %name, error = %e, "could not look for a registration without a machine");
-                return;
-            }
-        };
-        let Some(runner) = found else { return };
-        match self.remove_runner(runner.id).await {
-            Ok(()) => {
+        match self.remove_runner_named(name).await {
+            Ok(true) => {
                 tracing::info!(runner = %name, "removed a registration whose configuration never arrived")
             }
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(runner = %name, error = %e, "could not remove a registration without a machine")
             }
         }
-    }
-
-    /// The registered Actions runner of this name, if there is one.
-    pub async fn runner_by_name(&self, name: &str) -> Result<Option<RunnerRef>, Error> {
-        let path = format!("distributedtask/pools/0/agents?agentName={}", encode(name));
-        let response = self.admin_call(Method::GET, &path, None).await?;
-        Ok(decode::<Page<RunnerRef>>("Actions runners", &response)?
-            .value
-            .into_iter()
-            .find(|r| r.name == name))
     }
 
     /// Whether a registered Actions runner of the repository has a job, by GitHub's own record; `None` when GitHub no
@@ -515,16 +489,29 @@ impl ScaleSetClient {
             .await?)
     }
 
-    /// Removes a registered Actions runner. An Actions runner with a job refuses (the service answers 422); one that is
-    /// gone is [`Error::is_not_found`].
-    pub async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {
-        self.admin_call(
-            Method::DELETE,
-            &format!("distributedtask/pools/0/agents/{runner_id}"),
-            None,
-        )
-        .await
-        .map(|_| ())
+    /// Removes a registered Actions runner of this machine by GitHub's ID: whether it was there to remove. One with a
+    /// job is refused (status 422); one of another machine too (403).
+    pub async fn remove_runner(&self, runner_id: i64) -> Result<bool, Error> {
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.remove_runner(self, runner_id).await,
+        };
+        console
+            .scaleset_remove(&self.inner.machine, &self.inner.repo, Removal::Id(runner_id))
+            .await
+            .map_err(|e| from_console("remove", e))
+    }
+
+    /// Removes a registered Actions runner of this machine by name, as [`ScaleSetClient::remove_runner`] does.
+    pub async fn remove_runner_named(&self, name: &str) -> Result<bool, Error> {
+        let console = match &self.inner.admin {
+            Admin::Console(console) => console,
+            Admin::Key(key) => return key.remove_runner_named(self, name).await,
+        };
+        console
+            .scaleset_remove(&self.inner.machine, &self.inner.repo, Removal::Name(name))
+            .await
+            .map_err(|e| from_console("remove", e))
     }
 }
 
@@ -576,14 +563,5 @@ mod tests {
         // A fake on this machine is its own service, at its own port only.
         assert!(address_refusal("http://127.0.0.1:4000", "http://127.0.0.1:4000/svc").is_none());
         assert!(address_refusal("http://127.0.0.1:4000", "http://127.0.0.1:4001/svc").is_some());
-    }
-
-    #[test]
-    fn a_token_is_fresh_until_two_minutes_before_it_runs_out_whatever_it_says() {
-        assert!(is_fresh(1000, 879));
-        assert!(!is_fresh(1000, 880));
-        assert!(!is_fresh(1000, 1000));
-        assert!(!is_fresh(i64::MIN, 0));
-        assert!(is_fresh(i64::MAX, 0));
     }
 }

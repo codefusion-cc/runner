@@ -385,7 +385,8 @@ async fn a_registration_failure_starts_no_machine() {
         .scale(Some(&stats(1)))
         .await
         .expect_err("a failed registration fails the poll");
-    assert_eq!(err.status(), Some(500));
+    // GitHub's 5xx reaches the Runner as the console's 503 `github_busy`.
+    assert_eq!(err.status(), Some(503));
     assert!(h.hosts.started().is_empty());
     assert_eq!(h.slots.used(), 0, "slot held after a failed registration");
 }
@@ -404,14 +405,19 @@ async fn a_taken_runner_name_is_registered_again_under_another() {
 #[tokio::test]
 async fn a_409_that_says_when_to_ask_again_is_no_taken_name() {
     let mut h = harness(1).await;
-    h.fake.fail(
-        "generatejitconfig",
-        Reply::text(409, "no trusted job").with_header("retry-after", "15"),
-        5,
+    let calls = h.console.calls();
+    h.console.answer_next(
+        Reply::status_json(
+            409,
+            &serde_json::json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
     );
     let err = h.scaler.scale(Some(&stats(1))).await.expect_err("no job yet");
     assert_eq!(err.status(), Some(409));
-    assert_eq!(h.fake.count("generatejitconfig"), 1, "another name was tried");
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(15)), "{err:?}");
+    assert_eq!(h.console.calls(), calls + 1, "another name was tried");
+    assert_eq!(h.fake.count("generatejitconfig"), 0);
     assert!(h.hosts.started().is_empty());
     assert_eq!(h.slots.used(), 0, "slot held after no registration");
     assert!(h.machines.registrations_to_remove().is_empty());

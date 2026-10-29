@@ -7,10 +7,11 @@ use reqwest::Method;
 use serde::Deserialize;
 
 use crate::client::{DEFAULT_RUNNER_GROUP, Installation, PlainJit};
+use crate::clock::Clock;
 use crate::credentials::{AppCredentials, AppKey};
 use crate::error::Error;
 use crate::http::{Http, Response};
-use crate::jwt::{Clock, Signer};
+use crate::jwt::Signer;
 use crate::rest::{Installed, MAX_PAGES, Rest, decode, token_from};
 use crate::source::{Pending, TokenSource};
 
@@ -28,6 +29,10 @@ type TokenSlot = Arc<tokio::sync::Mutex<Option<CachedToken>>>;
 /// GitHub's time learned from its `Date` header), installation tokens with every permission of the App (cached until
 /// five minutes before they expire, one request at a time per installation), and the registration tokens and
 /// one-job Actions runners those make.
+///
+/// Only for a host that still holds the key while the console's scale set calls have not answered it yet (rollout
+/// step 3 of the console's `docs/RUNNERS.md`): the Runner deletes the key once they did, and this goes with the last
+/// host that held one.
 pub struct KeyTokens {
     signer: Signer,
     rest: Rest,
@@ -162,7 +167,9 @@ impl KeyTokens {
         }
     }
 
-    async fn registration(&self, installation: i64, repo: &str) -> Result<Secret<String>, Error> {
+    /// A token that registers Actions runners with `repo`, which the scale set client of a host with the key trades
+    /// for the Actions service's own.
+    pub async fn registration_token(&self, installation: i64, repo: &str) -> Result<Secret<String>, Error> {
         let path = format!("/repos/{repo}/actions/runners/registration-token");
         let response = self
             .rest
@@ -236,10 +243,6 @@ impl TokenSource for KeyTokens {
 
     fn repo_installation<'a>(&'a self, repo: &'a str) -> Pending<'a, i64> {
         Box::pin(self.find_installation(repo))
-    }
-
-    fn registration_token<'a>(&'a self, installation: i64, repo: &'a str) -> Pending<'a, Secret<String>> {
-        Box::pin(self.registration(installation, repo))
     }
 
     fn generate_jit_config<'a>(

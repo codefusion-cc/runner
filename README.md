@@ -79,7 +79,6 @@ A configuration file says what the Mac is:
 {
   "machine": "mac-a-vm",
   "state_dir": "/Users/someone/Library/Application Support/codefusion-runner",
-  "app_dir": "/Users/someone/.config/codefusion-runner",
   "image": "image-2026.10.10-21",
   "console": "https://console.example",
   "use": "dedicated"
@@ -88,17 +87,17 @@ A configuration file says what the Mac is:
 
 - `machine` names the Mac at GitHub and at the console. Its scale sets and Actions runners carry it, so no other
   Runner may have the same name.
-- `state_dir` holds everything the Runner keeps and is on the Mac's own disk. `app_dir` holds the GitHub App's
-  `app.json` and `app.pem` (0600); `scripts/runner-app.ts` in `codefusion-cc/codefusion` makes the App and writes them.
-  Without `app_dir`, the Mac gets its GitHub tokens from the console it is enrolled with, which holds the Runners
-  App's key: read tokens renewed at half their life, and a registration token or a one-job runner when it needs one.
-  With both, the console's tokens serve once the owner turns them on on the machine's page, and the key until then.
+- `state_dir` holds everything the Runner keeps and is on the Mac's own disk.
+- `console` is the console the Mac enrols with. It alone holds the Runners App's key: the Mac gets read tokens from
+  it, renewed at half their life, and asks it for its scale sets, sessions and one-job Actions runners. No machine
+  holds the key, a registration token or the Actions service's admin token. The console's tokens serve once the owner
+  turns them on on the machine's page.
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`
   jobs get Docker), `docker_max_jobs` (1) and `labels` (the host labels this host has, 8 at most; `["cf-macos"]`
-  on a Mac, `["cf-linux"]` on Linux). Without `console` the Mac reports to none.
-- The file names where the App's key and the console's token go, so one that others can write is refused
+  on a Mac, `["cf-linux"]` on Linux).
+- The file names where the console's token goes, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
 - A running Runner takes up a changed file by itself, as an update does: it looks every 30 seconds, and when a
@@ -118,8 +117,8 @@ An x86_64 Linux host takes the amd64 release of the same build instead, `amd64-i
 
 ```sh
 codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
-codefusion-runner check --config <file> --github   # what is missing, and what GitHub shows this Mac
 codefusion-runner enroll --config <file>           # the console's one-time code on standard input
+codefusion-runner check --config <file> --github   # what is missing, and what GitHub shows this Mac
 codefusion-runner install --config <file>
 ```
 
@@ -172,6 +171,16 @@ object is refused. Both take no new job until no machine stands and no slot prom
 install and start again. A new program that does not stay up for a minute three times is replaced by the one before,
 and the console hears why; a start that ends as asked (a signal, `restart`) does not count. `restart` ends the Runner
 at once and launchd (systemd on Linux) starts it again; machines that run go on and are adopted.
+
+A configuration written before the console held the App's key names `app_dir`, a folder with the key (`app.pem`)
+beside `app.json`. While the key file is there the Runner signs with it and makes its scale set calls itself, as before,
+and at each look at GitHub asks the console's scale set calls for its scale sets of a repository it serves. Once one
+answered, it deletes `<app_dir>/app.pem` (a link alone, not what it points to), takes `app_dir` out of the file, keeps
+the rest, and starts again through the console. Until then the console's report says why the key stays
+(`appKeyKept`): a console from before those calls, GitHub through the console off for the host, a console that fails
+or does not answer. A host whose file names no console, or that holds no token for it, keeps the key. A key file still
+there afterwards (one that could not be deleted, or what a link pointed to) is named in the report (`appKeyFile`) until
+it is gone.
 
 `test-run` runs a developer's test suite in one machine of the image CI jobs get, instead of on their laptop. The Runner
 takes it like a main-branch job GitHub assigned: before the CI jobs that wait, never stopping one that runs, waiting for
@@ -237,15 +246,14 @@ git clone https://github.com/codefusion-cc/runner ~/runner && cd ~/runner && git
 cargo xtask build
 ```
 
-The configuration is the Mac's without `use`, in `~/.config/codefusion-runner/config.json`, with the App's
-`app.json` and `app.pem` beside it (`app_dir` `~/.config/codefusion-runner`), `state_dir`
+The configuration is the Mac's without `use`, in `~/.config/codefusion-runner/config.json`, `state_dir`
 `~/.local/state/codefusion-runner` and `build_folder` `~/runner`, each as an absolute path. Then, with the image
 fetched as above:
 
 ```sh
 target/release/codefusion-runner image install <folder> --version <v> --state-dir <state_dir>
-target/release/codefusion-runner check --config <file> --github
 target/release/codefusion-runner enroll --config <file>
+target/release/codefusion-runner check --config <file> --github
 target/release/codefusion-runner install --config <file>
 ```
 

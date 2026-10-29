@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -8,24 +8,9 @@ use cf_secret::Secret;
 use ring::rand::SystemRandom;
 use ring::signature::RSA_PKCS1_SHA256;
 
+use crate::clock::Clock;
 use crate::credentials::AppKey;
 use crate::error::Error;
-
-/// Where the time comes from, so a test can move it.
-pub trait Clock: Send + Sync {
-    /// The current time.
-    fn now(&self) -> SystemTime;
-}
-
-/// The machine's clock.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> SystemTime {
-        SystemTime::now()
-    }
-}
 
 /// Signs the App's own tokens. GitHub refuses one issued in its future or valid for over ten minutes, so the token
 /// is issued a minute in the past and valid for nine minutes; and the signer learns GitHub's time from its

@@ -12,11 +12,10 @@ use cf_console_client::ConsoleTokens;
 use cf_daemon::names::ServePolicy;
 use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, UpdateFile};
 use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
-use cf_ghapp::{
-    AppCredentials, Clock, GitHubApp, Http, KeyTokens, RetryPolicy, SystemClock, SystemMonotonic, TokenSource,
-};
+use cf_ghapp::{AppCredentials, GitHubApp, Http, KeyTokens, RetryPolicy, SystemClock, SystemMonotonic};
 use cf_secret::Secret;
 
+use crate::app_key::When;
 use crate::commands::VERSION;
 use crate::config::{Class, Config};
 use crate::hidden::{self, NoLine};
@@ -65,47 +64,59 @@ fn runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
         .map_err(|error| format!("no runtime: {error}"))
 }
 
-/// The App's credentials in `app_dir`, when the configuration names the folder.
-fn credentials(config: &Config) -> Result<Option<AppCredentials>, String> {
-    config
-        .app_dir
-        .as_ref()
-        .map(|dir| {
-            AppCredentials::load(dir).map_err(|error| format!("the GitHub App in {}: {error}", dir.display()))
-        })
-        .transpose()
+/// The GitHub App client, with its tokens and its scale set calls from the console the host is enrolled with, which
+/// holds the App's key; on a host that still holds the key ([`held_key`]), signed for with it, and the key's tokens
+/// beside it.
+fn app_and_key(config: &Config) -> Result<(GitHubApp, Option<Arc<KeyTokens>>), String> {
+    let http = Http::new(ANSWER, RetryPolicy::default());
+    if let Some(key) = held_key(config, &http)? {
+        let app = GitHubApp::with_source(key.clone(), &config.github_api, http);
+        return Ok((app, Some(key)));
+    }
+    let (address, token) = console(config)?
+        .ok_or("no GitHub tokens: the settings name no console, which holds the GitHub App's key")?;
+    let client = cf_console_client::Client::new(&address, token, http.clone());
+    let tokens = ConsoleTokens::new(
+        client,
+        &config.machine,
+        Arc::new(SystemClock),
+        Arc::new(SystemMonotonic),
+    );
+    Ok((
+        GitHubApp::with_source(Arc::new(tokens), &config.github_api, http),
+        None,
+    ))
 }
 
-/// The GitHub App client, with its tokens from the console when the host is enrolled with one (the App's key here,
-/// when there is one, serves while the console's tokens are off for the host), else signed for with the key here.
+/// [`app_and_key`]'s client alone.
 fn app(config: &Config) -> Result<GitHubApp, String> {
-    let http = Http::new(ANSWER, RetryPolicy::default());
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let key = credentials(config)?;
-    match (console(config)?, key) {
-        (Some((address, token)), key) => {
-            let key = key.map(|credentials| {
-                Arc::new(KeyTokens::from_credentials(
-                    credentials,
-                    &config.github_api,
-                    http.clone(),
-                    clock.clone(),
-                )) as Arc<dyn TokenSource>
-            });
-            let client = cf_console_client::Client::new(&address, token, http.clone());
-            let tokens = ConsoleTokens::new(client, &config.machine, key, clock, Arc::new(SystemMonotonic));
-            Ok(GitHubApp::with_source(Arc::new(tokens), &config.github_api, http))
-        }
-        (None, Some(credentials)) => Ok(GitHubApp::from_credentials(
-            credentials,
-            &config.github_api,
-            http,
-            clock,
-        )),
-        (None, None) => {
-            Err("no GitHub tokens: no App key (app_dir) and no console to get them from (console)".into())
-        }
-    }
+    app_and_key(config).map(|(app, _)| app)
+}
+
+/// The tokens of the GitHub App's key, when the settings name its folder (`app_dir`) and its key file is there (a
+/// link counts): the host signs with it until the console's scale set calls answered it. A key file that is there and
+/// does not load keeps the Runner from starting, as before the console held the key.
+fn held_key(config: &Config, http: &Http) -> Result<Option<Arc<KeyTokens>>, String> {
+    let Some(dir) = config.app_dir.as_deref().filter(|dir| holds_key(dir)) else {
+        return Ok(None);
+    };
+    let credentials =
+        AppCredentials::load(dir).map_err(|error| format!("the GitHub App in {}: {error}", dir.display()))?;
+    Ok(Some(Arc::new(KeyTokens::from_credentials(
+        credentials,
+        &config.github_api,
+        http.clone(),
+        Arc::new(SystemClock),
+    ))))
+}
+
+/// Whether the App's folder `dir` holds a key file: anything but a file that is not there counts, a link or a file
+/// that cannot be read included, so that the Runner says why it does not load.
+fn holds_key(dir: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(dir.join(crate::app_key::KEY_FILE)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// This host's token for the console, when the configuration names one.
@@ -131,7 +142,8 @@ fn budget_of(facts: HostFacts, config: &Config) -> Result<Settings, String> {
 
 /// The settings in `path`, when a Runner can start on them: the file is one it takes, its limits are ones the budget
 /// takes on this host, the image it names is installed (no job is taken from GitHub to fail for a missing image),
-/// and the App's key and the console's token are where it says.
+/// and the host holds a token for the console it names, a host that signs with the App's key it still holds too, as
+/// [`service`] needs it.
 fn startable(path: &Path) -> Result<Config, String> {
     let config = Config::load(path)?;
     #[cfg(target_os = "macos")]
@@ -178,6 +190,8 @@ impl SettingsFile for ConfigFile {
     /// is taken out. The new text is checked as a Runner that starts would check it, in a file of its own beside
     /// this one, which then takes this one's place in one step.
     fn change(&self, change: &SettingsChange) -> Result<bool, String> {
+        // From the read to the write: the key's take-out changes the same file on a thread of its own.
+        let _one = crate::app_key::one_change();
         let said = |error: &dyn std::fmt::Display| format!("{}: {error}", self.path.display());
         let text = std::fs::read_to_string(&self.path).map_err(|error| said(&error))?;
         let was: serde_json::Value = serde_json::from_str(&text).map_err(|error| said(&error))?;
@@ -206,25 +220,13 @@ impl SettingsFile for ConfigFile {
             // Rewritten, the same settings would read as new ones, and the Runner would start again for nothing.
             return Ok(false);
         }
-        let mut written = serde_json::to_string_pretty(&file).map_err(|error| said(&error))?;
-        written.push('\n');
-
-        let next = self.path.with_extension("json.next");
-        cf_secret::replace_private(&next, written.as_bytes()).map_err(|error| said(&error))?;
-        let checked = startable(&next).and_then(|config| {
+        crate::app_key::write_settings(&self.path, &file, |next| {
+            let config = startable(next)?;
             if (&config.state_dir, &config.machine) == (&self.started.0, &self.started.1) {
                 Ok(())
             } else {
                 Err("`state_dir` and `machine` change only with `uninstall` and `install`".into())
             }
-        });
-        if let Err(why) = checked {
-            let _ = std::fs::remove_file(&next);
-            return Err(why.replace(&next.display().to_string(), &self.path.display().to_string()));
-        }
-        std::fs::rename(&next, &self.path).map_err(|error| {
-            let _ = std::fs::remove_file(&next);
-            said(&error)
         })?;
         Ok(true)
     }
@@ -250,12 +252,25 @@ fn installed_image(config: &Config) -> Result<PathBuf, String> {
         })
 }
 
-fn service(
-    config: &Config,
-    app: GitHubApp,
-    program: &Path,
+/// What only a Runner that runs gives its service; a command that only looks or cleans up gives none of it.
+#[derive(Default)]
+struct Running {
     updates: Option<Arc<dyn SelfUpdate>>,
     settings: Option<Arc<dyn SettingsFile>>,
+    /// What the report says of the GitHub App's key from the start: why the settings still name the key's folder,
+    /// when they do and no key serves.
+    app_key_said: Option<String>,
+}
+
+fn service(
+    config: &Config,
+    (app, held_key): (GitHubApp, Option<cf_daemon::HeldKey>),
+    program: &Path,
+    Running {
+        updates,
+        settings,
+        app_key_said,
+    }: Running,
 ) -> Result<(Arc<HostMachines>, HostService), String> {
     host_service::<This>(HostSetup {
         machine: config.machine.clone(),
@@ -279,6 +294,9 @@ fn service(
         stand_in: None,
         updates,
         settings,
+        app_key_file: crate::app_key::remembered(&config.state_dir),
+        app_key_said,
+        held_key,
     })
 }
 
@@ -306,28 +324,30 @@ fn only_runner(config: &Config) -> Result<std::fs::File, String> {
     }
 }
 
-/// The GitHub App client a check looks with: the Runner's own, but with the key here when the host has not enrolled
-/// with its console yet, as `check` comes before `enroll`.
-fn github_for_check(config: &Config) -> Result<GitHubApp, String> {
-    match config.app_dir {
-        Some(_) => app(&as_enrolled(config.clone())),
-        None => app(config),
-    }
-}
-
-/// The GitHub App client an uninstall removes this host's runners with (`config` as [`as_enrolled`] made it): none for
-/// a host with no way to GitHub at all, no App key here and no console token it can use (lost, or taken by an
-/// earlier `uninstall --leave`). It can remove nothing there, and must still be able to go; the console's Remove
-/// takes its runners off GitHub.
-fn github_for_uninstall(config: &Config) -> Result<Option<GitHubApp>, String> {
-    if config.app_dir.is_none() && config.console.is_none() {
+/// The GitHub App client an uninstall removes this host's Actions runners with (`config` as [`as_enrolled`] made it):
+/// none for a host with no console token it can use (lost, or taken by an earlier `uninstall --leave`) and no App key
+/// file, whatever folder its settings name. It can remove nothing at GitHub then, and must still be able to go; the
+/// console's Remove takes its Actions runners off GitHub.
+fn github_for_uninstall(config: &Config) -> Result<Option<(GitHubApp, Option<cf_daemon::HeldKey>)>, String> {
+    if config.console.is_none() && !config.app_dir.as_deref().is_some_and(holds_key) {
         return Ok(None);
     }
-    app(config).map(Some)
+    app_and_key(config).map(looking).map(Some)
+}
+
+/// [`app_and_key`]'s client and key for a command that only looks or cleans up: it signs with a key the host still
+/// holds, and never takes it out, which only a Runner that runs does.
+fn looking((app, key): (GitHubApp, Option<Arc<KeyTokens>>)) -> (GitHubApp, Option<cf_daemon::HeldKey>) {
+    let held = key.map(|tokens| cf_daemon::HeldKey {
+        tokens,
+        file: PathBuf::new(),
+        take_out: Arc::new(|| Err("only a Runner that runs takes the key out".into())),
+    });
+    (app, held)
 }
 
 /// The configuration with its console only when the host holds a token it can use: one that never enrolled, or whose
-/// enrolment was cut off, has nobody to tell when it goes and no tokens to get from it when it is checked.
+/// enrolment was cut off, has nobody to tell when it goes and no tokens to get from it.
 fn as_enrolled(mut config: Config) -> Config {
     if console(&config).is_err() {
         config.console = None;
@@ -385,20 +405,20 @@ fn run_daemon(config: &Path) -> Result<(), String> {
         Some(state) => update::guard(state, &program, VERSION)?,
         None => Started::Nothing,
     };
-    // As read before it is checked: a change that comes meanwhile is one more start, not one missed.
-    let read = std::fs::read(config).map_err(|error| format!("{}: {error}", config.display()))?;
-    let path = config.to_path_buf();
-    let config = startable(config)?;
-    let settings = ConfigFile {
-        path,
-        read,
-        started: (config.state_dir.clone(), config.machine.clone()),
-    };
-    let _only = only_runner(&config)?;
+    let Starting {
+        config,
+        settings,
+        key_taken_out,
+        only: _only,
+    } = start_on(config)?;
+    let path_of_settings = settings.path.clone();
     tracing::subscriber::set_global_default(Lines::new(&config.log(), ROLL_AT))
         .map_err(|error| format!("the log: {error}"))?;
     if let Some(said) = This::keep_state(&config.state_dir) {
         tracing::warn!("{said}");
+    }
+    if let Some(taken) = &key_taken_out {
+        log_key_taken_out(taken);
     }
     // Only the installed program replaces itself: one run from elsewhere would replace another.
     let updates = (program == config.program())
@@ -416,12 +436,22 @@ fn run_daemon(config: &Path) -> Result<(), String> {
     let runtime = runtime(2)?;
     let ran = runtime.block_on(async {
         let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
+        let (app, key) = app_and_key(&config)?;
+        let held = key.map(|tokens| held(&config, &path_of_settings, tokens));
+        // A key that serves says why it is kept, in its own words.
+        let app_key_said = key_taken_out
+            .as_ref()
+            .filter(|taken| held.is_none() && taken.app_dir_kept.is_some())
+            .map(said_of);
         let (_machines, service) = service(
             &config,
-            app(&config)?,
+            (app, held),
             &program,
-            updates,
-            Some(Arc::new(settings)),
+            Running {
+                updates,
+                settings: Some(Arc::new(settings)),
+                app_key_said,
+            },
         )?;
         let (trigger, stop) = cf_scaleset::shutdown();
         watch_signals();
@@ -483,6 +513,95 @@ fn run_daemon(config: &Path) -> Result<(), String> {
         tracing::warn!(%error, "the update under way still counts this start");
     }
     ran
+}
+
+/// What a Runner starts on: its settings, as [`startable`] took them, what became of the App's key folder they named,
+/// and the state folder's lock, which it holds for as long as it runs.
+struct Starting {
+    config: Config,
+    settings: ConfigFile,
+    key_taken_out: Option<crate::app_key::TakenOut>,
+    only: std::fs::File,
+}
+
+/// Reads the settings file at `path` as a Runner starts on it.
+fn start_on(path: &Path) -> Result<Starting, String> {
+    // The state folder's lock first: a Runner started beside one that runs changes nothing, the settings file
+    // included, which the one that runs may be changing.
+    let named = Config::load(path)?;
+    let only = only_runner(&named)?;
+    // Before the settings are checked: a file that still names the App's key folder whose key file this Runner's
+    // take-out deleted loses the folder, or the Runner does not start and an update under way puts the program before
+    // back. A key file that is there stays and serves until the console's scale set calls answered this host.
+    let key_taken_out = crate::app_key::take_out(path, When::KeyGone)?;
+    // As read before it is checked: a change that comes meanwhile is one more start, not one missed.
+    let read = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let config = startable(path)?;
+    if config.state_dir != named.state_dir {
+        return Err(format!(
+            "{}: `state_dir` changed while the Runner started; start it again",
+            path.display()
+        ));
+    }
+    let settings = ConfigFile {
+        path: path.to_path_buf(),
+        read,
+        started: (config.state_dir.clone(), config.machine.clone()),
+    };
+    Ok(Starting {
+        config,
+        settings,
+        key_taken_out,
+        only,
+    })
+}
+
+/// The key the host still holds, for the service: it takes it out of the settings file at `settings` once the
+/// console's scale set calls answered this host.
+fn held(config: &Config, settings: &Path, tokens: Arc<KeyTokens>) -> cf_daemon::HeldKey {
+    let file = config
+        .app_dir
+        .as_deref()
+        .unwrap_or(Path::new("/"))
+        .join(crate::app_key::KEY_FILE);
+    let settings = settings.to_path_buf();
+    cf_daemon::HeldKey {
+        tokens,
+        file,
+        take_out: Arc::new(
+            move || match crate::app_key::take_out(&settings, When::Answered)? {
+                Some(taken) => Ok(said_of(&taken)),
+                None => Ok("the settings name no key folder any more".into()),
+            },
+        ),
+    }
+}
+
+/// What became of the App's key file a settings file still named, in words for the log.
+fn said_of(taken: &crate::app_key::TakenOut) -> String {
+    use crate::app_key::Key;
+    let file = taken
+        .key_file
+        .as_deref()
+        .map_or_else(|| "none".to_string(), |file| file.display().to_string());
+    let key = match &taken.key {
+        Key::Deleted => format!("the key file {file} is deleted"),
+        Key::Missing => format!("no key file is at {file}"),
+        Key::LinkDeleted { to } => format!(
+            "the key file {file} was a link, which is deleted; the file it named, {}, is left: delete it",
+            to.display()
+        ),
+        Key::Kept { why } => format!("the key file {file} could not be deleted ({why}): delete it"),
+    };
+    match &taken.app_dir_kept {
+        None => format!("{key}; `app_dir` is out of the settings"),
+        Some(why) => format!("{key}; the settings still name its folder (`app_dir`): {why}"),
+    }
+}
+
+/// Says in the log what became of the App's key file a settings file still named.
+fn log_key_taken_out(taken: &crate::app_key::TakenOut) {
+    tracing::warn!(done = %said_of(taken), "the console holds the GitHub App's key");
 }
 
 /// The console's one-time code from standard input. A person at a terminal is told what is waited for, and what
@@ -693,22 +812,38 @@ fn needs(config: &Config, home: &Path, hostname: &str, program: &Path) -> Vec<Re
 
 /// What an install needs on every system.
 fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> {
-    vec![
-        credentials(config).map(|key| match (key, &config.app_dir) {
-            (Some(_), Some(dir)) => format!("the GitHub App's key in {}", dir.display()),
-            _ => "GitHub tokens from the console, which holds the App's key".to_string(),
-        }),
+    let key = held_key(config, &Http::new(ANSWER, RetryPolicy::default()));
+    let holds_key = matches!(key, Ok(Some(_)));
+    let mut lines = vec![
         installed_image(config).map(|_| format!("image {}", config.image)),
-        console(config).map(|console| match console {
-            Some((address, _)) => format!("a token for the console at {address}"),
-            None => "no console: job reports go to the log".to_string(),
+        console(config).and_then(|console| match console {
+            Some((address, _)) => Ok(format!(
+                "a token for the console at {address}, which holds the GitHub App's key"
+            )),
+            None if holds_key => {
+                Ok("no console: the GitHub App's key here serves, and job reports go to the log".into())
+            }
+            None => {
+                Err("no console: it holds the GitHub App's key and gives this host its GitHub tokens".into())
+            }
         }),
         This::fit(program).map(|()| format!("{} can start machines", program.display())),
         room(config),
-    ]
-    .into_iter()
-    .chain(config.trusted_policy().map(|policy| trusted_rules(&policy)))
-    .collect()
+    ];
+    if let Some(dir) = &config.app_dir {
+        lines.insert(
+            0,
+            key.map(|key| match key {
+                Some(_) => format!(
+                    "the GitHub App's key in {}, until the console's scale set calls answer this host",
+                    dir.display()
+                ),
+                None => format!("no key file in {}: GitHub tokens from the console", dir.display()),
+            }),
+        );
+    }
+    lines.extend(config.trusted_policy().map(|policy| trusted_rules(&policy)));
+    lines
 }
 
 /// What a trusted host runs, or why its rules refuse every job: an install waits for rules that hold, and a running
@@ -755,14 +890,14 @@ pub fn check(config: &Path, github: bool) -> Result<(), String> {
         // The service is built on a folder of its own that is removed after: building it takes up what a Runner
         // that runs leaves in the real one (machines, records, job events), and a look must change none of that.
         let scratch = crate::vm::Scratch::new("check")?;
-        let github = github_for_check(&config)?;
+        let github = looking(app_and_key(&config)?);
         let probe = Config {
             state_dir: scratch.path().to_path_buf(),
             console: None,
             ..config.clone()
         };
         let (served, problems) = runtime(1)?.block_on(async {
-            let (_machines, service) = service(&probe, github, &program, None, None)?;
+            let (_machines, service) = service(&probe, github, &program, Running::default())?;
             Ok::<_, String>(service.survey().await)
         })?;
         for line in &served {
@@ -888,13 +1023,13 @@ pub fn uninstall(config: &Path, leave: bool, purge: bool) -> Result<(), String> 
         None => {
             println!(
                 "{}",
-                nothing_removed("no GitHub tokens here: no App key (app_dir) and no console token".into())
+                nothing_removed("no GitHub tokens here: no token for the console and no App key file".into())
             );
             Vec::new()
         }
         Some(github) => runtime(2)?.block_on(async {
             let (machines, service) =
-                service(&config, github, &program, None, None).map_err(nothing_removed)?;
+                service(&config, github, &program, Running::default()).map_err(nothing_removed)?;
             let ticks = tokio::spawn(async move {
                 loop {
                     let machines = machines.clone();
@@ -947,8 +1082,8 @@ mod tests {
     use super::*;
     use cf_budget::Limits;
 
-    /// A folder a Runner could start in: its state folder with image `2026.10.1` installed, a GitHub App, and
-    /// `config.json`, which `write` writes with the mode a settings file must have.
+    /// A folder a Runner could start in: its state folder with image `2026.10.1` installed and a token for the
+    /// console, and `config.json`, which `write` writes with the mode a settings file must have.
     struct Startable {
         folder: tempfile::TempDir,
         state: PathBuf,
@@ -963,25 +1098,23 @@ mod tests {
             let installed = state.join("images").join("2026.10.1");
             std::fs::create_dir_all(&installed).expect("an image's folder");
             std::fs::write(installed.join(cf_image::store::ROOTFS_NAME), b"").expect("an image");
-            let app = folder.path().join("app");
-            std::fs::create_dir_all(&app).expect("the App's folder");
-            std::fs::write(app.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
-            std::fs::write(app.join("app.pem"), &cf_fake_github::test_key().private_pem)
-                .expect("the App's key");
-            std::fs::set_permissions(app.join("app.pem"), std::fs::Permissions::from_mode(0o600))
-                .expect("a mode");
+            std::fs::write(state.join("console-token"), TOKEN).expect("a token");
+            std::fs::set_permissions(
+                state.join("console-token"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("a mode");
             Startable { folder, state, path }
         }
 
-        fn app(&self) -> PathBuf {
-            self.folder.path().join("app")
+        fn token(&self) -> PathBuf {
+            self.state.join("console-token")
         }
 
         fn text(&self, image: &str, more: &str) -> String {
             format!(
-                r#"{{"machine": "settings-test-vm", "state_dir": "{}", "app_dir": "{}", "image": "{image}", "use": "dedicated"{more}}}"#,
+                r#"{{"machine": "settings-test-vm", "state_dir": "{}", "console": "https://console.example", "image": "{image}", "use": "dedicated"{more}}}"#,
                 self.state.display(),
-                self.app().display(),
             )
         }
 
@@ -989,6 +1122,23 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::write(&self.path, text).expect("written");
             std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        }
+
+        /// Names the App's folder in the settings, with the App and its key in it, as a host that still holds the
+        /// key has them; the key file's path.
+        fn holding_key(&self) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt as _;
+            let key = self.folder.path().join("app").join("app.pem");
+            let folder = key.parent().expect("a folder");
+            std::fs::create_dir_all(folder).expect("the App's folder");
+            std::fs::write(folder.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+            std::fs::write(&key, &cf_fake_github::test_key().private_pem).expect("a key");
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+            let mut settings: serde_json::Value =
+                serde_json::from_str(&self.text("2026.10.1", "")).expect("JSON");
+            settings["app_dir"] = folder.display().to_string().into();
+            self.write(&settings.to_string());
+            key
         }
 
         /// The settings file of a Runner started on what the file holds now.
@@ -1005,7 +1155,7 @@ mod tests {
     fn the_settings_file_is_new_when_its_bytes_are_and_usable_when_a_runner_could_start_on_it() {
         use std::os::unix::fs::PermissionsExt as _;
         let here = Startable::new();
-        let (folder, state, path, app) = (here.folder.path(), &here.state, &here.path, here.app());
+        let (folder, state, path, token) = (here.folder.path(), &here.state, &here.path, here.token());
         let text = |image: &str, more: &str| here.text(image, more);
         let write = |text: &str| here.write(text);
         let started = text("2026.10.1", "");
@@ -1034,9 +1184,28 @@ mod tests {
         };
         write(&text("2026.10.20", ""));
         unusable("is not installed");
-        // A console named before `enroll` gave its token: the next Runner could not start.
-        write(&text("2026.10.1", r#", "console": "https://console.example""#));
+        // The console's token gone (`uninstall --leave`): the next Runner could not start.
+        std::fs::rename(&token, token.with_extension("away")).expect("moved");
+        write(&text("2026.10.1", r#", "docker_repos": ["org/app"]"#));
         unusable("run `enroll` first");
+        std::fs::rename(token.with_extension("away"), &token).expect("moved back");
+        // A key folder whose key file is there and does not load: the next Runner could not sign with it.
+        let app = folder.join("app");
+        std::fs::create_dir_all(&app).expect("the App's folder");
+        std::fs::write(app.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
+        std::fs::write(app.join("app.pem"), "not a key").expect("a key file");
+        write(&text(
+            "2026.10.1",
+            &format!(r#", "app_dir": "{}""#, app.display()),
+        ));
+        unusable("the GitHub App in");
+        // One whose key file is gone: the console's tokens serve.
+        std::fs::remove_file(app.join("app.pem")).expect("gone");
+        write(&text(
+            "2026.10.1",
+            &format!(r#", "app_dir": "{}""#, app.display()),
+        ));
+        assert!(matches!(file.look(), SettingsLook::Changed { .. }));
         write(&started.replace("settings-test-vm", "other-vm"));
         unusable("change only with `uninstall` and `install`");
         let elsewhere = folder.join("elsewhere");
@@ -1049,12 +1218,9 @@ mod tests {
             b"",
         )
         .expect("an image");
+        std::fs::write(elsewhere.join("console-token"), TOKEN).expect("a token");
         write(&started.replace(&state.display().to_string(), &elsewhere.display().to_string()));
         unusable("change only with `uninstall` and `install`");
-        std::fs::rename(app.join("app.pem"), app.join("app.pem.away")).expect("moved");
-        write(&text("2026.10.1", r#", "docker_repos": ["org/app"]"#));
-        unusable("the GitHub App");
-        std::fs::rename(app.join("app.pem.away"), app.join("app.pem")).expect("moved back");
         write("{");
         unusable(&path.display().to_string());
         write(&text("2026.10.1", r#", "docker_max_jobs": "one""#));
@@ -1260,16 +1426,13 @@ mod tests {
         assert!(!here.path.exists(), "a settings file is never made");
     }
 
-    fn config(state: &Path, app: &Path, console: bool) -> Config {
+    /// A token of the console's shape, made up.
+    const TOKEN: &str = "cfr_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+
+    fn config(state: &Path) -> Config {
         Config::parse(&format!(
-            r#"{{"machine": "mac-a-vm", "state_dir": "{}", "app_dir": "{}", "image": "2026.10.1", "use": "dedicated"{}}}"#,
+            r#"{{"machine": "mac-a-vm", "state_dir": "{}", "console": "https://console.example", "image": "2026.10.1", "use": "dedicated"}}"#,
             state.display(),
-            app.display(),
-            if console {
-                r#", "console": "https://console.example""#
-            } else {
-                ""
-            }
         ))
         .expect("a configuration")
     }
@@ -1358,132 +1521,252 @@ mod tests {
     #[test]
     fn a_check_names_everything_that_is_missing_and_changes_nothing() {
         let folder = tempfile::tempdir().expect("folder");
-        let (state, app) = (folder.path().join("state"), folder.path().join("app"));
+        let state = folder.path().join("state");
         #[cfg(target_os = "macos")]
         let home = folder.path().join("home");
-        let config = config(&state, &app, true);
+        let config = config(&state);
         let unsigned = folder.path().join("program");
         std::fs::write(&unsigned, "#!/bin/sh\n").expect("a program");
         let lines = common_needs(&config, &unsigned);
         let missing: Vec<&String> = lines.iter().filter_map(|line| line.as_ref().err()).collect();
-        assert_eq!(missing.len(), 4, "{lines:?}");
-        assert!(missing[0].starts_with("the GitHub App in "), "{}", missing[0]);
+        assert_eq!(missing.len(), 3, "{lines:?}");
         assert!(
-            missing[1].starts_with("image 2026.10.1 is not installed"),
+            missing[0].starts_with("image 2026.10.1 is not installed"),
             "{}",
-            missing[1]
+            missing[0]
         );
-        assert!(missing[2].ends_with("run `enroll` first"), "{}", missing[2]);
+        assert!(missing[1].ends_with("run `enroll` first"), "{}", missing[1]);
         let unfit = if cfg!(target_os = "macos") {
             "is not signed with the com.apple.security.virtualization"
         } else {
             "did not say which cloud-hypervisor it carries"
         };
-        assert!(missing[3].contains(unfit), "{}", missing[3]);
-        assert!(lines[4].is_ok(), "the room is a look: {lines:?}");
+        assert!(missing[2].contains(unfit), "{}", missing[2]);
+        assert!(lines[3].is_ok(), "the room is a look: {lines:?}");
         #[cfg(target_os = "macos")]
         assert!(
             needs(&config, &home, "Build-Mac-2.local", &unsigned)[0].is_ok(),
             "no cf-runners manager in this home"
         );
-        assert!(!state.exists() && !app.exists(), "a check makes no folder");
+        assert!(!state.exists(), "a check makes no folder");
     }
 
     #[test]
-    fn github_tokens_come_from_the_console_when_enrolled_and_from_the_key_otherwise() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn github_tokens_come_from_the_console_the_host_is_enrolled_with_and_nowhere_else() {
         let folder = tempfile::tempdir().expect("folder");
-        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        let state = folder.path().join("state");
         std::fs::create_dir_all(&state).expect("the state folder");
-        std::fs::create_dir_all(&key).expect("the App's folder");
-        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
-        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
-        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o600))
-            .expect("a mode");
-
-        let signs = app(&config(&state, &key, false)).expect("the key alone");
-        assert!(signs.jwt().is_ok(), "signs with the key here");
-
-        let mut console_only = config(&state, &key, true);
-        console_only.app_dir = None;
-        let error = app(&console_only).expect_err("not enrolled");
+        let config = config(&state);
+        let error = app(&config).expect_err("not enrolled");
         assert!(error.ends_with("run `enroll` first"), "{error}");
-        std::fs::write(console_only.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
-        let brokered = app(&console_only).expect("the console");
-        assert!(brokered.jwt().is_err(), "no key here: the console holds it");
-        assert!(
-            app(&config(&state, &key, true)).expect("both").jwt().is_err(),
-            "the console first"
-        );
+        std::fs::write(config.console_token(), TOKEN).expect("a token");
+        app(&config).expect("the console's");
         assert_eq!(
-            common_needs(&console_only, Path::new("/nonexistent"))[0],
-            Ok("GitHub tokens from the console, which holds the App's key".to_string())
+            common_needs(&config, Path::new("/nonexistent"))[1],
+            Ok(
+                "a token for the console at https://console.example, which holds the GitHub App's key"
+                    .to_string()
+            )
         );
-
-        let mut neither = console_only.clone();
-        neither.console = None;
-        assert!(app(&neither).expect_err("nothing").contains("no GitHub tokens"));
+        let mut nowhere = config.clone();
+        nowhere.console = None;
+        assert!(app(&nowhere).expect_err("nothing").contains("no GitHub tokens"));
+        assert!(common_needs(&nowhere, Path::new("/nonexistent"))[1].is_err());
     }
 
     #[test]
-    fn an_uninstall_with_no_way_to_github_still_goes_and_one_with_a_broken_key_stops() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn an_uninstall_with_no_way_to_github_still_goes() {
         let folder = tempfile::tempdir().expect("folder");
-        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
+        let state = folder.path().join("state");
         std::fs::create_dir_all(&state).expect("the state folder");
-        // Console only, its token gone: nothing here reaches GitHub, and nothing stops the uninstall.
-        let mut console_only = config(&state, &key, true);
-        console_only.app_dir = None;
+        // Its token gone: nothing here reaches GitHub, and nothing stops the uninstall.
+        let config = config(&state);
         assert!(
-            github_for_uninstall(&as_enrolled(console_only.clone()))
+            github_for_uninstall(&as_enrolled(config.clone()))
                 .expect("goes")
                 .is_none()
         );
-        // With its token, the console's tokens remove the runners.
-        std::fs::write(console_only.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+        // Its settings still name the App's folder, whose key file is gone: nothing reaches GitHub either.
+        let mut keyless = config.clone();
+        keyless.app_dir = Some(folder.path().join("app"));
+        std::fs::create_dir_all(folder.path().join("app")).expect("the App's folder");
         assert!(
-            github_for_uninstall(&as_enrolled(console_only))
+            github_for_uninstall(&as_enrolled(keyless))
+                .expect("goes")
+                .is_none()
+        );
+        // With its token, the console's tokens remove the Actions runners.
+        std::fs::write(config.console_token(), TOKEN).expect("a token");
+        assert!(
+            github_for_uninstall(&as_enrolled(config))
                 .expect("the console")
                 .is_some()
         );
-        // A key named but not usable is an error, said before anything is removed.
-        std::fs::create_dir_all(&key).expect("the App's folder");
-        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
-        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
-        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o644))
-            .expect("a mode");
-        assert!(github_for_uninstall(&as_enrolled(config(&state, &key, false))).is_err());
     }
 
     #[test]
-    fn a_check_before_enroll_looks_at_github_with_the_key_here() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let folder = tempfile::tempdir().expect("folder");
-        let (state, key) = (folder.path().join("state"), folder.path().join("app"));
-        std::fs::create_dir_all(&key).expect("the App's folder");
-        std::fs::write(key.join("app.json"), r#"{"client_id":"Iv23abc"}"#).expect("the App");
-        std::fs::write(key.join("app.pem"), &cf_fake_github::test_key().private_pem).expect("the App's key");
-        std::fs::set_permissions(key.join("app.pem"), std::fs::Permissions::from_mode(0o600))
-            .expect("a mode");
-        let both = config(&state, &key, true);
-        let looks = github_for_check(&both).expect("not enrolled yet, with a key");
-        assert!(looks.jwt().is_ok(), "the key here");
-        let mut console_only = both.clone();
-        console_only.app_dir = None;
-        let error = github_for_check(&console_only).expect_err("not enrolled, no key");
-        assert!(error.ends_with("run `enroll` first"), "{error}");
-        std::fs::create_dir_all(&state).expect("the state folder");
-        std::fs::write(both.console_token(), format!("cfr_{}\n", "A".repeat(43))).expect("a token");
+    fn a_runner_signs_with_a_key_the_host_holds_until_it_is_taken_out_then_goes_through_the_console() {
+        let here = Startable::new();
+        let key = here.holding_key();
+
+        // As a Runner starts: the key that is there stays and signs.
+        assert_eq!(crate::app_key::take_out(&here.path, When::KeyGone), Ok(None));
+        let config = startable(&here.path).expect("a Runner starts on it");
+        let (_, signs) = app_and_key(&config).expect("an App");
+        assert!(signs.is_some(), "the key signs");
+        let (_, looked) = looking(app_and_key(&config).expect("an App"));
+        let looked = looked.expect("the key");
+        assert!((looked.take_out)().is_err(), "a look never takes it out");
+        assert!(key.exists());
+
+        // Once the console's scale set calls answered: the key goes, and the console's tokens serve.
+        let took = held(
+            &config,
+            &here.path,
+            app_and_key(&config).expect("an App").1.expect("a key"),
+        );
+        assert_eq!(took.file, key);
+        let said = (took.take_out)().expect("taken out");
+        assert!(said.contains("is deleted"), "{said}");
+        assert!(!key.exists());
+        let config = startable(&here.path).expect("a Runner starts on it");
+        assert_eq!(config.app_dir, None);
         assert!(
-            github_for_check(&both).expect("enrolled").jwt().is_err(),
-            "the console's, as the Runner's"
+            app_and_key(&config).expect("an App").1.is_none(),
+            "through the console"
+        );
+        assert_eq!(crate::app_key::remembered(&config.state_dir), Some(key.clone()));
+        assert_eq!(
+            (took.take_out)().expect("again"),
+            "the settings name no key folder any more"
+        );
+    }
+
+    /// The console's settings and the key's take-out each change the settings file, on two threads of one Runner,
+    /// at once: both changes are in the file whatever their order, and neither fails for the other.
+    #[test]
+    fn a_settings_change_and_the_keys_take_out_at_once_both_stay() {
+        for round in 0..20 {
+            let here = Startable::new();
+            let key = here.holding_key();
+            let file = here.file();
+            let both = std::sync::Barrier::new(2);
+            let (took, changed) = std::thread::scope(|threads| {
+                let took = threads.spawn(|| {
+                    both.wait();
+                    crate::app_key::take_out(&here.path, When::Answered)
+                });
+                let changed = threads.spawn(|| {
+                    both.wait();
+                    file.change(&SettingsChange {
+                        max_jobs: Some(Some(1)),
+                        ..SettingsChange::default()
+                    })
+                });
+                (
+                    took.join().expect("the take-out"),
+                    changed.join().expect("the change"),
+                )
+            });
+            assert!(took.as_ref().is_ok_and(Option::is_some), "{round}: {took:?}");
+            assert_eq!(changed, Ok(true), "{round}");
+            let config = Config::load(&here.path).expect("a Runner starts on it");
+            assert_eq!((config.app_dir, config.max_jobs), (None, Some(1)), "{round}");
+            assert!(!key.exists(), "{round}");
+        }
+    }
+
+    /// A key-holding Runner needs the console's token when its settings name a console, as the service it starts
+    /// does: settings without it are no settings it starts on, and a change to them is refused.
+    #[test]
+    fn a_key_holding_runner_starts_only_with_the_token_of_the_console_its_settings_name() {
+        let here = Startable::new();
+        here.holding_key();
+        startable(&here.path).expect("with its token");
+        let file = here.file();
+        std::fs::remove_file(here.token()).expect("the token gone");
+        let refused = startable(&here.path).expect_err("no token");
+        assert!(refused.ends_with("run `enroll` first"), "{refused}");
+        let before = std::fs::read(&here.path).expect("read");
+        assert!(
+            file.change(&SettingsChange {
+                max_jobs: Some(Some(1)),
+                ..SettingsChange::default()
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&here.path).expect("read"), before);
+    }
+
+    /// A Runner started while another runs over the same state folder is refused before it changes anything, the
+    /// settings file included: the one that runs may be changing it.
+    #[test]
+    fn a_runner_started_beside_one_that_runs_changes_nothing() {
+        let here = Startable::new();
+        let key = here.holding_key();
+        // Its take-out deleted the key, and the settings file still names the folder.
+        std::fs::remove_file(&key).expect("deleted");
+        std::fs::write(here.state.join("app-key-file"), format!("{}\n", key.display())).expect("remembered");
+        let before = std::fs::read_to_string(&here.path).expect("read");
+        let runs = only_runner(&Config::load(&here.path).expect("settings")).expect("the Runner that runs");
+        let refused = start_on(&here.path).err().expect("refused");
+        assert!(refused.starts_with("another Runner runs over"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&here.path).expect("read"), before);
+        drop(runs);
+        let started = start_on(&here.path).unwrap_or_else(|why| panic!("starts: {why}"));
+        assert_eq!(started.config.app_dir, None);
+        assert_eq!(started.settings.read, std::fs::read(&here.path).expect("read"));
+    }
+
+    /// The key deleted and the settings file not written: the service hears that the key is gone, so it starts
+    /// again through the console, in words that name the key file and say the file still names its folder. The
+    /// Runner that starts next goes on through the console and says so too.
+    #[test]
+    fn a_take_out_that_could_not_write_the_settings_says_the_key_is_gone_and_the_runner_goes_on() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let here = Startable::new();
+        let key = here.holding_key();
+        let config = startable(&here.path).expect("a Runner starts on it");
+        let took = held(
+            &config,
+            &here.path,
+            app_and_key(&config).expect("an App").1.expect("a key"),
+        );
+        let folder = here.folder.path();
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o500)).expect("a mode");
+        let said = (took.take_out)();
+        let started = start_on(&here.path);
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700)).expect("a mode");
+        let said = said.expect("the key is gone");
+        assert!(
+            said.starts_with(&format!(
+                "the key file {} is deleted; the settings still name its folder (`app_dir`): ",
+                key.display()
+            )),
+            "{said}"
+        );
+        assert!(!key.exists());
+        let started = started.unwrap_or_else(|why| panic!("it goes on: {why}"));
+        assert_eq!(started.config.app_dir.as_deref(), key.parent());
+        assert!(
+            app_and_key(&started.config).expect("an App").1.is_none(),
+            "through the console"
+        );
+        let taken = started.key_taken_out.expect("said");
+        assert!(
+            said_of(&taken).starts_with(&format!(
+                "no key file is at {}; the settings still name its folder (`app_dir`): ",
+                key.display()
+            )),
+            "{}",
+            said_of(&taken)
         );
     }
 
     #[test]
     fn a_token_file_that_is_empty_is_no_token() {
         let folder = tempfile::tempdir().expect("folder");
-        let with = config(folder.path(), folder.path(), true);
+        let with = config(folder.path());
         assert!(console(&with).is_err(), "no file");
         std::fs::write(with.console_token(), "\n").expect("a file");
         assert!(console(&with).is_err());
@@ -1491,14 +1774,15 @@ mod tests {
         let (address, token) = console(&with).expect("a token").expect("a console");
         assert_eq!(address, "https://console.example");
         assert_eq!(token.expose(), "the-token");
-        let none = config(folder.path(), folder.path(), false);
+        let mut none = config(folder.path());
+        none.console = None;
         assert!(console(&none).expect("no console is no error").is_none());
     }
 
     #[test]
     fn a_host_without_a_token_it_can_use_is_uninstalled_without_the_console() {
         let folder = tempfile::tempdir().expect("folder");
-        let with = || config(folder.path(), folder.path(), true);
+        let with = || config(folder.path());
         assert_eq!(as_enrolled(with()).console, None, "it never enrolled");
         // An enrolment that was cut off, or a token removed by hand.
         std::fs::write(with().console_token(), "\n").expect("a file");
@@ -1514,7 +1798,7 @@ mod tests {
     #[test]
     fn a_state_folder_has_one_runner_at_a_time() {
         let folder = tempfile::tempdir().expect("folder");
-        let config = config(&folder.path().join("state"), folder.path(), false);
+        let config = config(&folder.path().join("state"));
         let first = only_runner(&config).expect("the first Runner");
         let refused = only_runner(&config).expect_err("a second Runner over the same folder");
         assert!(
@@ -1579,7 +1863,7 @@ mod tests {
     #[test]
     fn what_stands_is_counted_from_the_records_and_the_look_changes_nothing() {
         let folder = tempfile::tempdir().expect("folder");
-        let config = config(folder.path(), folder.path(), false);
+        let config = config(folder.path());
         assert_eq!(crate::update::standing(&config.records()), 0, "no folder yet");
         std::fs::create_dir_all(config.records()).expect("folder");
         assert_eq!(crate::update::standing(&config.records()), 0);

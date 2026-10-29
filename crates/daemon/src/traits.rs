@@ -88,6 +88,10 @@ pub trait Slots: Send + Sync {
     /// last poll offered is the others' again.
     fn withdraw_offer(&self, _set: &SetKey) {}
 
+    /// The room [`Slots::offer_room`] last gave scale set `set` never reached GitHub: no poll carried it, so it counts
+    /// as none of the set's polls that offered room.
+    fn offer_not_sent(&self, _set: &SetKey) {}
+
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
 
@@ -227,8 +231,8 @@ pub trait Registry: Send + Sync {
     /// Registers an Actions runner that takes one job.
     fn generate_jit(&self, name: &str) -> impl Future<Output = Result<JitConfig, Error>> + Send;
 
-    /// Removes a registered Actions runner; one with a job refuses.
-    fn remove_runner(&self, runner_id: i64) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Removes a registered Actions runner: whether it was there to remove. One with a job refuses (422).
+    fn remove_runner(&self, runner_id: i64) -> impl Future<Output = Result<bool, Error>> + Send;
 
     /// Whether a registered Actions runner has a job, by GitHub's own record; `None` when GitHub no longer has it.
     fn runner_busy(&self, runner_id: i64) -> impl Future<Output = Result<Option<bool>, Error>> + Send;

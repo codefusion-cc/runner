@@ -11,11 +11,8 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::credentials::{AppCredentials, AppKey};
 use crate::error::Error;
 use crate::http::{Http, Response};
-use crate::jwt::Clock;
-use crate::key::KeyTokens;
 use crate::rest::{Installed, MAX_PAGES, Rest, decode};
 use crate::source::TokenSource;
 
@@ -257,16 +254,14 @@ struct RunJobs {
 struct Inner {
     rest: Rest,
     source: Arc<dyn TokenSource>,
-    /// The local key, when the tokens come from it: what [`GitHubApp::jwt`] signs with.
-    key: Option<Arc<KeyTokens>>,
     /// Each repository's current workflow files by blob hash.
     blobs: Mutex<HashMap<String, Blobs>>,
     /// What each repository's queue last read as.
     queue: Mutex<HashMap<String, QueueCache>>,
 }
 
-/// A GitHub App's REST client. Cheap to clone; safe to share. Its tokens come from a [`TokenSource`]: the App's key
-/// on this machine, or the CodeFusion Console. It keeps workflow files by their blob hash, so polling repositories
+/// A GitHub App's REST client. Cheap to clone; safe to share. Its tokens come from a [`TokenSource`]: the CodeFusion
+/// Console. It keeps workflow files by their blob hash, so polling repositories
 /// costs little.
 #[derive(Clone)]
 pub struct GitHubApp {
@@ -282,33 +277,12 @@ impl std::fmt::Debug for GitHubApp {
 }
 
 impl GitHubApp {
-    /// A client for the App with this client ID and key, which signs for its own tokens. `api` is the REST API root.
-    pub fn new(client_id: &str, key: AppKey, api: &str, http: Http, clock: Arc<dyn Clock>) -> GitHubApp {
-        let key = Arc::new(KeyTokens::new(client_id, key, api, http.clone(), clock));
-        GitHubApp::build(key.clone(), Some(key), api, http)
-    }
-
-    /// A client for the App in loaded credentials.
-    pub fn from_credentials(
-        credentials: AppCredentials,
-        api: &str,
-        http: Http,
-        clock: Arc<dyn Clock>,
-    ) -> GitHubApp {
-        GitHubApp::new(&credentials.client_id, credentials.key, api, http, clock)
-    }
-
-    /// A client whose tokens come from `source` (the console's, say). `api` is the REST API root the tokens are for.
+    /// A client whose tokens come from `source` (the console's). `api` is the REST API root the tokens are for.
     pub fn with_source(source: Arc<dyn TokenSource>, api: &str, http: Http) -> GitHubApp {
-        GitHubApp::build(source, None, api, http)
-    }
-
-    fn build(source: Arc<dyn TokenSource>, key: Option<Arc<KeyTokens>>, api: &str, http: Http) -> GitHubApp {
         GitHubApp {
             inner: Arc::new(Inner {
                 rest: Rest::new(api, http),
                 source,
-                key,
                 blobs: Mutex::new(HashMap::new()),
                 queue: Mutex::new(HashMap::new()),
             }),
@@ -325,8 +299,7 @@ impl GitHubApp {
         &self.inner.rest.http
     }
 
-    /// GitHub's clock minus this machine's, in seconds, as the App's key here learned it from GitHub's responses (0
-    /// until it was refused for the time, and always without a key here).
+    /// GitHub's clock minus this machine's, in seconds, as the token source learned it (0 when it did not).
     pub fn clock_skew_secs(&self) -> i64 {
         self.inner.source.clock_skew_secs()
     }
@@ -335,17 +308,6 @@ impl GitHubApp {
     /// the expiry of a token GitHub issued is compared with.
     pub fn now_epoch(&self) -> i64 {
         self.inner.source.now_epoch()
-    }
-
-    /// The App's own signed token, valid nine minutes and issued a minute in the past. An [`Error::Key`] for a
-    /// client whose tokens come from elsewhere: it holds no key.
-    pub fn jwt(&self) -> Result<Secret<String>, Error> {
-        match &self.inner.key {
-            Some(key) => key.jwt(),
-            None => Err(Error::Key(
-                "no App key here: the tokens come from the console".into(),
-            )),
-        }
     }
 
     /// A call authenticated with an installation token; a 401 drops the token and tries once with a new one.
@@ -413,16 +375,9 @@ impl GitHubApp {
         self.inner.source.installations().await
     }
 
-    /// A token that reads an installation's repositories. From the local key, one with every permission of the App,
-    /// reused until five minutes before it expires, one call at a time per installation asking GitHub for a new one.
+    /// A token that reads an installation's repositories, as the token source keeps it.
     pub async fn installation_token(&self, installation: i64) -> Result<Secret<String>, Error> {
         self.inner.source.token(installation, None).await
-    }
-
-    /// A token for registering Actions runners with a repository, which the scale set client trades for the Actions
-    /// service's own.
-    pub async fn registration_token(&self, installation: i64, repo: &str) -> Result<Secret<String>, Error> {
-        self.inner.source.registration_token(installation, repo).await
     }
 
     /// Registers an Actions runner for one job with a repository, outside any scale set, in the repository's default
