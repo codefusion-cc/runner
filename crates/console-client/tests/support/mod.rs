@@ -133,6 +133,7 @@ pub fn status(machine: &str) -> Status {
 
 pub fn report(machine: &str) -> Report {
     Report {
+        class: None,
         status: status(machine),
         activity: Activity {
             cpu_percent: 25.0,

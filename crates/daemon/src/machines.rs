@@ -58,6 +58,9 @@ pub struct MachineConfig {
     /// The most Docker jobs (`cf-docker`) at once: a daemon and its builds take the Mac's processors more than
     /// other jobs do.
     pub docker_max_jobs: usize,
+    /// The trusted class's rules every job of this Mac is checked against before its first step; none on a shared
+    /// Runner.
+    pub trusted: Option<cf_trusted::Policy>,
 }
 
 impl MachineConfig {
@@ -88,6 +91,7 @@ impl MachineConfig {
             boot: boot.to_string(),
             stand_in: None,
             docker_max_jobs: 1,
+            trusted: None,
         }
     }
 }
@@ -1567,6 +1571,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             env: own.env,
             deadline_s: own.deadline.as_secs(),
             docker: own.docker,
+            trusted: None,
         };
         let mut record = Record {
             unregistered: true,
@@ -2298,6 +2303,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             env: Vec::new(),
             deadline_s: self.config.deadline.as_secs(),
             docker: inner.docker.contains(&spec.ticket),
+            trusted: self.config.trusted.clone(),
         };
         let record = self.record(
             &spec.name,

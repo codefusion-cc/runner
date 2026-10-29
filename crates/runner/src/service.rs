@@ -18,7 +18,7 @@ use cf_ghapp::{
 use cf_secret::Secret;
 
 use crate::commands::VERSION;
-use crate::config::Config;
+use crate::config::{Class, Config};
 use crate::hidden::{self, NoLine};
 use crate::manager::ServiceManager;
 use crate::update::{self, CheckoutUpdate, Started};
@@ -124,7 +124,7 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
 
 /// The budget's numbers on this host under the configuration: the defaults with what the file sets on top.
 fn budget_of(facts: HostFacts, config: &Config) -> Result<Settings, String> {
-    This::settings(facts, config.mode())
+    This::settings(facts, config.mode(), config.class == Class::Trusted)
         .limited(&config.limits())
         .map_err(|error| format!("the limits for jobs: {error}"))
 }
@@ -273,6 +273,7 @@ fn service(
             docker_repos: config.docker_repos.clone(),
             docker_max_jobs: config.docker_max_jobs,
             host_labels: config.labels.clone(),
+            trusted: config.trusted_policy(),
         },
         console: console(config)?,
         stand_in: None,
@@ -431,6 +432,12 @@ fn run_daemon(config: &Path) -> Result<(), String> {
             trigger.trigger();
         });
         tracing::info!(version = VERSION, machine = %config.machine, "the Runner starts");
+        if let Some(policy) = config.trusted_policy() {
+            match trusted_rules(&policy) {
+                Ok(line) => tracing::info!(rules = %line, "trusted"),
+                Err(why) => tracing::error!(%why, "a trusted host whose rules refuse every job"),
+            }
+        }
         // Before the first report: the console sends the update's command again until it has the result.
         if let Started::Trying(pending) = &started {
             service.take_up(pending);
@@ -699,6 +706,32 @@ fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> 
         This::fit(program).map(|()| format!("{} can start machines", program.display())),
         room(config),
     ]
+    .into_iter()
+    .chain(config.trusted_policy().map(|policy| trusted_rules(&policy)))
+    .collect()
+}
+
+/// What a trusted host runs, or why its rules refuse every job: an install waits for rules that hold, and a running
+/// host whose rules stop holding refuses each job with the reason.
+fn trusted_rules(policy: &cf_trusted::Policy) -> Result<String, String> {
+    let rules = policy
+        .rules()
+        .map_err(|why| format!("trusted rules that hold; as written they refuse every job: {why}"))?;
+    let runs: Vec<String> = rules
+        .allow
+        .iter()
+        .map(|(file, events)| {
+            format!(
+                "{file} on {}",
+                events.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect();
+    Ok(format!(
+        "a trusted host: {}'s main runs {}",
+        rules.repository,
+        runs.join("; ")
+    ))
 }
 
 fn print(lines: &[Result<String, String>]) -> usize {

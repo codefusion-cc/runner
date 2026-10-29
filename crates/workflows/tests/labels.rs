@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use cf_workflows::{
-    DOCKER_LABEL, LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS, POOL_LABEL, SizeError, is_host_label,
-    self_hosted, self_hosted_with, size_gb,
+    DOCKER_LABEL, LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS, POOL_LABEL, SizeError, TRUSTED_LABEL,
+    is_host_label, is_trusted_label, self_hosted, self_hosted_with, size_gb,
 };
 use proptest::prelude::*;
 
@@ -933,4 +933,57 @@ proptest! {
             }
         }
     }
+}
+
+// The trusted class: a pull request may write `runs-on: [trusted, cf-8g]` or set it through a variable; a shared
+// host must never take such a job, for a trusted host's job carries production tokens.
+#[test]
+fn no_shared_host_serves_a_set_with_the_trusted_label() {
+    for labels in [
+        &[TRUSTED_LABEL][..],
+        &["self-hosted", "trusted"],
+        &["cf-8g", "Trusted"],
+        &["cf-docker", " TRUSTED "],
+        &["cf-2g", "cf-linux", "trusted"],
+    ] {
+        assert_eq!(LabelSet::served(labels.iter().copied()), None, "{labels:?}");
+    }
+    let wf = files(&[(
+        "deploy.yml",
+        "jobs:\n  a:\n    runs-on: [self-hosted, trusted]\n  b:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED }}\n  c:\n    runs-on: [cf-4g]\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_TRUSTED", "trusted")]))),
+        ["cf-4g"]
+    );
+}
+
+// GitHub matches labels without regard to case, and a capital of a letter outside ASCII can be an ASCII one: the
+// long s `ſ` is `S` in capitals. A shared Actions runner registered as `truſted` could then be handed main's deploy,
+// which asks for `trusted`, though lowercasing alone never turns it into the trusted label.
+#[test]
+fn no_shared_host_serves_a_set_whose_label_is_trusted_in_another_case() {
+    for labels in [&["self-hosted", "tru\u{17f}ted"][..], &["cf-8g", "TRU\u{17f}TED"]] {
+        assert_eq!(LabelSet::served(labels.iter().copied()), None, "{labels:?}");
+    }
+    // Another word with a long s is no trusted label.
+    assert_eq!(
+        LabelSet::served(["cf-2g", "tru\u{17f}\u{17f}"]).map(|set| set.key()),
+        Some("cf-2g,tru\u{17f}\u{17f}".to_string())
+    );
+    assert!(is_trusted_label("tru\u{17f}ted"));
+    assert!(is_trusted_label(" Trusted "));
+    assert!(!is_trusted_label("trusted-x"));
+    assert!(!is_trusted_label("tru\u{17f}\u{17f}"));
+    let wf = files(&[(
+        "deploy.yml",
+        "jobs:\n  a:\n    runs-on: [self-hosted, \"tru\u{17f}ted\"]\n  b:\n    runs-on: ${{ fromJSON(vars.CI_RUNNER_TRUSTED) }}\n  c:\n    runs-on: [cf-4g]\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER_TRUSTED", "[\"cf-8g\", \"TRU\u{17f}TED\"]")])
+        )),
+        ["cf-4g"]
+    );
 }

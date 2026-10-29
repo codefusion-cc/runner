@@ -580,6 +580,10 @@ pub struct Report {
     /// The system the Runner runs on; left out when it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<Os>,
+    /// The host's class, `trusted` on a host that runs only main's deploy, release and signing jobs. Left out on a
+    /// shared host and by a Runner from before classes; the console refuses a report whose class is not its record's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
     /// The settings in effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,

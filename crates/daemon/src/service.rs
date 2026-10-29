@@ -18,7 +18,7 @@ use cf_console_client::{
 };
 use cf_ghapp::{Clock, GitHubApp, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
-use cf_workflows::{LabelSet, self_hosted_with};
+use cf_workflows::{LabelSet, TRUSTED_LABEL, self_hosted_with};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Notify;
@@ -107,6 +107,9 @@ pub struct ServiceConfig {
     pub queued_keep: Duration,
     /// The most label sets of queued jobs served for one repository, and for the host: the newest are.
     pub queued_bounds: (usize, usize),
+    /// How often a trusted host asks the console for an Actions runner while it has none: the console answers
+    /// that no trusted job waits, with a time to ask again, until one does.
+    pub trusted_every: Duration,
 }
 
 impl ServiceConfig {
@@ -137,6 +140,7 @@ impl ServiceConfig {
             queue_budget: Duration::from_secs(45),
             queued_keep: Duration::from_secs(30 * 60),
             queued_bounds: (8, 32),
+            trusted_every: Duration::from_secs(15),
         }
     }
 }
@@ -703,6 +707,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// as [`Service::discover`] does, on the repositories and workflows the last discovery read. Only a change of
     /// those sets reaches GitHub: one more to serve, one that expired.
     pub async fn look_at_queue(&self) {
+        if self.shared.config.policy.trusted.is_some() {
+            return;
+        }
         let Some(read) = self.shared.main.lock().expect("main").clone() else {
             return;
         };
@@ -757,7 +764,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         };
         let mut wanted = read.wanted.clone();
         let mut problems = read.problems.clone();
-        let now_queued = if wants {
+        let now_queued = if wants && shared.config.policy.trusted.is_none() {
             let (queued, queue_problems, queued_now) = self.queued_wanted(&read).await;
             wanted.extend(queued);
             problems.extend(queue_problems);
@@ -1166,6 +1173,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         )
                     })
                     .clone();
+                if shared.config.policy.trusted.is_some() {
+                    // What its workflows ask for does not matter: its jobs come to Actions runners of its own.
+                    continue;
+                }
                 let files = match shared
                     .app
                     .workflow_files(installation.id, &name, shared.config.max_workflow_bytes)
@@ -1364,7 +1375,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     );
                     continue;
                 }
-                if let Some(ticket) = self.own_slot(state) {
+                if let Some(ticket) = self.own_slot(state.size, state.docker) {
                     held.own.tried(now, &set.name, String::new());
                     starts.push((state, set, ticket));
                 }
@@ -1414,12 +1425,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
 
     /// A slot for an Actions runner of a scale set's own, as the budget gives one to any job it is offered: none
     /// while the host is paused, full, or someone works on it.
-    fn own_slot(&self, state: &SetState) -> Option<Ticket> {
+    fn own_slot(&self, size: Size, docker: bool) -> Option<Ticket> {
         let machines = &*self.shared.machines;
-        let promised = machines.reserve_for(state.size, state.docker).ok()?;
-        match machines.claim(state.size, Some(promised)) {
+        let promised = machines.reserve_for(size, docker).ok()?;
+        match machines.claim(size, Some(promised)) {
             Claim::Start(ticket) => {
-                if state.docker {
+                if docker {
                     machines.mark_docker(ticket);
                 }
                 Some(ticket)
@@ -1466,6 +1477,72 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     "an Actions runner of its own for a held job could not start"
                 );
                 None
+            }
+        }
+    }
+
+    /// A trusted host's one Actions runner: when nothing stands here, it asks for one with the trusted label, in a
+    /// machine of the largest size it runs and with the host's rules for the gate. The console registers it only
+    /// while a trusted job waits, and otherwise answers when to ask again. One that waited [`held::OWN_WAIT`]
+    /// without a job is removed, as its job went elsewhere or was cancelled.
+    pub async fn ask_trusted(&self) {
+        let shared = &self.shared;
+        let Some(policy) = &shared.config.policy.trusted else {
+            return;
+        };
+        let Ok(repo) = policy.repository() else {
+            return;
+        };
+        let machines = &*shared.machines;
+        let now = shared.clock.now();
+        let idle: Vec<String> = shared
+            .roster
+            .runners(&repo, held::OWN)
+            .into_iter()
+            .filter(|runner| {
+                runner.waits() && now.duration_since(runner.started).unwrap_or_default() >= held::OWN_WAIT
+            })
+            .map(|runner| runner.name)
+            .collect();
+        if !idle.is_empty() {
+            Hosts::retire(machines, &repo, held::OWN, usize::MAX, &idle);
+        }
+        // One at a time: a machine, a registration under way or one to remove waits for its end.
+        if machines.unsettled() > 0 || machines.coming() > 0 || shared.roster.active(&repo, held::OWN) > 0 {
+            return;
+        }
+        let settings = machines.settings();
+        let Some(size) = Size::ALL
+            .into_iter()
+            .rev()
+            .find(|size| settings.can_run(*size).is_ok())
+        else {
+            return;
+        };
+        let Some(ticket) = self.own_slot(size, false) else {
+            return;
+        };
+        let Some(client) = self.client_for(&repo).await else {
+            machines.release(ticket);
+            tracing::warn!(%repo, "a trusted host cannot reach its repository at GitHub");
+            return;
+        };
+        let registry = SetRegistry::own(client, vec![TRUSTED_LABEL.to_string()]);
+        let at = Start {
+            machine: &shared.config.machine,
+            repo: &repo,
+            scale_set_id: held::OWN,
+            size,
+        };
+        match start_runner(&registry, machines, &shared.roster, &*shared.clock, at, ticket).await {
+            Ok(runner) => tracing::info!(%runner, %repo, "a trusted job waits: an Actions runner takes it"),
+            Err(error) => {
+                machines.release(ticket);
+                if error.retry_after().is_some() {
+                    tracing::debug!(%repo, %error, "no trusted job waits yet");
+                } else {
+                    tracing::warn!(%repo, %error, "an Actions runner for a trusted job could not start");
+                }
             }
         }
     }
@@ -1864,6 +1941,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             hostname: shared.config.hostname.clone(),
             model: shared.config.model.clone(),
             os: shared.config.os,
+            class: shared
+                .config
+                .policy
+                .trusted
+                .as_ref()
+                .map(|_| "trusted".to_string()),
             settings: None,
             limits: self.limits(&settings),
             image: None,
@@ -2070,7 +2153,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if shared.settings.is_some() {
             kinds.push("settings");
         }
-        if shared.console.is_some() {
+        // A trusted host runs main's own jobs and nothing else, a test run neither.
+        if shared.console.is_some() && shared.config.policy.trusted.is_none() {
             kinds.push("test-run");
         }
         kinds.into_iter().map(str::to_string).collect()
@@ -2093,6 +2177,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         // result finds the machine it started, even once a check since refuses Docker.
         if shared.machines.knows(&runner) {
             return Some((true, format!("started {runner}")));
+        }
+        if shared.config.policy.trusted.is_some() {
+            return Some((
+                false,
+                "never: a trusted host runs main's own jobs and no test run".into(),
+            ));
         }
         if run.docker
             && let Some(why) = self.docker_refused()
@@ -2173,7 +2263,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if shared.docker_refused.swap(refused, Ordering::SeqCst) != refused {
             shared.rediscover.notify_one();
         }
-        if machines.probing()
+        // A trusted host gives no job Docker, so it has nothing to check.
+        if shared.config.policy.trusted.is_some()
+            || machines.probing()
             || self.restart_requested()
             || self.update_under_way()
             || shared.applying.lock().expect("applying").under_way
@@ -2544,6 +2636,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let mut discover = tokio::time::interval(config.discover_every);
         let mut queue = tokio::time::interval(config.queue_every);
         queue.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let trusted = config.policy.trusted.is_some();
+        let mut ask = tokio::time::interval(config.trusted_every);
+        ask.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let looks = async {
             loop {
                 tokio::select! {
@@ -2557,6 +2652,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                         queue.reset();
                     }
                     _ = queue.tick() => self.look_at_queue().await,
+                    _ = ask.tick(), if trusted => self.ask_trusted().await,
                 }
             }
         };

@@ -265,6 +265,40 @@ impl Settings {
         self
     }
 
+    /// These settings on a host that runs one machine at a time and nothing else but the Runner: a trusted host
+    /// (`class: trusted`), which asks GitHub for one job at a time. With no second machine and nobody at it, CI takes
+    /// every core: the fast ones of a host whose cores differ ([`Settings::on_fast_cores`]), all of them otherwise.
+    /// A cf-4g takes up to 4 vCPUs, as when it runs alone, and no size takes more than CI has. On a headless host the
+    /// cap keeps the overhead of that one machine.
+    ///
+    /// Without this, a 2-vCPU cloud VM (an n2-standard-2 with 7.76 GB) would keep two for itself, leave CI one and
+    /// run no size at all. With it, both go to a cf-4g, the largest its memory holds.
+    pub fn one_at_a_time(mut self, fast_cores: u32) -> Settings {
+        let cpus = if (2..self.cores).contains(&fast_cores) {
+            fast_cores
+        } else {
+            self.cores
+        };
+        self.away.cpus = cpus;
+        if self.headless {
+            self.away.cap_bytes = self
+                .total_bytes
+                .saturating_sub(self.away.floor_bytes)
+                .saturating_sub(Self::HEADLESS_HOST_USE)
+                .saturating_sub(self.vm_host_overhead_bytes);
+        }
+        self.in_use = match self.mode {
+            Mode::Dedicated => self.away,
+            Mode::Workstation => Profile {
+                cpus: self.in_use.cpus.min(cpus),
+                ..self.in_use
+            },
+        };
+        self.vcpus = [2, cpus.clamp(2, 4), 4, 4].map(|vcpus| vcpus.min(cpus));
+        self.max_machines = Some(1);
+        self
+    }
+
     /// What a lean Linux host with nobody at it holds for itself: the kernel, systemd, sshd and the Runner. 0.4 GB
     /// measured with nothing to do on an RK3588 board with 7.75 GB (`MemTotal` less `MemAvailable`), Docker installed
     /// and idle; half a gigabyte with a little room.

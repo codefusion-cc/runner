@@ -26,6 +26,7 @@ fn job(secret: &str) -> Job {
         oom_grace_ms: 15_000,
         blocked: vec![([203, 0, 113, 0], 24)],
         docker: true,
+        trusted: None,
     }
 }
 

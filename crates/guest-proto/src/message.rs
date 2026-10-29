@@ -64,6 +64,10 @@ pub struct Job {
     /// Whether the job gets a Docker daemon of its own, in a sandbox beside its container.
     #[serde(default)]
     pub docker: bool,
+    /// On a host of the trusted class, its rules: the supervisor puts the gate in front of the Actions runner's Worker
+    /// (`cf_supervisor::gate`), which refuses every job they do not let run before any step of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<cf_trusted::Policy>,
 }
 
 /// A job's limits, enforced by the guest kernel on the job's control group.

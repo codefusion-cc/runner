@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 cf-guest-proto = { path = "../guest-proto" }
 cf-image = { path = "../image" }
+cf-trusted = { path = "../trusted" }
 cf-vmm = { path = "../vmm" }
 libc.workspace = true
 serde.workspace = true
