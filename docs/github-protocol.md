@@ -96,7 +96,7 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
   jobs GitHub has queued or runs ask for that those workflows do not name: a pull request's new workflow or labels
   would otherwise wait for ever. The Runner reads them with `actions: read`, about once a minute
   (`GET /repos/{repo}/actions/runs?status=queued`, the same with `in_progress`, then `/actions/runs/{id}/jobs`): the
-  newest 10 runs and one page of each run's jobs. A listing names the ETag of its last answer, so a queue that did
+  oldest 10 of the newest 100 runs, whose jobs waited longest, and one page of each run's jobs. A listing names the ETag of its last answer, so a queue that did
   not change costs 304s, which GitHub does not count against the rate limit; the jobs of a run whose `updated_at`
   did not change are not asked for again, and those of one that did are asked for with their ETag. A job's labels
   pass the same rules as a workflow's (`LabelSet::served`), and such a set is served for 30 minutes after a job of

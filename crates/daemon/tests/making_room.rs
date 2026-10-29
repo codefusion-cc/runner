@@ -109,6 +109,10 @@ async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_
     let offered = polls(&w, Size::G6, 601);
     assert!(offered[..600].iter().all(|offered| *offered == 0), "{offered:?}");
     assert_eq!(offered[600], 1, "ten minutes without room");
+    assert!(
+        w.m.offers_place(Size::G6),
+        "what it offers is a place in line, no room"
+    );
     assert_eq!(
         log.lines("a place in line"),
         [
@@ -119,6 +123,7 @@ async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_
     assert!(polls(&w, Size::G6, 120).iter().all(|offered| *offered == 1));
     assert_eq!(log.lines("a place in line").len(), 1);
     assert_eq!(w.m.open_slots(Size::G2), 1);
+    assert!(!w.m.offers_place(Size::G2), "a cf-2g machine fits: that is room");
 
     // A cf-8g machine needs 10432 MiB without the Mac's own machines; it has 9229.
     assert!(polls(&w, Size::G8, 900).iter().all(|offered| *offered == 0));

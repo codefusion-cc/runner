@@ -12,7 +12,7 @@ use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, Options, test_key};
 use cf_ghapp::{
     AppCredentials, AppKey, Clock, Error, GitHubApp, Http, Installation, JOBS_PAGE, MAX_RUN_SETS,
-    RetryPolicy, WAITING_RUNS, Waiting,
+    RUNS_LISTED, RetryPolicy, WAITING_RUNS, Waiting,
 };
 use cf_secret::Secret;
 use cf_workflows::{LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS};
@@ -1062,14 +1062,14 @@ async fn the_runs_jobs_and_labels_read_are_bounded_and_what_is_left_out_is_said(
         WAITING_RUNS,
         "only so many runs' jobs are read"
     );
-    let newest: Vec<i64> = ids[ids.len() - WAITING_RUNS..].to_vec();
+    let oldest: Vec<i64> = ids[..WAITING_RUNS].to_vec();
     let mut got: Vec<i64> = read.jobs.iter().map(|j| j.id).collect();
     got.sort();
-    assert_eq!(got, newest, "the newest runs");
+    assert_eq!(got, oldest, "the oldest runs: their jobs waited longest");
     assert_eq!(
         read.left_out,
         [format!(
-            "{} runs waiting, the newest {WAITING_RUNS} read",
+            "{} runs waiting, the oldest {WAITING_RUNS} read",
             WAITING_RUNS + 5
         )]
     );
@@ -1083,8 +1083,8 @@ async fn the_runs_jobs_and_labels_read_are_bounded_and_what_is_left_out_is_said(
         .collect();
     assert_eq!(
         listings,
-        [WAITING_RUNS.to_string(), WAITING_RUNS.to_string()],
-        "each listing asks for no more runs than are read"
+        [RUNS_LISTED.to_string(), RUNS_LISTED.to_string()],
+        "each listing asks for as many runs as one page holds, so the oldest are among them"
     );
 
     // One run of more jobs than a page, of more distinct sets than are kept.
@@ -1149,7 +1149,7 @@ async fn a_job_of_a_forks_pull_request_says_so() {
     h.fake.from_fork(stranger);
     let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
     let forks: Vec<(i64, bool)> = read.jobs.iter().map(|j| (j.id, j.from_fork)).collect();
-    assert_eq!(forks, [(stranger, true), (own, false)]);
+    assert_eq!(forks, [(own, false), (stranger, true)], "the oldest run first");
 }
 
 // added: an answer over the body limit is refused, never held, and a slow one gives up at the client's timeout.

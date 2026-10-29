@@ -265,6 +265,10 @@ impl Slots for Spy {
         self.machines.offer_room(set, size)
     }
 
+    fn offers_place(&self, size: Size) -> bool {
+        self.machines.offers_place(size)
+    }
+
     fn withdraw_offer(&self, set: &cf_daemon::SetKey) {
         self.machines.withdraw_offer(set);
     }

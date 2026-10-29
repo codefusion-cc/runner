@@ -51,8 +51,10 @@ pub struct Repo {
     pub disabled: bool,
 }
 
-/// How many runs' jobs one look reads, newest first.
+/// How many runs' jobs one look reads, the oldest first: their jobs have waited longest.
 pub const WAITING_RUNS: usize = 10;
+/// How many runs one listing names, GitHub's most: the oldest of them are read.
+pub const RUNS_LISTED: usize = 100;
 /// How many jobs of one run are read: one page.
 pub const JOBS_PAGE: usize = 100;
 /// The most distinct label sets kept of one run.
@@ -108,7 +110,7 @@ struct Run {
     from_fork: bool,
 }
 
-/// A page of a listing of runs: how many there are, and the newest.
+/// A page of a listing of runs: how many there are, and the newest [`RUNS_LISTED`].
 struct Listing {
     total: usize,
     runs: Vec<Run>,
@@ -613,7 +615,8 @@ impl GitHubApp {
     }
 
     /// The jobs of a repository GitHub has not finished, from its queued and running workflow runs, of the label
-    /// sets these Actions runners serve ([`LabelSet::served`]): the newest [`WAITING_RUNS`] runs, one page of each
+    /// sets these Actions runners serve ([`LabelSet::served`]): the oldest [`WAITING_RUNS`] of the newest [`RUNS_LISTED`]
+    /// runs, whose jobs have waited longest, one page of each
     /// run's jobs, and of each run the newest job of each distinct set, at most [`MAX_RUN_SETS`].
     /// [`Waiting::left_out`] says what the bounds left out.
     ///
@@ -633,7 +636,7 @@ impl GitHubApp {
             .unwrap_or_default();
         let listing_of = |status: &str| {
             format!(
-                "/repos/{repo}/actions/runs?status={status}&per_page={WAITING_RUNS}&exclude_pull_requests=true"
+                "/repos/{repo}/actions/runs?status={status}&per_page={RUNS_LISTED}&exclude_pull_requests=true"
             )
         };
         let (queued, running) = (listing_of("queued"), listing_of("in_progress"));
@@ -651,12 +654,12 @@ impl GitHubApp {
                 now.listings.insert(path, (tag, page));
             }
         }
-        runs.sort_unstable_by_key(|run| std::cmp::Reverse(run.id));
+        runs.sort_unstable_by_key(|run| run.id);
         runs.dedup_by_key(|run| run.id);
         let mut waiting = Waiting::default();
         if total.max(runs.len()) > WAITING_RUNS {
             waiting.left_out.push(format!(
-                "{} runs waiting, the newest {WAITING_RUNS} read",
+                "{} runs waiting, the oldest {WAITING_RUNS} read",
                 total.max(runs.len())
             ));
             runs.truncate(WAITING_RUNS);

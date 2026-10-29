@@ -2760,7 +2760,8 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     let machines = machines.clone();
                     Arc::new(move |runner| machines.was_out_of_memory(runner))
                 });
-                let (statistics, never) = (scaler.statistics_handle(), scaler.never_handle());
+                let (statistics, never, room) =
+                    (scaler.statistics_handle(), scaler.never_handle(), scaler.room_handle());
                 {
                     let mut state = state.lock().expect("set");
                     state.error = None;
@@ -2772,10 +2773,14 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         let mut state = state.lock().expect("set");
                         state.statistics.clone_from(&statistics.lock().expect("statistics"));
                         state.never.clone_from(&never.lock().expect("never"));
-                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here.
+                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here; a place in
+                        // line is none, so a full host names no job held back from it.
                         let assigned = state.statistics.as_ref().map_or(0, Statistics::assigned);
+                        let room = *room.lock().expect("room");
                         state.room_since = match capacity {
-                            Some(capacity) if capacity > assigned => state.room_since.or_else(|| Some(clock.now())),
+                            Some(capacity) if room && capacity > assigned => {
+                                state.room_since.or_else(|| Some(clock.now()))
+                            }
                             _ => None,
                         };
                     }

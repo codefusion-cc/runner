@@ -1527,3 +1527,19 @@ async fn an_offered_job_passed_over_keeps_its_age_however_many_other_offers_come
     assert_eq!(h.fake.job_state(old), Some(JobState::Acquired(h.set.id)));
     assert_eq!(h.fake.job_state(main), Some(JobState::Available));
 }
+
+// added: the held-job check counts only room a machine fits in: a Mac with a free slot says so with what its poll
+// offers, and a full one, which offers only what runs, says it has none.
+#[tokio::test]
+async fn a_poll_says_whether_it_offered_room_a_machine_fits_in() {
+    let mut h = harness(2).await;
+    let room = h.scaler.room_handle();
+    let capacity = h.scaler.scale(None).await.unwrap();
+    assert_eq!(capacity, 1, "an empty Mac offers a slot");
+    assert!(*room.lock().unwrap(), "a free slot is room");
+
+    let (mut h, _running) = busy_mac().await;
+    let room = h.scaler.room_handle();
+    assert_eq!(h.scaler.scale(None).await.unwrap(), 1, "the running job only");
+    assert!(!*room.lock().unwrap(), "a full Mac offers no room");
+}

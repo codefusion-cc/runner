@@ -2159,6 +2159,10 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         1
     }
 
+    fn offers_place(&self, size: Size) -> bool {
+        self.lock().offer.short[size.index()] == Some(PLACE)
+    }
+
     fn withdraw_offer(&self, set: &SetKey) {
         let mut inner = self.lock();
         inner.standing.remove(set);
