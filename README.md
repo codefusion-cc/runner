@@ -224,7 +224,8 @@ console, so no App key goes on it; run again (a reboot's startup script), it onl
 sudo scripts/host-setup.sh --machine <name> --console <url> --code-file <file>
 ```
 
-The script's head lists its options (`--home`, `--image`, `--ref`, `--check`). By hand, once, as root (Ubuntu 24.04
+The script's head lists its options (`--home`, `--image`, `--ref`, `--check`). It reads GitHub's API for the image
+with `GITHUB_TOKEN` when that is set, and waits out GitHub's rate limit as the answer says. By hand, once, as root (Ubuntu 24.04
 also needs the line about user namespaces):
 
 ```sh

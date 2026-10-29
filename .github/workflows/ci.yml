@@ -160,6 +160,10 @@ jobs:
             --jq '[.[] | select(.isDraft | not) | .tagName | select(startswith("amd64-image-"))][0]')
           echo "IMAGE=$image" >> "$GITHUB_ENV"
       - name: Set up the host
+        env:
+          # Its image's release is read through GitHub's API, whose rate limit for a GitHub-hosted runner's address
+          # without a token is often spent.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           # GitHub's image sets XDG_CONFIG_HOME to its own user's folder in /etc/environment, and pam_env gives it to
           # every user's systemd, so the Runner's user would read its units from a folder it cannot write.
@@ -167,7 +171,7 @@ jobs:
           sudo sed -i '/^XDG_CONFIG_HOME=/d' /etc/environment
           # The script takes a code only from a file of root's alone.
           sudo install -m 600 -o root -g root "$RUNNER_TEMP/code" /root/code
-          sudo scripts/host-setup.sh --machine ci-fresh --console "$CONSOLE" --code-file /root/code \
+          sudo --preserve-env=GITHUB_TOKEN scripts/host-setup.sh --machine ci-fresh --console "$CONSOLE" --code-file /root/code \
             --repo /tmp/runner.git --image "$IMAGE" --github-api "$GITHUB"
       - name: A run again changes nothing
         run: sudo scripts/host-setup.sh --machine ci-fresh --console "$CONSOLE" --code-file "$RUNNER_TEMP/none"
