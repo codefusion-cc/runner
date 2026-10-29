@@ -89,6 +89,20 @@ fn a_job_passed_over_for_the_defer_limit_beats_a_fresh_main_job() {
 }
 
 #[test]
+fn a_job_assigned_while_the_clock_was_behind_does_not_pass_one_that_waited_longer() {
+    let limit = DEFER_LIMIT.0 / 1000;
+    let (mut budget, running) = full();
+    let old = queue(&mut budget, 200, pull("acme/shop"));
+    // The clock goes back before the next job comes: by its time it came first, and it would reach the defer
+    // limit before the job that waited longer.
+    let later = queue(&mut budget, 100, pull("acme/shop"));
+    // A calm minute is watched before the room comes, so a job may start then.
+    watch(&mut budget, 40 + limit, 99 + limit, |_| {});
+    assert_eq!(budget.line(secs(100 + limit)), [old, later]);
+    assert_eq!(drain(&mut budget, running, 100 + limit), [old, later]);
+}
+
+#[test]
 fn two_repositories_take_turns() {
     let (mut budget, running) = full();
     let a: Vec<SlotId> = (0..3).map(|_| queue(&mut budget, 60, pull("acme/a"))).collect();
