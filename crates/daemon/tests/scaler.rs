@@ -400,6 +400,29 @@ async fn a_taken_runner_name_is_registered_again_under_another() {
     assert_eq!(h.fake.runners().len(), 1);
 }
 
+/// A 409 with a wait is the console's word that no trusted job is queued for a trusted machine's Actions runner: no
+/// name is taken and nothing was made, so no other name is tried, no machine starts and nothing is left to remove.
+#[tokio::test]
+async fn a_409_that_says_when_to_ask_again_is_no_taken_name() {
+    let mut h = harness(1).await;
+    let calls = h.console.calls();
+    h.console.answer_next(
+        Reply::status_json(
+            409,
+            &serde_json::json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
+    );
+    let err = h.scaler.scale(Some(&stats(1))).await.expect_err("no job yet");
+    assert_eq!(err.status(), Some(409));
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(15)), "{err:?}");
+    assert_eq!(h.console.calls(), calls + 1, "another name was tried");
+    assert_eq!(h.fake.count("generatejitconfig"), 0);
+    assert!(h.hosts.started().is_empty());
+    assert_eq!(h.slots.used(), 0, "slot held after no registration");
+    assert!(h.machines.registrations_to_remove().is_empty());
+}
+
 #[tokio::test]
 async fn a_completed_job_is_not_replaced_and_its_runner_is_left_to_exit() {
     let mut h = harness(2).await;

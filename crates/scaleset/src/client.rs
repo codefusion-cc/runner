@@ -390,8 +390,15 @@ impl ScaleSetClient {
             .map_err(|e| {
                 // The console answers every refusal of GitHub's with a 409; only `name_taken` says one is there. Its
                 // 503 (GitHub busy or gone mid-call) and a dropped answer may follow a registration GitHub made; its
-                // 429 is its own limit, which refused the call before GitHub was asked.
-                let own_limit = matches!(e, ConsoleError::Busy { status: 429, .. });
+                // 429 is its own limit, which refused the call before GitHub was asked, and its 409 that says when to
+                // ask again (no job for a trusted machine yet) made nothing either.
+                let own_limit = matches!(
+                    e,
+                    ConsoleError::Busy {
+                        status: 429 | 409,
+                        ..
+                    }
+                );
                 let leftover = e.code() == Some(NAME_TAKEN) || (e.is_transient() && !own_limit);
                 (from_console("jit", e), leftover)
             });
@@ -418,8 +425,11 @@ impl ScaleSetClient {
             })
             .map_err(|e| {
                 // A 429 is a limit that refused the call before anything was made (GitHub's, or the console's own, or
-                // a wait the console asked for that kept it unsent): there is nothing to look for.
-                let leftover = e.status() == Some(409) || (e.is_transient() && e.status() != Some(429));
+                // a wait the console asked for that kept it unsent), and so is a 409 that says when to ask again (the
+                // console has no job for a trusted machine yet): there is nothing to look for.
+                let no_job_yet = e.status() == Some(409) && e.retry_after().is_some();
+                let leftover =
+                    !no_job_yet && (e.status() == Some(409) || (e.is_transient() && e.status() != Some(429)));
                 (Error::from(e), leftover)
             });
         self.registered(name, answer).await

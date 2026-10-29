@@ -16,6 +16,18 @@ pub const POOL_LABEL: &str = "self-hosted";
 /// Docker; a variable may name it (`CI_RUNNER_DOCKER=cf-docker`), like a size label.
 pub const DOCKER_LABEL: &str = "cf-docker";
 
+/// The label of a trusted host's jobs (`cf_trusted`): main's deploy, release and signing jobs of one repository, on a
+/// host that runs nothing else. A shared host serves no set that has it, whatever else the set asks for; a trusted
+/// host registers its Actions runners with this label alone, one job at a time.
+pub const TRUSTED_LABEL: &str = "trusted";
+
+/// Whether a label is [`TRUSTED_LABEL`] to GitHub, which compares labels without regard to case: any spelling whose
+/// letters case mapping turns into it, `TRUSTED` and also `truſted` (a long s, whose capital is `S`), which lowercasing
+/// alone leaves apart.
+pub fn is_trusted_label(label: &str) -> bool {
+    label.trim().to_uppercase().to_lowercase() == TRUSTED_LABEL
+}
+
 /// A workflow file bigger than this is not read, and whoever fetches the files need not fetch it. GitHub's own limit
 /// is far lower; the cap keeps a hostile file from costing the Runner time or memory.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
@@ -53,8 +65,8 @@ impl LabelSet {
     /// The set these Actions runners serve for a job that asks for `labels`: a `runs-on` whose expressions are
     /// read, or a job's labels as GitHub's jobs API names them. Lowercased and without repeats, at most
     /// [`MAX_SET_LABELS`] labels, each of letters, digits (in any script), `-`, `_` and `.` and at most
-    /// [`MAX_LABEL_BYTES`] long; none empty, none of another platform, and one of them ours: [`POOL_LABEL`], [`DOCKER_LABEL`] or a
-    /// size. `None` for any other: such a job is left to other Actions runners.
+    /// [`MAX_LABEL_BYTES`] long; none empty, none of another platform, not [`TRUSTED_LABEL`], and one of them ours:
+    /// [`POOL_LABEL`], [`DOCKER_LABEL`] or a size. `None` for any other: such a job is left to other Actions runners.
     pub fn served<I, S>(labels: I) -> Option<LabelSet>
     where
         I: IntoIterator<Item = S>,
@@ -72,7 +84,12 @@ impl LabelSet {
             let plain = label
                 .chars()
                 .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
-            if !plain || label.len() > MAX_LABEL_BYTES || FOREIGN.contains(&label.as_str()) {
+            // A trusted host's job is left to it: a shared host would hand it what a pull request asked for.
+            if !plain
+                || label.len() > MAX_LABEL_BYTES
+                || FOREIGN.contains(&label.as_str())
+                || is_trusted_label(&label)
+            {
                 return None;
             }
             set.insert(label);
@@ -203,7 +220,12 @@ fn resolve(expression: &str, vars: &BTreeMap<String, String>) -> Vec<String> {
                 .filter(|label| !label.is_empty())
                 .collect::<Vec<_>>()
         })
-        .filter(|labels| labels.iter().any(|label| is_ours(label)))
+        // A trusted host's label stays itself, so that no shared host serves the job ([`LabelSet::served`]).
+        .filter(|labels| {
+            labels
+                .iter()
+                .any(|label| is_ours(label) || is_trusted_label(label))
+        })
         .unwrap_or_else(|| vec![POOL_LABEL.to_string()])
 }
 

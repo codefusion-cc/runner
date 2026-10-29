@@ -24,6 +24,18 @@ pub enum Use {
     Workstation,
 }
 
+/// What jobs a host is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Class {
+    /// CI: the jobs of the repositories it serves, by their labels.
+    #[default]
+    Shared,
+    /// Main's deploy, release and signing jobs of one repository and nothing else (`cf_trusted`): the label
+    /// `trusted` alone, one job at a time, no Docker, no test run, and every job checked before its first step.
+    Trusted,
+}
+
 /// The configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +105,14 @@ pub struct Config {
     /// on Linux.
     #[serde(default = "labels")]
     pub labels: Vec<String>,
+    /// What jobs the host is for; left out, `shared`.
+    #[serde(default)]
+    pub class: Class,
+    /// A trusted host's rules: `{"repository": "owner/name", "allow": {"<workflow file>": ["<event>", ...]}}`. Only
+    /// with `class: "trusted"`; left out there, `cf_trusted`'s defaults. An allow-list that does not hold starts the
+    /// host all the same, and every job it is given is refused with the reason.
+    #[serde(default)]
+    pub trusted: Option<cf_trusted::Policy>,
 }
 
 fn github_api() -> String {
@@ -254,7 +274,54 @@ impl Config {
                 return Err(format!("`{repo}` is no `owner/name` repository"));
             }
         }
+        self.check_class()
+    }
+
+    /// What a trusted host may not have: anything that serves more than one repository's `trusted` jobs, one at a
+    /// time.
+    fn check_class(&self) -> Result<(), String> {
+        let Some(policy) = self.trusted_policy() else {
+            return match self.trusted {
+                Some(_) => Err("trusted: rules for a trusted host only (`\"class\": \"trusted\"`)".into()),
+                None => Ok(()),
+            };
+        };
+        let repository = policy.repository().map_err(|why| format!("trusted: {why}"))?;
+        // The App's key mints tokens for every repository it is installed on, and with it the Runner registers
+        // Actions runners itself whenever the console's tokens are off, past the console's word on which job waits.
+        if self.app_dir.is_some() || self.console.is_none() {
+            return Err(
+                "app_dir: a trusted host keeps no GitHub App key and registers through the console alone; leave \
+                 app_dir out and name `console`"
+                    .into(),
+            );
+        }
+        if self.max_jobs.is_some_and(|jobs| jobs != 1) {
+            return Err("max_jobs: a trusted host runs one job at a time; say 1 or leave it out".into());
+        }
+        if !self.docker_repos.is_empty() {
+            return Err("docker_repos: a trusted host gives no job Docker".into());
+        }
+        if !self.public_repos.is_empty() {
+            return Err(format!(
+                "public_repos: a trusted host serves {repository} alone; leave public_repos out"
+            ));
+        }
+        if self
+            .repos
+            .iter()
+            .any(|repo| !repo.eq_ignore_ascii_case(&repository))
+        {
+            return Err(format!(
+                "repos: a trusted host serves {repository} alone; leave repos out or name only it"
+            ));
+        }
         Ok(())
+    }
+
+    /// A trusted host's rules, defaults where the file names none; none on a shared host.
+    pub fn trusted_policy(&self) -> Option<cf_trusted::Policy> {
+        (self.class == Class::Trusted).then(|| self.trusted.clone().unwrap_or_default())
     }
 
     /// The budget's mode.
@@ -268,7 +335,10 @@ impl Config {
     /// What the file sets of the budget on top of its defaults.
     pub fn limits(&self) -> Limits {
         Limits {
-            max_machines: self.max_jobs,
+            max_machines: match self.class {
+                Class::Shared => self.max_jobs,
+                Class::Trusted => Some(1),
+            },
             idle_after: self.idle_minutes.map(|minutes| Millis::mins(minutes.into())),
             floor_percent: self.min_free_memory_percent,
             vcpus: Size::ALL.map(|size| self.vcpus.get(size.label()).copied()),
@@ -415,6 +485,114 @@ mod tests {
             config.program(),
             Path::new("/Users/someone/Library/Application Support/CodeFusion Runner/bin/codefusion-runner")
         );
+    }
+
+    /// A trusted host's file: the console's, with no App key.
+    fn trusted_with(change: impl FnOnce(&mut serde_json::Value)) -> Result<Config, String> {
+        with(|v| {
+            v.as_object_mut().expect("object").remove("app_dir");
+            v["console"] = "https://console.example".into();
+            v["class"] = "trusted".into();
+            change(v);
+        })
+    }
+
+    #[test]
+    fn a_trusted_host_keeps_no_app_key_and_registers_through_the_console() {
+        assert!(trusted_with(|_| {}).is_ok());
+        for (change, why) in [
+            (
+                (|v: &mut serde_json::Value| {
+                    v["app_dir"] = "/Users/someone/.config/codefusion-runners".into()
+                }) as fn(&mut serde_json::Value),
+                "the App's key beside the console",
+            ),
+            (
+                |v| {
+                    v.as_object_mut().expect("object").remove("console");
+                    v["app_dir"] = "/Users/someone/.config/codefusion-runners".into();
+                },
+                "the App's key alone",
+            ),
+        ] {
+            let error = trusted_with(change).expect_err(why);
+            assert!(
+                error.starts_with("app_dir:") && error.contains("console"),
+                "{why}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_host_runs_one_job_of_one_repository_by_default_rules() {
+        let shared = Config::parse(WHOLE).expect("shared");
+        assert_eq!((shared.class, shared.trusted_policy()), (Class::Shared, None));
+        let config = trusted_with(|_| {}).expect("trusted");
+        assert_eq!(config.trusted_policy(), Some(cf_trusted::Policy::defaults()));
+        assert_eq!(config.limits().max_machines, Some(1));
+        let one = trusted_with(|v| {
+            v["max_jobs"] = 1.into();
+            v["repos"] = serde_json::json!(["CodeFusion-cc/codefusion"]);
+        })
+        .expect("one job, its own repository named");
+        assert_eq!(one.limits().max_machines, Some(1));
+        let error = with(|v| v["class"] = "Trusted".into()).expect_err("a class nobody knows");
+        assert!(error.contains("Trusted"), "{error}");
+    }
+
+    #[test]
+    fn a_trusted_host_takes_nothing_that_would_serve_more() {
+        for (change, says) in [
+            (
+                (|v| v["max_jobs"] = 2.into()) as fn(&mut serde_json::Value),
+                "max_jobs",
+            ),
+            (
+                |v| v["docker_repos"] = serde_json::json!(["codefusion-cc/codefusion"]),
+                "docker_repos",
+            ),
+            (
+                |v| v["public_repos"] = serde_json::json!(["codefusion-cc/codefusion"]),
+                "public_repos",
+            ),
+            (
+                |v| v["repos"] = serde_json::json!(["codefusion-cc/codefusion", "org/app"]),
+                "repos",
+            ),
+            (|v| v["repos"] = serde_json::json!(["org/app"]), "repos"),
+            (
+                |v| v["trusted"] = serde_json::json!({ "repository": "codefusion", "allow": {} }),
+                "repository",
+            ),
+            (
+                |v| v["trusted"] = serde_json::json!(["deploy.yml"]),
+                "not an object",
+            ),
+        ] {
+            let error = trusted_with(change).expect_err(says);
+            assert!(error.contains(says), "{says}: {error}");
+        }
+        // Rules on a shared host would read as if it were guarded.
+        let error = with(|v| v["trusted"] = serde_json::json!({ "allow": {} })).expect_err("shared");
+        assert!(error.starts_with("trusted:"), "{error}");
+    }
+
+    #[test]
+    fn a_trusted_host_whose_allow_list_does_not_hold_starts_to_refuse_every_job() {
+        for allow in [
+            serde_json::json!({}),
+            serde_json::json!({ "pr.yml": ["pull_request"] }),
+            serde_json::json!({ "../x.yml": ["push"] }),
+            serde_json::json!(null),
+        ] {
+            let config = trusted_with(|v| {
+                v["trusted"] = serde_json::json!({ "repository": "org/app", "allow": allow });
+            })
+            .expect("starts");
+            let policy = config.trusted_policy().expect("trusted");
+            assert_eq!(policy.repository().as_deref(), Ok("org/app"));
+            assert!(policy.rules().is_err(), "{allow}");
+        }
     }
 
     #[test]

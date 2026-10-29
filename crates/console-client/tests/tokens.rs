@@ -1062,3 +1062,40 @@ async fn a_token_github_refuses_that_a_console_hands_out_again_waits_and_is_name
     rig.advance(Duration::from_secs(21 * 60));
     assert!(rig.app.repositories(1).await.is_ok(), "a new token serves");
 }
+
+/// A trusted machine asks for its one-job Actions runner while no trusted job is queued: the console answers 409
+/// `no_trusted_job` with when to ask again. That is a wait, not a runner name GitHub has: nothing is asked again
+/// before it, and the answer keeps both the 409 and the wait for the caller.
+#[tokio::test]
+async fn no_trusted_job_yet_is_a_wait_and_not_a_taken_name() {
+    let rig = rig(true).await;
+    rig.console.answer_next(
+        Reply::status_json(
+            409,
+            &json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
+    );
+    let error = rig
+        .app
+        .generate_jit_config(1, REPO, RUNNER, &labels(&["trusted"]))
+        .await
+        .expect_err("no job yet");
+    assert_eq!(status_of(&error), Some(409));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(15)));
+    assert_eq!(rig.calls("jit"), 1);
+    rig.advance(Duration::from_secs(14));
+    let unsent = rig
+        .app
+        .generate_jit_config(1, REPO, RUNNER, &labels(&["trusted"]))
+        .await
+        .expect_err("still waiting");
+    assert_eq!(status_of(&unsent), Some(429), "{unsent}");
+    assert_eq!(rig.calls("jit"), 1, "asked again before its Retry-After");
+    rig.advance(Duration::from_secs(1));
+    rig.app
+        .generate_jit_config(1, REPO, RUNNER, &labels(&["trusted"]))
+        .await
+        .expect("asked again once the wait is over");
+    assert_eq!(rig.calls("jit"), 2);
+}

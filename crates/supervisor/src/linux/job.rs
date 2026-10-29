@@ -11,6 +11,7 @@ use cf_guest_proto::{
 };
 use cf_supervisor::disks::overlay_options;
 use cf_supervisor::environment::{find_user, groups_of, workload_environment};
+use cf_supervisor::gate::{self, GateConfig};
 use cf_supervisor::oom::{self, Kill};
 use cf_supervisor::outcome::{REPORT_BYTES, workload_end};
 use cf_supervisor::processes::{Process, Table, parse_stat};
@@ -221,6 +222,65 @@ fn share(name: &str, text: &str, mode: u32) -> Result<(), String> {
     )
 }
 
+/// Puts the gate (`cf_supervisor::gate`) in the place of the image's Worker, so the listener of a trusted job
+/// starts the gate with the job's message, and the gate starts the Worker only for a job its rules accept.
+fn install_gate(home: &str, policy: &cf_trusted::Policy) -> Result<(), String> {
+    let bin = format!("{ROOT}{home}/bin");
+    let worker = format!("{bin}/Runner.Worker");
+    let kind = context(&worker, fs::symlink_metadata(&worker))?.file_type();
+    if !kind.is_file() {
+        return Err(format!("{worker} is not the image's Worker but a {kind:?}"));
+    }
+    context(
+        &worker,
+        fs::rename(&worker, format!("{bin}/{}", gate::REAL_WORKER)),
+    )?;
+    context(
+        &worker,
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&worker)
+            .and_then(|mut file| {
+                file.write_all(b"#!/bin/sh\nexec /run/codefusion/supervisor worker-gate \"$@\"\n")
+            })
+            .and_then(|()| fs::set_permissions(&worker, fs::Permissions::from_mode(0o755))),
+    )?;
+    // A verdict the image came with is not this job's.
+    let _ = fs::remove_file(format!("{ROOT}{home}/{}", gate::VERDICT));
+    let config = GateConfig {
+        policy: policy.clone(),
+        worker: format!("{home}/bin/{}", gate::REAL_WORKER),
+        verdict: format!("{home}/{}", gate::VERDICT),
+    };
+    share(
+        gate::CONFIG,
+        &serde_json::to_string(&config).map_err(|error| error.to_string())?,
+        0o644,
+    )
+}
+
+/// What the gate said of the job, read without following a link the job may have put in its place.
+fn read_verdict(path: &str) -> String {
+    let mut bytes = Vec::new();
+    let read = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|file| {
+            if file.metadata()?.file_type().is_file() {
+                file.take(gate::VERDICT_MAX as u64).read_to_end(&mut bytes)
+            } else {
+                Err(std::io::Error::other("not a file"))
+            }
+        });
+    match read {
+        Ok(_) => gate::read_back(&String::from_utf8_lossy(&bytes)),
+        Err(error) => format!("no verdict ({error}): the Actions runner started no Worker"),
+    }
+}
+
 /// Runs a job to its end.
 pub fn run(
     job: Job,
@@ -231,6 +291,12 @@ pub fn run(
 ) -> Result<Summary, Failure> {
     let disks = |error| ("disks", error);
     let began = sys::uptime_ms();
+    if job.trusted.is_some() && (job.docker || !matches!(job.workload, Workload::ActionsRunner { .. })) {
+        return Err((
+            "container",
+            "a trusted job runs GitHub's Actions runner only, without Docker".into(),
+        ));
+    }
     if !job.docker {
         // What only a Docker job loads goes at once: the machine's memory is the job's.
         let _ = fs::remove_dir_all(docker::MODULE_DIR);
@@ -333,13 +399,28 @@ pub fn run(
             share(cf_supervisor::docker::PROBLEM, &error, 0o644).map_err(container)?;
         }
     }
-    let argv = match &job.workload {
-        Workload::ActionsRunner { jit_config } => vec![
+    let verdict = job
+        .trusted
+        .as_ref()
+        .map(|_| format!("{ROOT}{home}/{}", gate::VERDICT));
+    let argv = match (&job.workload, &job.trusted) {
+        (Workload::ActionsRunner { jit_config }, None) => vec![
             format!("{home}/run.sh"),
             "--jitconfig".to_string(),
             jit_config.expose().to_string(),
         ],
-        Workload::Command { argv } => argv.clone(),
+        // The listener itself, not `run.sh`: an update it took would be started by `run.sh`, past the gate, and
+        // without it the update ends the job instead.
+        (Workload::ActionsRunner { jit_config }, Some(policy)) => {
+            install_gate(&home, policy).map_err(container)?;
+            vec![
+                format!("{home}/bin/Runner.Listener"),
+                "run".to_string(),
+                "--jitconfig".to_string(),
+                jit_config.expose().to_string(),
+            ]
+        }
+        (Workload::Command { argv }, _) => argv.clone(),
     };
     let spec = Spec {
         root: ROOT.into(),
@@ -402,6 +483,9 @@ pub fn run(
     // A process the kernel stopped in the job's last half second, which a workload that died of it ends with, was
     // not looked for yet.
     watch.last_look();
+    if let Some(path) = &verdict {
+        say(&format!("trusted gate: {}", read_verdict(path)));
+    }
     let summary_usage = usage();
     kill_job();
 

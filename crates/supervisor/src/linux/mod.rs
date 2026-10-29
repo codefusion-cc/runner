@@ -2,6 +2,7 @@
 
 pub mod container;
 pub mod docker;
+pub mod gate;
 pub mod hook;
 pub mod init;
 mod job;

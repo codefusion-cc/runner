@@ -38,8 +38,8 @@ pub enum Error {
     /// Trying again later can work.
     #[error("the console cannot be reached: {0}")]
     Unavailable(String),
-    /// The console answered a 429 or a 5xx that says how long to wait (`Retry-After`): asking again sooner gets the
-    /// same answer.
+    /// The console answered a 429 or a 5xx that says how long to wait (`Retry-After`), or a 409 that does (a trusted
+    /// machine's JIT while no trusted job is queued): asking again sooner gets the same answer.
     #[error("the console answered {status}: {message}")]
     Busy {
         /// The HTTP status.
@@ -158,6 +158,13 @@ impl From<HttpError> for Error {
                     status: s.status,
                     message: message_of(&s.body),
                     code: code_of(&s.body),
+                },
+                // A 409 that says when to ask again is a trusted machine's `no_trusted_job`: no job for it yet, and
+                // nothing was made.
+                409 if s.retry_after.is_some() => Error::Busy {
+                    status: 409,
+                    message: message_of(&s.body),
+                    retry_after: s.retry_after.unwrap_or_default().min(RETRY_AFTER_MAX),
                 },
                 429 | 500..=599 => match s.retry_after {
                     Some(wait) => Error::Busy {

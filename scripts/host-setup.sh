@@ -5,8 +5,10 @@
 # service. The host takes its GitHub tokens from the console: no App key is ever on it. A cloud VM's startup script runs
 # it from a clone of this repository:
 #
-#   scripts/host-setup.sh --machine <name> --console <url> --code-file <file>
+#   scripts/host-setup.sh --machine <name> --console <url> --code-file <file> [--class trusted]
 #
+# --class      shared (the default) or trusted: a host that runs only main's deploy, release and signing jobs of
+#              codefusion-cc/codefusion, by the Runner's default rules (crates/trusted), one job at a time
 # --code-file  the console's one-time connect code, alone in a file only root reads; deleted once the host enrolled
 # --ref        the commit the Runner is built at (default: the commit of the clone this script is in; needed when the
 #              script comes on standard input: curl -fsSL <raw URL at that commit> | bash -s -- --ref <commit> …)
@@ -26,7 +28,7 @@ GITHUB_REPO=https://github.com/codefusion-cc/runner
 RELEASES_API=https://api.github.com/repos/codefusion-cc/runner/releases
 PACKAGES=(passt git curl jq build-essential pkg-config libssl-dev ca-certificates)
 
-machine='' console='' code_file='' ref='' image='' home=/home/$USER_NAME repo=$GITHUB_REPO github_api='' check=0
+machine='' console='' code_file='' class=shared ref='' image='' home=/home/$USER_NAME repo=$GITHUB_REPO github_api='' check=0
 # The clone this script is in; none when it came on standard input (curl … | bash -s), which then names --ref.
 here=''
 [[ -f ${BASH_SOURCE[0]:-} ]] && here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -52,6 +54,7 @@ while (($#)); do
     --machine) machine=${2-} ;;
     --console) console=${2-} ;;
     --code-file) code_file=${2-} ;;
+    --class) class=${2-} ;;
     --ref) ref=${2-} ;;
     --image) image=${2-} ;;
     --home) home=${2-} ;;
@@ -65,6 +68,7 @@ while (($#)); do
   (($# >= 2)) || fail "$1 needs a value"
   shift 2
 done
+[[ $class == shared || $class == trusted ]] || fail "--class: shared or trusted"
 [[ $machine =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#machine} -le 24 ]] || fail "--machine: lowercase letters, digits and dashes, at most 24"
 # As the Runner has it: https, or http only to this host.
 [[ $console =~ ^(https://[A-Za-z0-9.:-]+|http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?)(/[A-Za-z0-9._/-]*)?$ ]] ||
@@ -221,10 +225,14 @@ if [[ ! -d $state/images/$image ]]; then
 fi
 
 step=config
-# The host takes its GitHub tokens from the console it enrols with, which holds the GitHub App's key.
+# The host takes its GitHub tokens from the console it enrols with, which holds the GitHub App's key. A trusted host's
+# file names its class and no rules, so the Runner's defaults apply.
+trusted_class=''
+[[ $class == trusted ]] && trusted_class='
+  "class": "trusted",'
 as_user "mkdir -p '$config_dir' && umask 022 && cat > '$config.new' <<EOF
 {
-  \"machine\": \"$machine\",
+  \"machine\": \"$machine\",$trusted_class
   \"state_dir\": \"$state\",
   \"build_folder\": \"$checkout\",
   \"image\": \"$image\",

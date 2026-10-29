@@ -429,6 +429,88 @@ proptest! {
     }
 }
 
+/// A cloud VM of 2 vCPUs and 8 GB (GCP's n2-standard-2): `MemTotal` about 7.76 GiB.
+const TWO_VCPU_BYTES: u64 = 8_138_000 * 1024;
+
+#[test]
+fn a_two_vcpu_cloud_vm_runs_no_size_shared_and_a_cf_4g_with_both_vcpus_trusted() {
+    let shared = Settings::for_headless(host(TWO_VCPU_BYTES, 2), 0);
+    assert_eq!(shared.away.cpus, 1);
+    for size in Size::ALL {
+        assert!(shared.can_run(size).is_err(), "{size:?}");
+    }
+
+    let trusted = Settings::for_headless(host(TWO_VCPU_BYTES, 2), 0).one_at_a_time(0);
+    assert_eq!(trusted.check(), Ok(()));
+    assert_eq!((trusted.away.cpus, trusted.max_machines), (2, Some(1)));
+    assert_eq!(trusted.in_use, trusted.away);
+    assert_eq!(trusted.vcpus, [2, 2, 2, 2]);
+    // The cap keeps one machine's overhead: 7.76 GiB less 1.24 GiB of floor, 0.5 GiB for the host and 192 MiB.
+    let floor = GIB + TWO_VCPU_BYTES / 32;
+    assert_eq!(
+        trusted.away.cap_bytes,
+        TWO_VCPU_BYTES - floor - Settings::HEADLESS_HOST_USE - OVERHEAD
+    );
+    assert_eq!(trusted.can_run(G2), Ok(()));
+    assert_eq!(trusted.can_run(G4), Ok(()));
+    assert!(matches!(trusted.can_run(G6), Err(Refusal::Full { .. })));
+    assert!(matches!(trusted.can_run(G8), Err(Refusal::Full { .. })));
+    // The largest size it offers is granted with both vCPUs, and nothing runs beside it.
+    assert_eq!(grants(trusted.clone(), &[G4]), [Ok(2)]);
+    assert!(matches!(
+        grants(trusted, &[G2, G2])[1],
+        Err(Refusal::Machines { cap: 1 })
+    ));
+}
+
+#[test]
+fn a_trusted_host_takes_every_core_or_the_fast_ones_and_a_16_gb_one_runs_a_cf_8g() {
+    let alone = |total: u64, cores: u32, fast: u32| {
+        Settings::for_headless(host(total, cores), fast).one_at_a_time(fast)
+    };
+    let four = alone(16 * GIB, 4, 0);
+    assert_eq!((four.away.cpus, four.vcpus), (4, [2, 4, 4, 4]));
+    assert_eq!(four.can_run(G8), Ok(()));
+    assert_eq!(grants(four, &[G8]), [Ok(4)]);
+    // A board whose cores differ keeps its machine on the fast ones; one fast core counts as cores alike.
+    assert_eq!(alone(BOARD_BYTES, 8, 4).away.cpus, 4);
+    assert_eq!(alone(BOARD_BYTES, 8, 1).away.cpus, 8);
+    assert_eq!(alone(BOARD_BYTES, 8, 8).away.cpus, 8);
+    // A single core gives every size that one vCPU.
+    let one = alone(4 * GIB, 1, 0);
+    assert_eq!((one.away.cpus, one.vcpus), (1, [1, 1, 1, 1]));
+    assert_eq!(one.check(), Ok(()));
+    // The owner's limits still apply on top.
+    let limited = alone(16 * GIB, 4, 0)
+        .limited(&Limits {
+            max_machines: Some(2),
+            ..Limits::default()
+        })
+        .expect("limits the budget takes");
+    assert_eq!(limited.max_machines, Some(2));
+}
+
+proptest! {
+    /// A trusted host offers GitHub the largest size it can run. Every size it offers must start on the host as it
+    /// is when idle, with the host's own share in use: a size offered and never started holds the deploy forever.
+    #[test]
+    fn every_size_a_trusted_host_offers_starts_when_it_is_idle(
+        total_mib in 1100..96 * 1024u64,
+        cores in 1..64u32,
+        fast in 0..72u32,
+    ) {
+        let settings = Settings::for_headless(host(total_mib * MIB, cores), fast).one_at_a_time(fast);
+        prop_assert_eq!(settings.check(), Ok(()));
+        let idle = settings.total_bytes.saturating_sub(Settings::HEADLESS_HOST_USE);
+        for size in Size::ALL {
+            if settings.can_run(size).is_ok() {
+                prop_assert_eq!(admit(&settings, &settings.away, idle, &[], size), Ok(()), "{:?}", size);
+                prop_assert!(settings.vcpus_of(size) <= settings.away.cpus);
+            }
+        }
+    }
+}
+
 #[test]
 fn a_4_cpu_cloud_vm_with_16_gb_runs_two_cf_4g() {
     // An n2-standard-4: 4 vCPUs alike, 15.6 GB. Keeping two cores back, as a Mac does, left CI two CPUs, one cf-4g,

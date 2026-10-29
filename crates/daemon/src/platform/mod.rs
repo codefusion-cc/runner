@@ -66,8 +66,8 @@ pub trait Platform {
     fn host(state_dir: &Path) -> Result<Self::Host, HostError>;
 
     /// The budget's settings for a host with these facts. `mode` is whether a person works there, on a system where
-    /// one does.
-    fn settings(facts: HostFacts, mode: Mode) -> Settings;
+    /// one does. A trusted host runs one machine at a time ([`Settings::one_at_a_time`]).
+    fn settings(facts: HostFacts, mode: Mode, trusted: bool) -> Settings;
 
     /// A name for this start of the host: another one after every start, the same until the next, whatever the
     /// clock does meanwhile. `None` when the system will not say.
@@ -199,11 +199,12 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     let mut config = MachineConfig::new(&setup.machine, &setup.image, &boot, setup.deadline);
     config.stand_in = setup.stand_in;
     config.docker_max_jobs = setup.policy.docker_max_jobs;
+    config.trusted = setup.policy.trusted.clone();
     let rings = bell.clone();
     let machines = Machines::restore(MachineParts {
         host,
         vms: P::vm_hosts(&setup.program, state),
-        settings: P::settings(facts, setup.mode)
+        settings: P::settings(facts, setup.mode, setup.policy.trusted.is_some())
             .limited(&setup.limits)
             .map_err(|error| format!("the limits for jobs: {error}"))?,
         config,

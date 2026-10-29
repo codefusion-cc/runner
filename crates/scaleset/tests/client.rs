@@ -578,6 +578,34 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
         h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
         lookups
     );
+
+    // Nor a 409 that says when to ask again: the console's answer while no trusted job waits, which made nothing.
+    let removes = |h: &Harness| {
+        h.console
+            .github_calls()
+            .iter()
+            .filter(|c| c.route == "scaleset/remove")
+            .count()
+    };
+    let before = removes(&h);
+    h.console.answer_next(
+        Reply::status_json(
+            409,
+            &serde_json::json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
+    );
+    let error = h
+        .client
+        .generate_jit_config(set.id, "mac-a-j0000409")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status(), error.retry_after()),
+        (Some(409), Some(std::time::Duration::from_secs(15))),
+        "{error:?}"
+    );
+    assert_eq!(removes(&h), before, "nothing was made, so nothing is looked for");
 }
 
 #[tokio::test]

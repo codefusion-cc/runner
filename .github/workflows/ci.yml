@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 30
     env:
       # The crates that build and pass on Linux. Add a crate here once it does.
-      LINUX_CRATES: -p cf-budget -p cf-clock -p cf-console-client -p cf-daemon -p cf-fake-console -p cf-fake-github -p cf-ghapp -p cf-guest-proto -p cf-harness -p cf-host-linux -p cf-image -p cf-lifecycle -p cf-netlink -p cf-nft -p cf-scaleset -p cf-secret -p cf-supervisor -p cf-vmhost -p cf-vmm -p cf-vmm-ch -p cf-workflows -p codefusion-runner -p xtask
+      LINUX_CRATES: -p cf-budget -p cf-clock -p cf-console-client -p cf-daemon -p cf-fake-console -p cf-fake-github -p cf-ghapp -p cf-guest-proto -p cf-harness -p cf-host-linux -p cf-image -p cf-lifecycle -p cf-netlink -p cf-nft -p cf-scaleset -p cf-secret -p cf-supervisor -p cf-trusted -p cf-vmhost -p cf-vmm -p cf-vmm-ch -p cf-workflows -p codefusion-runner -p xtask
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

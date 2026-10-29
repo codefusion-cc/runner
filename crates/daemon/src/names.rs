@@ -86,6 +86,10 @@ pub struct ServePolicy {
     /// The host labels this host has ([`cf_workflows::is_host_label`]): a set that asks for others is left to
     /// the hosts that have them.
     pub host_labels: Vec<String>,
+    /// A trusted host's rules (`cf_trusted`): it serves their repository alone, with no scale set but one Actions
+    /// runner of the label `trusted` at a time, and its machines refuse every job the rules do not accept. None on a
+    /// shared host.
+    pub trusted: Option<cf_trusted::Policy>,
 }
 
 impl Default for ServePolicy {
@@ -96,6 +100,7 @@ impl Default for ServePolicy {
             docker_repos: Vec::new(),
             docker_max_jobs: 1,
             host_labels: Vec::new(),
+            trusted: None,
         }
     }
 }
@@ -107,17 +112,23 @@ impl ServePolicy {
         if repo.archived || repo.disabled {
             return false;
         }
+        if let Some(trusted) = &self.trusted {
+            // Whether it is public or private: its jobs are main's own, and the machines refuse every other.
+            return trusted
+                .repository()
+                .is_ok_and(|name| name.eq_ignore_ascii_case(&repo.full_name));
+        }
         if !repo.private && !listed(&self.public_repos, repo) {
             return false;
         }
         self.repos.is_empty() || listed(&self.repos, repo) || listed(&self.public_repos, repo)
     }
 
-    /// Whether a repository's `cf-docker` jobs are served: one the Runner serves, private, and in
+    /// Whether a repository's `cf-docker` jobs are served: on a shared host, one the Runner serves, private, and in
     /// [`ServePolicy::docker_repos`]. A public repository never is, even listed: anyone can open a pull request
     /// there, and a Docker job is the most a job can do on a machine.
     pub fn serves_docker(&self, repo: &Repo) -> bool {
-        repo.private && self.serves(repo) && listed(&self.docker_repos, repo)
+        self.trusted.is_none() && repo.private && self.serves(repo) && listed(&self.docker_repos, repo)
     }
 
     /// Whether this host serves a label set: it has every host label the set asks for.
@@ -246,6 +257,52 @@ mod tests {
         };
         assert!(on_purpose.serves(&repo("org/public", false)));
         assert!(on_purpose.serves(&repo("org/app", true)));
+    }
+
+    #[test]
+    fn a_trusted_host_serves_its_one_repository_public_or_private_and_never_docker() {
+        let trusted = ServePolicy {
+            docker_repos: vec!["codefusion-cc/codefusion".into()],
+            trusted: Some(cf_trusted::Policy::defaults()),
+            ..ServePolicy::default()
+        };
+        for private in [true, false] {
+            assert!(
+                trusted.serves(&repo("Codefusion-cc/CodeFusion", private)),
+                "{private}"
+            );
+            assert!(
+                !trusted.serves_docker(&repo("codefusion-cc/codefusion", private)),
+                "{private}"
+            );
+            assert!(
+                !trusted.serves(&repo("codefusion-cc/other", private)),
+                "{private}"
+            );
+            assert!(!trusted.serves(&repo("someone/codefusion", private)), "{private}");
+        }
+        let mut archived = repo("codefusion-cc/codefusion", true);
+        archived.archived = true;
+        assert!(!trusted.serves(&archived));
+        let other = ServePolicy {
+            trusted: Some(cf_trusted::Policy::new(
+                serde_json::json!({ "repository": "org/app", "allow": {} }),
+            )),
+            ..ServePolicy::default()
+        };
+        assert!(
+            other.serves(&repo("org/app", true)),
+            "an empty allow-list still serves, to refuse"
+        );
+        assert!(!other.serves(&repo("codefusion-cc/codefusion", true)));
+        let broken = ServePolicy {
+            trusted: Some(cf_trusted::Policy::new(
+                serde_json::json!({ "repository": "no-slash" }),
+            )),
+            ..ServePolicy::default()
+        };
+        assert!(!broken.serves(&repo("codefusion-cc/codefusion", true)));
+        assert!(!broken.serves(&repo("no-slash", true)));
     }
 
     #[test]

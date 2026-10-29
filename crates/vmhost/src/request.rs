@@ -32,6 +32,9 @@ pub struct JobRequest {
     /// Whether the job gets a Docker daemon of its own beside its container (`cf-docker`).
     #[serde(default)]
     pub docker: bool,
+    /// The trusted class's rules on a host of that class: the guest's gate runs the job only when they let it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<cf_trusted::Policy>,
 }
 
 /// Why a request is refused before anything starts.
@@ -93,6 +96,16 @@ impl JobRequest {
             && argv.is_empty()
         {
             return refuse("the command is empty");
+        }
+        if self.trusted.is_some() {
+            // The gate stands in front of the Actions runner's Worker: a command has none, and Docker is a daemon
+            // beside the job that runs before any gate.
+            if !matches!(self.workload, Workload::ActionsRunner { .. }) {
+                return refuse("a trusted job runs GitHub's Actions runner only");
+            }
+            if self.docker {
+                return refuse("a trusted job gets no Docker");
+            }
         }
         Ok(())
     }
