@@ -13,9 +13,14 @@
 //! with every answer until a result names it), and the console's history, samples and audit log.
 
 mod github;
+mod scaleset;
 mod schema;
 
 pub use github::{GithubCall, JIT_PER_MACHINE, JIT_PER_REPO, JIT_WINDOW_S, REUSE_MIN_S};
+pub use scaleset::{
+    ADMIN_REUSE_S, AuditRow, GITHUB_DEADLINE, JIT_RUNNERS_PER_WINDOW, RATE_WINDOW_S, REMOVALS_PER_WINDOW,
+    SESSIONS_PER_WINDOW, SETS_PER_WINDOW,
+};
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -60,10 +65,16 @@ struct Pending {
 #[derive(Default)]
 struct Faults {
     down: bool,
+    /// Down for everything but the `github/…` routes.
+    reports_down: bool,
     /// Calls left, the status, and the `Retry-After` it says.
     fail: Option<(u32, u16, Option<u32>)>,
     drop_before: u32,
     drop_after: u32,
+    /// As `drop_after`, for calls other than the `github/…` ones.
+    drop_after_reports: u32,
+    /// What every scale set call is answered instead, while set.
+    scaleset: Option<Reply>,
 }
 
 #[derive(Default)]
@@ -96,6 +107,8 @@ struct State {
     override_next: Option<Reply>,
     /// A console before `refused` was read: kept read tokens are handed out again whatever a read names.
     ignore_refused: bool,
+    /// What the scale set routes keep: ownership rows, admin tokens, rate counters, the audit.
+    scalesets: scaleset::Scalesets,
 }
 
 /// A running fake console. It stops when dropped.
@@ -323,6 +336,7 @@ impl State {
         if let Some(at) = self.machines.iter().position(|m| m.id == machine) {
             let gone = self.machines.remove(at);
             self.left.push(gone.name);
+            self.scalesets.forget(machine);
         }
         Reply::json(&json!({ "ok": true }))
     }
@@ -335,7 +349,7 @@ impl FakeConsole {
         let shared = state.clone();
         let handler: Handler = Arc::new(move |request| {
             let state = shared.clone();
-            Box::pin(async move { FakeConsole::handle(&state, &request) })
+            Box::pin(async move { FakeConsole::handle(&state, request).await })
         });
         FakeConsole {
             state,
@@ -347,26 +361,46 @@ impl FakeConsole {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn handle(state: &Mutex<State>, request: &Request) -> Reply {
+    async fn handle(state: &Arc<Mutex<State>>, request: Request) -> Reply {
+        let github_route = request.path.starts_with(&format!("{PREFIX}github/"));
+        let step = {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.calls += 1;
+            if state.faults.down || (state.faults.reports_down && !github_route) {
+                return error(503, "The console is down");
+            }
+            if take(&mut state.faults.drop_before) {
+                return Reply::Drop;
+            }
+            if let Some((left, status, wait)) = state.faults.fail {
+                state.faults.fail = (left > 1).then_some((left - 1, status, wait));
+                let reply = error(status, "The console fails on purpose");
+                return match wait {
+                    Some(s) => reply.with_header("retry-after", &s.to_string()),
+                    None => reply,
+                };
+            }
+            if let Some(reply) = &state.faults.scaleset
+                && request.path.starts_with(scaleset::PREFIX)
+            {
+                return reply.clone();
+            }
+            match request.path.strip_prefix(scaleset::PREFIX) {
+                Some(route) if request.method == "POST" => state.scaleset_begin(route, &request),
+                _ => scaleset::Step::Done(state.route(&request)),
+            }
+        };
+        // GitHub is asked with no lock held.
+        let reply = match step {
+            scaleset::Step::Done(reply) => reply,
+            scaleset::Step::Call(call) => scaleset::run(state, *call).await,
+        };
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        state.calls += 1;
-        if state.faults.down {
-            return error(503, "The console is down");
-        }
-        if take(&mut state.faults.drop_before) {
-            return Reply::Drop;
-        }
-        if let Some((left, status, wait)) = state.faults.fail {
-            state.faults.fail = (left > 1).then_some((left - 1, status, wait));
-            let reply = error(status, "The console fails on purpose");
-            return match wait {
-                Some(s) => reply.with_header("retry-after", &s.to_string()),
-                None => reply,
-            };
-        }
-        let reply = state.route(request);
         let taken = matches!(&reply, Reply::Response { status: 200, .. });
         if taken && take(&mut state.faults.drop_after) {
+            return Reply::Drop;
+        }
+        if taken && !github_route && take(&mut state.faults.drop_after_reports) {
             return Reply::Drop;
         }
         reply
@@ -403,6 +437,25 @@ impl FakeConsole {
     /// While down, every call is answered 503 before anything else is looked at.
     pub fn down(&self, down: bool) {
         self.lock().faults.down = down;
+    }
+
+    /// While down, every call but a `github/…` one is answered 503: reports and job events wait while the console
+    /// still gives the host its GitHub tokens and makes its scale set calls.
+    pub fn reports_down(&self, down: bool) {
+        self.lock().faults.reports_down = down;
+    }
+
+    /// While `answer` is set, every scale set call (`github/scaleset/…`) is answered it, before anything else is
+    /// looked at: [`FakeConsole::no_scaleset_calls`] for a console from before them, a 5xx for one that fails,
+    /// [`Reply::Hang`] for one that never answers. `None` serves them again.
+    pub fn scaleset_answer(&self, answer: Option<Reply>) {
+        self.lock().faults.scaleset = answer;
+    }
+
+    /// What a console from before the scale set calls answers them: the 404 of a route it does not know, with no
+    /// code (agent.ts `handleAgent`).
+    pub fn no_scaleset_calls() -> Reply {
+        error(404, "Not found")
     }
 
     /// The next `n` calls are answered `status` with an `error` text, before anything else is looked at.
@@ -460,8 +513,25 @@ impl FakeConsole {
     }
 
     /// Every `github/…` call that passed the machine's token and the body checks, in order, with its answer's status.
+    /// A scale set call's route is `scaleset/<route>`, such as `scaleset/session/open`.
     pub fn github_calls(&self) -> Vec<GithubCall> {
         self.lock().github_calls.clone()
+    }
+
+    /// The audit rows of the scale set routes (`runner_scaleset_calls`), in order.
+    pub fn scaleset_audit(&self) -> Vec<AuditRow> {
+        self.lock().scalesets.audit()
+    }
+
+    /// The `Retry-After` of the scale set routes' `github_busy` when GitHub named none: the console says 30 seconds,
+    /// which a suite that makes GitHub fail on purpose shortens.
+    pub fn github_busy_wait(&self, seconds: u32) {
+        self.lock().scalesets.set_busy_wait(seconds.clamp(1, 3600));
+    }
+
+    /// Forgets the admin tokens kept for the scale set routes, as the console's prune of expired ones does.
+    pub fn forget_admin_tokens(&self) {
+        self.lock().scalesets.forget_admins();
     }
 
     /// The next `n` calls get a closed connection and nothing else, and the console does nothing with them.
@@ -473,6 +543,12 @@ impl FakeConsole {
     /// closes without a byte.
     pub fn accept_then_drop_next(&self, n: u32) {
         self.lock().faults.drop_after = n;
+    }
+
+    /// As [`FakeConsole::accept_then_drop_next`], for calls other than the `github/…` ones: a report or a batch of job
+    /// events is taken and its answer lost, while the host's GitHub calls go on.
+    pub fn accept_then_drop_next_report(&self, n: u32) {
+        self.lock().faults.drop_after_reports = n;
     }
 
     /// Whether the console says every Mac is paused in its answers.

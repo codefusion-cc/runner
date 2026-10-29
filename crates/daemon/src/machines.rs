@@ -301,7 +301,8 @@ struct Offer {
     said: [Option<Millis>; 4],
 }
 
-/// Room for one job of `size` a scale set's poll offered GitHub at `at`, the last of `polls` in a row that did.
+/// Room for one job of `size` a scale set's poll offered GitHub at `at`, the last of `polls` in a row that did (none
+/// yet while the offer was never sent).
 #[derive(Clone, Copy, Debug)]
 struct Standing {
     size: Size,
@@ -1375,6 +1376,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// - [`Answer::Refused`], [`Answer::Busy`]: a job holds it. The registration stays, and is asked about again.
     ///
     /// A job only these answers name is stored as such ([`GithubJob::inferred`]) and reported started and ended once.
+    /// An answer that comes after one said the registration is gone changes nothing.
     pub fn answered(&self, runner: &str, answer: Answer) {
         let mut inner = self.lock();
         let now = inner.host.now();
@@ -1386,6 +1388,11 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             return;
         };
         let job = inner.jobs.get_mut(&name).expect("just found");
+        // GitHub's answer that the registration is gone was heard already: a removal or a look sent before that
+        // answer came (two sweeps at once) says nothing more, and its "gone" is no job that ran.
+        if job.record.unregistered {
+            return;
+        }
         let stands = job.record.ended.is_none();
         let (repo, set) = (job.record.repo.clone(), job.record.scale_set_id);
         let word = match answer {
@@ -2181,6 +2188,13 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         let mut inner = self.lock();
         inner.standing.remove(set);
         inner.passed_over.remove(set);
+    }
+
+    fn offer_not_sent(&self, set: &SetKey) {
+        // The room stays the set's, which the offer took from the others, but its polls are those GitHub saw.
+        if let Some(standing) = self.lock().standing.get_mut(set) {
+            standing.polls = standing.polls.saturating_sub(1);
+        }
     }
 
     fn held(&self) -> bool {

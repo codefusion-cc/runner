@@ -17,15 +17,17 @@ use cf_daemon::testing::{
 };
 use cf_daemon::update::{SettingsChange, SettingsLook};
 use cf_daemon::{
-    Claim, Console, HostExtras, JobReport, Nudge, OutboxReports, RESULT_WAIT, Reports, Roster, Service,
-    ServiceConfig, ServiceParts, Slots,
+    Claim, Console, HeldKey, HostExtras, JobReport, KEY_NOT_ASKED, Nudge, OutboxReports, RESULT_WAIT,
+    Reports, Roster, Service, ServiceConfig, ServiceParts, Slots,
 };
 use cf_fake_console::FakeConsole;
-use cf_fake_github::harness::{REPO, TestClock, app, fast, until};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, JobState, Options};
 use cf_ghapp::{Clock as _, Http, RetryPolicy};
 use cf_guest_proto::{Pressure as Stalls, Psi, StopReason};
+use cf_harness::{
+    REPO, TestClock, Ticks, admin_requests_from_machines, app_on, enrolled, fast, key_app, key_tokens, until,
+};
 use cf_scaleset::ScaleSetClient;
 use cf_secret::Secret;
 use cf_vmhost::End;
@@ -149,6 +151,11 @@ impl Rig {
         )
         .await
         .expect("enrolled");
+        // The console holds the Runners App and asks GitHub for the Mac.
+        console.serve_github(github.clone());
+        // GitHub fails on purpose here, and names no wait: the console's 30 seconds would outlast every wait below.
+        console.github_busy_wait(1);
+        assert!(console.set_broker(MACHINE, true));
         let folder = tempfile::tempdir().expect("folder");
         let outbox = Arc::new(Outbox::open(folder.path().join("outbox.json"), OUTBOX_CAPACITY));
         let clock = Arc::new(TestClock::default());
@@ -463,7 +470,7 @@ fn service_with(
     // What stays across a daemon's starts: the outbox, the update it builds (none for a Runner with nowhere to
     // update from), its settings file, the folder of its files, how long an update waits for the machines that
     // stand.
-    (outbox, updates, settings, folder, update_limit): (
+    kept: (
         &Arc<Outbox>,
         Option<&Arc<FakeUpdate>>,
         &Arc<FakeSettings>,
@@ -472,6 +479,29 @@ fn service_with(
     ),
     tweak: impl FnOnce(&mut ServiceConfig),
 ) -> TestService {
+    Service::new(parts_with(
+        github, console, parts, machines, token, battery, kept, tweak,
+    ))
+}
+
+/// The parts of [`service_with`]'s service, for a test that changes more than its configuration.
+#[allow(clippy::too_many_arguments)]
+fn parts_with(
+    github: &FakeGithub,
+    console: &FakeConsole,
+    parts: &TestParts,
+    machines: &Arc<TestMachines>,
+    token: &Secret<String>,
+    battery: &Arc<Mutex<Option<Battery>>>,
+    (outbox, updates, settings, folder, update_limit): (
+        &Arc<Outbox>,
+        Option<&Arc<FakeUpdate>>,
+        &Arc<FakeSettings>,
+        &std::path::Path,
+        Duration,
+    ),
+    tweak: impl FnOnce(&mut ServiceConfig),
+) -> ServiceParts<FakeHost, FakeVms> {
     let battery = battery.clone();
     let mut config = ServiceConfig::new(
         MACHINE,
@@ -490,14 +520,22 @@ fn service_with(
         Duration::from_secs(60),
     );
     tweak(&mut config);
-    Service::new(ServiceParts {
-        app: app(github, http(), parts.clock.clone()),
+    let client = Client::new(&console.url(), Secret::new(token.expose().clone()), http());
+    ServiceParts {
+        app: app_on(
+            github,
+            &client,
+            MACHINE,
+            http(),
+            parts.clock.clone(),
+            Arc::new(Ticks(parts.clock.clone())),
+        ),
         machines: machines.clone(),
         roster: parts.roster.clone(),
         clock: parts.clock.clone(),
         nudge: parts.bell.clone(),
         console: Some(Console {
-            client: Client::new(&console.url(), Secret::new(token.expose().clone()), http()),
+            client,
             outbox: outbox.clone(),
         }),
         config,
@@ -513,7 +551,8 @@ fn service_with(
         results: Some(folder.join("results.json")),
         pause: Some(folder.join("pause")),
         settings: Some(settings.clone()),
-    })
+        held_key: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -638,6 +677,42 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
     );
     rig.nothing_left().await;
     assert_eq!(rig.events().len(), 2, "each once");
+}
+
+/// A Runner newer than the console that runs: the console answers its scale set calls a 404 without a code, as one
+/// from before them does. The Runner makes them itself with the console's registration token, and the job runs,
+/// reaches the console and leaves nothing at GitHub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_newer_than_the_console_takes_a_job_through_a_console_without_scale_set_calls() {
+    let rig = Rig::new(2).await;
+    rig.console
+        .scaleset_answer(Some(FakeConsole::no_scaleset_calls()));
+    rig.service.discover().await;
+    until("the scale set", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let runner = rig.job_running().await;
+    until("the start at the console", || rig.events().len() == 1).await;
+    assert_eq!(rig.console.job_events()[0]["kind"], json!("started"));
+    rig.finish(&runner, "succeeded");
+    until("the end at the console", || rig.events().len() == 2).await;
+    rig.nothing_left().await;
+    let routes: Vec<String> = rig
+        .console
+        .github_calls()
+        .into_iter()
+        .filter(|call| call.machine == MACHINE && call.status == 200)
+        .map(|call| call.route)
+        .collect();
+    assert!(
+        routes.iter().any(|route| route == "registration"),
+        "the console's registration token: {routes:?}"
+    );
+    assert!(
+        !routes.iter().any(|route| route.starts_with("scaleset/")),
+        "no scale set call the console answered: {routes:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -984,7 +1059,8 @@ async fn a_registration_github_will_not_remove_yet_is_tried_again_until_it_is_go
 async fn while_the_console_is_away_reports_wait_and_arrive_later_in_order_each_once() {
     let rig = Rig::new(2).await;
     rig.service.discover().await;
-    rig.console.down(true);
+    // Its GitHub routes still answer: without them no job would start at all.
+    rig.console.reports_down(true);
     let mut expected = Vec::new();
     for result in ["succeeded", "failed", "canceled"] {
         let runner = rig.job_running().await;
@@ -1001,8 +1077,8 @@ async fn while_the_console_is_away_reports_wait_and_arrive_later_in_order_each_o
     .await;
 
     // An answer that is lost on the way back: the console took the events and the Mac cannot know.
-    rig.console.down(false);
-    rig.console.accept_then_drop_next(1);
+    rig.console.reports_down(false);
+    rig.console.accept_then_drop_next_report(1);
     until("everything arrived", || rig.outbox.is_empty()).await;
     let sent = rig.console.job_event_ids();
     assert!(
@@ -1044,7 +1120,8 @@ async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers
             .is_some_and(|r| r["status"]["paused"] == json!(true))
     })
     .await;
-    rig.console.down(true);
+    // The console makes the scale set calls, which only it can, but hears no report.
+    rig.console.reports_down(true);
     rig.restart().await;
     for set in rig.github.scale_sets() {
         // GitHub lets a session that nobody polls expire.
@@ -1069,7 +1146,7 @@ async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers
     );
 
     rig.console.pause(false);
-    rig.console.down(false);
+    rig.console.reports_down(false);
     rig.settles("room offered again", || rig.github.offers_room(REPO))
         .await;
     // The job was queued while the Mac offered no room: it is held until the Runner looks at the queue again.
@@ -1810,11 +1887,21 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
     assert_eq!(rig.machines.snapshot().waiting, 0);
 
     // Another Mac serves the same repository with the same labels and has room: the job is its.
+    let other = enrolled(&rig.console, "mac-c", http()).await;
     let elsewhere = ScaleSetClient::new(
-        app(&rig.github, http(), rig.parts.clock.clone()),
+        app_on(
+            &rig.github,
+            &other,
+            "mac-c",
+            http(),
+            rig.parts.clock.clone(),
+            Arc::new(Ticks(rig.parts.clock.clone())),
+        ),
+        other,
+        "mac-c",
         1,
         OTHER,
-        &format!("{}/{OTHER}", rig.github.url()),
+        &format!("https://github.com/{OTHER}"),
         Duration::from_secs(5),
     );
     let labels = ["self-hosted".to_string(), "cf-2g".to_string()];
@@ -1822,7 +1909,7 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
         .ensure_scale_set("mac-c--cf-2g", &labels)
         .await
         .expect("a scale set");
-    let session = elsewhere.open_session(set.id, "mac-c").await.expect("a session");
+    let session = elsewhere.open_session(set.id).await.expect("a session");
     rig.github.set_poll_timeout(Duration::from_millis(150));
     session.poll(0, 1).await.expect("a poll");
     session.poll(0, 1).await.expect("a poll");
@@ -3135,10 +3222,13 @@ async fn a_surplus_found_gone_while_its_machine_stands_ran_a_job() {
         !rig.github.runners().contains(&runner),
         "a one-job Actions runner removes its own registration"
     );
-    let removals = rig.github.count(REMOVAL);
+    let calls = rig.console.github_calls().len();
     rig.github.recover(REMOVAL);
-    until("the next removal, answered 404", || {
-        rig.github.count(REMOVAL) > removals
+    // The console looks the registration up before it removes it, and finds it gone: no removal reaches GitHub.
+    until("the next removal, which finds it gone", || {
+        rig.console.github_calls()[calls..]
+            .iter()
+            .any(|call| call.route == "scaleset/remove" && call.status == 200)
     })
     .await;
     until("the start at the console", || heard(&rig, &runner).0).await;
@@ -3844,7 +3934,7 @@ async fn a_runner_says_it_starts_until_its_first_look_at_github_ends() {
         let mut rig = Rig::new(2).await;
         if !github_answers {
             rig.github.fail(
-                "GET /app/installations",
+                "GET /installation/repositories",
                 Reply::status_json(503, &json!({"message": "unavailable"})),
                 usize::MAX,
             );
@@ -3858,6 +3948,365 @@ async fn a_runner_says_it_starts_until_its_first_look_at_github_ends() {
         assert!(last.get("starting").is_none(), "{last}");
         assert_eq!(last["discoveryError"].is_string(), !github_answers, "{last}");
     }
+}
+
+/// F1: a job served from end to end, through every fault GitHub can throw at it above, never has the Runner ask for a
+/// registration token or hold the Actions service's admin token: the console makes both and keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_served_end_to_end_never_has_the_runner_ask_for_a_registration_or_hold_an_admin_token() {
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    rig.finish(&runner, "succeeded");
+    until("the end at the console", || rig.events().len() == 2).await;
+    rig.nothing_left().await;
+    assert_eq!(
+        cf_harness::registrations(&rig.github),
+        0,
+        "a registration token asked for"
+    );
+    assert_eq!(
+        cf_harness::admin_requests_from_machines(&rig.github),
+        Vec::<String>::new(),
+        "an admin token used by the Runner"
+    );
+    let routes: Vec<String> = rig
+        .console
+        .github_calls()
+        .into_iter()
+        .map(|call| call.route)
+        .collect();
+    for route in [
+        "scaleset/create",
+        "scaleset/session/open",
+        "scaleset/jit",
+        "scaleset/remove",
+    ] {
+        assert!(
+            routes.iter().any(|r| r == route),
+            "{route} not through the console: {routes:?}"
+        );
+    }
+}
+
+/// The App's key file the host held before the console held the key: the report names it while it is on disk,
+/// and stops once it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_names_an_app_key_file_the_host_still_holds_until_it_is_gone() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let key = rig.folder.path().join("app").join("app.pem");
+    std::fs::create_dir_all(key.parent().expect("a folder")).expect("the App's folder");
+    std::fs::write(&key, "-----BEGIN RSA PRIVATE KEY-----\n").expect("a key file");
+    let held = key.clone();
+    let service = service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        move |config| config.app_key_file = Some(held),
+    );
+    service.report().await;
+    assert_eq!(
+        last_status(&rig.console)["appKeyFile"],
+        json!(key.display().to_string()),
+        "the file on disk"
+    );
+    std::fs::remove_file(&key).expect("deleted");
+    service.report().await;
+    let last = last_status(&rig.console);
+    assert!(last.get("appKeyFile").is_none(), "{last}");
+    // A Runner that never held one says nothing.
+    rig.service.report().await;
+    let last = last_status(&rig.console);
+    assert!(last.get("appKeyFile").is_none(), "{last}");
+}
+
+/// A Runner of the rig's host that still holds the Runners App's key, in a file of the rig's folder: it signs with
+/// the key, and its take-out deletes the file and counts, or fails with `fails`. Its console client gives up on a
+/// call after 300 ms.
+struct Holding {
+    service: TestService,
+    file: std::path::PathBuf,
+    taken: Arc<AtomicUsize>,
+}
+
+fn holding(rig: &Rig, fails: Option<&'static str>) -> Holding {
+    let file = rig.folder.path().join("app").join("app.pem");
+    std::fs::create_dir_all(file.parent().expect("a folder")).expect("the App's folder");
+    std::fs::write(&file, "a key file").expect("the key file");
+    let taken = Arc::new(AtomicUsize::new(0));
+    let mut parts = parts_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |_| {},
+    );
+    let tokens = key_tokens(&rig.github, http(), rig.parts.clock.clone());
+    parts.app = key_app(&rig.github, &tokens, http());
+    parts.console = Some(Console {
+        client: Client::new(
+            &rig.console.url(),
+            Secret::new(rig.token.expose().clone()),
+            Http::new(Duration::from_millis(300), fast()),
+        ),
+        outbox: rig.outbox.clone(),
+    });
+    let (deleted, counted) = (file.clone(), taken.clone());
+    parts.held_key = Some(HeldKey {
+        tokens,
+        file: file.clone(),
+        take_out: Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            match fails {
+                Some(why) => Err(why.into()),
+                None => std::fs::remove_file(&deleted)
+                    .map(|()| "deleted".into())
+                    .map_err(|error| error.to_string()),
+            }
+        }),
+    });
+    Holding {
+        service: Service::new(parts),
+        file,
+        taken,
+    }
+}
+
+/// The scale set calls of the console that answered `machine`.
+fn answered_scaleset_calls(console: &FakeConsole, machine: &str) -> usize {
+    console
+        .github_calls()
+        .iter()
+        .filter(|call| call.machine == machine && call.route.starts_with("scaleset/") && call.status == 200)
+        .count()
+}
+
+/// A host that still holds the key: once a scale set call of the console it made was answered, the key file is
+/// taken out and the Runner starts again, through the console; before, the report says why the key is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_holds_the_key_takes_it_out_once_the_consoles_scale_set_calls_answered_it() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let held = holding(&rig, None);
+    assert_eq!(held.service.key_kept().as_deref(), Some(KEY_NOT_ASKED));
+    held.service.report().await;
+    let status = last_status(&rig.console);
+    assert_eq!(status["appKeyKept"], json!(KEY_NOT_ASKED));
+    assert_eq!(status["appKeyFile"], json!(held.file.display().to_string()));
+    assert_eq!(
+        held.taken.load(Ordering::SeqCst),
+        0,
+        "not before the console answered"
+    );
+
+    held.service.discover().await;
+    assert!(
+        answered_scaleset_calls(&rig.console, MACHINE) >= 1,
+        "{:?}",
+        rig.console.github_calls()
+    );
+    assert_eq!(held.taken.load(Ordering::SeqCst), 1);
+    assert!(!held.file.exists(), "the key file is gone");
+    assert!(
+        held.service.restart_requested(),
+        "the Runner starts again through the console"
+    );
+    assert_eq!(held.service.key_kept(), None);
+    held.service.report().await;
+    let status = last_status(&rig.console);
+    assert!(status.get("appKeyKept").is_none(), "{status}");
+    assert!(status.get("appKeyFile").is_none(), "{status}");
+}
+
+/// A host that still holds the key, and a console whose scale set calls do not answer it (one from before them, one
+/// that answers what is not the contract's, one that fails, one that never answers, one where the owner has not
+/// turned GitHub through the console on): the key
+/// stays and serves the host's scale sets and jobs, and the report says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_whose_console_does_not_answer_its_scale_set_calls_keeps_the_key_and_serves_with_it() {
+    let failures: [(&str, Option<Reply>, &str); 5] = [
+        (
+            "older console",
+            Some(FakeConsole::no_scaleset_calls()),
+            "no such calls yet (404)",
+        ),
+        // A 200 is not an answer unless it is the contract's.
+        (
+            "console that answers nonsense",
+            Some(Reply::json(&json!({ "scaleSets": "none" }))),
+            "not the console's protocol",
+        ),
+        (
+            "failing console",
+            Some(Reply::status_json(500, &json!({ "error": "boom" }))),
+            "cannot be reached",
+        ),
+        ("silent console", Some(Reply::Hang), "cannot be reached"),
+        (
+            "broker off",
+            None,
+            "GitHub through the console is off for this host",
+        ),
+    ];
+    for (case, answer, why) in failures {
+        let mut rig = Rig::new(2).await;
+        rig.stop_pump().await;
+        match answer {
+            Some(answer) => rig.console.scaleset_answer(Some(answer)),
+            None => assert!(rig.console.set_broker(MACHINE, false)),
+        }
+        let held = holding(&rig, None);
+        rig.service = Arc::new(held.service);
+        rig.pump();
+        rig.service.discover().await;
+        let kept = rig.service.key_kept().unwrap_or_default();
+        assert!(
+            kept.starts_with("the console's scale set calls did not answer: ") && kept.contains(why),
+            "{case}: {kept}"
+        );
+        assert_eq!(held.taken.load(Ordering::SeqCst), 0, "{case}");
+        assert!(held.file.exists(), "{case}: the key stays");
+        assert!(!rig.service.restart_requested(), "{case}");
+        assert_eq!(answered_scaleset_calls(&rig.console, MACHINE), 0, "{case}");
+        // The key serves: the scale set and its session are made with it, and a job runs.
+        rig.settles("the scale set's session", || {
+            rig.github.scale_sets().iter().any(|s| s.has_session)
+        })
+        .await;
+        assert!(
+            !admin_requests_from_machines(&rig.github).is_empty(),
+            "{case}: the host's own admin token"
+        );
+        let runner = rig.job_running().await;
+        rig.finish(&runner, "succeeded");
+        rig.settles("the job's end on the console", || {
+            rig.events().iter().any(|(_, end)| !end.is_null())
+        })
+        .await;
+        rig.settles("a report that says why", || {
+            rig.console.reports().last().is_some_and(|report| {
+                report["status"]["appKeyKept"] == json!(kept)
+                    && report["status"]["appKeyFile"] == json!(held.file.display().to_string())
+            })
+        })
+        .await;
+        rig.stop_pump().await;
+    }
+}
+
+/// The console answered, and the key could not be taken out: it stays and serves, and the report says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_that_cannot_be_taken_out_stays_and_the_report_says_why() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    let held = holding(&rig, Some("the settings file is read-only"));
+    held.service.discover().await;
+    assert_eq!(held.taken.load(Ordering::SeqCst), 1);
+    assert!(held.file.exists());
+    assert!(!held.service.restart_requested());
+    let kept = held.service.key_kept().unwrap_or_default();
+    assert_eq!(
+        kept,
+        "the console's scale set calls answer, and the key could not be taken out: the settings file is read-only"
+    );
+    held.service.report().await;
+    assert_eq!(last_status(&rig.console)["appKeyKept"], json!(kept));
+    // Asked again at the next look, and taken out once it can be.
+    held.service.discover().await;
+    assert_eq!(held.taken.load(Ordering::SeqCst), 2);
+}
+
+/// A host that serves two repositories and holds the key, and a console whose scale set calls refuse it the first
+/// repository asked about: the next one is asked, and once it answered, the key is taken out. A console from before the
+/// scale set calls is asked about one repository: it would answer the same about the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_key_is_taken_out_once_the_console_answered_about_any_repository_the_host_serves() {
+    const OTHER: &str = "org/other";
+    let refused = Reply::status_json(
+        403,
+        &json!({ "error": "The repository is not this machine's", "code": "not_yours" }),
+    );
+    for (case, first, asked_after, taken) in [
+        ("refused", refused, vec![403, 200], 1),
+        ("older console", FakeConsole::no_scaleset_calls(), vec![404], 0),
+    ] {
+        let mut rig = Rig::new(2).await;
+        rig.stop_pump().await;
+        rig.github.add_repo(OTHER, true);
+        rig.github.set_workflow(OTHER, "ci.yml", WORKFLOW);
+        let held = holding(&rig, None);
+        rig.console.answer_next(first);
+        held.service.discover().await;
+        let asked: Vec<(String, u16)> = rig
+            .console
+            .github_calls()
+            .into_iter()
+            .filter(|call| call.machine == MACHINE && call.route == "scaleset/list")
+            .map(|call| (call.body["repo"].as_str().unwrap_or("").to_string(), call.status))
+            .collect();
+        assert_eq!(
+            asked.iter().map(|(_, status)| *status).collect::<Vec<_>>(),
+            asked_after,
+            "{case}: {asked:?}"
+        );
+        if let [one, two] = asked.as_slice() {
+            assert_ne!(one.0, two.0, "{case}: another repository");
+        }
+        assert_eq!(held.taken.load(Ordering::SeqCst), taken, "{case}");
+        assert_eq!(held.service.restart_requested(), taken == 1, "{case}");
+        assert_eq!(held.service.key_kept().is_none(), taken == 1, "{case}");
+    }
+}
+
+/// A host that holds no key it signs with, and whose settings still name the key's folder: its report says why from
+/// the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_says_why_the_settings_still_name_a_key_the_host_does_not_hold() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    const SAID: &str = "no key file is at /app/app.pem; the settings still name its folder (`app_dir`)";
+    let service = service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |config| config.app_key_said = Some(SAID.into()),
+    );
+    assert_eq!(service.key_kept().as_deref(), Some(SAID));
+    service.report().await;
+    assert_eq!(last_status(&rig.console)["appKeyKept"], json!(SAID));
+    // A key the host holds says why it is kept instead.
+    rig.service.report().await;
+    assert!(last_status(&rig.console).get("appKeyKept").is_none());
 }
 
 fn changed(id: &str) -> SettingsLook {
@@ -5547,36 +5996,15 @@ async fn passes_until(machines: &TestMachines, what: &str, done: impl Fn() -> bo
     panic!("{what} never came");
 }
 
-/// A trusted host (`cf_trusted`): it makes no scale set whatever the workflows ask for, and asks for one Actions
-/// runner with the label `trusted` at a time, outside any scale set, in the largest machine it has, whose machine
-/// carries the rules each job is checked against before its first step. One that waited five minutes for a job is
-/// removed. It takes no test run and says its class; the shared host beside it never serves a set with `trusted`,
-/// from a list or a variable, and says no class.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_carries_the_rules() {
-    // Room for two of its largest machines: one at a time is the trusted host's own rule.
-    let mut rig = Rig::new(20).await;
-    rig.stop_pump().await;
+/// A trusted host of [`REPO`] on the rig's machines, which carry its rules; its settings still list [`REPO`] for
+/// Docker, as a shared host's file left over. The rules and the service.
+fn trusted_host(rig: &mut Rig) -> (cf_trusted::Policy, TestService) {
     let rules = cf_trusted::Policy::new(
         json!({ "repository": REPO, "allow": { "deploy.yml": ["workflow_dispatch"] } }),
     );
     rig.machines = rig
         .parts
         .machines_with(|config| config.trusted = Some(rules.clone()));
-    rig.github.set_workflow(
-        REPO,
-        "deploy.yml",
-        "on: workflow_dispatch\njobs:\n  image:\n    runs-on: [self-hosted, cf-2g, cf-docker]\n    steps: []\n  listed:\n    runs-on: [cf-8g, trusted]\n    steps: []\n  deploy:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED || 'ubuntu-latest' }}\n    steps: []\n",
-    );
-    rig.github.set_variable(REPO, "CI_RUNNER_TRUSTED", "trusted");
-    let (shared, _) = rig.service.survey().await;
-    assert!(
-        !shared.is_empty() && shared.iter().all(|line| !line.contains("trusted")),
-        "{shared:?}"
-    );
-    let report = serde_json::to_value(rig.service.status()).expect("a report");
-    assert_eq!(report.get("class"), None, "a shared host says no class");
-
     let trusted = service_with(
         &rig.github,
         &rig.console,
@@ -5597,6 +6025,74 @@ async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_ca
             config.policy.docker_repos = vec![REPO.into()];
         },
     );
+    (rules, trusted)
+}
+
+/// A trusted host asks the console for an Actions runner and is told no trusted job waits yet (a 409 that says when
+/// to ask again): that is no failure, and no warning in the log. A console that answers 429 or 503, even with a time
+/// to ask again, failed the ask, and the log warns of it. Nothing is registered either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_host_warns_of_a_console_that_failed_its_ask_and_not_of_no_trusted_job_yet() {
+    for (status, code, warned) in [
+        (409, "no_trusted_job", false),
+        (429, "rate_limited", true),
+        (503, "github_busy", true),
+    ] {
+        let mut rig = Rig::new(20).await;
+        rig.stop_pump().await;
+        let (_, trusted) = trusted_host(&mut rig);
+        trusted.discover().await;
+        let log = rig.folder.path().join("trusted.log");
+        rig.console.answer_next(
+            Reply::status_json(status, &json!({ "error": "not now", "code": code }))
+                .with_header("retry-after", "1"),
+        );
+        {
+            let _logged = tracing::subscriber::set_default(cf_daemon::Lines::new(&log, cf_daemon::ROLL_AT));
+            trusted.ask_trusted().await;
+        }
+        let asked: Vec<u16> = rig
+            .console
+            .github_calls()
+            .into_iter()
+            .filter(|call| call.route == "jit")
+            .map(|call| call.status)
+            .collect();
+        assert_eq!(asked.first(), Some(&status), "{code}: {asked:?}");
+        let lines = std::fs::read_to_string(&log).unwrap_or_default();
+        let warning = lines
+            .lines()
+            .any(|line| line.contains(" WARN ") && line.contains("a trusted job could not start"));
+        assert_eq!(warning, warned, "{code}: {lines}");
+        assert!(rig.github.plain_runners().is_empty(), "{code}");
+    }
+}
+
+/// A trusted host (`cf_trusted`): it makes no scale set whatever the workflows ask for, and asks for one Actions
+/// runner with the label `trusted` at a time, outside any scale set, in the largest machine it has, whose machine
+/// carries the rules each job is checked against before its first step. One that waited five minutes for a job is
+/// removed. It takes no test run and says its class; the shared host beside it never serves a set with `trusted`,
+/// from a list or a variable, and says no class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_carries_the_rules() {
+    // Room for two of its largest machines: one at a time is the trusted host's own rule.
+    let mut rig = Rig::new(20).await;
+    rig.stop_pump().await;
+    let (rules, trusted) = trusted_host(&mut rig);
+    rig.github.set_workflow(
+        REPO,
+        "deploy.yml",
+        "on: workflow_dispatch\njobs:\n  image:\n    runs-on: [self-hosted, cf-2g, cf-docker]\n    steps: []\n  listed:\n    runs-on: [cf-8g, trusted]\n    steps: []\n  deploy:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED || 'ubuntu-latest' }}\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER_TRUSTED", "trusted");
+    let (shared, _) = rig.service.survey().await;
+    assert!(
+        !shared.is_empty() && shared.iter().all(|line| !line.contains("trusted")),
+        "{shared:?}"
+    );
+    let report = serde_json::to_value(rig.service.status()).expect("a report");
+    assert_eq!(report.get("class"), None, "a shared host says no class");
+
     let (served, problems) = trusted.survey().await;
     assert_eq!(served, Vec::<String>::new());
     assert_eq!(problems, Vec::<String>::new());

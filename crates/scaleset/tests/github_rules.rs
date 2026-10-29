@@ -25,7 +25,7 @@ async fn a_session_opening_hands_out_no_queued_job() {
     assert_eq!(session.poll(0, 0).await.unwrap(), None);
     let job = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     session.close().await.unwrap();
-    let session = h.client.open_session(set.id, "mac-a").await.unwrap();
+    let session = h.client.open_session(set.id).await.unwrap();
     for _ in 0..3 {
         assert_eq!(session.poll(0, 1).await.unwrap(), None);
     }
@@ -43,7 +43,7 @@ async fn a_session_that_ends_takes_its_pending_messages_with_it() {
     let job = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     assert_eq!(h.fake.job_state(job), Some(JobState::Acquired(set.id)));
     session.close().await.unwrap();
-    let session = h.client.open_session(set.id, "mac-a").await.unwrap();
+    let session = h.client.open_session(set.id).await.unwrap();
     assert_eq!(
         session.poll(0, 1).await.unwrap(),
         None,
@@ -64,7 +64,7 @@ async fn the_counts_never_name_a_job_github_holds() {
     session.poll(0, 0).await.unwrap();
     h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     session.close().await.unwrap();
-    let session = h.client.open_session(set.id, "mac-a").await.unwrap();
+    let session = h.client.open_session(set.id).await.unwrap();
     assert_eq!(session.initial_statistics().total_available_jobs, 0);
 }
 
@@ -126,7 +126,7 @@ async fn an_assignment_no_actions_runner_takes_within_five_minutes_is_taken_back
     session.poll(assigned.id, 0).await.unwrap();
     let jit = h
         .client
-        .generate_jit_config(set.id, "mac-a-late", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000a1e")
         .await
         .unwrap();
 
@@ -170,7 +170,7 @@ async fn a_stale_rest_view_answers_what_the_read_before_saw() {
     h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     let jit = h
         .client
-        .generate_jit_config(set.id, "mac-a-stale", "_work")
+        .generate_jit_config(set.id, "mac-a-j005da1e")
         .await
         .unwrap();
     let id = jit.runner.id;

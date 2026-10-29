@@ -659,7 +659,7 @@ mod tests {
             serde_json::json!({
                 "machine": "unit-trial",
                 "state_dir": state,
-                "app_dir": folder.path().join("app"),
+                "console": "https://console.example",
                 "image": "0.0.0",
             })
             .to_string(),

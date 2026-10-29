@@ -2,6 +2,8 @@
 //! `image verify` and `image install`, `vm` (the vm-host of one job) and `boot-proof`, on macOS and on Linux. On
 //! Linux, a machine's monitor runs through the hidden `vm-sandbox`, and `vmm` names the monitor the build carries.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod app_key;
 mod commands;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod config;

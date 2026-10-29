@@ -13,7 +13,7 @@ use crate::keys::test_key;
 /// How the fake behaves.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// The App's client ID, the `iss` of its tokens.
+    /// The App's client ID, the `iss` of the tokens a host that holds the App's key signs.
     pub client_id: String,
     /// How long a long poll waits before it answers 202.
     pub poll_timeout: Duration,
@@ -172,7 +172,15 @@ pub struct Logged {
     pub max_capacity: Option<String>,
     /// The `lastMessageId` of polls.
     pub last_message_id: Option<String>,
+    /// Whether the request bore an admin token of the Actions service ([`FakeGithub::mint_admin_token`]) that
+    /// was good when it came.
+    pub admin: bool,
+    /// Whether the request said it came from the fake console ([`CONSOLE_MARK`]).
+    pub from_console: bool,
 }
+
+/// The header the fake console sends with each of its own requests, so a test can tell them from the Runner's.
+pub const CONSOLE_MARK: &str = "x-cf-fake-console";
 
 /// A scale set as the service has it.
 #[derive(Debug, Clone)]
@@ -332,6 +340,25 @@ impl State {
         self.registration_tokens
             .insert(token.clone(), (exp, repo.to_string()));
         Some((token, exp))
+    }
+
+    /// A new admin token of the Actions service for `repo`: where the service is, the token, when it expires.
+    fn admin_token(&mut self, repo: String) -> (String, String, i64) {
+        let exp = self.now() + self.opts.admin_token_ttl.as_secs() as i64;
+        self.next += 1;
+        let payload = json!({"exp": exp, "n": self.next}).to_string();
+        let admin = format!(
+            "{}.{}.{}",
+            b64url(br#"{"alg":"RS256"}"#),
+            b64url(payload.as_bytes()),
+            "sig"
+        );
+        self.admin_tokens.insert(admin.clone(), (exp, repo));
+        let url = self
+            .service_at
+            .clone()
+            .unwrap_or_else(|| format!("{}/svc", self.base));
+        (url, admin, exp)
     }
 
     fn scale_set(&mut self, id: i64) -> Option<&mut ScaleSet> {
@@ -664,6 +691,26 @@ impl FakeGithub {
     /// for a repository the App lacks.
     pub fn mint_registration_token(&self, repo: &str) -> Option<(String, i64)> {
         self.lock().registration_token(repo)
+    }
+
+    /// The Actions service's address and an admin token for `repo`, with when it expires, as the console gets them with
+    /// a registration token of its own (`POST /actions/runner-registration`), made here without a request reaching
+    /// the fake; none for a repository the App lacks. The address is where [`FakeGithub::send_the_service_to`] sent
+    /// the service, if anywhere.
+    pub fn mint_admin_token(&self, repo: &str) -> Option<(String, String, i64)> {
+        let mut st = self.lock();
+        let repo = st.repos.keys().find(|r| r.eq_ignore_ascii_case(repo))?.clone();
+        Some(st.admin_token(repo))
+    }
+
+    /// An installation token with every permission of the console's App (Administration among them), made as the
+    /// console makes one with its key, with when it expires (no request reaches the fake).
+    pub fn mint_installation_token(&self) -> (String, i64) {
+        let mut st = self.lock();
+        let token = st.token("ghs");
+        let exp = st.now() + st.opts.installation_token_ttl.as_secs() as i64;
+        st.installation_tokens.insert(token.clone(), exp);
+        (token, exp)
     }
 
     /// An Actions runner for one job of `repo`, registered as the console registers one: its ID and configuration,
@@ -1091,13 +1138,21 @@ impl FakeGithub {
         let line = req.line();
         let hook = {
             let mut st = self.lock();
+            let authorization = req.header("authorization").map(String::from);
+            let admin = authorization
+                .as_deref()
+                .and_then(|a| a.strip_prefix("Bearer "))
+                .and_then(|token| st.admin_tokens.get(token))
+                .is_some_and(|(exp, _)| *exp > st.now());
             st.log.push(Logged {
                 line: line.clone(),
                 query: req.query.clone(),
-                authorization: req.header("authorization").map(String::from),
+                authorization,
                 body: String::from_utf8_lossy(&req.body).to_string(),
                 max_capacity: req.header("x-scalesetmaxcapacity").map(String::from),
                 last_message_id: req.query("lastMessageId").map(String::from),
+                admin,
+                from_console: req.header(CONSOLE_MARK).is_some(),
             });
             st.hooks
                 .iter()
@@ -1161,6 +1216,16 @@ impl FakeGithub {
                     Reply::status_json(201, &json!({"token": token, "expires_at": rfc3339(exp)}))
                 })
             }
+            ("GET", ["repos", owner, repo, "installation"]) => {
+                let name = format!("{owner}/{repo}");
+                self.with_jwt(&req, |st| {
+                    if st.repos.contains_key(&name) {
+                        Reply::json(&json!({"id": 1}))
+                    } else {
+                        Reply::status_json(404, &json!({"message": "Not Found"}))
+                    }
+                })
+            }
             ("GET", ["installation", "repositories"]) => self.with_installation(&req, |st| {
                 let repos: Vec<Value> = st
                     .repos
@@ -1172,16 +1237,6 @@ impl FakeGithub {
                     .collect();
                 Reply::json(&json!({"total_count": repos.len(), "repositories": repos}))
             }),
-            ("GET", ["repos", owner, repo, "installation"]) => {
-                let name = format!("{owner}/{repo}");
-                self.with_jwt(&req, |st| {
-                    if st.repos.contains_key(&name) {
-                        Reply::json(&json!({"id": 1}))
-                    } else {
-                        Reply::status_json(404, &json!({"message": "Not Found"}))
-                    }
-                })
-            }
             ("GET", ["repos", owner, repo, "contents", ".github", "workflows"]) => {
                 let name = format!("{owner}/{repo}");
                 self.with_installation(&req, |st| match st.repos.get(&name) {
@@ -1384,20 +1439,7 @@ impl FakeGithub {
             Some((exp, repo)) if *exp > st.now() => repo.clone(),
             _ => return Reply::status_json(401, &json!({"message": "Bad credentials"})),
         };
-        let exp = st.now() + st.opts.admin_token_ttl.as_secs() as i64;
-        st.next += 1;
-        let payload = json!({"exp": exp, "n": st.next}).to_string();
-        let admin = format!(
-            "{}.{}.{}",
-            b64url(br#"{"alg":"RS256"}"#),
-            b64url(payload.as_bytes()),
-            "sig"
-        );
-        st.admin_tokens.insert(admin.clone(), (exp, repo));
-        let url = st
-            .service_at
-            .clone()
-            .unwrap_or_else(|| format!("{}/svc", st.base));
+        let (url, admin, _) = st.admin_token(repo);
         Reply::json(&json!({"url": url, "token": admin}))
     }
 
@@ -1827,7 +1869,9 @@ fn create_session(st: &mut State, id: i64, req: &Request) -> Reply {
     let now = st.now();
     let ttl = st.opts.session_token_ttl.as_secs() as i64;
     let token = st.token("mq");
-    let sid = st.token("sess");
+    // GitHub names sessions by GUID.
+    st.next += 1;
+    let sid = format!("5e55{:04x}-0000-4000-8000-{:012x}", st.next & 0xffff, st.next);
     let Some(set) = st.scale_set(id) else {
         return json_error(404, "RunnerScaleSetNotFoundException", "scale set not found");
     };

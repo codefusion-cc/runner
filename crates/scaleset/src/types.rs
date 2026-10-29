@@ -69,25 +69,6 @@ impl Statistics {
     }
 }
 
-/// What the service sends when a message session opens, and what a refresh returns.
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SessionInfo {
-    pub session_id: String,
-    pub message_queue_url: String,
-    pub message_queue_access_token: String,
-    #[serde(default)]
-    pub statistics: Option<Statistics>,
-}
-
-impl std::fmt::Debug for SessionInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionInfo")
-            .field("session_id", &self.session_id)
-            .finish_non_exhaustive()
-    }
-}
-
 /// An Actions runner registered with the scale set.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RunnerRef {
@@ -105,14 +86,6 @@ pub struct JitConfig {
     pub runner: RunnerRef,
     /// What the Actions runner is started with. A credential: it never reaches a log.
     pub encoded: Secret<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct JitResponse {
-    pub runner: Option<RunnerRef>,
-    #[serde(rename = "encodedJITConfig")]
-    pub encoded_jit_config: String,
 }
 
 /// A field the service may send as `null`, which Go's decoder reads as the empty value and serde's does not.

@@ -1,9 +1,8 @@
-//! The administrator's side and one session's calls, against the fake GitHub.
+//! The administrator's side and one session's calls, through the fake console to the fake GitHub.
 
 mod support;
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use cf_fake_github::JobState;
 use cf_fake_github::httpd::Reply;
@@ -57,13 +56,14 @@ async fn a_queued_job_arrives_is_acquired_and_gets_a_one_job_runner() {
         .filter(|r| r.line.starts_with("GET /svc") && r.line.ends_with("/messages"))
         .collect::<Vec<_>>();
     assert_eq!(polls[0].max_capacity.as_deref(), Some("2"));
+    assert!(polls.iter().all(|r| !r.admin), "the session's own token");
 
     assert_eq!(session.acquire_jobs(&[request]).await.unwrap(), vec![request]);
     assert_eq!(h.fake.job_state(request), Some(JobState::Acquired(set.id)));
 
     let jit = h
         .client
-        .generate_jit_config(set.id, "mac-a-j0000001", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000001")
         .await
         .unwrap();
     assert_eq!(jit.runner.name, "mac-a-j0000001");
@@ -74,15 +74,14 @@ async fn a_queued_job_arrives_is_acquired_and_gets_a_one_job_runner() {
         "the configuration is a credential"
     );
 
-    h.client.remove_runner(jit.runner.id).await.unwrap();
+    assert!(h.client.remove_runner(jit.runner.id).await.unwrap());
     assert!(h.fake.runners().is_empty());
     assert!(
-        h.client
-            .remove_runner(jit.runner.id)
-            .await
-            .unwrap_err()
-            .is_not_found()
+        !h.client.remove_runner(jit.runner.id).await.unwrap(),
+        "already gone"
     );
+    assert_eq!(registrations(&h.fake), 0);
+    assert_eq!(admin_requests_from_machines(&h.fake), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -117,11 +116,11 @@ async fn the_lifecycle_messages_carry_the_runner_and_the_result() {
     session.acquire_jobs(&[request]).await.unwrap();
     let jit = h
         .client
-        .generate_jit_config(set.id, "mac-a-jabc", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000abc")
         .await
         .unwrap();
-    h.fake.start_job("mac-a-jabc");
-    h.fake.complete_job("mac-a-jabc", "failed");
+    h.fake.start_job("mac-a-j0000abc");
+    h.fake.complete_job("mac-a-j0000abc", "failed");
     let mut seen = Message::default();
     let mut after = 0;
     for _ in 0..4 {
@@ -143,9 +142,9 @@ async fn the_lifecycle_messages_carry_the_runner_and_the_result() {
         ),
         (1, 1, 1, 1)
     );
-    assert_eq!(seen.started[0].runner_name, "mac-a-jabc");
+    assert_eq!(seen.started[0].runner_name, "mac-a-j0000abc");
     assert_eq!(seen.completed[0].result, "failed");
-    assert_eq!(seen.completed[0].runner_name, "mac-a-jabc");
+    assert_eq!(seen.completed[0].runner_name, "mac-a-j0000abc");
     assert_eq!(seen.completed[0].workflow_run_id, 7000 + request);
     assert!(seen.completed[0].queue_time.is_some());
     let _ = jit;
@@ -156,105 +155,109 @@ async fn a_second_session_of_the_machine_is_refused_until_the_first_is_closed() 
     let h = harness().await;
     let (set, first) = with_session(&h).await;
     assert_eq!(
-        h.client.open_session(set.id, "mac-a").await.unwrap_err(),
+        h.client.open_session(set.id).await.unwrap_err(),
         Error::SessionExists
     );
     first.close().await.unwrap();
     assert!(!h.fake.scale_sets()[0].has_session);
-    h.client.open_session(set.id, "mac-a").await.unwrap();
+    h.client.open_session(set.id).await.unwrap();
 }
 
 #[tokio::test]
-async fn the_admin_token_is_replaced_when_it_runs_out() {
-    let h = harness_with(
-        cf_fake_github::Options {
-            admin_token_ttl: Duration::from_secs(1000),
-            ..Default::default()
-        },
-        fast(),
-        Duration::from_secs(10),
-    )
-    .await;
-    h.client.list_scale_sets().await.unwrap();
-    h.client.list_scale_sets().await.unwrap();
+async fn acquiring_goes_to_the_service_address_with_the_session_token_only() {
+    let h = harness().await;
+    let (set, session) = with_session(&h).await;
+    let request = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    session.poll(0, 1).await.unwrap().expect("the offer");
+    assert_eq!(session.acquire_jobs(&[request]).await.unwrap(), vec![request]);
+    let acquired = h
+        .fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.line.ends_with("/acquirejobs"))
+        .collect::<Vec<_>>();
+    assert_eq!(acquired.len(), 1);
     assert_eq!(
-        h.fake.count("POST /actions/runner-registration"),
-        1,
-        "the token is kept"
+        acquired[0].line,
+        format!("POST /svc/_apis/runtime/runnerscalesets/{}/acquirejobs", set.id),
+        "at the serviceUrl the console named"
     );
-    // 900 s later it has 100 s left: inside the two minutes it is replaced before it is used.
-    h.clock.advance(Duration::from_secs(900));
-    h.client.list_scale_sets().await.unwrap();
-    assert_eq!(h.fake.count("POST /actions/runner-registration"), 2);
+    assert!(!acquired[0].admin && !acquired[0].from_console);
 }
 
 #[tokio::test]
-async fn a_clock_that_runs_ahead_keeps_the_admin_token() {
-    let h = harness_with(
-        cf_fake_github::Options {
-            admin_token_ttl: Duration::from_secs(1000),
-            ..Default::default()
-        },
-        fast(),
-        Duration::from_secs(10),
-    )
-    .await;
-    // This machine's clock is half an hour ahead of GitHub's: read by it, every admin token ran out long ago.
-    h.fake.set_clock_offset(-1800);
-    for _ in 0..3 {
-        h.client.list_scale_sets().await.unwrap();
-    }
+async fn the_machine_never_asks_for_a_registration_or_holds_an_admin_token() {
+    let h = harness().await;
+    let (set, session) = with_session(&h).await;
+    let request = h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    session.poll(0, 1).await.unwrap().expect("the offer");
+    session.acquire_jobs(&[request]).await.unwrap();
+    let jit = h
+        .client
+        .generate_jit_config(set.id, "mac-a-j00000f1")
+        .await
+        .unwrap();
+    h.fake.start_job(&jit.runner.name);
+    h.fake.complete_job(&jit.runner.name, "succeeded");
+    h.client.remove_runner_named("mac-a-j00000f1").await.unwrap();
+    session.close().await.unwrap();
+    assert!(h.client.delete_scale_set(set.id).await.unwrap());
+
     assert_eq!(
-        h.fake.count("POST /actions/runner-registration"),
-        1,
-        "a token good for a quarter of an hour was thrown away"
+        registrations(&h.fake),
+        0,
+        "nothing asked GitHub for a registration over HTTP"
+    );
+    assert_eq!(admin_requests_from_machines(&h.fake), Vec::<String>::new());
+    let console_calls = h.console.github_calls();
+    assert!(
+        console_calls.iter().all(|c| c.route != "registration"),
+        "{console_calls:?}"
+    );
+    let kinds = h
+        .console
+        .scaleset_audit()
+        .into_iter()
+        .map(|row| (row.kind, row.outcome))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            ("set-create", "ok"),
+            ("session-open", "ok"),
+            ("jit", "ok"),
+            ("remove", "ok"),
+            ("session-close", "ok"),
+            ("set-delete", "ok"),
+        ]
     );
 }
 
 #[tokio::test]
-async fn callers_refused_together_share_one_new_admin_token() {
+async fn an_admin_token_the_service_stops_taking_is_replaced_by_the_console_out_of_sight() {
     let h = harness().await;
     h.client.list_scale_sets().await.unwrap();
     h.fake.revoke_admin_tokens();
-    let (a, b, c, d) = tokio::join!(
-        h.client.list_scale_sets(),
-        h.client.list_scale_sets(),
-        h.client.list_scale_sets(),
-        h.client.list_scale_sets(),
-    );
-    for answer in [a, b, c, d] {
-        answer.unwrap();
-    }
-    assert_eq!(
-        h.fake.count("POST /actions/runner-registration"),
-        2,
-        "each refused caller registered again and threw the others' token away"
-    );
+    let (a, b) = tokio::join!(h.client.list_scale_sets(), h.client.list_scale_sets());
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(admin_requests_from_machines(&h.fake), Vec::<String>::new());
 }
 
 #[tokio::test]
-async fn a_registration_that_names_another_host_is_refused_and_no_token_goes_there() {
+async fn a_service_address_that_is_not_githubs_is_refused_by_the_console_and_no_token_goes_there() {
     let h = harness().await;
     let (other, visits) = elsewhere().await;
     h.fake.send_the_service_to(&format!("{}/svc", other.url()));
     let error = h.client.list_scale_sets().await.unwrap_err();
     assert!(
-        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
+        matches!(error, Error::Api(cf_ghapp::Error::Transport(_))),
         "{error:?}"
     );
-    assert!(!error.is_transient(), "a refusal is not tried again");
     assert_eq!(
         visits.load(Ordering::SeqCst),
         0,
         "the admin token went to another host"
-    );
-    // The same goes for a host on the internet that only looks like GitHub's.
-    h.fake
-        .send_the_service_to("https://actions.githubusercontent.com.example.org/svc");
-    let error = h.client.list_scale_sets().await.unwrap_err();
-    assert!(
-        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
-        "{error:?}"
     );
 }
 
@@ -268,15 +271,67 @@ async fn a_session_whose_queue_is_on_another_host_is_refused_and_closed() {
         .unwrap();
     let (other, visits) = elsewhere().await;
     h.fake.send_the_queue_to(&format!("{}/messages", other.url()));
-    let error = h.client.open_session(set.id, "mac-a").await.unwrap_err();
+    let error = h.client.open_session(set.id).await.unwrap_err();
     assert!(
         matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
         "{error:?}"
     );
+    assert!(!error.is_transient(), "a refusal is not tried again");
     assert_eq!(visits.load(Ordering::SeqCst), 0);
     assert!(
         !h.fake.scale_sets()[0].has_session,
         "the refused session was left open at the service"
+    );
+}
+
+/// A console answer as the console writes one for `scaleset/session/open`, with `queue` and `service` as addresses.
+fn opened(queue: &str, service: &str) -> Reply {
+    Reply::json(&serde_json::json!({
+        "sessionId": "5f0c-1",
+        "messageQueueUrl": queue,
+        "messageQueueAccessToken": "queue-token-not-for-elsewhere",
+        "serviceUrl": service,
+        "statistics": {
+            "totalAvailableJobs": 0, "totalAcquiredJobs": 0, "totalAssignedJobs": 0, "totalRunningJobs": 0,
+            "totalRegisteredRunners": 0, "totalBusyRunners": 0, "totalIdleRunners": 0
+        }
+    }))
+}
+
+#[tokio::test]
+async fn a_console_answer_naming_another_host_is_refused_and_the_session_token_goes_nowhere() {
+    let h = harness().await;
+    let set = h
+        .client
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .await
+        .unwrap();
+    let (other, visits) = elsewhere().await;
+    let service = format!("{}/svc", h.fake.url());
+    for (queue, service) in [
+        (format!("{}/messages", other.url()), service.clone()),
+        (format!("{service}/messages"), format!("{}/svc", other.url())),
+        (
+            "https://actions.githubusercontent.com.example.org/messages".to_string(),
+            service.clone(),
+        ),
+        (
+            format!("{service}/messages"),
+            "http://pipelines.actions.githubusercontent.com/svc".into(),
+        ),
+    ] {
+        h.console.answer_next(opened(&queue, &service));
+        let error = h.client.open_session(set.id).await.unwrap_err();
+        assert!(
+            matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
+            "{queue} {service}: {error:?}"
+        );
+        assert!(!format!("{error:?}").contains("queue-token-not-for-elsewhere"));
+    }
+    assert_eq!(
+        visits.load(Ordering::SeqCst),
+        0,
+        "a session token went to another host"
     );
 }
 
@@ -301,6 +356,72 @@ async fn a_refreshed_session_cannot_move_its_queue_to_another_host() {
 }
 
 #[tokio::test]
+async fn the_consoles_refusals_keep_their_meaning() {
+    let h = harness().await;
+    let set = h
+        .client
+        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
+        .await
+        .unwrap();
+    let refusal = |status: u16, code: &str| {
+        Reply::status_json(
+            status,
+            &serde_json::json!({"error": format!("refused: {code}"), "code": code}),
+        )
+    };
+
+    h.console.answer_next(refusal(409, "session_exists"));
+    assert_eq!(
+        h.client.open_session(set.id).await.unwrap_err(),
+        Error::SessionExists
+    );
+
+    h.console.answer_next(refusal(403, "not_yours"));
+    let error = h.client.delete_scale_set(set.id).await.unwrap_err();
+    assert_eq!(
+        (error.status(), error.is_transient()),
+        (Some(403), false),
+        "{error:?}"
+    );
+
+    h.console.answer_next(refusal(422, "runner_busy"));
+    let error = h.client.remove_runner(77).await.unwrap_err();
+    assert_eq!(
+        (error.status(), error.is_transient()),
+        (Some(422), false),
+        "{error:?}"
+    );
+
+    // A wait longer than the client waits out by itself comes back with the error.
+    h.console
+        .answer_next(refusal(503, "github_busy").with_header("retry-after", "60"));
+    let error = h.client.list_scale_sets().await.unwrap_err();
+    assert_eq!(error.status(), Some(503), "{error:?}");
+    assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(60)));
+    assert!(error.is_transient());
+
+    h.console.answer_next(Reply::status_json(
+        403,
+        &serde_json::json!({"error": "GitHub through the console is off", "code": "broker_off"}),
+    ));
+    let error = h.client.list_scale_sets().await.unwrap_err();
+    assert_eq!(
+        (error.status(), error.is_transient()),
+        (Some(403), false),
+        "{error:?}"
+    );
+
+    h.console.answer_next(Reply::status_json(
+        404,
+        &serde_json::json!({"error": "Not found"}),
+    ));
+    // A console without the route is older than this Runner, not a set that is gone: the host lists them itself
+    // (tests/older_console.rs).
+    let sets = h.client.list_scale_sets().await.expect("listed by the host");
+    assert_eq!(sets.len(), 1, "{sets:?}");
+}
+
+#[tokio::test]
 async fn a_job_named_twice_in_the_answer_is_acquired_once_and_a_stranger_not_at_all() {
     let h = harness().await;
     let (set, session) = with_session(&h).await;
@@ -317,23 +438,16 @@ async fn a_job_named_twice_in_the_answer_is_acquired_once_and_a_stranger_not_at_
 #[tokio::test]
 async fn an_answer_of_the_wrong_shape_keeps_its_text_out_of_the_error() {
     let h = harness().await;
-    // serde names the value it met where it expected another: here that value is the service's token.
-    h.fake.fail(
-        "POST /actions/runner-registration",
-        Reply::text(200, r#""admin-token-leaked""#),
-        1,
-    );
-    let error = h
-        .client
-        .ensure_scale_set("mac-a--cf-2g", &labels(&["self-hosted", "cf-2g"]))
-        .await
-        .unwrap_err();
+    // serde names the value it met where it expected another: here that value is a token.
+    h.console
+        .answer_next(Reply::json(&serde_json::json!({"scaleSets": "token-leaked"})));
+    let error = h.client.list_scale_sets().await.unwrap_err();
     assert!(
         matches!(error, Error::Api(cf_ghapp::Error::Decode { .. })),
         "{error:?}"
     );
     let said = format!("{error} {error:?}");
-    assert!(!said.contains("admin-token-leaked"), "{said}");
+    assert!(!said.contains("token-leaked"), "{said}");
 }
 
 #[tokio::test]
@@ -344,25 +458,39 @@ async fn a_configuration_that_does_not_name_its_runner_is_refused_and_its_regist
     for answer in [
         serde_json::json!({"encodedJITConfig": "abc"}),
         serde_json::json!({"runner": null, "encodedJITConfig": "abc"}),
-        serde_json::json!({"runner": {"id": 0, "name": "mac-a-cf-2g-who"}, "encodedJITConfig": "abc"}),
-        serde_json::json!({"runner": {"id": 7, "name": "mac-a-cf-2g-who"}, "encodedJITConfig": ""}),
+        serde_json::json!({"runner": {"id": 0, "name": "mac-a-j0000c0f"}, "encodedJITConfig": "abc"}),
+        serde_json::json!({"runner": {"id": 7, "name": "mac-a-j0000c0f"}, "encodedJITConfig": ""}),
     ] {
         h.client
-            .generate_jit_config(set.id, "mac-a-cf-2g-who", "_work")
+            .generate_jit_config(set.id, "mac-a-j0000c0f")
             .await
             .expect("registered");
-        assert_eq!(h.fake.runners(), vec!["mac-a-cf-2g-who".to_string()]);
+        assert_eq!(h.fake.runners(), vec!["mac-a-j0000c0f".to_string()]);
         h.fake.fail("generatejitconfig", Reply::json(&answer), 1);
         let error = h
             .client
-            .generate_jit_config(set.id, "mac-a-cf-2g-who", "_work")
+            .generate_jit_config(set.id, "mac-a-j0000c0f")
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), None, "{answer}: {error:?}");
+        assert_eq!(h.fake.runners(), Vec::<String>::new(), "{answer}");
+    }
+    // The console's own answer may be what is wrong.
+    for answer in [
+        serde_json::json!({"runnerId": 0, "encodedJitConfig": "abc"}),
+        serde_json::json!({"runnerId": 9, "encodedJitConfig": ""}),
+        serde_json::json!({"encodedJitConfig": "abc"}),
+    ] {
+        h.console.answer_next(Reply::json(&answer));
+        let error = h
+            .client
+            .generate_jit_config(set.id, "mac-a-j0000c0f")
             .await
             .unwrap_err();
         assert!(
             matches!(error, Error::Api(cf_ghapp::Error::Decode { .. })),
             "{answer}: {error:?}"
         );
-        assert_eq!(h.fake.runners(), Vec::<String>::new(), "{answer}");
     }
 }
 
@@ -370,28 +498,43 @@ async fn a_configuration_that_does_not_name_its_runner_is_refused_and_its_regist
 async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine() {
     let h = harness().await;
     let (set, _session) = with_session(&h).await;
-    // The service registers the Actions runner, the answer is lost, and the next try meets the name it just took.
+    let jits = |h: &Harness| {
+        h.console
+            .github_calls()
+            .iter()
+            .filter(|c| c.route == "scaleset/jit")
+            .count()
+    };
+
+    // The service registers the Actions runner and the answer is lost: the console says GitHub is busy, the call is
+    // not sent again (it may have registered one), and the registration is looked for and removed.
     h.fake.lose_answer("generatejitconfig", 1);
+    let before = jits(&h);
     let error = h
         .client
-        .generate_jit_config(set.id, "mac-a-cf-2g-lost", "_work")
+        .generate_jit_config(set.id, "mac-a-j000105e")
+        .await
+        .unwrap_err();
+    assert!(error.is_transient(), "{error:?}");
+    assert_eq!(jits(&h) - before, 1, "sent once");
+    assert_eq!(h.fake.runners(), Vec::<String>::new());
+
+    // A name the service already has is taken: whatever holds it has no machine.
+    h.client
+        .generate_jit_config(set.id, "mac-a-j00007a4")
+        .await
+        .unwrap();
+    let error = h
+        .client
+        .generate_jit_config(set.id, "mac-a-j00007a4")
         .await
         .unwrap_err();
     assert_eq!(error.status(), Some(409), "{error:?}");
     assert_eq!(h.fake.runners(), Vec::<String>::new());
 
-    // Every try loses its answer: the call fails as a network error, and still nothing stays behind.
-    h.fake.lose_answer("generatejitconfig", 3);
-    let error = h
-        .client
-        .generate_jit_config(set.id, "mac-a-cf-2g-gone", "_work")
-        .await
-        .unwrap_err();
-    assert!(error.is_transient(), "{error:?}");
-    assert_eq!(h.fake.runners(), Vec::<String>::new());
-
-    // A refusal that registered nothing looks for nothing.
+    // Another refusal of GitHub's (the console answers 409 without `name_taken`) registered nothing.
     let lookups = h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents");
+    assert!(lookups > 0);
     h.fake.fail(
         "generatejitconfig",
         Reply::status_json(403, &serde_json::json!({"message": "no"})),
@@ -399,82 +542,132 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
     );
     let error = h
         .client
-        .generate_jit_config(set.id, "mac-a-cf-2g-no", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000403")
         .await
         .unwrap_err();
     assert_eq!(
         (error.status(), error.is_transient()),
-        (Some(403), false),
+        (Some(409), false),
         "{error:?}"
     );
-    assert!(lookups > 0);
     assert_eq!(
         h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
         lookups
     );
 
-    // Nor does a limit, which refused the call before anything was made.
-    h.fake
-        .fail_until_recovered("generatejitconfig", Reply::text(429, "slow down"));
+    // Nor did the console's own limit, which refused the call before GitHub was asked.
+    h.console.answer_next(
+        Reply::status_json(
+            429,
+            &serde_json::json!({"error": "Too many", "code": "rate_limited"}),
+        )
+        .with_header("retry-after", "300"),
+    );
     let error = h
         .client
-        .generate_jit_config(set.id, "mac-a-cf-2g-limit", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000429")
         .await
         .unwrap_err();
     assert_eq!(error.status(), Some(429), "{error:?}");
-    h.fake.recover("generatejitconfig");
     assert_eq!(
         h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
         lookups
     );
 
     // Nor a 409 that says when to ask again: the console's answer while no trusted job waits, which made nothing.
-    // A 409 without it is a name already taken, whose registration may be the one just made.
-    h.fake.fail(
-        "generate-jitconfig",
-        Reply::status_json(409, &serde_json::json!({"error": "no_trusted_job"}))
-            .with_header("Retry-After", "15"),
-        1,
+    let removes = |h: &Harness| {
+        h.console
+            .github_calls()
+            .iter()
+            .filter(|c| c.route == "scaleset/remove")
+            .count()
+    };
+    let before = removes(&h);
+    h.console.answer_next(
+        Reply::status_json(
+            409,
+            &serde_json::json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
     );
     let error = h
         .client
-        .generate_plain_jit_config("mac-a-j0000002", &["trusted".to_string()])
+        .generate_jit_config(set.id, "mac-a-j0000409")
         .await
         .unwrap_err();
     assert_eq!(
         (error.status(), error.retry_after()),
-        (Some(409), Some(Duration::from_secs(15))),
+        (Some(409), Some(std::time::Duration::from_secs(15))),
         "{error:?}"
     );
-    assert_eq!(
-        h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
-        lookups
-    );
-    h.fake.fail(
-        "generate-jitconfig",
-        Reply::status_json(409, &serde_json::json!({"message": "taken"})),
-        1,
+    assert_eq!(removes(&h), before, "nothing was made, so nothing is looked for");
+}
+
+/// A trusted host's Actions runner outside any scale set: the console's 409 with a wait (`no_trusted_job`) made
+/// nothing, so nothing is looked for; a 409 without one is a name GitHub has, whose registration may be the one just
+/// made, so it is removed.
+#[tokio::test]
+async fn a_plain_registration_that_waits_for_a_trusted_job_leaves_nothing_to_remove() {
+    let h = harness().await;
+    let removes = |h: &Harness| {
+        h.console
+            .github_calls()
+            .iter()
+            .filter(|c| c.route == "scaleset/remove")
+            .count()
+    };
+    let trusted = labels(&["trusted"]);
+    h.console.answer_next(
+        Reply::status_json(
+            409,
+            &serde_json::json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
     );
     let error = h
         .client
-        .generate_plain_jit_config("mac-a-j0000003", &["trusted".to_string()])
+        .generate_plain_jit_config("mac-a-j0000002", &trusted)
         .await
         .unwrap_err();
-    assert_eq!(error.status(), Some(409), "{error:?}");
     assert_eq!(
-        h.fake.count("GET /svc/_apis/distributedtask/pools/0/agents"),
-        lookups + 1
+        (error.status(), error.retry_after()),
+        (Some(409), Some(std::time::Duration::from_secs(15))),
+        "{error:?}"
     );
+    assert_eq!(removes(&h), 0, "nothing was made, so nothing is looked for");
 
-    // And a name that works is found by its name.
+    // Past the wait, a 409 without one is a name already taken.
+    h.clock.advance(std::time::Duration::from_secs(15));
+    h.console.answer_next(Reply::status_json(
+        409,
+        &serde_json::json!({"error": "Taken", "code": "name_taken"}),
+    ));
+    let error = h
+        .client
+        .generate_plain_jit_config("mac-a-j0000003", &trusted)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status(), error.retry_after()),
+        (Some(409), None),
+        "{error:?}"
+    );
+    assert_eq!(removes(&h), 1, "a name taken may be this call's own registration");
+}
+
+#[tokio::test]
+async fn removing_by_name_or_id_says_whether_it_was_there() {
+    let h = harness().await;
+    let (set, _session) = with_session(&h).await;
     let jit = h
         .client
-        .generate_jit_config(set.id, "mac-a-cf-2g-ok", "_work")
+        .generate_jit_config(set.id, "mac-a-j0000aaa")
         .await
         .unwrap();
-    assert_eq!(
-        h.client.runner_by_name("mac-a-cf-2g-ok").await.unwrap(),
-        Some(jit.runner.clone())
-    );
-    assert_eq!(h.client.runner_by_name("mac-a-cf-2g-nobody").await.unwrap(), None);
+    assert!(!h.client.remove_runner_named("mac-a-j0000bbb").await.unwrap());
+    assert!(h.client.remove_runner_named("mac-a-j0000aaa").await.unwrap());
+    assert!(!h.client.remove_runner(jit.runner.id).await.unwrap());
+    // Another machine's Actions runner is refused before anything is sent.
+    let error = h.client.remove_runner_named("mac-b-j0000aaa").await.unwrap_err();
+    assert_eq!(error.status(), None, "refused unsent: {error:?}");
 }

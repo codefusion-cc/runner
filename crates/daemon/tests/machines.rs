@@ -2032,3 +2032,25 @@ async fn a_word_of_a_job_after_its_machine_ended_without_one_is_not_reported_as_
     assert_eq!(w.ends(), [(runner, EndKind::Stopped)]);
     w.assert_nothing_left();
 }
+
+#[tokio::test]
+async fn a_second_removal_that_finds_the_registration_gone_reports_no_job_for_a_machine_that_was_idle() {
+    let mut w = World::new(2);
+    let idle = w.start().await;
+    w.parts.vms.ready(job_name(&idle));
+    pass(&w.m, 1);
+    w.retire(&idle);
+    // Two sweeps read the registration to remove before either is answered: the first removes it, the second finds
+    // it gone, which says nothing more of a machine whose removal was heard.
+    let first = w.m.registrations_to_remove();
+    let second = w.m.registrations_to_remove();
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    w.registered.remove(&idle);
+    w.m.answered(&idle, cf_daemon::Answer::Removed);
+    w.m.answered(&idle, cf_daemon::Answer::Gone);
+    pass(&w.m, 2);
+    assert_eq!(ids(&w.reports()), Vec::<String>::new(), "no job ran there");
+    w.assert_nothing_left();
+    assert_eq!(ids(&w.reports()), Vec::<String>::new(), "no job ran there");
+}

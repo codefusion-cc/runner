@@ -145,6 +145,7 @@ dependencies = [
  "cf-fake-console",
  "cf-fake-github",
  "cf-ghapp",
+ "cf-harness",
  "cf-secret",
  "proptest",
  "reqwest",
@@ -166,6 +167,7 @@ dependencies = [
  "cf-fake-github",
  "cf-ghapp",
  "cf-guest-proto",
+ "cf-harness",
  "cf-host-linux",
  "cf-host-macos",
  "cf-lifecycle",
@@ -194,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "cf-fake-github",
  "rand 0.9.5",
+ "reqwest",
  "serde_json",
  "tokio",
 ]
@@ -203,9 +206,6 @@ name = "cf-fake-github"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "cf-ghapp",
- "cf-scaleset",
- "cf-secret",
  "ring",
  "rsa",
  "serde",
@@ -220,10 +220,12 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "cf-console-client",
+ "cf-fake-console",
  "cf-fake-github",
+ "cf-harness",
  "cf-secret",
  "cf-workflows",
- "proptest",
  "rand 0.9.5",
  "reqwest",
  "ring",
@@ -246,6 +248,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "cf-harness"
+version = "0.1.0"
+dependencies = [
+ "cf-console-client",
+ "cf-fake-console",
+ "cf-fake-github",
+ "cf-ghapp",
+ "cf-scaleset",
+ "cf-secret",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -316,8 +332,10 @@ name = "cf-scaleset"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "cf-console-client",
  "cf-fake-github",
  "cf-ghapp",
+ "cf-harness",
  "cf-secret",
  "proptest",
  "rand 0.9.5",
@@ -653,7 +671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1573,7 +1591,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1848,7 +1866,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2300,6 +2318,7 @@ dependencies = [
  "cf-fake-github",
  "cf-ghapp",
  "cf-guest-proto",
+ "cf-harness",
  "cf-host-linux",
  "cf-image",
  "cf-scaleset",

@@ -1,6 +1,7 @@
 //! A scaler that writes down what it is given, and can be told to wait or to fail.
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cf_scaleset::{Error, Message, Scaler, Statistics};
@@ -23,6 +24,8 @@ pub struct Recorder {
     /// Signalled when a message has arrived (before the gate).
     pub arrived: Arc<Notify>,
     pub capacity: usize,
+    /// How often the listener said a number the scaler gave never reached the service.
+    pub not_sent: Arc<AtomicUsize>,
 }
 
 impl Recorder {
@@ -47,6 +50,10 @@ impl Recorder {
 }
 
 impl Scaler for Recorder {
+    fn not_sent(&mut self) {
+        self.not_sent.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn scale(&mut self, message: Option<&Message>) -> impl Future<Output = Result<usize, Error>> + Send {
         let seen = self.seen.clone();
         let fail_on = self.fail_on.clone();

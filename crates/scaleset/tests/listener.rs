@@ -74,8 +74,42 @@ async fn a_nudge_ends_the_wait_asks_the_scaler_and_loses_no_message() {
     // A job queued now arrives on the wait that followed the nudge.
     h.fake.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
     until("the job's message", || seen.messages().len() == 1).await;
+    assert_eq!(
+        seen.not_sent.load(Ordering::SeqCst),
+        0,
+        "the number the ended wait carried reached the service"
+    );
     trigger.trigger();
     task.await.unwrap().unwrap();
+}
+
+// A nudge that comes while the scaler is busy is kept, and taken before the next wait: the number the scaler gave
+// before it never reaches the service, and the scaler hears so, since the room it offered was offered to no one.
+#[tokio::test]
+async fn a_nudge_kept_while_the_scaler_was_busy_asks_again_before_the_wait_and_says_the_number_was_not_sent()
+{
+    let h = harness().await;
+    let (_, session) = with_session(&h).await;
+    h.fake.set_poll_timeout(Duration::from_secs(30));
+    let nudge = Arc::new(Notify::new());
+    nudge.notify_one();
+    let mut scaler = Recorder::new(1);
+    let seen = scaler.clone();
+    let (trigger, stop) = shutdown();
+    let task = tokio::spawn({
+        let (session, nudge) = (session.clone(), nudge.clone());
+        async move { listen_nudged(&session, &mut scaler, stop, &nudge).await }
+    });
+    until("the first wait", || polls(&h) == 1).await;
+    assert_eq!(seen.not_sent.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(seen.seen.lock().unwrap()[..], [Seen::Initial(_), Seen::Quiet]),
+        "the scaler is asked again before the wait: {:?}",
+        seen.seen.lock().unwrap()
+    );
+    trigger.trigger();
+    task.await.unwrap().unwrap();
+    assert_eq!(polls(&h), 1);
 }
 
 // A message is handled first and acknowledged after: while the scaler is busy with it, the service still has it.
@@ -259,7 +293,7 @@ async fn a_session_lost_mid_poll_is_opened_again_and_the_next_job_still_arrives(
                 move || {
                     let (client, stop, mut scaler) = (client.clone(), stop.clone(), scaler.clone());
                     async move {
-                        let session = client.open_session(set.id, "mac-a").await?;
+                        let session = client.open_session(set.id).await?;
                         let result = listen(&session, &mut scaler, stop).await;
                         let _ = session.close().await;
                         result
@@ -364,7 +398,7 @@ async fn a_refresh_for_a_session_the_service_forgot_is_a_lost_session() {
             .ensure_scale_set("mac-a--cf-4g", &labels(&["self-hosted", "cf-4g"]))
             .await
             .unwrap();
-        let session = h.client.open_session(set.id, "mac-a").await.unwrap();
+        let session = h.client.open_session(set.id).await.unwrap();
         (set, session)
     };
     h.fake

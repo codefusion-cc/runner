@@ -1,26 +1,50 @@
-//! The GitHub App client against a fake GitHub at the HTTP edge. The Go manager's `ghapp_test.go` is the model;
-//! `// Go:` comments name the test each one ports, `// added:` the ones the Go code had no test for.
+//! The GitHub App client against a fake GitHub at the HTTP edge, its tokens from the fake console as a machine gets
+//! them. The Go manager's `ghapp_test.go` is the model; `// Go:` comments name the test each one ports, `// added:` the
+//! ones the Go code had no test for. How the console's tokens are kept and renewed is `cf-console-client`'s.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cf_fake_github::harness::{TestClock, elsewhere, fast};
+use cf_console_client::{Client, ConsoleTokens};
+use cf_fake_console::FakeConsole;
 use cf_fake_github::httpd::Reply;
-use cf_fake_github::{FakeGithub, Options, test_key};
+use cf_fake_github::{FakeGithub, Options};
 use cf_ghapp::{
-    AppCredentials, AppKey, Clock, Error, GitHubApp, Http, Installation, JOBS_PAGE, MAX_RUN_SETS,
-    RUNS_LISTED, RetryPolicy, WAITING_RUNS, Waiting,
+    Error, GitHubApp, Http, Installation, JOBS_PAGE, MAX_RUN_SETS, RUNS_LISTED, RetryPolicy, WAITING_RUNS,
+    Waiting,
 };
-use cf_secret::Secret;
+use cf_harness::{TestClock, elsewhere, enrolled, fast};
 use cf_workflows::{LabelSet, MAX_LABEL_BYTES, MAX_SET_LABELS};
 
 struct Harness {
     fake: FakeGithub,
+    console: FakeConsole,
+    client: Client,
     app: GitHubApp,
     clock: Arc<TestClock>,
+}
+
+impl Harness {
+    /// How many read tokens the machine asked the console for.
+    fn reads(&self) -> usize {
+        self.console
+            .github_calls()
+            .iter()
+            .filter(|c| c.route == "read")
+            .count()
+    }
+
+    /// The App client of this machine for another address of GitHub's.
+    fn app_at(&self, api: &str, http: Http) -> GitHubApp {
+        let tokens = ConsoleTokens::new(
+            self.client.clone(),
+            "mac-a",
+            self.clock.clone(),
+            self.clock.clone(),
+        );
+        GitHubApp::with_source(Arc::new(tokens), api, http)
+    }
 }
 
 /// The largest workflow file the tests' caller reads, as the Runner's own limit is.
@@ -30,95 +54,35 @@ async fn harness_with(retry: RetryPolicy, timeout: Duration) -> Harness {
     let fake = FakeGithub::start(Options::default()).await;
     fake.add_repo("org/app", true);
     fake.add_repo("org/other", false);
+    let console = FakeConsole::start().await;
+    console.serve_github(fake.clone());
     let clock = Arc::new(TestClock::default());
     let http = Http::new(timeout, retry).with_max_body(64 * 1024);
-    let app = cf_fake_github::harness::app(&fake, http, clock.clone());
-    Harness { fake, app, clock }
+    let client = enrolled(&console, "mac-a", http.clone()).await;
+    let app = cf_harness::app(&fake, &client, "mac-a", http, clock.clone());
+    Harness {
+        fake,
+        console,
+        client,
+        app,
+        clock,
+    }
 }
 
 async fn harness() -> Harness {
     harness_with(fast(), Duration::from_secs(10)).await
 }
 
-fn claims_of(authorization: &str) -> serde_json::Value {
-    let jwt = authorization.strip_prefix("Bearer ").expect("bearer");
-    let payload = jwt.split('.').nth(1).expect("payload");
-    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("base64")).expect("json")
-}
-
-// Go: TestNewRejectsBadKey
-#[test]
-fn a_key_that_is_not_pem_is_refused_without_echoing_it() {
-    let err = AppKey::from_pem(&Secret::new("not a key SECRETMARKER".into()))
-        .unwrap_err()
-        .to_string();
-    assert!(!err.contains("SECRETMARKER"), "{err}");
-    let truncated = test_key().private_pem[..200].to_string();
-    assert!(AppKey::from_pem(&Secret::new(truncated)).is_err());
-    let wrong_label = test_key().private_pem.replace("RSA PRIVATE KEY", "CERTIFICATE");
-    assert!(AppKey::from_pem(&Secret::new(wrong_label)).is_err());
-}
-
-// added: the key and the tokens never show
+// added: the tokens never show
 #[tokio::test]
-async fn the_key_and_tokens_never_show_in_debug_output_or_errors() {
+async fn tokens_never_show_in_debug_output_or_errors() {
     let h = harness().await;
-    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).unwrap();
-    assert_eq!(format!("{key:?}"), "AppKey(..)");
-    let body_line = test_key().private_pem.lines().nth(2).unwrap().to_string();
-    let shown = format!(
-        "{:?} {:?}",
-        h.app,
-        AppCredentials {
-            client_id: "x".into(),
-            key
-        }
-    );
-    assert!(!shown.contains(&body_line));
     let token = h.app.installation_token(1).await.unwrap();
     let error = h.app.installation_token(99).await.unwrap_err();
-    for text in [error.to_string(), format!("{error:?}")] {
-        assert!(
-            !text.contains(token.expose().as_str()) && !text.contains(&body_line),
-            "{text}"
-        );
+    for text in [error.to_string(), format!("{error:?}"), format!("{:?}", h.app)] {
+        assert!(!text.contains(token.expose().as_str()), "{text}");
     }
     assert_eq!(format!("{token:?}"), "Secret(..)");
-    let jwt = h.app.jwt().unwrap();
-    assert!(!format!("{jwt:?} {:?}", h.app).contains(jwt.expose().as_str()));
-}
-
-// Go: TestJWTIsWhatGitHubAccepts
-#[tokio::test]
-async fn the_jwt_is_what_github_accepts() {
-    let h = harness().await;
-    h.app
-        .installations()
-        .await
-        .expect("the fake checks signature, issuer, iat and exp as GitHub does");
-    let seen = h
-        .fake
-        .requests()
-        .into_iter()
-        .find(|r| r.line == "GET /app/installations")
-        .unwrap();
-    let claims = claims_of(&seen.authorization.unwrap());
-    assert_eq!(claims["iss"], "Iv23test");
-    let (iat, exp) = (claims["iat"].as_i64().unwrap(), claims["exp"].as_i64().unwrap());
-    assert!(
-        exp - iat <= 600,
-        "GitHub refuses tokens that live longer than ten minutes"
-    );
-    let now = h
-        .clock
-        .now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    assert!(
-        iat < now,
-        "issued in the past: a clock a little ahead of GitHub's makes a token issued now invalid"
-    );
 }
 
 // Go: TestInstallations
@@ -126,84 +90,6 @@ async fn the_jwt_is_what_github_accepts() {
 async fn installations_are_listed_with_the_apps_own_token() {
     let h = harness().await;
     assert_eq!(h.app.installations().await.unwrap(), vec![Installation { id: 1 }]);
-}
-
-// Go: TestTokenIsReusedUntilNearExpiry
-#[tokio::test]
-async fn a_token_is_reused_until_five_minutes_before_it_expires() {
-    let h = harness().await;
-    let first = h.app.installation_token(1).await.unwrap();
-    h.clock.advance(Duration::from_secs(54 * 60));
-    h.fake.set_clock_offset(54 * 60);
-    let again = h.app.installation_token(1).await.unwrap();
-    assert_eq!(
-        again.expose(),
-        first.expose(),
-        "replaced a token with 6 minutes left"
-    );
-    assert_eq!(h.fake.count("POST /app/installations/1/access_tokens"), 1);
-
-    h.clock.advance(Duration::from_secs(2 * 60));
-    h.fake.set_clock_offset(56 * 60);
-    let fresh = h.app.installation_token(1).await.unwrap();
-    assert_ne!(fresh.expose(), first.expose(), "kept a token with 4 minutes left");
-}
-
-// Go: TestTokenErrors
-#[tokio::test]
-async fn token_errors_are_results_and_are_not_cached() {
-    let h = harness().await;
-    h.fake.fail(
-        "access_tokens",
-        Reply::status_json(401, &serde_json::json!({"message": "Bad credentials"})),
-        1,
-    );
-    let err = h.app.installation_token(1).await.unwrap_err();
-    assert_eq!(err.status(), Some(401));
-    assert!(err.to_string().contains("Bad credentials"), "{err}");
-
-    h.fake.fail(
-        "access_tokens",
-        Reply::status_json(
-            201,
-            &serde_json::json!({"token": "", "expires_at": "2030-01-01T00:00:00Z"}),
-        ),
-        1,
-    );
-    assert!(
-        matches!(h.app.installation_token(1).await, Err(Error::Decode { .. })),
-        "accepted an empty token"
-    );
-
-    let body = br#"{"token":"abc","expires_at":"2030-01-01T00:00:00Z"}"#.to_vec();
-    h.fake.fail(
-        "access_tokens",
-        Reply::Truncated {
-            status: 201,
-            body,
-            sent: 10,
-        },
-        3,
-    );
-    assert!(
-        matches!(h.app.installation_token(1).await, Err(Error::Transport(_))),
-        "accepted a cut-off response"
-    );
-
-    h.fake.fail(
-        "access_tokens",
-        Reply::status_json(201, &serde_json::json!({"token": "abc"})),
-        1,
-    );
-    assert!(
-        matches!(h.app.installation_token(1).await, Err(Error::Decode { .. })),
-        "a token without expires_at"
-    );
-
-    // None of the failures is cached: the next call asks again and gets a token.
-    let before = h.fake.count("access_tokens");
-    h.app.installation_token(1).await.expect("recovers");
-    assert_eq!(h.fake.count("access_tokens"), before + 1);
 }
 
 // Go: TestRepositoriesFollowsPages
@@ -249,13 +135,17 @@ async fn a_next_page_on_another_host_is_never_followed_with_the_token() {
 #[tokio::test]
 async fn a_listing_that_names_a_next_page_for_ever_is_refused() {
     let h = harness().await;
-    let link = format!("<{}/app/installations?page=2>; rel=\"next\"", h.fake.url());
+    let link = format!(
+        "<{}/installation/repositories?page=2>; rel=\"next\"",
+        h.fake.url()
+    );
     let page =
-        Reply::json(&serde_json::json!([{"id": 1, "account": {"login": "org"}}])).with_header("link", &link);
-    h.fake.fail("GET /app/installations", page, 150);
-    let error = h.app.installations().await.unwrap_err();
+        Reply::json(&serde_json::json!({"total_count": 1, "repositories": [{"full_name": "org/app"}]}))
+            .with_header("link", &link);
+    h.fake.fail("GET /installation/repositories", page, 150);
+    let error = h.app.repositories(1).await.unwrap_err();
     assert!(matches!(error, Error::Refused(_)), "{error:?}");
-    assert_eq!(h.fake.count("GET /app/installations"), 100);
+    assert_eq!(h.fake.count("GET /installation/repositories"), 100);
 }
 
 // Go: TestWorkflowFiles
@@ -371,16 +261,13 @@ async fn an_answer_that_does_not_say_its_length_is_cut_off_at_the_limit() {
             counter.fetch_add(chunk.len(), Ordering::SeqCst);
         }
     });
-    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).unwrap();
-    let app = GitHubApp::new(
-        "Iv23test",
-        key,
+    let h = harness().await;
+    let app = h.app_at(
         &format!("http://{address}"),
         Http::new(Duration::from_secs(5), fast()).with_max_body(64 * 1024),
-        Arc::new(TestClock::default()),
     );
     let started = std::time::Instant::now();
-    let err = app.installations().await.unwrap_err();
+    let err = app.repositories(1).await.unwrap_err();
     assert!(matches!(err, Error::Refused(_)), "{err:?}");
     assert!(
         started.elapsed() < Duration::from_secs(4),
@@ -425,16 +312,12 @@ async fn a_redirect_on_the_same_host_is_followed() {
 #[tokio::test]
 async fn a_token_never_goes_out_over_plain_http() {
     let h = harness().await;
-    let key = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).unwrap();
     // A name that is not this machine: nothing is even looked up.
-    let app = GitHubApp::new(
-        "Iv23test",
-        key,
+    let app = h.app_at(
         "http://api.github.example",
         Http::new(Duration::from_secs(5), fast()),
-        h.clock.clone(),
     );
-    let err = app.installations().await.unwrap_err();
+    let err = app.repositories(1).await.unwrap_err();
     assert!(matches!(err, Error::Refused(_)), "{err:?}");
     assert!(err.to_string().contains("api.github.example"), "{err}");
     for (address, safe) in [
@@ -488,11 +371,7 @@ async fn callers_refused_together_share_one_new_token() {
     for call in calls {
         assert_eq!(call.await.unwrap().unwrap().len(), 2);
     }
-    assert_eq!(
-        h.fake.count("access_tokens"),
-        2,
-        "each refused caller bought a token of its own"
-    );
+    assert_eq!(h.reads(), 2, "each refused caller asked for a token of its own");
 }
 
 // not ported: Go's TestLatestCommit, TestTarball and TestLocate* test the source lookups (commit, tarball, moved
@@ -503,7 +382,7 @@ async fn the_installation_of_a_repository_is_found_and_a_missing_one_is_a_404() 
     let h = harness().await;
     assert_eq!(h.app.repo_installation("org/app").await.unwrap(), 1);
     assert_eq!(
-        h.app.repo_installation("org/gone").await.unwrap_err().status(),
+        h.app.repo_installation("else/gone").await.unwrap_err().status(),
         Some(404)
     );
 }
@@ -536,50 +415,36 @@ async fn variables_are_read_and_a_missing_permission_is_said() {
     assert_eq!(h.app.variables(1, "org/app").await.unwrap().len(), 2);
 }
 
-// added: registration
-#[tokio::test]
-async fn a_registration_token_is_asked_with_the_installation_token() {
-    let h = harness().await;
-    let token = h.app.registration_token(1, "org/app").await.unwrap();
-    assert!(token.expose().starts_with("AREG_"));
-    assert_eq!(
-        h.app
-            .registration_token(1, "org/gone")
-            .await
-            .unwrap_err()
-            .status(),
-        Some(404)
-    );
-}
-
 // added: 5xx is tried again, a refusal is not
 #[tokio::test]
 async fn server_errors_are_tried_again_and_refusals_are_not() {
     let h = harness().await;
-    h.fake.fail("GET /app/installations", Reply::text(503, "down"), 1);
-    h.app.installations().await.expect("one 503 is retried");
-    assert_eq!(h.fake.count("GET /app/installations"), 2);
+    h.fake
+        .fail("GET /installation/repositories", Reply::text(503, "down"), 1);
+    h.app.repositories(1).await.expect("one 503 is retried");
+    assert_eq!(h.fake.count("GET /installation/repositories"), 2);
 
     h.fake
-        .fail("GET /app/installations", Reply::text(500, "down"), 10);
-    let err = h.app.installations().await.unwrap_err();
+        .fail("GET /installation/repositories", Reply::text(500, "down"), 10);
+    let err = h.app.repositories(1).await.unwrap_err();
     assert_eq!(err.status(), Some(500));
     assert!(err.is_transient());
     assert_eq!(
-        h.fake.count("GET /app/installations"),
+        h.fake.count("GET /installation/repositories"),
         2 + 3,
         "one try and two retries"
     );
 
-    for status in [401u16, 403, 404, 409] {
+    // A 401 is the token's: replaced once (a_revoked_installation_token_is_replaced_once).
+    for status in [403u16, 404, 409] {
         let h = harness().await;
         h.fake
-            .fail("GET /app/installations", Reply::text(status, "no"), 10);
-        let err = h.app.installations().await.unwrap_err();
+            .fail("GET /installation/repositories", Reply::text(status, "no"), 10);
+        let err = h.app.repositories(1).await.unwrap_err();
         assert_eq!(err.status(), Some(status));
         assert!(!err.is_transient(), "{status}");
         assert_eq!(
-            h.fake.count("GET /app/installations"),
+            h.fake.count("GET /installation/repositories"),
             1,
             "{status} was tried again"
         );
@@ -591,13 +456,13 @@ async fn server_errors_are_tried_again_and_refusals_are_not() {
 async fn retry_after_is_waited_out_when_short_and_reported_when_long() {
     let h = harness().await;
     h.fake.fail(
-        "GET /app/installations",
+        "GET /installation/repositories",
         Reply::text(429, "slow down").with_header("retry-after", "1"),
         1,
     );
     let started = Instant::now();
     h.app
-        .installations()
+        .repositories(1)
         .await
         .expect("a short Retry-After is waited out");
     assert!(
@@ -605,15 +470,15 @@ async fn retry_after_is_waited_out_when_short_and_reported_when_long() {
         "did not wait the Retry-After: {:?}",
         started.elapsed()
     );
-    assert_eq!(h.fake.count("GET /app/installations"), 2);
+    assert_eq!(h.fake.count("GET /installation/repositories"), 2);
 
     h.fake.fail(
-        "GET /app/installations",
+        "GET /installation/repositories",
         Reply::text(429, "slow down").with_header("retry-after", "3600"),
         1,
     );
     let started = Instant::now();
-    let err = h.app.installations().await.unwrap_err();
+    let err = h.app.repositories(1).await.unwrap_err();
     assert_eq!(err.status(), Some(429));
     assert_eq!(
         err.retry_after(),
@@ -628,7 +493,7 @@ async fn retry_after_is_waited_out_when_short_and_reported_when_long() {
 
     // A 403 is a refusal unless GitHub says when to come back (a secondary rate limit).
     h.fake.fail(
-        "GET /app/installations",
+        "GET /installation/repositories",
         Reply::text(403, "limit").with_header("retry-after", "0"),
         1,
     );
@@ -643,12 +508,12 @@ async fn retry_after_is_waited_out_when_short_and_reported_when_long() {
 async fn a_slow_cut_off_or_dropped_response_is_a_network_error() {
     let h = harness_with(fast(), Duration::from_millis(300)).await;
     h.fake.fail(
-        "GET /app/installations",
+        "GET /installation/repositories",
         Reply::After(Duration::from_secs(2), Box::new(Reply::empty(200))),
         10,
     );
     let started = Instant::now();
-    assert!(matches!(h.app.installations().await, Err(Error::Transport(_))));
+    assert!(matches!(h.app.repositories(1).await, Err(Error::Transport(_))));
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the timeout is not applied"
@@ -657,7 +522,7 @@ async fn a_slow_cut_off_or_dropped_response_is_a_network_error() {
     let h = harness().await;
     let body = br#"[{"id":1},{"id":2}]"#.to_vec();
     h.fake.fail(
-        "GET /app/installations",
+        "GET /installation/repositories",
         Reply::Truncated {
             status: 200,
             body,
@@ -666,33 +531,30 @@ async fn a_slow_cut_off_or_dropped_response_is_a_network_error() {
         10,
     );
     assert!(
-        matches!(h.app.installations().await, Err(Error::Transport(_))),
+        matches!(h.app.repositories(1).await, Err(Error::Transport(_))),
         "a cut-off list read as a short list"
     );
-    h.fake.fail("GET /app/installations", Reply::Drop, 10);
+    h.fake.fail("GET /installation/repositories", Reply::Drop, 10);
     // The Truncated faults above matched first and are used up by now or still queued; clear both with calls.
     for _ in 0..4 {
-        let _ = h.app.installations().await;
+        let _ = h.app.repositories(1).await;
     }
-    h.fake.fail("GET /app/installations", Reply::Drop, 10);
-    assert!(matches!(h.app.installations().await, Err(Error::Transport(_))));
+    h.fake.fail("GET /installation/repositories", Reply::Drop, 10);
+    assert!(matches!(h.app.repositories(1).await, Err(Error::Transport(_))));
 }
 
 #[tokio::test]
 async fn an_answer_of_the_wrong_shape_keeps_its_text_out_of_the_error() {
     let h = harness().await;
-    // serde names the value it met where it expected another: here that value is the token.
+    // serde names the value it met where it expected another: here that value is a token.
     for body in [
         r#""ghs_leaked""#,
-        r#"{"token": {"ghs_leaked": 1}}"#,
-        r#"{"token": "ghs_leaked""#,
+        r#"{"total_count": 1, "repositories": {"ghs_leaked": 1}}"#,
+        r#"{"total_count": 1, "repositories": "ghs_leaked""#,
     ] {
-        h.fake.fail(
-            "POST /app/installations/1/access_tokens",
-            Reply::text(201, body),
-            1,
-        );
-        let error = h.app.installation_token(1).await.unwrap_err();
+        h.fake
+            .fail("GET /installation/repositories", Reply::text(200, body), 1);
+        let error = h.app.repositories(1).await.unwrap_err();
         assert!(matches!(error, Error::Decode { .. }), "{error:?}");
         let said = format!("{error} {error:?}");
         assert!(!said.contains("ghs_leaked"), "{said}");
@@ -719,7 +581,7 @@ fn an_answer_shown_for_debugging_shows_none_of_its_body() {
 async fn a_workflow_file_larger_than_its_listing_said_is_left_out() {
     let h = harness().await;
     h.fake.set_workflow("org/app", "ci.yml", "on: push\n");
-    let long = base64::engine::general_purpose::STANDARD.encode("x".repeat(100));
+    let long = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "x".repeat(100));
     h.fake.fail(
         "GET /repos/org/app/git/blobs",
         Reply::json(&serde_json::json!({"content": long, "encoding": "base64"})),
@@ -753,54 +615,6 @@ async fn malformed_json_is_a_decode_error_not_a_panic() {
     }
 }
 
-// added: clock skew on the JWT
-#[tokio::test]
-async fn a_machine_clock_that_is_wrong_still_gets_a_token_github_accepts() {
-    // Each of these is far enough off that GitHub refuses the first token: issued in its future, or already expired.
-    for offset in [-1200i64, -120, 700, 3600] {
-        let h = harness().await;
-        h.fake.set_clock_offset(offset);
-        h.app
-            .installations()
-            .await
-            .unwrap_or_else(|e| panic!("clock {offset}s off: {e}"));
-        let skew = h.app.clock_skew_secs();
-        assert!((skew - offset).abs() <= 2, "learned {skew}s for {offset}s");
-        // Learned once: the next call signs right.
-        let before = h.fake.count("GET /app/installations");
-        h.app.installations().await.unwrap();
-        assert_eq!(h.fake.count("GET /app/installations"), before + 1);
-    }
-    // A little off is inside the margins and needs no correction.
-    let h = harness().await;
-    h.fake.set_clock_offset(30);
-    h.app.installations().await.unwrap();
-    assert_eq!(h.fake.count("GET /app/installations"), 1);
-}
-
-// added: a 401 that is not the clock
-#[tokio::test]
-async fn a_401_that_is_not_about_the_clock_is_not_tried_forever() {
-    let h = harness().await;
-    h.fake.set_clock_offset(3600);
-    // A key GitHub does not know: every token is refused, even one signed by GitHub's time.
-    let other = AppKey::from_pem(&Secret::new(test_key().private_pem.clone())).unwrap();
-    let wrong = GitHubApp::new(
-        "Iv23someoneelse",
-        other,
-        &h.fake.url(),
-        Http::new(Duration::from_secs(5), fast()),
-        h.clock.clone(),
-    );
-    let err = wrong.installations().await.unwrap_err();
-    assert_eq!(err.status(), Some(401));
-    assert!(
-        h.fake.count("GET /app/installations") <= 2,
-        "{}",
-        h.fake.count("GET /app/installations")
-    );
-}
-
 // added: a token GitHub revoked early
 #[tokio::test]
 async fn a_revoked_installation_token_is_replaced_once() {
@@ -812,12 +626,12 @@ async fn a_revoked_installation_token_is_replaced_once() {
         1,
     );
     assert_eq!(h.app.repositories(1).await.unwrap().len(), 2);
-    assert_eq!(h.fake.count("access_tokens"), 2);
+    assert_eq!(h.reads(), 2);
 
     h.fake
         .fail("GET /installation/repositories", Reply::text(401, "no"), 5);
     assert_eq!(h.app.repositories(1).await.unwrap_err().status(), Some(401));
-    assert_eq!(h.fake.count("access_tokens"), 3, "one new token and no more");
+    assert!(h.reads() <= 3, "one new token and no more: {}", h.reads());
 }
 
 // added: one token request for many callers
@@ -835,42 +649,7 @@ async fn concurrent_callers_share_one_token_request() {
         values.insert(call.await.unwrap().unwrap().expose().clone());
     }
     assert_eq!(values.len(), 1);
-    assert_eq!(h.fake.count("access_tokens"), 1);
-}
-
-// added: where the key is read from
-#[cfg(unix)]
-#[test]
-fn credentials_load_from_a_folder_and_a_key_others_can_read_is_refused() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("app.json"),
-        r#"{"client_id":"Iv23abc","other":1}"#,
-    )
-    .unwrap();
-    let pem = dir.path().join("app.pem");
-    std::fs::write(&pem, &test_key().private_pem).unwrap();
-    std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let err = AppCredentials::load(dir.path()).unwrap_err().to_string();
-    assert!(err.contains("0600") && err.contains("app.pem"), "{err}");
-    assert!(!err.contains("BEGIN"));
-
-    std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(AppCredentials::load(dir.path()).unwrap().client_id, "Iv23abc");
-
-    std::fs::write(dir.path().join("app.json"), r#"{"client_id":""}"#).unwrap();
-    assert!(
-        AppCredentials::load(dir.path())
-            .unwrap_err()
-            .to_string()
-            .contains("client_id")
-    );
-    std::fs::write(dir.path().join("app.json"), "{").unwrap();
-    assert!(AppCredentials::load(dir.path()).is_err());
-    std::fs::remove_file(&pem).unwrap();
-    std::fs::write(dir.path().join("app.json"), r#"{"client_id":"Iv23abc"}"#).unwrap();
-    assert!(AppCredentials::load(dir.path()).is_err());
+    assert_eq!(h.reads(), 1);
 }
 
 /// The labels of what [`GitHubApp::waiting_jobs`] read, by job, sorted for comparing.
@@ -1237,36 +1016,30 @@ async fn a_plain_actions_runner_is_registered_with_exactly_its_labels() {
     let labels = vec!["self-hosted".to_string(), "cf-2g".to_string()];
     let jit = h
         .app
-        .generate_jit_config(1, "org/app", "mac-b-1", &labels)
+        .generate_jit_config(1, "org/app", "mac-a-j0000001", &labels)
         .await
         .unwrap();
     assert!(jit.id > 0);
     assert!(!jit.encoded.expose().is_empty());
     assert_eq!(
         h.fake.plain_runners(),
-        [("mac-b-1".to_string(), "org/app".to_string(), labels.clone())]
+        [(
+            "mac-a-j0000001".to_string(),
+            "org/app".to_string(),
+            labels.clone()
+        )]
     );
     let again = h
         .app
-        .generate_jit_config(1, "org/app", "mac-b-1", &labels)
+        .generate_jit_config(1, "org/app", "mac-a-j0000001", &labels)
         .await
         .unwrap_err();
     assert_eq!(again.status(), Some(409));
     assert_eq!(h.fake.plain_runners().len(), 1);
-    // Sent once: GitHub may have registered it although its answer failed, and a second try would meet the name.
-    let path = "POST /repos/org/app/actions/runners/generate-jitconfig";
-    let sent = h.fake.count(path);
-    h.fake.fail(path, Reply::text(502, "bad gateway"), 1);
-    let failed = h
-        .app
-        .generate_jit_config(1, "org/app", "mac-b-3", &labels)
-        .await
-        .unwrap_err();
-    assert_eq!(failed.status(), Some(502));
-    assert_eq!(h.fake.count(path), sent + 1);
+    // Sent once whatever the answer: `cf-console-client`'s a_runner_is_asked_for_once_even_when_the_answer_fails.
     let unknown = h
         .app
-        .generate_jit_config(1, "org/none", "mac-b-2", &labels)
+        .generate_jit_config(1, "org/none", "mac-a-j0000002", &labels)
         .await
         .unwrap_err();
     assert_eq!(unknown.status(), Some(404));

@@ -15,6 +15,10 @@ pub trait Scaler: Send {
     /// sends it again. Returns how many Actions runners the machine would take now, which the next wait carries to the
     /// service. An error ends the session without acknowledging the message.
     fn scale(&mut self, message: Option<&Message>) -> impl Future<Output = Result<usize, Error>> + Send;
+
+    /// The number the last [`Scaler::scale`] returned never reached the service: the scaler is asked again before
+    /// any wait carried it.
+    fn not_sent(&mut self) {}
 }
 
 /// Asks [`listen`] and [`supervise`] to stop.
@@ -81,6 +85,18 @@ pub async fn listen_nudged(
     loop {
         if stop.is_set() {
             return Ok(());
+        }
+        // A nudge kept while the scaler or an acknowledgement was busy: the scaler is asked again before the wait,
+        // and the number it gave before goes to the service with no wait.
+        let rang = tokio::select! {
+            biased;
+            () = nudge.notified() => true,
+            () = std::future::ready(()) => false,
+        };
+        if rang {
+            scaler.not_sent();
+            capacity = scaler.scale(None).await?;
+            continue;
         }
         let polled = tokio::select! {
             biased;

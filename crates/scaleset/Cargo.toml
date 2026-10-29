@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+cf-console-client = { path = "../console-client" }
 cf-ghapp = { path = "../ghapp" }
 cf-secret = { path = "../secret" }
 rand = "0.9"
@@ -20,6 +21,7 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
+cf-harness = { path = "../harness" }
 cf-fake-github = { path = "../fake-github" }
 proptest.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

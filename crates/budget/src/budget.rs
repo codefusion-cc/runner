@@ -569,11 +569,17 @@ impl Budget {
                 Assigned::Start(self.insert(slot, size, None, self.assigned_origin(now)))
             }
             Err(why) => {
+                // A job that comes later has waited no longer, whatever a clock that went back says: the line stays
+                // in the order the jobs came, and none reaches the defer limit before one that came earlier.
+                let since = self
+                    .waiting
+                    .back()
+                    .map_or(now.elapsed, |last| last.since.max(now.elapsed));
                 self.waiting.push_back(Waiter {
                     slot,
                     size,
                     turn,
-                    since: now.elapsed,
+                    since,
                 });
                 Assigned::Waits { slot, why }
             }

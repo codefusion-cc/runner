@@ -5,7 +5,7 @@
 //! test drives them one at a time; [`Service::run`] is the loop that calls them until it is told to stop.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,12 +16,12 @@ use cf_console_client::{
     MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
     RunnerUsage, ScaleSetStatus, Share, SizeStatus, Stalls, Status, Update,
 };
-use cf_ghapp::{Clock, GitHubApp, Repo};
+use cf_ghapp::{Clock, GitHubApp, KeyTokens, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
 use cf_workflows::{LabelSet, TRUSTED_LABEL, self_hosted_with};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
@@ -107,6 +107,13 @@ pub struct ServiceConfig {
     pub queued_keep: Duration,
     /// The most label sets of queued jobs served for one repository, and for the host: the newest are.
     pub queued_bounds: (usize, usize),
+    /// Where a GitHub App key this host held before the console held it would be (`<the old app_dir>/app.pem`), as
+    /// the update that deleted it remembered: reported to the console while a file is there (`appKeyFile`).
+    pub app_key_file: Option<PathBuf>,
+    /// What the report says of the GitHub App's key from the start (`appKeyKept`) on a host that holds no key it
+    /// signs with: why its settings still name the key's folder (its key file is missing and no take-out of this
+    /// Runner deleted it, or the settings file could not be written once one did).
+    pub app_key_said: Option<String>,
     /// How often a trusted host asks the console for an Actions runner while it has none: the console answers
     /// that no trusted job waits, with a time to ask again, until one does.
     pub trusted_every: Duration,
@@ -140,10 +147,43 @@ impl ServiceConfig {
             queue_budget: Duration::from_secs(45),
             queued_keep: Duration::from_secs(30 * 60),
             queued_bounds: (8, 32),
+            app_key_file: None,
+            app_key_said: None,
             trusted_every: Duration::from_secs(15),
         }
     }
 }
+
+/// The Runners App's key a host still holds from before the console held it (rollout step 3 of the console's
+/// `docs/RUNNERS.md`). While it does, the Runner reads GitHub and makes its scale set calls with the key, as before
+/// the console made them, and asks the console's scale set calls at each discovery whether they answer this host:
+/// once one did, it takes the key out ([`HeldKey::take_out`]) and starts again, and from then on goes through the
+/// console. Until then its report says why it keeps the key (`appKeyKept`).
+pub struct HeldKey {
+    /// The key's tokens, which the service's GitHub App client signs for too.
+    pub tokens: Arc<KeyTokens>,
+    /// The key file, which the report names while the host holds it (`appKeyFile`).
+    pub file: PathBuf,
+    /// Deletes the key file and takes its folder out of the settings, so that the Runner that starts next goes
+    /// through the console: what it did once the key is gone (the settings may still name its folder, and say why),
+    /// or why the key stays. Called only right after a call of the console's scale set calls that this host made was
+    /// answered.
+    pub take_out: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for HeldKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldKey")
+            .field("file", &self.file)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The most characters of `appKeyKept` the console reads.
+const KEY_KEPT_MAX: usize = 300;
+
+/// What the report says while a host keeps the key because the console's scale set calls were not asked yet.
+pub const KEY_NOT_ASKED: &str = "the console's scale set calls were not asked yet";
 
 /// The console and the job events that wait for it.
 pub struct Console {
@@ -289,6 +329,9 @@ pub struct ServiceParts<H, V> {
     /// Where the console's last word on the pause is kept, so that a Runner that starts again (after an update, a
     /// crash) takes no job on a paused host before the console says so again; none to keep it in memory only.
     pub pause: Option<PathBuf>,
+    /// The Runners App's key the host still holds, until the console's scale set calls answered it; none on a host
+    /// that goes through the console alone. `app` signs with it too.
+    pub held_key: Option<HeldKey>,
 }
 
 struct Shared<H, V> {
@@ -316,6 +359,8 @@ struct Shared<H, V> {
     results: Mutex<Vec<CommandResult>>,
     /// Registrations GitHub would not remove, and when each is tried again.
     refused: Mutex<BTreeMap<String, Instant>>,
+    /// Held through a sweep: the service's own and an uninstall's take turns, so no removal is sent twice.
+    sweeping: AsyncMutex<()>,
     console_paused: Mutex<bool>,
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
@@ -341,6 +386,9 @@ struct Shared<H, V> {
     looked: AtomicBool,
     /// Whether the last look at the Docker check found Docker refused: a change reads the label sets again.
     docker_refused: AtomicBool,
+    /// The key the host still holds, and why it keeps it (for the report): none once taken out.
+    held_key: Option<HeldKey>,
+    key_kept: Mutex<Option<String>>,
     /// Rung when the label sets are to be read again before the next discovery in its turn: the looks at GitHub
     /// take it one at a time with the others.
     rediscover: Notify,
@@ -547,6 +595,42 @@ impl Reports for LoggedReports {
     }
 }
 
+impl<H, V> Shared<H, V> {
+    /// The scale set client of `repo` (`owner/name`, whose page is `page`), made once and kept for removing what is
+    /// left there: through the console, or with the key a host still holds; none on a Runner that is neither enrolled
+    /// nor holds the key, which has no scale sets.
+    fn client_of(&self, installation: i64, repo: &str, page: &str) -> Option<ScaleSetClient> {
+        let make = || match (&self.held_key, &self.console) {
+            (Some(key), _) => Some(ScaleSetClient::with_key(
+                self.app.clone(),
+                key.tokens.clone(),
+                &self.config.machine,
+                installation,
+                repo,
+                page,
+                self.config.poll_timeout,
+            )),
+            (None, Some(console)) => Some(ScaleSetClient::new(
+                self.app.clone(),
+                console.client.clone(),
+                &self.config.machine,
+                installation,
+                repo,
+                page,
+                self.config.poll_timeout,
+            )),
+            (None, None) => None,
+        };
+        let mut clients = self.clients.lock().expect("clients");
+        if let Some(client) = clients.get(repo) {
+            return Some(client.clone());
+        }
+        let client = make()?;
+        clients.insert(repo.to_string(), client.clone());
+        Some(client)
+    }
+}
+
 impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// Another handle on this service, for a task of its own.
     fn handle(&self) -> Service<H, V> {
@@ -561,6 +645,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let paused = parts.console.is_some() && kept_pause(parts.pause.as_deref());
         // Before any listener opens: a host the console paused stays closed until the console answers.
         parts.machines.pause(paused);
+        let app_key_said = parts.config.app_key_said.clone();
         Service {
             shared: Arc::new(Shared {
                 app: parts.app,
@@ -579,6 +664,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 queued: Mutex::new(Queued::default()),
                 queue_cursor: AtomicUsize::new(0),
                 refused: Mutex::new(BTreeMap::new()),
+                sweeping: AsyncMutex::new(()),
                 console_paused: Mutex::new(paused),
                 told: Mutex::new((0, false)),
                 unanswered: AtomicUsize::new(0),
@@ -594,6 +680,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 looked: AtomicBool::new(false),
                 test_run: Mutex::new(None),
                 docker_refused: AtomicBool::new(false),
+                key_kept: Mutex::new(match &parts.held_key {
+                    Some(_) => Some(KEY_NOT_ASKED.to_string()),
+                    None => app_key_said.map(|said| cut(said, KEY_KEPT_MAX)),
+                }),
+                held_key: parts.held_key,
                 rediscover: Notify::new(),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
                 results_file: parts.results,
@@ -708,6 +799,88 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// is left, deleted.
     pub async fn discover(&self) {
         self.look(true).await;
+        self.ask_for_the_key().await;
+    }
+
+    /// Why the host keeps the Runners App's key, while it holds one.
+    pub fn key_kept(&self) -> Option<String> {
+        self.shared.key_kept.lock().expect("key kept").clone()
+    }
+
+    /// On a host that still holds the Runners App's key: asks the console's scale set calls for this host's scale
+    /// sets of each repository it serves in turn, until they answered about one; then takes the key out and starts
+    /// again, through the console. Otherwise the key stays and serves, and the report says why the last one asked
+    /// was not answered: one repository the console refuses keeps no key. A console that cannot be reached, is busy
+    /// or has no such calls would answer the same about every repository, and is asked about one.
+    async fn ask_for_the_key(&self) {
+        let shared = &self.shared;
+        let Some(key) = &shared.held_key else {
+            return;
+        };
+        let keep = |why: String| {
+            let why = cut(why, KEY_KEPT_MAX);
+            let mut kept = shared.key_kept.lock().expect("key kept");
+            if kept.as_deref() != Some(why.as_str()) {
+                tracing::warn!(file = %key.file.display(), %why, "the GitHub App's key stays on this host and serves");
+            }
+            *kept = Some(why);
+        };
+        let Some(console) = &shared.console else {
+            return keep("this Runner is not enrolled with a console".into());
+        };
+        let repos: Vec<String> = shared
+            .main
+            .lock()
+            .expect("main")
+            .as_ref()
+            .map(|read| {
+                read.repos
+                    .iter()
+                    .map(|(repo, _)| repo.full_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut not_answered = None;
+        let mut answered = None;
+        for repo in repos {
+            match console.client.scaleset_list(&repo).await {
+                Ok(_) => {
+                    answered = Some(repo);
+                    break;
+                }
+                Err(error) => {
+                    let of_this_repo = matches!(
+                        &error,
+                        cf_console_client::Error::Refused { status, code, .. } if !(*status == 404 && code.is_none())
+                    );
+                    not_answered = Some(error);
+                    if !of_this_repo {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(repo) = answered else {
+            return keep(match not_answered {
+                Some(error) => format!(
+                    "the console's scale set calls did not answer: {}",
+                    why_not(&error)
+                ),
+                None => "no repository is served yet to ask the console's scale set calls about".into(),
+            });
+        };
+        let take_out = key.take_out.clone();
+        match tokio::task::spawn_blocking(move || take_out()).await {
+            Ok(Ok(done)) => {
+                tracing::warn!(%repo, %done, "the console's scale set calls answered: the GitHub App's key is taken out, and the Runner starts again through the console");
+                *shared.key_kept.lock().expect("key kept") = None;
+                self.restart();
+            }
+            Ok(Err(why)) => keep(format!(
+                "the console's scale set calls answer, and the key could not be taken out: {why}"
+            )),
+            Err(error) => keep(format!("the key's take-out stopped: {error}")),
+        }
     }
 
     /// Reads the jobs GitHub has queued and serves the label sets of those no workflow on a default branch names,
@@ -847,7 +1020,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 if shared.roster.active(&repo, set.id) == 0 {
                     match client.delete_scale_set(set.id).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             tracing::info!(%repo, set = %set.name, "a scale set nothing asks for was deleted")
                         }
                         Err(error) => {
@@ -1165,21 +1338,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 }
                 served.push((repo.clone(), installation.id));
                 let name = repo.full_name.clone();
-                let client = shared
-                    .clients
-                    .lock()
-                    .expect("clients")
-                    .entry(name.clone())
-                    .or_insert_with(|| {
-                        ScaleSetClient::new(
-                            shared.app.clone(),
-                            installation.id,
-                            &name,
-                            &repo.html_url,
-                            shared.config.poll_timeout,
-                        )
-                    })
-                    .clone();
+                let Some(client) = shared.client_of(installation.id, &name, &repo.html_url) else {
+                    problems.push(format!(
+                        "{name}: scale sets need the console, and this Runner is not enrolled"
+                    ));
+                    continue;
+                };
                 if shared.config.policy.trusted.is_some() {
                     // What its workflows ask for does not matter: its jobs come to Actions runners of its own.
                     continue;
@@ -1291,6 +1455,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if let Some(client) = shared.clients.lock().expect("clients").get(repo) {
             return Some(client.clone());
         }
+        if shared.console.is_none() && shared.held_key.is_none() {
+            return None;
+        }
         let installation = shared.app.repo_installation(repo).await.ok()?;
         let found = shared
             .app
@@ -1299,19 +1466,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .ok()?
             .into_iter()
             .find(|found| found.full_name.eq_ignore_ascii_case(repo))?;
-        let client = ScaleSetClient::new(
-            shared.app.clone(),
-            installation,
-            repo,
-            &found.html_url,
-            shared.config.poll_timeout,
-        );
-        shared
-            .clients
-            .lock()
-            .expect("clients")
-            .insert(repo.to_string(), client.clone());
-        Some(client)
+        shared.client_of(installation, &found.full_name, &found.html_url)
     }
 
     /// Finds the jobs GitHub holds back from this host's scale sets while they have room ([`crate::held`]), keeps
@@ -1545,7 +1700,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             Ok(runner) => tracing::info!(%runner, %repo, "a trusted job waits: an Actions runner takes it"),
             Err(error) => {
                 machines.release(ticket);
-                if error.retry_after().is_some() {
+                // Only the console's 409 says no trusted job waits; a 429 or a 5xx says when to ask again too.
+                if error.is_no_job_yet() {
                     tracing::debug!(%repo, %error, "no trusted job waits yet");
                 } else {
                     tracing::warn!(%repo, %error, "an Actions runner for a trusted job could not start");
@@ -1640,6 +1796,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// tried again later, for as long as it takes.
     pub async fn sweep(&self) {
         let shared = &self.shared;
+        let _turn = shared.sweeping.lock().await;
         for registration in shared.machines.registrations_to_remove() {
             let waits = shared
                 .refused
@@ -1656,24 +1813,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 self.sweep_later(registration.runner);
                 continue;
             };
-            let id = match registration.runner_id {
-                Some(id) => Ok(Some(id)),
-                // Registered or not, nobody heard: GitHub is asked by name.
-                None => client
-                    .runner_by_name(&registration.runner)
-                    .await
-                    .map(|found| found.map(|runner| runner.id)),
-            };
-            // GitHub's answer is what proves anything (`Machines::answered`); no answer (a 5xx, a timeout, a dropped
-            // connection) proves nothing, and the removal is sent again at a later sweep.
-            let answer = match id {
-                Ok(None) => Ok(machines::Answer::Gone),
-                Ok(Some(id)) => match client.remove_runner(id).await {
-                    Ok(()) => Ok(machines::Answer::Removed),
-                    Err(error) if error.is_not_found() => Ok(machines::Answer::Gone),
-                    Err(error) if error.status() == Some(422) => Ok(machines::Answer::Refused),
-                    Err(error) => Err(error),
-                },
+            // Removed by its name, which the console checks is this machine's: an ID heard or not, the name is the
+            // registration's. GitHub's answer is what proves anything (`Machines::answered`); no answer (a 5xx, a
+            // timeout, a dropped connection) proves nothing, and the removal is sent again at a later sweep.
+            let answer = match client.remove_runner_named(&registration.runner).await {
+                Ok(true) => Ok(machines::Answer::Removed),
+                Ok(false) => Ok(machines::Answer::Gone),
+                Err(error) if error.status() == Some(422) => Ok(machines::Answer::Refused),
                 Err(error) => Err(error),
             };
             match answer {
@@ -1857,6 +2003,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 update,
                 not_serving,
                 starting: !shared.looked.load(Ordering::SeqCst),
+                app_key_file: held_key_file(
+                    shared
+                        .held_key
+                        .as_ref()
+                        .map(|key| key.file.as_path())
+                        .or(shared.config.app_key_file.as_deref()),
+                ),
+                app_key_kept: self.key_kept(),
                 settings_error: settings_error
                     .as_ref()
                     .map(|(error, _)| cut(error.clone(), STATUS_TEXT_MAX)),
@@ -2752,7 +2906,7 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     machines.answered(runner, answer);
                 })
                 .await;
-                let session = client.open_session(set.id, &shared.config.machine).await?;
+                let session = client.open_session(set.id).await?;
                 tracing::info!(set = %name, "a session is open: the Runner listens for this scale set's jobs");
                 let slots: Arc<dyn Slots> = machines.clone();
                 let mut scaler = Scaler::new(
@@ -2833,4 +2987,34 @@ impl<S: cf_scaleset::Scaler, F: Fn(Option<usize>) + Send + Sync> cf_scaleset::Sc
         (self.1)(capacity.as_ref().ok().copied());
         capacity
     }
+
+    fn not_sent(&mut self) {
+        self.0.not_sent();
+    }
+}
+
+/// Why the console's scale set calls did not answer, in words for the owner: an older console without them, GitHub
+/// through the console off for the host, or the console's own failure.
+fn why_not(error: &cf_console_client::Error) -> String {
+    use cf_console_client::Error;
+    match error {
+        Error::Refused {
+            status: 404,
+            code: None,
+            ..
+        } => "the console has no such calls yet (404)".into(),
+        Error::GithubOff(_) => "GitHub through the console is off for this host".into(),
+        other => other.to_string(),
+    }
+}
+
+/// The key file a host still holds where its App's key was, as the report names it: an absolute path of at most
+/// [`cf_console_client::KEY_FILE_PATH_MAX`] bytes that is there (a link included, which is not followed), or none.
+fn held_key_file(path: Option<&Path>) -> Option<String> {
+    let path = path?;
+    let text = path.to_str()?;
+    if !path.is_absolute() || text.len() > cf_console_client::KEY_FILE_PATH_MAX {
+        return None;
+    }
+    std::fs::symlink_metadata(path).ok().map(|_| text.to_string())
 }

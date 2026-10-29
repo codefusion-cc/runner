@@ -39,6 +39,7 @@ GitHub said is over.
 | `Gone` | 404, under a VM that never came up | nothing ran | `Unregistered` |
 | `Refused` | 422 | a job holds the registration | `JobStarted`, inferred if none was heard |
 | `Busy` | REST `busy: true` at a session's opening | the same | `JobStarted` |
+| any | after a 204 or 404 was heard | nothing more: a removal or look sent before that answer came | nothing |
 
 A 5xx, a timeout or a lost answer proves nothing: the removal is tried again at the next sweep. Only a 204 says no
 job ran.

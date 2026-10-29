@@ -1,4 +1,4 @@
-//! The Runner's configuration file: where its state is, which GitHub App and console it talks to, what the host
+//! The Runner's configuration file: where its state is, which console it gets its GitHub tokens from, what the host
 //! is for. One JSON file that the service manager's entry names; nothing in it is a secret.
 
 use std::collections::BTreeMap;
@@ -13,6 +13,8 @@ use serde::Deserialize;
 /// The label of the cf-runners manager's launchd agent, which the Runner may run beside and never touches.
 #[cfg(target_os = "macos")]
 pub const OLD_MANAGER_LABEL: &str = "cc.codefusion.runners";
+/// The file in the state folder that holds the host's token for its console, as `enroll` keeps it.
+pub const CONSOLE_TOKEN: &str = "console-token";
 
 /// What a person works on the Mac means for jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -46,9 +48,9 @@ pub struct Config {
     /// The folder with everything the Runner keeps: images, job disks, records, the outbox, logs. On the
     /// internal disk: a launchd agent may not open an external volume.
     pub state_dir: PathBuf,
-    /// The folder with the GitHub App's `app.json` and `app.pem`, when the Mac signs for its GitHub tokens itself.
-    /// Left out, the Mac gets them from the console it is enrolled with (`console`), which holds the App's key. With
-    /// both, the console's serve while the owner has turned them on for the Mac, and the key the rest of the time.
+    /// The folder with the GitHub App's `app.json` and `app.pem`, on a host that held the key before the console
+    /// held it. The Runner signs with it until the console's scale set calls answered this host, then deletes the key
+    /// file and takes this out of the file ([`crate::app_key`]). A new host leaves it out.
     #[serde(default)]
     pub app_dir: Option<PathBuf>,
     /// GitHub's API.
@@ -69,7 +71,9 @@ pub struct Config {
     /// The most Docker jobs at once: a daemon and its builds take more of the Mac's processors than other jobs.
     #[serde(default = "docker_max_jobs")]
     pub docker_max_jobs: usize,
-    /// The console's address, when the Mac reports to one.
+    /// The console's address. It holds the GitHub App's key and gives the host its GitHub tokens, so a host that is
+    /// not enrolled with it (`enroll`) reaches nothing at GitHub. Required unless the host still holds the key
+    /// (`app_dir`); `None` also inside the Runner, for a look that reports to nobody.
     #[serde(default)]
     pub console: Option<String>,
     /// Whether a person works on the Mac. Required on a Mac; on Linux, where nobody sits at the host, it is
@@ -139,22 +143,10 @@ const fn dedicated() -> Use {
 }
 
 impl Config {
-    /// Reads and checks the file. One that others can write is refused: it says where the console's token and the
-    /// App's key go.
+    /// Reads and checks the file. One that others can write is refused: it says where the state folder and the
+    /// console are.
     pub fn load(path: &Path) -> Result<Config, String> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?
-            .permissions()
-            .mode();
-        if mode & 0o022 != 0 {
-            return Err(format!(
-                "{}: others can write it (mode {:o}); `chmod go-w` it",
-                path.display(),
-                mode & 0o777
-            ));
-        }
-        let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let text = read_settings(path)?;
         Config::parse(&text).map_err(|error| format!("{}: {error}", path.display()))
     }
 
@@ -173,12 +165,20 @@ impl Config {
             ));
         }
         let build_folder = self.build_folder.iter().map(|folder| ("build_folder", folder));
-        let app_dir = self.app_dir.iter().map(|folder| ("app_dir", folder));
+        let app_dir = self.app_dir.iter().map(|folder| (APP_DIR, folder));
         let folders = std::iter::once(("state_dir", &self.state_dir)).chain(app_dir);
         for (what, folder) in folders.chain(build_folder.clone()) {
             if !folder.is_absolute() {
                 return Err(format!("{what}: `{}` is not an absolute path", folder.display()));
             }
+        }
+        // A key folder named through `..` could hold a key file outside it, which the Runner would delete.
+        if let Some(folder) = &self.app_dir
+            && folder
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err(format!("{APP_DIR}: `{}` goes through `..`", folder.display()));
         }
         // The service reads and writes the state folder, and `update` builds in the build folder.
         #[cfg(target_os = "macos")]
@@ -198,12 +198,8 @@ impl Config {
                     .into(),
             );
         }
-        if self.app_dir.is_none() && self.console.is_none() {
-            return Err(
-                "app_dir: the folder of the GitHub App's key, unless the Mac gets its GitHub tokens from the console \
-                 (`console`)"
-                    .into(),
-            );
+        if self.console.is_none() && self.app_dir.is_none() {
+            return Err(NO_CONSOLE.into());
         }
         if self.image.is_empty() {
             return Err("image: no version".into());
@@ -363,7 +359,7 @@ impl Config {
 
     /// Where this Mac's token for the console is kept, readable by its owner alone.
     pub fn console_token(&self) -> PathBuf {
-        self.state_dir.join("console-token")
+        self.state_dir.join(CONSOLE_TOKEN)
     }
 
     /// Where the service writes its log.
@@ -375,6 +371,30 @@ impl Config {
     pub fn program(&self) -> PathBuf {
         self.state_dir.join("bin").join("codefusion-runner")
     }
+}
+
+/// The key of the GitHub App's folder, on a host that still holds the key.
+pub const APP_DIR: &str = "app_dir";
+
+const NO_CONSOLE: &str =
+    "console: the console's address; it holds the GitHub App's key and gives this host its GitHub tokens";
+
+/// The settings file's text, when only its owner can write it: whoever writes it says where the state folder and the
+/// console are.
+pub fn read_settings(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{}: others can write it (mode {:o}); `chmod go-w` it",
+            path.display(),
+            mode & 0o777
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// The name the cf-runners manager has on this Mac, when it is installed for this user: the `machine` of its
@@ -420,7 +440,7 @@ mod tests {
     const WHOLE: &str = r#"{
         "machine": "mac-a-vm",
         "state_dir": "/Users/someone/Library/Application Support/CodeFusion Runner",
-        "app_dir": "/Users/someone/.config/codefusion-runners",
+        "console": "https://console.example",
         "image": "2026.10.1",
         "use": "dedicated"
     }"#;
@@ -461,7 +481,7 @@ mod tests {
         assert_eq!(config.github_api, "https://api.github.com");
         assert_eq!(config.deadline(), Duration::from_secs(6 * 3600));
         assert_eq!(config.mode(), Mode::Dedicated);
-        assert_eq!(config.console, None);
+        assert_eq!(config.console.as_deref(), Some("https://console.example"));
         assert_eq!(config.repos, Vec::<String>::new());
         assert_eq!(
             config.program(),
@@ -607,41 +627,57 @@ mod tests {
     }
 
     #[test]
-    fn github_tokens_come_from_the_apps_key_the_console_or_both() {
-        let key = Config::parse(WHOLE).expect("the key");
-        assert_eq!(
-            key.app_dir,
-            Some(PathBuf::from("/Users/someone/.config/codefusion-runners"))
-        );
-        let console = with(|v| {
-            v.as_object_mut().expect("object").remove("app_dir");
-            v["console"] = "https://console.example".into();
+    fn github_tokens_come_from_the_console_or_a_key_the_host_still_holds() {
+        let no_console = with(|v| {
+            v.as_object_mut().expect("object").remove("console");
         })
-        .expect("the console alone");
-        assert_eq!(console.app_dir, None);
+        .expect_err("no console");
         assert!(
-            with(|v| v["console"] = "https://console.example".into()).is_ok(),
-            "both"
+            no_console.starts_with("console:") && no_console.contains("GitHub tokens"),
+            "{no_console}"
         );
         assert!(
-            with(|v| v["app_dir"] = serde_json::Value::Null).is_err(),
+            with(|v| v["console"] = serde_json::Value::Null).is_err(),
+            "null is no console"
+        );
+        // A host that held the App's key before the console held it: taken, with a console or without one.
+        let folder = "/Users/someone/.config/codefusion-runners";
+        for console in [true, false] {
+            let config = with(|v| {
+                v["app_dir"] = folder.into();
+                if !console {
+                    v.as_object_mut().expect("object").remove("console");
+                }
+            })
+            .expect("a key folder");
+            assert_eq!(config.app_dir, Some(PathBuf::from(folder)), "{console}");
+            assert_eq!(config.console.is_some(), console);
+        }
+        assert_eq!(Config::parse(WHOLE).expect("whole").app_dir, None);
+        // Only an absolute folder that does not go through `..`: the Runner deletes `app.pem` in it.
+        for app_dir in [
+            serde_json::Value::from("relative/app"),
+            serde_json::Value::from(""),
+            serde_json::Value::from("/Users/someone/app/../../other"),
+            serde_json::Value::from(7),
+        ] {
+            assert!(with(|v| v["app_dir"] = app_dir.clone()).is_err(), "{app_dir}");
+        }
+        assert!(
+            with(|v| {
+                v["app_dir"] = serde_json::Value::Null;
+                v.as_object_mut().expect("object").remove("console");
+            })
+            .is_err(),
             "null is no folder, and no console"
-        );
-        let neither = with(|v| {
-            v.as_object_mut().expect("object").remove("app_dir");
-        })
-        .expect_err("neither");
-        assert!(
-            neither.starts_with("app_dir:") && neither.contains("console"),
-            "{neither}"
         );
     }
 
     #[test]
     fn the_state_folder_is_absolute_and_on_a_mac_on_no_external_volume() {
         assert!(with(|v| v["state_dir"] = "state".into()).is_err());
-        assert!(with(|v| v["app_dir"] = "~/.config/x".into()).is_err());
-        assert!(with(|v| v["app_dir"] = "".into()).is_err());
+        assert!(with(|v| v["build_folder"] = "~/runner".into()).is_err());
+        assert!(with(|v| v["build_folder"] = "".into()).is_err());
         let external = with(|v| v["state_dir"] = "/Volumes/External/runner".into());
         if cfg!(target_os = "macos") {
             let error = external.expect_err("refused");

@@ -4,8 +4,8 @@ mod support;
 
 use std::time::Duration;
 
-use cf_fake_github::harness::until;
 use cf_fake_github::{JobState, Options};
+use cf_harness::until;
 use cf_scaleset::{listen, shutdown};
 use support::*;
 

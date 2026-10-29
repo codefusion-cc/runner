@@ -109,6 +109,8 @@ pub fn status(machine: &str) -> Status {
         update: None,
         not_serving: None,
         starting: false,
+        app_key_file: None,
+        app_key_kept: None,
         settings_error: None,
         settings_error_at: None,
         idle_with_jobs_waiting_seconds: 0,
