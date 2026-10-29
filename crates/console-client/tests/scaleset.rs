@@ -10,7 +10,7 @@ use std::time::Duration;
 use cf_console_client::{
     Client, Error, NAME_TAKEN, NOT_YOURS, RUNNER_BUSY, Removal, SESSION_EXISTS, SESSION_LOST,
 };
-use cf_fake_console::{FakeConsole, SESSIONS_PER_WINDOW, SETS_PER_WINDOW};
+use cf_fake_console::{FakeConsole, RATE_WINDOW_S, SESSIONS_PER_WINDOW, SETS_PER_WINDOW};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{FakeGithub, Options};
 use cf_ghapp::Http;
@@ -600,6 +600,11 @@ async fn a_removed_machine_is_unknown() {
 #[tokio::test]
 async fn a_machine_over_its_rate_waits_to_the_end_of_the_window() {
     let rig = rig().await;
+    // The windows are fixed on the console's clock: start this at the first second of one, so no window ends while the
+    // calls are counted, however slow the machine running the test.
+    rig.github.set_clock_offset(0);
+    let into = rig.github.now_epoch().rem_euclid(RATE_WINDOW_S);
+    rig.github.set_clock_offset(1 - into);
     // The set made counts in the window.
     let id = rig.set().await;
     for _ in 1..SETS_PER_WINDOW {
