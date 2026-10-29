@@ -1084,7 +1084,7 @@ async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers
             .is_some_and(|r| r["status"]["paused"] == json!(true))
     })
     .await;
-    // The console still makes the scale set calls (only it can now) but hears no report.
+    // The console makes the scale set calls, which only it can, but hears no report.
     rig.console.reports_down(true);
     rig.restart().await;
     for set in rig.github.scale_sets() {
