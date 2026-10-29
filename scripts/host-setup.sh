@@ -18,6 +18,8 @@
 # --github-api GitHub's API the Runner talks to, for a test against the fakes (`cargo xtask fakes serve`)
 # --check      does every step but the enrolment and the service, and needs no code
 #
+# GITHUB_TOKEN, when set, goes with its reads of GitHub's API (the image's release), whose rate limit it waits out.
+#
 # Each step is skipped when it is done already. A host that enrolled is set up: run again (a reboot's startup script),
 # it only makes sure the service runs. It says each step on standard output; a failure ends it with one line on
 # standard error, `host-setup: <step>: <why>`, and a status other than 0.
@@ -48,6 +50,45 @@ ended() {
 }
 trap ended EXIT
 say() { echo "host-setup: $step: $*"; }
+
+# A GET of GitHub's API, its body on standard output. It sends GITHUB_TOKEN when that is set (on standard input, never
+# on a command line). A 403 or 429 (GitHub's rate limit), a 408, a 5xx or no answer at all is asked again after the
+# wait the answer names (Retry-After, else x-ratelimit-reset), else after 2, 4, 8 … s, each wait at most
+# GITHUB_WAIT_MAX s, GITHUB_TRIES times in all. Any other status fails at once.
+github_get() {
+  local url=$1 tries=0 status wait reset headers body
+  headers=$(mktemp) body=$(mktemp)
+  while :; do
+    status=$(
+      {
+        echo 'header = "Accept: application/vnd.github+json"'
+        [[ -z ${GITHUB_TOKEN:-} ]] || echo "header = \"Authorization: Bearer $GITHUB_TOKEN\""
+      } | curl -sSL --config - -D "$headers" -o "$body" -w '%{http_code}' "$url"
+    ) || status=000
+    if [[ $status == 2?? ]]; then
+      cat "$body"
+      rm -f "$headers" "$body"
+      return 0
+    fi
+    if [[ ! $status =~ ^(000|403|408|429|5..)$ ]] || ((++tries >= ${GITHUB_TRIES:-6})); then
+      echo "host-setup: $step: GitHub answered $status for $url" >&2
+      rm -f "$headers" "$body"
+      return 1
+    fi
+    # The headers of the last answer (-L may have followed a redirect), by name in any case.
+    wait=$(tr -d '\r' <"$headers" | awk -F': *' 'tolower($1) == "retry-after" { v = $2 } END { print v }')
+    if [[ ! $wait =~ ^[0-9]+$ ]]; then
+      reset=$(tr -d '\r' <"$headers" | awk -F': *' 'tolower($1) == "x-ratelimit-reset" { v = $2 } END { print v }')
+      if [[ $reset =~ ^[0-9]+$ ]]; then wait=$((reset - $(date +%s))); else wait=$((2 ** tries)); fi
+    fi
+    ((wait >= 1)) || wait=1
+    ((wait <= ${GITHUB_WAIT_MAX:-900})) || wait=${GITHUB_WAIT_MAX:-900}
+    echo "host-setup: $step: GitHub answered $status, asking again in ${wait}s" >&2
+    sleep "$wait"
+  done
+}
+# Sourced (the tests), it only defines the above.
+if (return 0 2>/dev/null); then return 0; fi
 
 while (($#)); do
   case $1 in
@@ -209,7 +250,7 @@ fi
 step=image
 if [[ -z $image ]]; then
   # The arm64 releases are image-…, the x86_64 ones amd64-image-… of the same build.
-  image=$(curl -fsSL --retry 5 "$RELEASES_API?per_page=50" |
+  image=$(github_get "$RELEASES_API?per_page=50" |
     jq -r --arg prefix "$image_prefix" \
       '[.[] | select(.draft | not) | .tag_name | select(startswith($prefix))][0] // empty')
   [[ -n $image ]] || fail "no ${image_prefix}… release at $RELEASES_API"
@@ -217,7 +258,7 @@ fi
 [[ $image =~ ^[A-Za-z0-9.-]+$ ]] || fail "--image: not a release name"
 if [[ ! -d $state/images/$image ]]; then
   say "installing image $image"
-  files=$(curl -fsSL --retry 5 "$RELEASES_API/tags/$image" | jq -r '.assets[].name' | tr '\n' ' ')
+  files=$(github_get "$RELEASES_API/tags/$image" | jq -r '.assets[].name' | tr '\n' ' ')
   [[ $files =~ ^([A-Za-z0-9._-]+\ )+$ ]] || fail "release $image has no files, or one whose name is not plain"
   as_user "rm -rf 'downloads/$image' && mkdir -p 'downloads/$image' && cd 'downloads/$image' &&
     for f in $files; do curl -fsSL --retry 5 -o \"\$f\" '$GITHUB_REPO/releases/download/$image/'\"\$f\"; done &&
