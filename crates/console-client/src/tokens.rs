@@ -6,9 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use cf_ghapp::{
-    Clock, Error as GitHubError, Installation, Monotonic, Pending, PlainJit, StatusError, TokenSource,
-};
+use cf_ghapp::{Clock, Error as GitHubError, Installation, Monotonic, Pending, PlainJit, TokenSource};
 use cf_secret::Secret;
 
 use crate::client::Client;
@@ -138,18 +136,6 @@ impl std::fmt::Debug for ConsoleTokens {
             .field("machine", &self.machine)
             .finish_non_exhaustive()
     }
-}
-
-/// An answer of `status` to a call to `path` of the console, as the App client's error.
-fn status_error(path: &str, status: u16, body: String, retry_after: Option<Duration>) -> GitHubError {
-    GitHubError::Status(StatusError {
-        method: "POST".into(),
-        path: path.into(),
-        status,
-        body,
-        retry_after,
-        server_time: None,
-    })
 }
 
 fn as_github(path: &str, error: Error) -> GitHubError {
@@ -503,14 +489,16 @@ impl ConsoleTokens {
             Some(until) if now < *until => {
                 let left = until.saturating_duration_since(now);
                 // A 429 whatever the console first answered: this call reached nobody, so nothing was made.
-                Err(status_error(
+                Err(as_github(
                     route,
-                    429,
-                    format!(
-                        "not sent: the console asked to wait {} s more before asking for {repo} again",
-                        left.as_secs().max(1)
-                    ),
-                    Some(left),
+                    Error::Busy {
+                        status: 429,
+                        message: format!(
+                            "not sent: the console asked to wait {} s more before asking for {repo} again",
+                            left.as_secs().max(1)
+                        ),
+                        retry_after: left,
+                    },
                 ))
             }
             Some(_) => {

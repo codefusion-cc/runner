@@ -13,6 +13,8 @@ use serde::Deserialize;
 /// The label of the cf-runners manager's launchd agent, which the Runner may run beside and never touches.
 #[cfg(target_os = "macos")]
 pub const OLD_MANAGER_LABEL: &str = "cc.codefusion.runners";
+/// The file in the state folder that holds the host's token for its console, as `enroll` keeps it.
+pub const CONSOLE_TOKEN: &str = "console-token";
 
 /// What a person works on the Mac means for jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -357,7 +359,7 @@ impl Config {
 
     /// Where this Mac's token for the console is kept, readable by its owner alone.
     pub fn console_token(&self) -> PathBuf {
-        self.state_dir.join("console-token")
+        self.state_dir.join(CONSOLE_TOKEN)
     }
 
     /// Where the service writes its log.

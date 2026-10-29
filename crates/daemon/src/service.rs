@@ -2938,12 +2938,12 @@ fn why_not(error: &cf_console_client::Error) -> String {
     }
 }
 
-/// The key file a host still holds where its App's key was, as the report names it: an absolute path of at most 1024
-/// bytes that is there (a link included, which is not followed), or none.
+/// The key file a host still holds where its App's key was, as the report names it: an absolute path of at most
+/// [`cf_console_client::KEY_FILE_PATH_MAX`] bytes that is there (a link included, which is not followed), or none.
 fn held_key_file(path: Option<&Path>) -> Option<String> {
     let path = path?;
     let text = path.to_str()?;
-    if !path.is_absolute() || text.len() > 1024 {
+    if !path.is_absolute() || text.len() > cf_console_client::KEY_FILE_PATH_MAX {
         return None;
     }
     std::fs::symlink_metadata(path).ok().map(|_| text.to_string())

@@ -7,6 +7,8 @@
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
+use cf_console_client::KEY_FILE_PATH_MAX as PATH_MAX;
+
 use crate::config::{APP_DIR, Config};
 
 /// The key file's name in the App's folder.
@@ -14,9 +16,6 @@ pub const KEY_FILE: &str = "app.pem";
 
 /// The file in the state folder that names the key file the host held.
 const REMEMBERED: &str = "app-key-file";
-
-/// The longest path the report carries.
-const PATH_MAX: usize = 1024;
 
 /// What [`take_out`] did, for the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +143,8 @@ pub const KEPT_NOT_ENROLLED: &str =
 
 /// Whether the host holds a token for its console, as `enroll` keeps it.
 fn enrolled(state_dir: &Path) -> bool {
-    std::fs::read_to_string(state_dir.join("console-token")).is_ok_and(|token| !token.trim().is_empty())
+    std::fs::read_to_string(state_dir.join(crate::config::CONSOLE_TOKEN))
+        .is_ok_and(|token| !token.trim().is_empty())
 }
 
 /// Keeps `key_file` in the state folder, for this user alone.
@@ -156,7 +156,7 @@ fn remember(state_dir: &Path, key_file: &Path) -> Result<(), String> {
     cf_secret::replace_private(&state_dir.join(REMEMBERED), &bytes).map_err(said)
 }
 
-/// The key file the host held, as [`take_out`] remembered it in `state_dir`: an absolute path of at most 1024 bytes.
+/// The key file the host held, as [`take_out`] remembered it in `state_dir`: an absolute path of at most [`PATH_MAX`] bytes.
 /// The report names it while something is there.
 pub fn remembered(state_dir: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(state_dir.join(REMEMBERED)).ok()?;
