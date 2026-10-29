@@ -38,9 +38,18 @@ pub const MAX_SET_LABELS: usize = 16;
 /// The longest label of a set that is served.
 pub const MAX_LABEL_BYTES: usize = 64;
 
-/// Labels that name a platform these Actions runners are not: a job asking for one of them is left to other Actions
-/// runners.
+/// Labels that name a platform these Actions runners are not: a job asking for one of them, or for a version of one
+/// (`macos-latest`, `windows-2022`), is left to other Actions runners.
 const FOREIGN: [&str; 6] = ["macos", "osx", "windows", "x64", "x86", "arm"];
+
+/// Whether a (lowercase) label names another platform: one of [`FOREIGN`], or one of them followed by `-` and more.
+fn is_foreign(label: &str) -> bool {
+    FOREIGN.iter().any(|platform| {
+        label
+            .strip_prefix(platform)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    })
+}
 
 /// One `runs-on` request: its labels lowercased, deduplicated and sorted. GitHub compares labels without regard to
 /// case, so two spellings of one set are the same set.
@@ -85,11 +94,7 @@ impl LabelSet {
                 .chars()
                 .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
             // A trusted host's job is left to it: a shared host would hand it what a pull request asked for.
-            if !plain
-                || label.len() > MAX_LABEL_BYTES
-                || FOREIGN.contains(&label.as_str())
-                || is_trusted_label(&label)
-            {
+            if !plain || label.len() > MAX_LABEL_BYTES || is_foreign(&label) || is_trusted_label(&label) {
                 return None;
             }
             set.insert(label);
