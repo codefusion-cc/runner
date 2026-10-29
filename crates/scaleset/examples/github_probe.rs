@@ -62,7 +62,15 @@ async fn probe(args: &[String], token: Secret<String>) -> Result<(), Box<dyn std
         Ok(v) => say(&format!("variables: readable ({} found)", v.len())),
         Err(e) => say(&format!("variables: NOT readable ({e})")),
     }
-    let client = ScaleSetClient::new(app, console, machine, installation, repo, Duration::from_secs(75));
+    let client = ScaleSetClient::new(
+        app,
+        console,
+        machine,
+        installation,
+        repo,
+        &format!("https://github.com/{repo}"),
+        Duration::from_secs(75),
+    );
     let set = client
         .ensure_scale_set(&format!("{machine}--{suffix}"), &labels)
         .await?;

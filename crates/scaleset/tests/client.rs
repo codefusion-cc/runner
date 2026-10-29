@@ -415,15 +415,10 @@ async fn the_consoles_refusals_keep_their_meaning() {
         404,
         &serde_json::json!({"error": "Not found"}),
     ));
-    let error = h.client.list_scale_sets().await.unwrap_err();
-    assert!(
-        matches!(error, Error::Api(cf_ghapp::Error::Refused(_))),
-        "{error:?}"
-    );
-    assert!(
-        !error.is_not_found(),
-        "a console without the route is not a set that is gone"
-    );
+    // A console without the route is older than this Runner, not a set that is gone: the host lists them itself
+    // (tests/older_console.rs).
+    let sets = h.client.list_scale_sets().await.expect("listed by the host");
+    assert_eq!(sets.len(), 1, "{sets:?}");
 }
 
 #[tokio::test]

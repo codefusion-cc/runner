@@ -493,6 +493,7 @@ impl Harness {
             MACHINE,
             1,
             repo,
+            &format!("https://github.com/{repo}"),
             Duration::from_secs(10),
         );
         let labels = vec!["self-hosted".to_string(), SIZE.label().to_string()];

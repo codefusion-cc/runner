@@ -45,6 +45,15 @@ pub struct InstallationToken {
     pub expires_in: Duration,
 }
 
+/// A token that registers Actions runners with one repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationToken {
+    /// The token.
+    pub token: Secret<String>,
+    /// How long it lasts, at most [`MAX_TOKEN_LIFE`].
+    pub expires_in: Duration,
+}
+
 /// An Actions runner registered for one job.
 #[derive(Debug)]
 pub struct JitRunner {
@@ -178,6 +187,28 @@ impl Client {
                 })
             })
             .collect()
+    }
+
+    /// `github/registration`: a token that registers Actions runners with `repo` (`owner/name`), for a console older
+    /// than its `github/scaleset/*` calls: the Runner then makes the scale set administrator's calls itself with it.
+    /// A name the console would refuse is refused here as [`Error::Protocol`], unsent.
+    pub async fn github_registration(&self, repo: &str) -> Result<RegistrationToken, Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            token: String,
+            expires_in_s: u64,
+        }
+        if !is_repo_name(repo) {
+            return Err(refuse("not a repository the console takes"));
+        }
+        let body = body_of(&serde_json::json!({ "repo": repo }))?;
+        let response = self.post("github/registration", body).await?;
+        let wire: Wire = read("the registration token's answer", &response)?;
+        Ok(RegistrationToken {
+            token: token_of("the registration token's answer", wire.token)?,
+            expires_in: life_of("the registration token's answer", wire.expires_in_s)?,
+        })
     }
 
     /// `github/jit`: one Actions runner `name` for one job of `repo`, with exactly `labels`. Sent once and never again

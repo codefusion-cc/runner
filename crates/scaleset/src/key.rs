@@ -1,15 +1,17 @@
-//! The scale set administrator's calls of a host that still holds the Runners App's key: the key's installation token
-//! buys a registration token, which buys the Actions service's own admin token, and the host makes the calls itself.
+//! The scale set administrator's calls a host makes itself: a registration token buys the Actions service's own admin
+//! token, and the host makes the calls with it. The registration token comes from the Runners App's key the host still
+//! holds, or from the console's `github/registration` while the console is older than its `github/scaleset/*`.
 //!
-//! Only until the console's `github/scaleset/*` answered the host (rollout step 3 of the console's `docs/RUNNERS.md`):
-//! the Runner then deletes the key and makes every such call through the console. This goes with the last host that
-//! held a key.
+//! A host with the key does this only until the console's `github/scaleset/*` answered it (rollout step 3 of the
+//! console's `docs/RUNNERS.md`): the Runner then deletes the key and makes every such call through the console. A
+//! Runner never needs a console newer than the one that runs, so the console's way stays as long as a console without
+//! those calls may run.
 
 use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cf_console_client::{OpenedSession, RefreshedSession, SessionCounts};
+use cf_console_client::{Client as Console, OpenedSession, RefreshedSession, SessionCounts};
 use cf_ghapp::{DEFAULT_RUNNER_GROUP as RUNNER_GROUP, Error as ApiError, KeyTokens, Response};
 use cf_secret::Secret;
 use reqwest::Method;
@@ -33,9 +35,30 @@ struct Admin {
     expires: i64,
 }
 
-/// The key a host holds and the admin token it bought, for one repository (`config_url` is its page).
+/// Where a host's registration token comes from.
+pub(crate) enum Registrar {
+    /// The Runners App's key the host still holds.
+    Key(Arc<KeyTokens>),
+    /// The console, older than its scale set calls.
+    Console(Console),
+}
+
+impl Registrar {
+    async fn registration_token(&self, installation: i64, repo: &str) -> Result<Secret<String>, Error> {
+        match self {
+            Registrar::Key(tokens) => Ok(tokens.registration_token(installation, repo).await?),
+            Registrar::Console(console) => console
+                .github_registration(repo)
+                .await
+                .map(|answer| answer.token)
+                .map_err(|e| Error::Api(e.to_github("/agent/runners/github/registration"))),
+        }
+    }
+}
+
+/// The registration token's source and the admin token it bought, for one repository (`config_url` is its page).
 pub(crate) struct KeyAdmin {
-    tokens: Arc<KeyTokens>,
+    tokens: Registrar,
     config_url: String,
     admin: tokio::sync::Mutex<Option<Admin>>,
 }
@@ -107,7 +130,7 @@ fn gone<T>(result: Result<T, Error>) -> Result<bool, Error> {
 }
 
 impl KeyAdmin {
-    pub(crate) fn new(tokens: Arc<KeyTokens>, config_url: &str) -> KeyAdmin {
+    pub(crate) fn new(tokens: Registrar, config_url: &str) -> KeyAdmin {
         KeyAdmin {
             tokens,
             config_url: config_url.to_string(),
