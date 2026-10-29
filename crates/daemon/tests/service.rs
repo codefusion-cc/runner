@@ -511,6 +511,7 @@ fn service_with(
         }),
         updates: updates.map(|updates| updates.clone() as Arc<dyn cf_daemon::update::SelfUpdate>),
         results: Some(folder.join("results.json")),
+        pause: Some(folder.join("pause")),
         settings: Some(settings.clone()),
     })
 }
@@ -1027,6 +1028,58 @@ async fn while_the_console_is_away_reports_wait_and_arrive_later_in_order_each_o
             && ends.contains(&json!("cancelled"))
     );
     rig.nothing_left().await;
+}
+
+// added: a Runner that starts again (an update, a crash) on a host the console paused takes no job before the console
+// answers: until then it goes by the pause it kept. Once the console says the pause is over, jobs start again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    rig.console.pause(true);
+    until("the Mac says it is paused", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["paused"] == json!(true))
+    })
+    .await;
+    rig.console.down(true);
+    rig.restart().await;
+    for set in rig.github.scale_sets() {
+        // GitHub lets a session that nobody polls expire.
+        rig.github.lose_session(set.id);
+    }
+    rig.service.discover().await;
+    rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    rig.settles("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    for _ in 0..3 {
+        rig.later(Duration::from_secs(150));
+        rig.service.look_at_queue().await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.github.offers_room(REPO), "a paused host offers no room");
+    assert_eq!(own_runners(&rig), Vec::<String>::new());
+    assert!(
+        rig.standing().is_empty(),
+        "a paused host that started again starts nothing before the console answers"
+    );
+
+    rig.console.pause(false);
+    rig.console.down(false);
+    rig.settles("room offered again", || rig.github.offers_room(REPO))
+        .await;
+    // The job was queued while the Mac offered no room: it is held until the Runner looks at the queue again.
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    until(
+        "the job gets a machine once the console says the pause is over",
+        || !rig.standing().is_empty(),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1719,8 +1772,9 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
         sets.len() == 2 && sets.iter().all(|s| s.has_session)
     })
     .await;
-    // Polls that stand for seconds, as GitHub's do: only the Runner ends one early.
-    rig.github.set_poll_timeout(Duration::from_secs(4));
+    // Polls that stand longer than the checks below, as GitHub's do: only the Runner ends one early. The two scale
+    // sets take turns at the one slot, two polls each, so a poll stands no longer than a turn fits the wait for room.
+    rig.github.set_poll_timeout(Duration::from_secs(1));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     rig.queue().await;
@@ -3740,7 +3794,27 @@ async fn a_result_said_while_a_report_is_under_way_keeps_the_ones_it_carries() {
     assert_eq!(ids, BTreeSet::from(["first".into(), "second".into()]));
 }
 
-/// The last report of a Runner that ends says so, and not that the Mac serves nothing.
+/// The last report of a Runner stopped from outside says it stopped, not that another Runner follows: its machine
+/// may be gone for good, as a spot VM Google took back is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_report_of_a_runner_stopped_from_outside_says_it_stopped() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    rig.stop_pump().await;
+    rig.service.report().await;
+    assert!(last_status(&rig.console).get("notServing").is_none());
+    rig.service.shutdown().await;
+    assert_eq!(
+        last_status(&rig.console)["notServing"],
+        json!("the Runner stopped: its machine shuts down or its service was stopped")
+    );
+}
+
+/// The last report of a Runner that ends to start again says another follows, and not that the Mac serves nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
     let mut rig = Rig::new(2).await;
@@ -3750,7 +3824,9 @@ async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
     })
     .await;
     rig.stop_pump().await;
+    rig.console.queue_command("restart", None);
     rig.service.report().await;
+    assert!(rig.service.restart_requested());
     assert!(last_status(&rig.console).get("notServing").is_none());
     rig.service.shutdown().await;
     let last = last_status(&rig.console);

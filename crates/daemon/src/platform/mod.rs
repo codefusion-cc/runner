@@ -225,6 +225,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
         extras: P::extras(state).map_err(system)?,
         updates: setup.updates,
         results: Some(state.join("results.json")),
+        pause: Some(state.join("pause")),
         settings: setup.settings,
     });
     Ok((machines, service))

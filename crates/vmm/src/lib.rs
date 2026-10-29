@@ -67,6 +67,25 @@ impl From<SpecError> for VmmError {
     }
 }
 
+/// What a machine's processes read from and wrote to the host's disks ([`Vm::disk_io`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskIo {
+    /// Bytes read from the disks; what the page cache already held is not read again and counts nothing.
+    pub read_bytes: u64,
+    /// Bytes written, or left in the page cache for the disks to take.
+    pub written_bytes: u64,
+}
+
+impl DiskIo {
+    /// Both counts together, as of two machines one after the other.
+    pub fn plus(self, other: DiskIo) -> DiskIo {
+        DiskIo {
+            read_bytes: self.read_bytes.saturating_add(other.read_bytes),
+            written_bytes: self.written_bytes.saturating_add(other.written_bytes),
+        }
+    }
+}
+
 /// How a machine came to its end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmExit {
@@ -111,6 +130,13 @@ pub trait Vm: Send + Sync {
     /// How long the machine's vCPUs waited for one of the host's CPUs over the last 10 s: the machine's cgroup's
     /// `cpu.pressure` on Linux. `None` where the host keeps no such account, as on a Mac.
     fn cpu_pressure(&self) -> Option<Psi> {
+        None
+    }
+
+    /// What the machine read from and wrote to the host's disks since it started: its disk images, through the
+    /// page cache, the sum of `/proc/<pid>/io` over its cgroup on Linux. `None` once it ended, and where the host
+    /// keeps no such account, as on a Mac.
+    fn disk_io(&self) -> Option<DiskIo> {
         None
     }
 }

@@ -8,7 +8,7 @@ use cf_guest_proto::{
 use cf_vmhost::control::{self, Request};
 use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run};
 use cf_vmm::testing::{FakeVmm, PowerSwitch, Script, Stop};
-use cf_vmm::{Network, Psi, VmmError};
+use cf_vmm::{DiskIo, Network, Psi, VmmError};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -347,7 +347,17 @@ fn a_guest_that_never_answers_is_booted_twice_and_the_job_fails_to_boot() {
         stop: Stop::Obeys,
     };
     let vmm = FakeVmm::new([formatter(), mute(), mute()]);
+    // Each machine reads the image's start from its disk; the second starts counting at nothing again.
+    vmm.disk(Some(DiskIo {
+        read_bytes: 300 << 20,
+        written_bytes: 1 << 20,
+    }));
     let state = go(&vmm, &layout, request("a"), quick()).unwrap();
+    assert_eq!(
+        (state.disk_read_bytes, state.disk_written_bytes),
+        (Some(600 << 20), Some(2 << 20)),
+        "both machines' counts add up, the formatter's not among them"
+    );
     let ended = state.end.unwrap();
     assert_eq!((ended.end, state.boots), (End::BootFailed, 2));
     assert!(ended.message.unwrap().contains("not ready"));
@@ -445,6 +455,11 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
         full: 300,
     };
     vmm.stall(Some(stalled));
+    // It read and wrote its disks.
+    vmm.disk(Some(DiskIo {
+        read_bytes: 7 << 30,
+        written_bytes: 2 << 30,
+    }));
     let mut limits = quick();
     limits.heartbeat = Duration::from_secs(30);
     let (state, running) = std::thread::scope(|scope| {
@@ -458,6 +473,11 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
             };
             // The wait eases before the stop: the job's worst stays what it was.
             vmm.stall(Some(Psi { some: 100, full: 0 }));
+            // A look that finds only the machine's network helper, its monitor gone: the counts never shrink.
+            vmm.disk(Some(DiskIo {
+                read_bytes: 4096,
+                written_bytes: 0,
+            }));
             control::ask(
                 &layout,
                 "a",
@@ -490,6 +510,11 @@ fn a_stop_over_the_socket_reaches_the_guest_with_its_reason_and_names_the_end() 
         )
     );
     assert_eq!(state.resident_bytes, None, "a machine that is gone holds nothing");
+    assert_eq!(
+        (state.disk_read_bytes, state.disk_written_bytes),
+        (Some(7 << 30), Some(2 << 30)),
+        "a machine that is gone can no longer be read: its last look stands"
+    );
     assert_eq!(
         (state.host_cpu, state.host_cpu_peak),
         (None, Some(stalled)),

@@ -802,6 +802,8 @@ mod tests {
             pressure_peak: None,
             host_cpu: None,
             host_cpu_peak: None,
+            disk_read_bytes: None,
+            disk_written_bytes: None,
             oom: None,
             end: None,
         }

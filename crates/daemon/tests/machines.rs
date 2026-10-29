@@ -134,6 +134,7 @@ async fn a_job_that_succeeds_is_reported_once_with_what_was_measured_and_leaves_
 
 #[tokio::test]
 async fn a_jobs_load_and_stalls_show_while_it_runs_and_its_worst_stalls_at_its_end() {
+    let log = Log::start();
     let mut settings = cf_daemon::testing::settings_for(2);
     settings.vcpus[Size::G4.index()] = 2;
     let mut w = World::on(settings);
@@ -176,6 +177,10 @@ async fn a_jobs_load_and_stalls_show_while_it_runs_and_its_worst_stalls_at_its_e
         .expect("the machine");
     assert_eq!(machine.cpu_percent, Some(200));
 
+    w.parts.vms.disk(&job, 2 * GIB, MIB);
+    pass(&w.m, 1);
+    // The counts at the end are the job's, not the first look's.
+    w.parts.vms.disk(&job, 5 * GIB, 3 * GIB);
     w.parts.vms.end(&job, End::Ok);
     w.github(EventKind::Completed, &runner, "succeeded");
     pass(&w.m, 2);
@@ -190,6 +195,30 @@ async fn a_jobs_load_and_stalls_show_while_it_runs_and_its_worst_stalls_at_its_e
         })
     );
     assert_eq!(done.host_cpu_peak, Some(psi(2500, 300)));
+    let record = w
+        .parts
+        .store
+        .load()
+        .into_iter()
+        .find(|r| r.runner == runner)
+        .expect("the record");
+    let ended = record.ended.expect("its end");
+    assert_eq!(
+        (ended.disk_read_bytes, ended.disk_written_bytes),
+        (Some(5 * GIB), Some(3 * GIB)),
+        "the record keeps what the machine read and wrote by its end"
+    );
+    let gone = log.lines("machine gone");
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert!(
+        gone[0].ends_with(&format!(
+            "disk_read_bytes={} disk_written_bytes={}",
+            5 * GIB,
+            3 * GIB
+        )),
+        "{}",
+        gone[0]
+    );
     w.assert_nothing_left();
 }
 
