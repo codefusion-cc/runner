@@ -3794,7 +3794,27 @@ async fn a_result_said_while_a_report_is_under_way_keeps_the_ones_it_carries() {
     assert_eq!(ids, BTreeSet::from(["first".into(), "second".into()]));
 }
 
-/// The last report of a Runner that ends says so, and not that the Mac serves nothing.
+/// The last report of a Runner stopped from outside says it stopped, not that another Runner follows: its machine
+/// may be gone for good, as a spot VM Google took back is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_report_of_a_runner_stopped_from_outside_says_it_stopped() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    rig.stop_pump().await;
+    rig.service.report().await;
+    assert!(last_status(&rig.console).get("notServing").is_none());
+    rig.service.shutdown().await;
+    assert_eq!(
+        last_status(&rig.console)["notServing"],
+        json!("the Runner stopped: its machine shuts down or its service was stopped")
+    );
+}
+
+/// The last report of a Runner that ends to start again says another follows, and not that the Mac serves nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
     let mut rig = Rig::new(2).await;
@@ -3804,7 +3824,9 @@ async fn the_last_report_of_a_runner_that_ends_says_it_ends() {
     })
     .await;
     rig.stop_pump().await;
+    rig.console.queue_command("restart", None);
     rig.service.report().await;
+    assert!(rig.service.restart_requested());
     assert!(last_status(&rig.console).get("notServing").is_none());
     rig.service.shutdown().await;
     let last = last_status(&rig.console);
