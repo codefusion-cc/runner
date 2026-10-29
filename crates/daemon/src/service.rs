@@ -610,6 +610,7 @@ impl<H, V> Shared<H, V> {
                 &self.config.machine,
                 installation,
                 repo,
+                page,
                 self.config.poll_timeout,
             )),
             (None, None) => None,

@@ -152,6 +152,7 @@ impl Harness {
             &self.machine,
             1,
             repo,
+            &format!("https://github.com/{repo}"),
             timeout,
         )
     }
@@ -177,7 +178,15 @@ pub async fn harness_as(machine: &str, options: Options, retry: RetryPolicy, tim
     let console_client = enrolled(&console, machine, http.clone()).await;
     let clock = Arc::new(TestClock::default());
     let app = app(&fake, &console_client, machine, http, clock.clone());
-    let client = ScaleSetClient::new(app.clone(), console_client.clone(), machine, 1, REPO, timeout);
+    let client = ScaleSetClient::new(
+        app.clone(),
+        console_client.clone(),
+        machine,
+        1,
+        REPO,
+        &format!("https://github.com/{REPO}"),
+        timeout,
+    );
     Harness {
         fake,
         console,

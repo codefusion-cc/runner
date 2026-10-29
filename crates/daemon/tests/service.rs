@@ -1865,6 +1865,7 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
         "mac-c",
         1,
         OTHER,
+        &format!("https://github.com/{OTHER}"),
         Duration::from_secs(5),
     );
     let labels = ["self-hosted".to_string(), "cf-2g".to_string()];
