@@ -301,7 +301,8 @@ struct Offer {
     said: [Option<Millis>; 4],
 }
 
-/// Room for one job of `size` a scale set's poll offered GitHub at `at`, the last of `polls` in a row that did.
+/// Room for one job of `size` a scale set's poll offered GitHub at `at`, the last of `polls` in a row that did (none
+/// yet while the offer was never sent).
 #[derive(Clone, Copy, Debug)]
 struct Standing {
     size: Size,
@@ -2169,6 +2170,13 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         let mut inner = self.lock();
         inner.standing.remove(set);
         inner.passed_over.remove(set);
+    }
+
+    fn offer_not_sent(&self, set: &SetKey) {
+        // The room stays the set's, which the offer took from the others, but its polls are those GitHub saw.
+        if let Some(standing) = self.lock().standing.get_mut(set) {
+            standing.polls = standing.polls.saturating_sub(1);
+        }
     }
 
     fn held(&self) -> bool {

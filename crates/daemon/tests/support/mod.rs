@@ -269,6 +269,10 @@ impl Slots for Spy {
         self.machines.withdraw_offer(set);
     }
 
+    fn offer_not_sent(&self, set: &cf_daemon::SetKey) {
+        self.machines.offer_not_sent(set);
+    }
+
     fn state(&self) -> (bool, String) {
         self.machines.state()
     }

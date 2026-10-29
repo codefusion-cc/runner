@@ -88,6 +88,10 @@ pub trait Slots: Send + Sync {
     /// last poll offered is the others' again.
     fn withdraw_offer(&self, _set: &SetKey) {}
 
+    /// The room [`Slots::offer_room`] last gave scale set `set` never reached GitHub: no poll carried it, so it counts
+    /// as none of the set's polls that offered room.
+    fn offer_not_sent(&self, _set: &SetKey) {}
+
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
 

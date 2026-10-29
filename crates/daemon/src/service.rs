@@ -2966,6 +2966,10 @@ impl<S: cf_scaleset::Scaler, F: Fn(Option<usize>) + Send + Sync> cf_scaleset::Sc
         (self.1)(capacity.as_ref().ok().copied());
         capacity
     }
+
+    fn not_sent(&mut self) {
+        self.0.not_sent();
+    }
 }
 
 /// Why the console's scale set calls did not answer, in words for the owner: an older console without them, GitHub
