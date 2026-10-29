@@ -342,6 +342,25 @@ fn a_fact_given_twice_is_refused_in_any_case() {
     assert!(refused(&github).contains("more than once"), "{github}");
 }
 
+/// The Worker's dictionaries ignore case as .NET's `OrdinalIgnoreCase` does, which takes `ſ` (long s) for `s` and
+/// `ı` (dotless i) for `i`: a second fact spelled so is the same name to the Worker, and the message is refused.
+#[test]
+fn a_fact_given_twice_in_a_spelling_only_unicode_case_folds_together_is_refused() {
+    let fork = "someone/codefusion";
+    let repository = message_with(&[
+        ("repository", json!(REPO)),
+        ("repo\u{17f}itory", json!(fork)),
+        ("ref", json!("refs/heads/main")),
+        ("workflow_ref", json!(workflow_ref("deploy-production.yml"))),
+        ("event_name", json!("workflow_dispatch")),
+        ("run_attempt", json!("1")),
+    ]);
+    assert!(refused(&repository).contains("more than once"), "{repository}");
+    let good = main_run("deploy-production.yml", "workflow_dispatch");
+    let github = good.replacen("\"github\"", "\"g\u{131}thub\":{\"t\":2},\"github\"", 1);
+    assert!(refused(&github).contains("more than once"), "{github}");
+}
+
 #[test]
 fn a_message_that_is_not_a_job_message_is_refused() {
     for text in [

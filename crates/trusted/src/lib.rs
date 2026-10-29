@@ -351,7 +351,7 @@ impl Entries {
     /// The value of `name`, with case ignored as the Actions runner's dictionaries ignore it; an error when it comes
     /// more than once.
     fn one(&self, name: &str) -> Result<Option<&Value>, String> {
-        let mut found = self.0.iter().filter(|(key, _)| key.eq_ignore_ascii_case(name));
+        let mut found = self.0.iter().filter(|(key, _)| same_name(key, name));
         let first = found.next().map(|(_, value)| value);
         if found.next().is_some() {
             return Err(format!("{name} is there more than once"));
@@ -365,6 +365,13 @@ impl Entries {
         let first = found.next().map(|(_, value)| value);
         found.next().is_none().then_some(first).flatten()
     }
+}
+
+/// Whether two names are one to .NET's `OrdinalIgnoreCase`, which compares each character's capital: `ſ` is `s` and
+/// `ı` is `i` there. Rust's capitals are .NET's or longer, so a name it takes for another is refused, never missed.
+fn same_name(a: &str, b: &str) -> bool {
+    a.chars().count() == b.chars().count()
+        && a.chars().zip(b.chars()).all(|(a, b)| a == b || a.to_uppercase().eq(b.to_uppercase()))
 }
 
 impl<'de> Deserialize<'de> for Entries {
