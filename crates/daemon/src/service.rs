@@ -21,7 +21,7 @@ use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics
 use cf_workflows::{LabelSet, TRUSTED_LABEL, self_hosted_with};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
@@ -359,6 +359,8 @@ struct Shared<H, V> {
     results: Mutex<Vec<CommandResult>>,
     /// Registrations GitHub would not remove, and when each is tried again.
     refused: Mutex<BTreeMap<String, Instant>>,
+    /// Held through a sweep: the service's own and an uninstall's take turns, so no removal is sent twice.
+    sweeping: AsyncMutex<()>,
     console_paused: Mutex<bool>,
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
@@ -655,6 +657,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 queued: Mutex::new(Queued::default()),
                 queue_cursor: AtomicUsize::new(0),
                 refused: Mutex::new(BTreeMap::new()),
+                sweeping: AsyncMutex::new(()),
                 console_paused: Mutex::new(paused),
                 told: Mutex::new((0, false)),
                 stall: Mutex::new(None),
@@ -1785,6 +1788,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// tried again later, for as long as it takes.
     pub async fn sweep(&self) {
         let shared = &self.shared;
+        let _turn = shared.sweeping.lock().await;
         for registration in shared.machines.registrations_to_remove() {
             let waits = shared
                 .refused
