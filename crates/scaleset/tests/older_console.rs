@@ -67,7 +67,7 @@ async fn through_a_console_without_scale_set_calls_the_host_makes_its_scale_sets
         !admin_requests_from_machines(&h.fake).is_empty(),
         "the host's own admin token"
     );
-    // The console is taken at its word for a while: one that has the calls now is not asked them at once.
+    // The console is taken at its word while the client lives: what the host made is not the console's.
     h.console.scaleset_answer(None);
     h.client.list_scale_sets().await.expect("listed");
     assert_eq!(scaleset_calls(&h), Vec::<String>::new());

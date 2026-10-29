@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cf_console_client::{
@@ -19,11 +20,6 @@ use crate::types::{JitConfig, Label, RunnerRef, ScaleSet};
 
 pub(crate) const API_VERSION: &str = "6.0-preview";
 
-/// How long a console that answered it has no scale set calls (a 404 without a code: older than this Runner) is
-/// taken at its word: until then this host makes those calls itself, with the console's registration token, and asks
-/// the console again after it.
-pub const OLDER_CONSOLE_RECHECK: Duration = Duration::from_secs(600);
-
 /// Where github.com's Actions service lives: the addresses it hands back are on this host or one below it.
 pub const ACTIONS_HOST: &str = "actions.githubusercontent.com";
 
@@ -34,8 +30,8 @@ pub const ACTIONS_HOST: &str = "actions.githubusercontent.com";
 /// machine and scoped to it. The machine holds only a session's message queue token, sent to GitHub's addresses
 /// only, and each Actions runner's configuration. A host that still holds the App's key ([`ScaleSetClient::with_key`])
 /// makes these calls itself until the console's answered it, and so does a host whose console is older than these
-/// calls, with the console's registration token: a Runner never needs a console newer than the one that runs. Every call returns a `Result`; nothing here panics for
-/// what the console, the service or the network does.
+/// calls, with the console's registration token: a Runner never needs a console newer than the one that runs. Every
+/// call returns a `Result`; nothing here panics for what the console, the service or the network does.
 #[derive(Clone)]
 pub struct ScaleSetClient {
     inner: Arc<Inner>,
@@ -50,10 +46,11 @@ enum Admin {
 }
 
 /// This host's own calls, with the console's registration token, for a console older than its scale set calls; and
-/// until when the console is not asked them, since it last answered that it has none.
+/// whether it answered that it has none. That holds for as long as this client lives: the scale sets and sessions the
+/// host made are not the console's, and a console deployed later takes over when the Runner starts again.
 struct OlderConsole {
     host: KeyAdmin,
-    until: Mutex<Option<tokio::time::Instant>>,
+    older: AtomicBool,
 }
 
 struct Inner {
@@ -161,7 +158,7 @@ impl ScaleSetClient {
     ) -> ScaleSetClient {
         let older = OlderConsole {
             host: KeyAdmin::new(Registrar::Console(console.clone()), config_url),
-            until: Mutex::new(None),
+            older: AtomicBool::new(false),
         };
         ScaleSetClient::of(
             app,
@@ -220,18 +217,13 @@ impl ScaleSetClient {
     fn admin(&self) -> Result<&Console, &KeyAdmin> {
         match &self.inner.admin {
             Admin::Key(key) => Err(key),
-            Admin::Console(console, older) => {
-                let until = *older.until.lock().unwrap_or_else(|e| e.into_inner());
-                match until {
-                    Some(until) if tokio::time::Instant::now() < until => Err(&older.host),
-                    _ => Ok(console),
-                }
-            }
+            Admin::Console(_, older) if older.older.load(Ordering::Acquire) => Err(&older.host),
+            Admin::Console(console, _) => Ok(console),
         }
     }
 
     /// This host's calls when `error` is the console's 404 without a code, which says it is older than its scale set
-    /// calls: they are made here from now on, for [`OLDER_CONSOLE_RECHECK`].
+    /// calls: they are made here from now on, for as long as this client lives.
     fn older_console(&self, route: &str, error: &ConsoleError) -> Option<&KeyAdmin> {
         let Admin::Console(_, older) = &self.inner.admin else {
             return None;
@@ -239,11 +231,13 @@ impl ScaleSetClient {
         if !matches!(error, ConsoleError::Refused { status: 404, .. }) || error.code().is_some() {
             return None;
         }
-        let mut until = older.until.lock().unwrap_or_else(|e| e.into_inner());
-        if until.is_none() {
-            tracing::warn!(repo = %self.inner.repo, route, "the console has no scale set calls, it is older than this Runner: this host makes them with the console's registration token");
+        if !older.older.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                repo = %self.inner.repo, route,
+                "the console has no scale set calls, it is older than this Runner: this host makes them with the \
+                 console's registration token"
+            );
         }
-        *until = Some(tokio::time::Instant::now() + OLDER_CONSOLE_RECHECK);
         Some(&older.host)
     }
 

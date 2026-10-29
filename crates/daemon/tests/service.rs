@@ -679,6 +679,42 @@ async fn a_job_goes_from_githubs_queue_to_the_consoles_page_and_leaves_nothing()
     assert_eq!(rig.events().len(), 2, "each once");
 }
 
+/// A Runner newer than the console that runs: the console answers its scale set calls a 404 without a code, as one
+/// from before them does. The Runner makes them itself with the console's registration token, and the job runs,
+/// reaches the console and leaves nothing at GitHub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_newer_than_the_console_takes_a_job_through_a_console_without_scale_set_calls() {
+    let rig = Rig::new(2).await;
+    rig.console
+        .scaleset_answer(Some(FakeConsole::no_scaleset_calls()));
+    rig.service.discover().await;
+    until("the scale set", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    let runner = rig.job_running().await;
+    until("the start at the console", || rig.events().len() == 1).await;
+    assert_eq!(rig.console.job_events()[0]["kind"], json!("started"));
+    rig.finish(&runner, "succeeded");
+    until("the end at the console", || rig.events().len() == 2).await;
+    rig.nothing_left().await;
+    let routes: Vec<String> = rig
+        .console
+        .github_calls()
+        .into_iter()
+        .filter(|call| call.machine == MACHINE && call.status == 200)
+        .map(|call| call.route)
+        .collect();
+    assert!(
+        routes.iter().any(|route| route == "registration"),
+        "the console's registration token: {routes:?}"
+    );
+    assert!(
+        !routes.iter().any(|route| route.starts_with("scaleset/")),
+        "no scale set call the console answered: {routes:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_size_the_mac_never_runs_gets_no_scale_set_and_a_label_from_a_variable_is_read() {
     let rig = Rig::new(3).await;
