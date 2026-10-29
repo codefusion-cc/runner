@@ -272,7 +272,9 @@ pub fn decide(policy: &Policy, message: &str) -> Result<Accepted, String> {
 
 /// The run's five facts from a job message's `contextData.github`. The message is GitHub's, through the Actions
 /// runner, as the Actions runner's Worker would read it: dictionaries by name with case ignored, so a name that
-/// comes twice, in any case, is refused rather than guessed. A fact left out, or that is not a text, is refused;
+/// comes twice in two spellings, or a fact the dictionary lists twice, is refused rather than guessed. A key written
+/// twice alike within one JSON object below the top is its last value, as the Worker's Newtonsoft reads it too. A
+/// fact left out, or that is not a text, is refused;
 /// `run_attempt` may also be a whole number.
 pub fn read_run(message: &str) -> Result<Run, String> {
     let top: Entries =
@@ -371,7 +373,9 @@ impl Entries {
 /// `ı` is `i` there. Rust's capitals are .NET's or longer, so a name it takes for another is refused, never missed.
 fn same_name(a: &str, b: &str) -> bool {
     a.chars().count() == b.chars().count()
-        && a.chars().zip(b.chars()).all(|(a, b)| a == b || a.to_uppercase().eq(b.to_uppercase()))
+        && a.chars()
+            .zip(b.chars())
+            .all(|(a, b)| a == b || a.to_uppercase().eq(b.to_uppercase()))
 }
 
 impl<'de> Deserialize<'de> for Entries {
