@@ -987,3 +987,33 @@ fn no_shared_host_serves_a_set_whose_label_is_trusted_in_another_case() {
         ["cf-4g"]
     );
 }
+
+// added: GitHub's own images name a platform with a version (`macos-latest`, `windows-2022`); a job asking for one
+// beside a label of ours is left to other Actions runners, as one asking for the bare platform is. A label that only
+// starts with the same letters is not a platform.
+#[test]
+fn a_platform_with_a_version_is_another_platform() {
+    for platform in [
+        "macos-latest",
+        "macos-14",
+        "macos-13-xlarge",
+        "MacOS-Latest",
+        "windows-latest",
+        "windows-2022",
+        "osx-arm64",
+        "x64-large",
+        "arm-v7",
+    ] {
+        assert_eq!(
+            LabelSet::served(["self-hosted", "cf-2g", platform]),
+            None,
+            "{platform}"
+        );
+    }
+    for ours in ["macosx", "armada", "x86ish", "windowsill", "cf-macos", "os-x"] {
+        assert!(
+            LabelSet::served(["self-hosted", "cf-2g", ours]).is_some(),
+            "{ours}"
+        );
+    }
+}

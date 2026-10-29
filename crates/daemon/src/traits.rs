@@ -84,6 +84,12 @@ pub trait Slots: Send + Sync {
         self.open_slots(size).min(1)
     }
 
+    /// Whether what this machine offers GitHub for `size` now is only a place in line: no machine of the size fits,
+    /// and a job of it waits for the smaller ones to end.
+    fn offers_place(&self, _size: Size) -> bool {
+        false
+    }
+
     /// The poll scale set `set` is about to send offers no room, for its own reasons, or none follows: the room its
     /// last poll offered is the others' again.
     fn withdraw_offer(&self, _set: &SetKey) {}

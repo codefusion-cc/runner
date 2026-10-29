@@ -18,7 +18,7 @@ mod rest;
 mod source;
 
 pub use client::{
-    API, DEFAULT_RUNNER_GROUP, GitHubApp, Installation, JOBS_PAGE, MAX_RUN_SETS, PlainJit, Repo,
+    API, DEFAULT_RUNNER_GROUP, GitHubApp, Installation, JOBS_PAGE, MAX_RUN_SETS, PlainJit, RUNS_LISTED, Repo,
     WAITING_RUNS, Waiting, WaitingJob,
 };
 pub use clock::{Clock, SystemClock};

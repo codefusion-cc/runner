@@ -109,6 +109,10 @@ async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_
     let offered = polls(&w, Size::G6, 601);
     assert!(offered[..600].iter().all(|offered| *offered == 0), "{offered:?}");
     assert_eq!(offered[600], 1, "ten minutes without room");
+    assert!(
+        w.m.offers_place(Size::G6),
+        "what it offers is a place in line, no room"
+    );
     assert_eq!(
         log.lines("a place in line"),
         [
@@ -119,6 +123,7 @@ async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_
     assert!(polls(&w, Size::G6, 120).iter().all(|offered| *offered == 1));
     assert_eq!(log.lines("a place in line").len(), 1);
     assert_eq!(w.m.open_slots(Size::G2), 1);
+    assert!(!w.m.offers_place(Size::G2), "a cf-2g machine fits: that is room");
 
     // A cf-8g machine needs 10432 MiB without the Mac's own machines; it has 9229.
     assert!(polls(&w, Size::G8, 900).iter().all(|offered| *offered == 0));
@@ -344,4 +349,134 @@ async fn the_size_room_is_made_for_is_promised_the_room_before_the_jobs_held_bac
     assert!(w.m.reserve(Size::G6).is_ok());
     assert!(!w.m.ready(cf2g));
     assert_ne!(w.m.snapshot().room(Size::G2).why, Some("making-room"));
+}
+
+/// A Google Compute Engine host of the CI pool: 15.6 GB and 8 CPUs, given to CI, one of many.
+fn gcp() -> World {
+    World::on(cf_budget::Settings::for_headless(
+        cf_budget::HostFacts {
+            total_bytes: 15_600 * cf_budget::MIB,
+            cores: 8,
+        },
+        8,
+    ))
+}
+
+/// How long each cf-4g job of the steady load runs.
+const JOB_S: u64 = 10 * 60;
+
+/// A pool host under a steady cf-4g load: a new cf-4g job is assigned whenever one ends, each runs [`JOB_S`], and
+/// the first three started a third of a job apart. A cf-6g job is assigned once the load is steady. Says after how
+/// many seconds the cf-6g job got its machine, or none within `within` seconds.
+async fn steady_cf4g_and_one_cf6g(w: &mut World, within: u64) -> Option<u64> {
+    // (runner, when its job ends)
+    let mut running: Vec<(String, u64)> = Vec::new();
+    let mut waiting: Vec<Ticket> = Vec::new();
+    for at in 0..3 {
+        running.push((w.running_sized(Size::G4).await, at * JOB_S / 3 + JOB_S));
+        pass(&w.m, JOB_S / 3);
+    }
+    let mut now = JOB_S;
+    let cf6g = match w.m.claim(Size::G6, None) {
+        Claim::Waits { ticket, .. } => ticket,
+        other => panic!("a full host started the cf-6g job: {other:?}"),
+    };
+    for second in 0..within {
+        pass(&w.m, 1);
+        now += 1;
+        if w.m.ready(cf6g) {
+            return Some(second);
+        }
+        let (over, on): (Vec<_>, Vec<_>) = running.into_iter().partition(|(_, end)| *end <= now);
+        running = on;
+        for (runner, _) in over {
+            w.parts.vms.end(job_name(&runner), End::Ok);
+            w.github(EventKind::Completed, &runner, "succeeded");
+            pass(&w.m, 2);
+            now += 2;
+            // The next cf-4g job is assigned at once.
+            match w.m.claim(Size::G4, None) {
+                Claim::Start(ticket) => {
+                    let runner = w.start_as(ticket, Size::G4).await.expect("starts");
+                    w.github(EventKind::Started, &runner, "");
+                    running.push((runner, now + JOB_S));
+                }
+                Claim::Waits { ticket, .. } => waiting.push(ticket),
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut still = Vec::new();
+        for ticket in waiting {
+            if w.m.ready(ticket) {
+                let runner = w.start_as(ticket, Size::G4).await.expect("starts");
+                w.github(EventKind::Started, &runner, "");
+                running.push((runner, now + JOB_S));
+            } else {
+                still.push(ticket);
+            }
+        }
+        waiting = still;
+    }
+    None
+}
+
+// added: one host of a pool that the console does not name never offers a place in line: it would win the job from
+// a host with room, hold back its other sizes for it, and lose it when GitHub takes it back.
+#[tokio::test]
+async fn a_pool_host_the_console_does_not_name_offers_no_place_and_holds_nothing_back() {
+    let log = Log::start();
+    let mut w = gcp();
+    for _ in 0..3 {
+        w.running_sized(Size::G4).await;
+    }
+    assert!(
+        polls(&w, Size::G6, 15 * 60).iter().all(|offered| *offered == 0),
+        "a full pool host offered a cf-6g place"
+    );
+    assert!(!w.m.offers_place(Size::G6));
+    assert!(log.lines("a place in line").is_empty());
+    assert_ne!(
+        w.m.snapshot().room(Size::G2).why,
+        Some("making-room"),
+        "the other sizes were held back"
+    );
+    assert!(log.lines("smaller ones keep taking").is_empty(), "room was made");
+}
+
+// added: the host the console names makes room under a steady cf-4g load: the cf-6g job starts within one job's
+// length, and its place in line is offered at once, since the console waited for it.
+#[tokio::test]
+async fn the_pool_host_the_console_names_starts_the_cf6g_job_within_one_jobs_length() {
+    let mut w = gcp();
+    for _ in 0..3 {
+        w.running_sized(Size::G4).await;
+    }
+    assert_eq!(w.m.open_slots(Size::G6), 0);
+    w.m.make_room_for(Some(Size::G6));
+    assert_eq!(w.m.open_slots(Size::G6), 1, "named, it offers a place at once");
+    assert!(w.m.offers_place(Size::G6));
+    w.m.make_room_for(None);
+    assert_eq!(w.m.open_slots(Size::G6), 0, "no longer named, no place");
+
+    let mut w = gcp();
+    w.m.make_room_for(Some(Size::G6));
+    let cf6g = steady_cf4g_and_one_cf6g(&mut w, 3 * JOB_S).await;
+    let after = cf6g.expect("the cf-6g job never started");
+    assert!(
+        after <= JOB_S,
+        "the cf-6g job waited {after} s, over one job's length"
+    );
+}
+
+// added (review): a Mac decides alone with its own ten-minute rule; a makeRoomFor the console sends it changes
+// nothing.
+#[tokio::test]
+async fn a_mac_the_console_names_still_waits_ten_minutes_before_offering_a_place() {
+    let (w, _cf4g) = mini_with_a_cf4g().await;
+    w.m.make_room_for(Some(Size::G6));
+    assert_eq!(
+        w.m.open_slots(Size::G6),
+        0,
+        "a Mac offered a cf-6g place at once because the console named it"
+    );
 }

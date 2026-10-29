@@ -365,6 +365,9 @@ struct Shared<H, V> {
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
     told: Mutex<(u64, bool)>,
+    /// Reports in a row the console did not answer: past [`NAME_KEPT_UNANSWERED`] the size it named this host to make
+    /// room for is dropped, for no console can name another host meanwhile.
+    unanswered: AtomicUsize,
     /// Jobs that wait while the Mac could run them, since the first look that saw them.
     stall: Mutex<Option<Stall>>,
     held: Mutex<Held>,
@@ -446,6 +449,9 @@ pub struct Service<H, V> {
 
 /// The longest `discoveryError`, scale set `error` and command result `message` the console reads (it takes four
 /// times the bound of a text and cuts it; over that it refuses the whole report).
+/// Reports in a row the console may leave unanswered before this host stops making room for the size it named.
+pub const NAME_KEPT_UNANSWERED: usize = 3;
+
 const STATUS_TEXT_MAX: usize = 1000;
 /// The longest `hostError` the console keeps.
 const HOST_ERROR_MAX: usize = 300;
@@ -661,6 +667,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 sweeping: AsyncMutex::new(()),
                 console_paused: Mutex::new(paused),
                 told: Mutex::new((0, false)),
+                unanswered: AtomicUsize::new(0),
                 stall: Mutex::new(None),
                 held: Mutex::new(Held::default()),
                 updates: parts.updates,
@@ -2147,6 +2154,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let queued = console.outbox.queued();
         let delivered = console.client.deliver(&console.outbox, report).await;
         *shared.told.lock().expect("told") = (queued, delivered.is_ok());
+        if delivered.is_ok() {
+            shared.unanswered.store(0, Ordering::SeqCst);
+        } else if shared.unanswered.fetch_add(1, Ordering::SeqCst) + 1 >= NAME_KEPT_UNANSWERED {
+            shared.machines.make_room_for(None);
+        }
         match delivered {
             Ok(answer) => {
                 if !results.is_empty() {
@@ -2197,6 +2209,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             wanted.store(false, Ordering::SeqCst);
         }
         shared.machines.pause(answer.paused);
+        shared
+            .machines
+            .make_room_for(answer.make_room_for.as_deref().and_then(Size::from_label));
         for command in answer.commands {
             // A result names its command by the id. One the console would not read back cannot be answered, and a
             // result it refuses would hold up every report after it: such a command is not done at all.
@@ -2914,7 +2929,8 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                     let machines = machines.clone();
                     Arc::new(move |runner| machines.was_out_of_memory(runner))
                 });
-                let (statistics, never) = (scaler.statistics_handle(), scaler.never_handle());
+                let (statistics, never, room) =
+                    (scaler.statistics_handle(), scaler.never_handle(), scaler.room_handle());
                 {
                     let mut state = state.lock().expect("set");
                     state.error = None;
@@ -2926,10 +2942,14 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         let mut state = state.lock().expect("set");
                         state.statistics.clone_from(&statistics.lock().expect("statistics"));
                         state.never.clone_from(&never.lock().expect("never"));
-                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here.
+                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here; a place in
+                        // line is none, so a full host names no job held back from it.
                         let assigned = state.statistics.as_ref().map_or(0, Statistics::assigned);
+                        let room = *room.lock().expect("room");
                         state.room_since = match capacity {
-                            Some(capacity) if capacity > assigned => state.room_since.or_else(|| Some(clock.now())),
+                            Some(capacity) if room && capacity > assigned => {
+                                state.room_since.or_else(|| Some(clock.now()))
+                            }
                             _ => None,
                         };
                     }

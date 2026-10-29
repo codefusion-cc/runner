@@ -92,6 +92,8 @@ struct State {
     withdrawn: HashSet<String>,
     calls: usize,
     paused: bool,
+    /// The size the answers name the Mac to make room for.
+    make_room_for: Option<String>,
     watched: bool,
     faults: Faults,
     /// The Runners App's installations, as the console reaches them with its key; none until a test attaches one.
@@ -317,9 +319,12 @@ impl State {
             .collect();
         // REPORT_WATCHED_S while a command waits or the page is watched, REPORT_IDLE_S otherwise.
         let quick = !commands.is_empty() || self.watched;
-        Reply::json(
-            &json!({ "paused": self.paused, "reportEvery": if quick { 5 } else { 60 }, "commands": commands }),
-        )
+        let mut answer =
+            json!({ "paused": self.paused, "reportEvery": if quick { 5 } else { 60 }, "commands": commands });
+        if let Some(size) = &self.make_room_for {
+            answer["makeRoomFor"] = json!(size);
+        }
+        Reply::json(&answer)
     }
 
     /// agent.ts `leave`: the Mac goes from the console; its token stops working with its row.
@@ -549,6 +554,11 @@ impl FakeConsole {
     /// Whether the console says every Mac is paused in its answers.
     pub fn pause(&self, paused: bool) {
         self.lock().paused = paused;
+    }
+
+    /// The size the answers name the Mac to make room for (`makeRoomFor`), or none.
+    pub fn make_room_for(&self, size: Option<&str>) {
+        self.lock().make_room_for = size.map(String::from);
     }
 
     /// Whether someone watches the console's page: `reportEvery` is 5 instead of 60.

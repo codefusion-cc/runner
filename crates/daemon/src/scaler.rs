@@ -94,6 +94,8 @@ pub struct Scaler<J, R, H> {
     never: Arc<Mutex<Option<String>>>,
     /// The counts as the service last reported them.
     last: Arc<Mutex<Option<Statistics>>>,
+    /// Whether the last poll offered room a machine fits in now, not only a place in line.
+    room: Arc<Mutex<bool>>,
     /// How many Actions runners the scale set's assigned jobs need now: the service's count, less the jobs that ended
     /// since without a new one. None before the first report.
     wanted: Option<usize>,
@@ -127,6 +129,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             offered: vec![],
             never: Arc::new(Mutex::new(None)),
             last: Arc::new(Mutex::new(None)),
+            room: Arc::new(Mutex::new(false)),
             wanted: None,
         }
     }
@@ -153,6 +156,12 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     /// the scaler is lent to the listener.
     pub fn never_handle(&self) -> Arc<Mutex<Option<String>>> {
         self.never.clone()
+    }
+
+    /// Whether the last poll offered GitHub room a machine of the scale set's size fits in now: a place in line
+    /// ([`Slots::offers_place`]) is none. The handle stays valid while the scaler is lent to the listener.
+    pub fn room_handle(&self) -> Arc<Mutex<bool>> {
+        self.room.clone()
     }
 
     fn now(&self) -> OffsetDateTime {
@@ -586,6 +595,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     pub fn capacity(&self) -> usize {
         let held = self.active() + self.promised.len();
         let set = (self.config.repo.clone(), self.config.scale_set_id);
+        *self.room.lock().expect("room") = false;
         if self.slots.held() {
             self.slots.withdraw_offer(&set);
             return held;
@@ -597,6 +607,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         } else {
             self.slots.offer_room(&set, self.config.size)
         };
+        *self.room.lock().expect("room") = open > 0 && !self.slots.offers_place(self.config.size);
         held + self.waiting.len() - overdue + open
     }
 

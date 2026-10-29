@@ -714,6 +714,20 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         }
     }
 
+    /// The size the console names this host to make room for ([`Making::name`]): a headless host makes room, and
+    /// offers a place in line, for none other. The polls in flight are told.
+    pub fn make_room_for(&self, size: Option<Size>) {
+        let mut inner = self.lock();
+        if !inner.making.name(size) {
+            return;
+        }
+        let now = inner.host.now();
+        let Inner { making, budget, .. } = &mut *inner;
+        making.check(budget, now);
+        drop(inner);
+        self.ring();
+    }
+
     /// Takes no new job while an update or new settings wait for the machines that stand to end, or takes them
     /// again when the wait gave up. Unlike [`Machines::drain`], a machine that ends meanwhile ends as it would
     /// otherwise. The polls in flight are told.
@@ -2164,6 +2178,10 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             },
         );
         1
+    }
+
+    fn offers_place(&self, size: Size) -> bool {
+        self.lock().offer.short[size.index()] == Some(PLACE)
     }
 
     fn withdraw_offer(&self, set: &SetKey) {
