@@ -10,8 +10,8 @@ use crate::error::Error;
 /// What a [`TokenSource`] call resolves to.
 pub type Pending<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
-/// Where a [`crate::GitHubApp`] gets its GitHub tokens: the App's own key on this machine ([`crate::KeyTokens`]), or
-/// the CodeFusion Console, which holds the key and hands each machine tokens (`cf_console_client::ConsoleTokens`).
+/// Where a [`crate::GitHubApp`] gets its GitHub tokens: the CodeFusion Console, which holds the Runners App's key and
+/// hands each machine tokens (`cf_console_client::ConsoleTokens`), or a test's stand-in.
 ///
 /// Every call is a result: a source that cannot give a token says why, and nothing here panics on what the network
 /// or the console does. A token is a [`Secret`] and appears in no error.
@@ -20,8 +20,8 @@ pub trait TokenSource: Send + Sync {
     fn installations(&self) -> Pending<'_, Vec<Installation>>;
 
     /// A token that reads the repositories of `installation`. `repo` names the repository a call is about, when it is
-    /// about one: a source whose installations are not the ones the caller learned (the machine moved between the
-    /// local key and the console since) takes the installation that covers it instead.
+    /// about one: a source whose installations are not the ones the caller learned takes the installation that covers
+    /// it instead.
     fn token<'a>(&'a self, installation: i64, repo: Option<&'a str>) -> Pending<'a, Secret<String>>;
 
     /// GitHub refused `token` (401): it is not handed out again, unless another call already replaced it.
@@ -33,10 +33,6 @@ pub trait TokenSource: Send + Sync {
 
     /// The installation that covers `repo` (`owner/name`).
     fn repo_installation<'a>(&'a self, repo: &'a str) -> Pending<'a, i64>;
-
-    /// A token that registers Actions runners with `repo`, which the scale set client trades for the Actions
-    /// service's own.
-    fn registration_token<'a>(&'a self, installation: i64, repo: &'a str) -> Pending<'a, Secret<String>>;
 
     /// Registers an Actions runner for one job with `repo`, outside any scale set, with exactly `labels` (see
     /// [`crate::GitHubApp::generate_jit_config`]). Sent once: a call that fails may still have registered it.

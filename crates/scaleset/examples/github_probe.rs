@@ -1,106 +1,109 @@
-//! A check against the real GitHub, for one throwaway repository: registers a scale set under its own name, opens a
-//! session, registers an Actions runner, finds it by its name and removes it, waits for a queued job on the long
-//! poll (offered, or assigned by the service itself), acquires it if it was only offered, fetches (and removes) a
-//! one-job Actions runner configuration for it, then closes the session and deletes the scale set. Every address the
-//! service hands back passes the client's check on the way, or the probe fails naming the host.
+//! A check against the real GitHub through a console, for one throwaway repository: registers a scale set under the
+//! machine's name, opens a session, registers an Actions runner and removes it by its name, waits for a queued job on
+//! the long poll (offered, or assigned by the service itself), acquires it if it was only offered, fetches (and
+//! removes) a one-job Actions runner configuration for it, then closes the session and deletes the scale set. Every
+//! address the console hands back passes the client's check on the way, or the probe fails naming the host.
 //!
-//! `github_probe <credentials folder> <owner/name> <scale set name> <seconds to wait> <label>...`
+//! `CF_RUNNER_TOKEN=cfr_… github_probe <console URL> <machine> <owner/name> <scale set suffix> <seconds> <label>...`
 //!
-//! The folder holds `app.json` and `app.pem` (see `cf_ghapp::AppCredentials::load`). It prints ids, counts and
-//! statuses, never a token, a key or an Actions runner configuration.
+//! The machine is one enrolled with the console, with GitHub through the console on; the token is its own. The console
+//! holds the Runners App's key and the Actions service's admin token: the probe never sees either. It prints ids,
+//! counts and statuses, never a token or an Actions runner configuration.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cf_ghapp::{API, AppCredentials, GitHubApp, Http, RetryPolicy, SystemClock};
+use cf_console_client::{Client, ConsoleTokens};
+use cf_ghapp::{API, GitHubApp, Http, RetryPolicy, SystemClock, SystemMonotonic};
 use cf_scaleset::ScaleSetClient;
+use cf_secret::Secret;
 
 fn say(what: &str) {
     println!("{what}");
 }
 
+/// A name of an Actions runner of `machine`, as the console takes one: `<machine>-j` and 7 lowercase hex digits.
+fn runner_name(machine: &str) -> String {
+    format!("{machine}-j{:07x}", rand::random::<u32>() & 0x0fff_ffff)
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() < 5 {
+    let token = std::env::var("CF_RUNNER_TOKEN").ok().filter(|t| !t.is_empty());
+    let (Some(token), true) = (token, args.len() >= 6) else {
         eprintln!(
-            "usage: github_probe <credentials folder> <owner/name> <scale set name> <seconds to wait> <label>..."
+            "usage: CF_RUNNER_TOKEN=cfr_… github_probe <console URL> <machine> <owner/name> <scale set suffix> <seconds> <label>..."
         );
         std::process::exit(2);
-    }
-    if let Err(e) = probe(&args).await {
+    };
+    if let Err(e) = probe(&args, Secret::new(token)).await {
         eprintln!("FAILED: {e}");
         std::process::exit(1);
     }
 }
 
-async fn probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (dir, repo, name) = (&args[0], &args[1], &args[2]);
-    let wait: u64 = args[3].parse()?;
-    let labels: Vec<String> = args[4..].to_vec();
-    let credentials = AppCredentials::load(Path::new(dir))?;
-    let app = GitHubApp::from_credentials(
-        credentials,
-        API,
-        Http::new(Duration::from_secs(30), RetryPolicy::default()),
+async fn probe(args: &[String], token: Secret<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let (console, machine, repo, suffix) = (&args[0], &args[1], &args[2], &args[3]);
+    let wait: u64 = args[4].parse()?;
+    let labels: Vec<String> = args[5..].to_vec();
+    let http = Http::new(Duration::from_secs(30), RetryPolicy::default());
+    let console = Client::new(console, token, http.clone());
+    let tokens = ConsoleTokens::new(
+        console.clone(),
+        machine,
         Arc::new(SystemClock),
+        Arc::new(SystemMonotonic),
     );
+    let app = GitHubApp::with_source(Arc::new(tokens), API, http);
     let installation = app.repo_installation(repo).await?;
     say(&format!("installation {installation} covers {repo}"));
-    let all = app.repositories(installation).await?;
-    say(&format!(
-        "the installation reaches {} repositories; this one is {}",
-        all.len(),
-        all.iter().any(|r| r.full_name == *repo)
-    ));
     match app.variables(installation, repo).await {
         Ok(v) => say(&format!("variables: readable ({} found)", v.len())),
         Err(e) => say(&format!("variables: NOT readable ({e})")),
     }
-    let client = ScaleSetClient::new(
-        app,
-        installation,
-        repo,
-        &format!("https://github.com/{repo}"),
-        Duration::from_secs(75),
-    );
-    let set = client.ensure_scale_set(name, &labels).await?;
+    let client = ScaleSetClient::new(app, console, machine, installation, repo, Duration::from_secs(75));
+    let set = client
+        .ensure_scale_set(&format!("{machine}--{suffix}"), &labels)
+        .await?;
     say(&format!(
         "scale set {} registered with labels {:?}",
         set.id,
         set.label_names()
     ));
-    let result = run(&client, set.id, wait).await;
+    let result = run(&client, machine, set.id, wait).await;
     // Whatever happened, the scale set goes.
     match client.delete_scale_set(set.id).await {
-        Ok(()) => say(&format!("scale set {} deleted", set.id)),
+        Ok(deleted) => say(&format!("scale set {} deleted: {deleted}", set.id)),
         Err(e) => say(&format!("scale set {} NOT deleted: {e}", set.id)),
     }
     result
 }
 
-async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let session = client.open_session(id, "cf-runner-probe").await?;
+async fn run(
+    client: &ScaleSetClient,
+    machine: &str,
+    id: i64,
+    wait: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session = client.open_session(id).await?;
     let stats = session.initial_statistics();
     say(&format!(
         "session open; at the start: available {}, assigned {}",
         stats.total_available_jobs, stats.total_assigned_jobs
     ));
-    // An Actions runner is found by its name and gone after its removal: what a registration whose answer was lost
-    // is cleaned up with.
-    let lookup = "cf-runner-probe-l0000001";
-    let registered = client.generate_jit_config(id, lookup, "_work").await?;
-    let found = client.runner_by_name(lookup).await?;
+    // An Actions runner is removed by its name, and is gone after: what a registration whose answer was lost is
+    // cleaned up with.
+    let lookup = runner_name(machine);
+    let registered = client.generate_jit_config(id, &lookup).await?;
     say(&format!(
-        "Actions runner {} found by its name: {}",
+        "Actions runner {} registered; removed by its name: {}",
         registered.runner.id,
-        found.as_ref() == Some(&registered.runner)
+        client.remove_runner_named(&lookup).await?
     ));
-    client.remove_runner(registered.runner.id).await?;
     say(&format!(
         "after its removal the name finds nothing: {}",
-        client.runner_by_name(lookup).await?.is_none()
+        !client.remove_runner_named(&lookup).await?
     ));
     let deadline = Instant::now() + Duration::from_secs(wait);
     let mut after = 0;
@@ -156,16 +159,16 @@ async fn run(client: &ScaleSetClient, id: i64, wait: u64) -> Result<(), Box<dyn 
             job = Some(assigned.clone());
         }
         if job.is_some() {
-            let jit = client
-                .generate_jit_config(id, "cf-runner-probe-j0000001", "_work")
-                .await?;
+            let jit = client.generate_jit_config(id, &runner_name(machine)).await?;
             say(&format!(
                 "Actions runner {} registered, configuration of {} bytes fetched",
                 jit.runner.id,
                 jit.encoded.expose().len()
             ));
-            client.remove_runner(jit.runner.id).await?;
-            say("Actions runner removed");
+            say(&format!(
+                "Actions runner removed: {}",
+                client.remove_runner(jit.runner.id).await?
+            ));
             outcome = Ok(());
         }
         session.acknowledge(message.id).await?;

@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cf_console_client::OpenedSession;
 use cf_ghapp::Response;
 use cf_secret::Secret;
 use reqwest::Method;
@@ -9,12 +10,14 @@ use serde_json::Value;
 
 use crate::client::{API_VERSION, ScaleSetClient, decode, encode};
 use crate::error::Error;
-use crate::types::{Message, RawMessage, SessionInfo, Statistics};
+use crate::types::{Message, RawMessage, Statistics};
 
 struct State {
     session_id: String,
     queue_url: String,
     token: Secret<String>,
+    /// The Actions service's address, where `acquirejobs` goes with the session's token.
+    service_url: String,
 }
 
 struct Inner {
@@ -55,16 +58,26 @@ fn lost(error: Error) -> Error {
 }
 
 impl MessageSession {
-    pub(crate) fn new(client: ScaleSetClient, scale_set_id: i64, info: SessionInfo) -> MessageSession {
+    pub(crate) fn new(client: ScaleSetClient, scale_set_id: i64, opened: OpenedSession) -> MessageSession {
+        let c = opened.counts;
         MessageSession {
             inner: Arc::new(Inner {
                 client,
                 scale_set_id,
-                initial: info.statistics.unwrap_or_default(),
+                initial: Statistics {
+                    total_available_jobs: c.total_available_jobs,
+                    total_acquired_jobs: c.total_acquired_jobs,
+                    total_assigned_jobs: c.total_assigned_jobs,
+                    total_running_jobs: c.total_running_jobs,
+                    total_registered_runners: c.total_registered_runners,
+                    total_busy_runners: c.total_busy_runners,
+                    total_idle_runners: c.total_idle_runners,
+                },
                 state: Mutex::new(State {
-                    session_id: info.session_id,
-                    queue_url: info.message_queue_url,
-                    token: Secret::new(info.message_queue_access_token),
+                    session_id: opened.session_id,
+                    queue_url: opened.queue_url,
+                    token: opened.queue_token,
+                    service_url: opened.service_url.trim_end_matches('/').to_string(),
                 }),
             }),
         }
@@ -81,8 +94,13 @@ impl MessageSession {
     }
 
     fn snapshot(&self) -> (String, String, Secret<String>) {
-        let s = self.inner.state.lock().expect("session state");
+        let s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         (s.session_id.clone(), s.queue_url.clone(), s.token.clone())
+    }
+
+    fn service_url(&self) -> String {
+        let s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.service_url.clone()
     }
 
     async fn refresh(&self) -> Result<(), Error> {
@@ -92,11 +110,12 @@ impl MessageSession {
             .client
             .refresh_session(self.inner.scale_set_id, &session_id)
             .await?;
-        let mut s = self.inner.state.lock().expect("session state");
-        s.token = Secret::new(info.message_queue_access_token);
-        if !info.message_queue_url.is_empty() {
-            s.queue_url = info.message_queue_url;
+        let mut s = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.token = info.queue_token;
+        if let Some(queue) = info.queue_url {
+            s.queue_url = queue;
         }
+        s.service_url = info.service_url.trim_end_matches('/').to_string();
         Ok(())
     }
 
@@ -176,15 +195,16 @@ impl MessageSession {
         if request_ids.is_empty() {
             return Ok(vec![]);
         }
-        let base = self.inner.client.service_url().await?;
-        let url = format!(
-            "{base}/_apis/runtime/runnerscalesets/{}/acquirejobs?api-version={API_VERSION}",
-            self.inner.scale_set_id
-        );
+        let set = self.inner.scale_set_id;
         let body = Value::from(request_ids.to_vec());
-        let response = self
-            .call(Method::POST, |_, _| url.clone(), Some(&body), None, None)
-            .await?;
+        // The address as it is at each try: a refresh after a refused token may name the service anew.
+        let url = |_: &str, _: &str| {
+            format!(
+                "{}/_apis/runtime/runnerscalesets/{set}/acquirejobs?api-version={API_VERSION}",
+                self.service_url()
+            )
+        };
+        let response = self.call(Method::POST, url, Some(&body), None, None).await?;
         let acquired: Acquired = decode("acquired jobs", &response)?;
         // Only what was asked for counts, and once: the service has no business handing out other IDs, and a job
         // named twice is still one job.

@@ -293,7 +293,7 @@ async fn a_session_lost_mid_poll_is_opened_again_and_the_next_job_still_arrives(
                 move || {
                     let (client, stop, mut scaler) = (client.clone(), stop.clone(), scaler.clone());
                     async move {
-                        let session = client.open_session(set.id, "mac-a").await?;
+                        let session = client.open_session(set.id).await?;
                         let result = listen(&session, &mut scaler, stop).await;
                         let _ = session.close().await;
                         result
@@ -398,7 +398,7 @@ async fn a_refresh_for_a_session_the_service_forgot_is_a_lost_session() {
             .ensure_scale_set("mac-a--cf-4g", &labels(&["self-hosted", "cf-4g"]))
             .await
             .unwrap();
-        let session = h.client.open_session(set.id, "mac-a").await.unwrap();
+        let session = h.client.open_session(set.id).await.unwrap();
         (set, session)
     };
     h.fake

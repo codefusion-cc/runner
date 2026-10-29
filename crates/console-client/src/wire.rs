@@ -133,6 +133,8 @@ pub struct ScaleSetStatus {
 
 /// The most entries of [`Status::held_jobs`].
 pub const MAX_HELD_JOBS: usize = 32;
+/// The longest key file path a report names in `app_key_file`.
+pub const KEY_FILE_PATH_MAX: usize = 1024;
 
 /// Jobs of one repository and label set that GitHub holds back from this host's scale set although its polls
 /// offered room for them: GitHub hands a job over only when it looks at its queue, and the Runner starts an Actions
@@ -296,6 +298,17 @@ pub struct Status {
     /// Why the host serves no repository, when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_serving: Option<String>,
+    /// A GitHub App key file this host still holds (an absolute path, at most [`KEY_FILE_PATH_MAX`] bytes): the console
+    /// holds the key, and the owner deletes the file. Left out when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_key_file: Option<String>,
+    /// Why this host still holds the GitHub App's key and signs with it: the console's scale set calls have not
+    /// answered it yet (an older console, GitHub through the console off for the host, a failure), or the key could
+    /// not be taken out. On a host that goes through the console, why its settings still name the key's folder: its
+    /// key file is missing and the Runner did not delete it, or the settings file could not be written once it did.
+    /// Left out on a host that goes through the console alone; a console from before ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_key_kept: Option<String>,
     /// Whether the Runner's first look at GitHub since it started has not ended yet: its scale sets are not listed
     /// yet, so serving none says nothing. Left out once it ended, and by a Runner from before it said it; a console
     /// from before ignores it.

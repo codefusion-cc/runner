@@ -104,7 +104,132 @@ sudo -n perl -e '
 sudo -n perl -e '
   socket(S, 40, 1, 0) or do { print "vsock-port=refused(socket)\n"; exit };
   print "vsock-port=", (bind(S, pack("SSLLx4", 40, 0, 6000, 0xFFFFFFFF)) ? "0" : "refused"), "\n"'
+k='cf-it-planted-app-''key-7d1e'; t='cfr''_itplanted7d1e'; b='-----''BEGIN'; c='cfr''_'
+env | grep -qF -e "$k" -e "$t" -e "$b" -e "$c"; echo key-env=$?
+grep -qF -e "$k" -e "$t" -e "$b" -e "$c" /proc/cmdline; echo key-cmdline=$?
+grep -qF -e "$k" -e "$t" -e "$b" -e "$c" /proc/mounts; echo key-mounts=$?
+sudo -n timeout 300 grep -rlsF --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev -e "$k" -e "$t" / > /tmp/key-files 2>/dev/null
+echo key-search=$?
+echo key-files=$(wc -l < /tmp/key-files)
 exit 7"#;
+
+/// The marker in the App key file `inside` plants on the host for the update step to delete, and in the console
+/// token it plants beside it: no job may find either. [`INSIDE_PROBES`] carries them cut in two, so that the script
+/// itself, wherever the guest keeps it, does not hold them.
+const KEY_MARKER: &str = "cf-it-planted-app-key-7d1e";
+const TOKEN_MARKER: &str = "cfr_itplanted7d1e";
+
+/// Writes an App key file into `app` as an older host kept it (with its `app.json`), 0600: the key's path.
+fn plant_key(app: &Path) -> Fallible<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::create_dir_all(app)?;
+    fs::write(
+        app.join("app.json"),
+        json!({ "client_id": "Iv23test" }).to_string(),
+    )?;
+    let key = app.join("app.pem");
+    fs::write(
+        &key,
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{KEY_MARKER}\n-----END RSA PRIVATE KEY-----\n"),
+    )?;
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+    Ok(key)
+}
+
+/// Writes the settings file as only its owner may write it.
+fn write_settings(path: &Path, settings: &Value) -> Fallible<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::write(path, settings.to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Whether `text` holds a planted marker, a console token's prefix or a PEM header.
+fn holds_a_secret(text: &str) -> bool {
+    [KEY_MARKER, TOKEN_MARKER, "cfr_", "-----BEGIN"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// A host as it was when it held the App's key, in a folder of its own: the key (with [`KEY_MARKER`]) in the App's
+/// folder, which the settings name, and a console token (with [`TOKEN_MARKER`]). The program's `daemon` starts on
+/// it, takes the key out and then cannot start (no image there) and is ended: the key must be gone, the settings
+/// without `app_dir` and the rest kept, and nothing it printed a secret.
+fn take_out_planted_key(bench: &Bench) -> Fallible<String> {
+    let folder = std::env::temp_dir().join("cc.codefusion.runner.it-key");
+    let _ = fs::remove_dir_all(&folder);
+    let (state, app, config) = (
+        folder.join("state"),
+        folder.join("app"),
+        folder.join("config.json"),
+    );
+    fs::create_dir_all(&state)?;
+    let key = plant_key(&app)?;
+    fs::write(state.join("console-token"), format!("{TOKEN_MARKER}\n"))?;
+    let settings = |held: bool| {
+        let mut settings = json!({
+            "machine": "it-key",
+            "state_dir": state,
+            "image": bench.image,
+            "console": "http://127.0.0.1:9",
+            "use": "dedicated",
+        });
+        if held {
+            settings["app_dir"] = json!(app);
+        }
+        settings
+    };
+    write_settings(&config, &settings(true))?;
+    let printed = folder.join("daemon.stderr");
+    let mut daemon = Command::new(&bench.binary)
+        .args(["daemon", "--config"])
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&printed)?)
+        .spawn()?;
+    let gone = within(Duration::from_secs(20), || fs::symlink_metadata(&key).is_err());
+    signal(daemon.id(), "TERM");
+    if !within(Duration::from_secs(10), || {
+        matches!(daemon.try_wait(), Ok(Some(_)))
+    }) {
+        let _ = daemon.kill();
+    }
+    let _ = daemon.wait();
+    let said = fs::read_to_string(&printed).unwrap_or_default();
+    expect(
+        gone,
+        format!("the update step left the App's key: {}", tail(&said)),
+    )?;
+    let now: Value = serde_json::from_str(&fs::read_to_string(&config)?)?;
+    expect(
+        now == settings(false),
+        format!("the settings are not the same without app_dir: {now}"),
+    )?;
+    expect(
+        app.join("app.json").exists() && state.join("console-token").exists(),
+        "the update step deleted more than the key",
+    )?;
+    expect(!holds_a_secret(&said), "the daemon printed a secret")?;
+    Ok(format!(
+        "the update step deleted the planted App key and took app_dir out of the settings; the daemon said: {}",
+        said.lines().next().unwrap_or("nothing")
+    ))
+}
+
+/// The environment of the process `pid`.
+#[cfg(target_os = "linux")]
+fn environment_of(pid: u32) -> String {
+    fs::read(format!("/proc/{pid}/environ"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', "\n"))
+        .unwrap_or_default()
+}
+
+/// The command line and environment of the process `pid`, as `ps` shows a process of this user's.
+#[cfg(not(target_os = "linux"))]
+fn environment_of(pid: u32) -> String {
+    output("ps", &["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+}
 
 struct Bench {
     binary: PathBuf,
@@ -1574,8 +1699,35 @@ fn inside(bench: &Bench) -> Fallible<Vec<String>> {
         "vsock-port",
         "root-nodev",
     ];
-    let finished = job(bench, "it-inside", 512, 120, INSIDE_PROBES)?;
+    let took_out = take_out_planted_key(bench)?;
+    let running = start(bench, "it-inside", 512, 420, INSIDE_PROBES, &[])?;
+    let environment = environment_of(running.child.id());
+    let finished = finish(bench, running, Duration::from_secs(480), &mut |_, _| Ok(()))?;
+    expect(
+        !environment.is_empty() && !holds_a_secret(&environment),
+        "the vm-host's environment could not be read, or holds a planted marker, a console token or a PEM header",
+    )?;
     let value = |name: &str| printed(&finished.console, name).unwrap_or("not tried");
+    // Nothing of the host's key or token reaches the guest: not its environment, the kernel's command line, the
+    // mounts, nor any file.
+    let keys = ["key-env", "key-cmdline", "key-mounts"]
+        .iter()
+        .map(|name| format!("{name}={}", value(name)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    expect(
+        ["key-env", "key-cmdline", "key-mounts"]
+            .iter()
+            .all(|name| value(name) == "1")
+            // 0 or 1 by what it found, 2 when some file could not be read; 124 is a search cut short.
+            && ["0", "1", "2"].contains(&value("key-search"))
+            && value("key-files") == "0",
+        format!(
+            "the guest found the host's key or token, or could not look: {keys} key-search={} key-files={}",
+            value("key-search"),
+            value("key-files")
+        ),
+    )?;
     let line = REFUSED
         .iter()
         .chain(&["control", "swaps"])
@@ -1619,6 +1771,8 @@ fn inside(bench: &Bench) -> Fallible<Vec<String>> {
     )?;
     tidy(bench, "it-inside")?;
     Ok(vec![
+        took_out,
+        format!("no planted key or token in the vm-host's environment nor anywhere in the guest: {keys}"),
         "refused to the job's root, whose job then ended with its own exit code 7:".to_string(),
         line,
     ])
@@ -1794,7 +1948,21 @@ step();'"#;
 
 #[cfg(test)]
 mod tests {
-    use super::{cidr, ms_after, pid_arg};
+    use super::{INSIDE_PROBES, KEY_MARKER, TOKEN_MARKER, cidr, holds_a_secret, ms_after, pid_arg};
+
+    #[test]
+    fn the_guests_search_names_the_planted_markers_without_holding_them() {
+        for marker in [KEY_MARKER, TOKEN_MARKER, "-----BEGIN", "cfr_"] {
+            assert!(!INSIDE_PROBES.contains(marker), "{marker}");
+            assert!(holds_a_secret(&format!("A={marker}x")), "{marker}");
+        }
+        // The script's pieces, as bash joins them.
+        let joined = INSIDE_PROBES.replace("''", "");
+        assert!(joined.contains(&format!("k='{KEY_MARKER}'")));
+        assert!(joined.contains(&format!("t='{TOKEN_MARKER}'")));
+        assert!(joined.contains("b='-----BEGIN'") && joined.contains("c='cfr_'"));
+        assert!(!holds_a_secret("PATH=/usr/bin\nHOME=/Users/someone\n"));
+    }
 
     #[test]
     fn a_network_is_read_with_its_mask() {

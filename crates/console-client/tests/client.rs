@@ -118,7 +118,11 @@ async fn enrolling_names_what_went_wrong() {
         .await
         .unwrap_err()
     {
-        Error::Refused { status: 403, message } => {
+        Error::Refused {
+            status: 403,
+            message,
+            code: None,
+        } => {
             assert!(message.starts_with("This code is for mac-a"), "{message}")
         }
         other => panic!("{other:?}"),
@@ -557,7 +561,11 @@ async fn each_failure_has_its_name() {
     for status in [400, 403, 404, 413, 415] {
         w.fake.fail_next(1, status);
         match w.client.report(&report).await.unwrap_err() {
-            Error::Refused { status: got, message } => {
+            Error::Refused {
+                status: got,
+                message,
+                code: None,
+            } => {
                 assert_eq!((got, message.as_str()), (status, "The console fails on purpose"))
             }
             other => panic!("{status}: {other:?}"),
@@ -646,7 +654,11 @@ async fn an_html_error_page_is_a_refusal_without_a_message_not_a_crash() {
         .await
         .unwrap_err()
     {
-        Error::Refused { status: 403, message } => assert_eq!(message, "no message from the console"),
+        Error::Refused {
+            status: 403,
+            message,
+            code: None,
+        } => assert_eq!(message, "no message from the console"),
         other => panic!("{other:?}"),
     }
     let (server, _) = answering(Reply::status_json(
@@ -660,7 +672,11 @@ async fn an_html_error_page_is_a_refusal_without_a_message_not_a_crash() {
         .unwrap_err()
     {
         // The status error keeps 512 bytes of the body, which cuts the JSON: no message to read.
-        Error::Refused { status: 400, message } => assert!(message.len() <= 300, "{message}"),
+        Error::Refused {
+            status: 400,
+            message,
+            code: None,
+        } => assert!(message.len() <= 300, "{message}"),
         other => panic!("{other:?}"),
     }
     let (server, _) = answering(Reply::status_json(
@@ -673,7 +689,11 @@ async fn an_html_error_page_is_a_refusal_without_a_message_not_a_crash() {
         .await
         .unwrap_err()
     {
-        Error::Refused { status: 409, message } => {
+        Error::Refused {
+            status: 409,
+            message,
+            code: None,
+        } => {
             assert!(message.len() <= 300 && !message.contains('\u{7}'), "{message}")
         }
         other => panic!("{other:?}"),

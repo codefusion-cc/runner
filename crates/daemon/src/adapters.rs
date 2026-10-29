@@ -44,16 +44,12 @@ impl SetRegistry {
 impl Registry for SetRegistry {
     async fn generate_jit(&self, name: &str) -> Result<JitConfig, Error> {
         match &self.kind {
-            Kind::Set(scale_set_id) => {
-                self.client
-                    .generate_jit_config(*scale_set_id, name, "_work")
-                    .await
-            }
+            Kind::Set(scale_set_id) => self.client.generate_jit_config(*scale_set_id, name).await,
             Kind::Own(labels) => self.client.generate_plain_jit_config(name, labels).await,
         }
     }
 
-    async fn remove_runner(&self, runner_id: i64) -> Result<(), Error> {
+    async fn remove_runner(&self, runner_id: i64) -> Result<bool, Error> {
         self.client.remove_runner(runner_id).await
     }
 

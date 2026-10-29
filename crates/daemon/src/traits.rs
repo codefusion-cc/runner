@@ -231,8 +231,8 @@ pub trait Registry: Send + Sync {
     /// Registers an Actions runner that takes one job.
     fn generate_jit(&self, name: &str) -> impl Future<Output = Result<JitConfig, Error>> + Send;
 
-    /// Removes a registered Actions runner; one with a job refuses.
-    fn remove_runner(&self, runner_id: i64) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Removes a registered Actions runner: whether it was there to remove. One with a job refuses (422).
+    fn remove_runner(&self, runner_id: i64) -> impl Future<Output = Result<bool, Error>> + Send;
 
     /// Whether a registered Actions runner has a job, by GitHub's own record; `None` when GitHub no longer has it.
     fn runner_busy(&self, runner_id: i64) -> impl Future<Output = Result<Option<bool>, Error>> + Send;
