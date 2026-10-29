@@ -86,12 +86,6 @@ impl Making {
         changed
     }
 
-    /// Whether room may be made, and a place offered, for `size` here: on a Mac, which decides alone, for every
-    /// size; on a headless host only for the one the console names.
-    fn may_make(&self, settings: &Settings, size: Size) -> bool {
-        !settings.headless || self.named == Some(size)
-    }
-
     /// Before every decision of the budget's: makes room for the first job in line that waits for room the Mac's
     /// own machines hold, all of them smaller; gives up room that has been made for too long, for a job GitHub took
     /// back and did not hand here again, or on an empty Mac that has no room for the size anyway; and tells the
@@ -99,7 +93,6 @@ impl Making {
     pub fn check(&mut self, budget: &mut Budget, now: Now) {
         let rests = self.rests(now);
         let named = self.named;
-        let may_make = |settings: &Settings, size: Size| !settings.headless || named == Some(size);
         match &mut self.room {
             Some(room) => {
                 let size = room.size;
@@ -123,8 +116,11 @@ impl Making {
                 };
                 let end = if budget.settings().can_run(size).is_err() {
                     Some((false, "the settings no longer run this size"))
-                } else if !may_make(budget.settings(), size) {
-                    Some((false, "the console names another host to make room for this size"))
+                } else if !may_make(budget.settings(), named, size) {
+                    Some((
+                        false,
+                        "the console no longer names this host to make room for this size",
+                    ))
                 } else if now.elapsed.since(room.since) >= MAKE_ROOM_LIMIT {
                     Some((true, "room was made for half an hour and is still not there"))
                 } else if past(room.empty, NO_ROOM_WAIT) {
@@ -157,7 +153,7 @@ impl Making {
                 let mut line = status.waiting.iter().filter(|waiter| !waiter.never).peekable();
                 let first = match line.peek() {
                     Some(first) if held_back(first.why) => line.find(|waiter| {
-                        may_make(budget.settings(), waiter.size)
+                        may_make(budget.settings(), named, waiter.size)
                             && worth(budget.settings(), &status, waiter.size)
                     }),
                     _ => None,
@@ -212,7 +208,8 @@ impl Making {
     /// for, while GitHub has taken its job back; or a size whose polls have found no room for [`STARVED_AFTER`],
     /// for which room would be made ([`Making::check`]) once a job of it waits.
     pub fn place(&self, budget: &Budget, now: Now, size: Size, why: Refusal) -> bool {
-        if !self.may_make(budget.settings(), size) {
+        let settings = budget.settings();
+        if !may_make(settings, self.named, size) {
             return false;
         }
         if let Some(room) = self.room {
@@ -220,7 +217,7 @@ impl Making {
         }
         // The console names a size once none of the hosts had room for it long enough: this host need not have
         // found none for as long itself.
-        let starved = self.named == Some(size)
+        let starved = (settings.headless && self.named == Some(size))
             || self.starved[size.index()].is_some_and(|since| now.elapsed.since(since) >= STARVED_AFTER);
         if !starved || self.rests(now) || !held_back(Some(why)) || budget.slots() == 0 {
             return false;
@@ -233,6 +230,12 @@ impl Making {
     fn rests(&self, now: Now) -> bool {
         self.resting.is_some_and(|until| now.elapsed < until)
     }
+}
+
+/// Whether room may be made, and a place offered, for `size` here: on a Mac, which decides alone, for every size; on
+/// a headless host only for the one the console names (`named`).
+fn may_make(settings: &Settings, named: Option<Size>, size: Size) -> bool {
+    !settings.headless || named == Some(size)
 }
 
 /// Whether what keeps a machine out is what the Mac's own machines, or the jobs in line, hold: room that making room

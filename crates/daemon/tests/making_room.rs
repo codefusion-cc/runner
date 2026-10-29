@@ -467,3 +467,16 @@ async fn the_pool_host_the_console_names_starts_the_cf6g_job_within_one_jobs_len
         "the cf-6g job waited {after} s, over one job's length"
     );
 }
+
+// added (review): a Mac decides alone with its own ten-minute rule; a makeRoomFor the console sends it changes
+// nothing.
+#[tokio::test]
+async fn a_mac_the_console_names_still_waits_ten_minutes_before_offering_a_place() {
+    let (w, _cf4g) = mini_with_a_cf4g().await;
+    w.m.make_room_for(Some(Size::G6));
+    assert_eq!(
+        w.m.open_slots(Size::G6),
+        0,
+        "a Mac offered a cf-6g place at once because the console named it"
+    );
+}

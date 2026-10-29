@@ -1271,3 +1271,33 @@ async fn a_plain_actions_runner_is_registered_with_exactly_its_labels() {
         .unwrap_err();
     assert_eq!(unknown.status(), Some(404));
 }
+
+// added: a repository with more runs under way than are read, each still holding a queued job, does not hide a newer
+// run whose jobs all wait: queued runs are read first, then those under way, each the oldest first.
+#[tokio::test]
+async fn a_queued_run_is_read_before_runs_under_way() {
+    let h = harness().await;
+    for n in 0..WAITING_RUNS {
+        let label = format!("busy{n}");
+        let ids = h.fake.queue_run(
+            "org/app",
+            &[(&["self-hosted"], "first"), (&["self-hosted", &label], "second")],
+            "refs/heads/main",
+        );
+        h.fake.take_job(ids[0]);
+    }
+    let fresh = h.fake.queue_job("org/app", &["self-hosted", "cf-6g"], "build");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert!(
+        read.jobs.iter().any(|j| j.id == fresh),
+        "the queued run is read: {:?}",
+        read.jobs.iter().map(|j| j.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        read.left_out,
+        [format!(
+            "{} runs waiting, the oldest {WAITING_RUNS} read",
+            WAITING_RUNS + 1
+        )]
+    );
+}

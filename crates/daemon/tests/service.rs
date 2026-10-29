@@ -5686,11 +5686,14 @@ async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_ca
 }
 
 // added: the size the console's answer names the host to make room for reaches its machines, the log says so once,
-// a label the Runner does not know names none, and an answer without one takes the name back.
+// a label the Runner does not know names none, an answer without one takes the name back, and so do reports the
+// console leaves unanswered.
 #[tokio::test]
 async fn the_size_the_console_names_to_make_room_for_reaches_the_machines() {
     let log = support::Log::start();
-    let rig = Rig::new(2).await;
+    let mut rig = Rig::new(2).await;
+    // Reports go only when the test sends them.
+    rig.stop_pump().await;
     let named = "the console names this host to make room for a size no host has room for size=\"cf-6g\"";
     let unnamed = "the console names this host to make room for no size";
     let answered = async |size: Option<&str>| {
@@ -5717,5 +5720,30 @@ async fn the_size_the_console_names_to_make_room_for_reaches_the_machines() {
         log.lines("the console names"),
         [named, unnamed, named, unnamed],
         "an answer without one"
+    );
+    // A console that stops answering can name no other host: the name holds through a few missed reports, then
+    // goes.
+    answered(Some("cf-6g")).await;
+    rig.console.down(true);
+    for _ in 1..cf_daemon::NAME_KEPT_UNANSWERED {
+        rig.service.report().await;
+    }
+    assert_eq!(
+        log.lines("the console names").len(),
+        5,
+        "kept while a few reports go unanswered"
+    );
+    rig.service.report().await;
+    assert_eq!(
+        log.lines("the console names"),
+        [named, unnamed, named, unnamed, named, unnamed],
+        "dropped once the console is gone that long"
+    );
+    rig.console.down(false);
+    answered(Some("cf-6g")).await;
+    assert_eq!(
+        log.lines("the console names").len(),
+        7,
+        "named again once it answers"
     );
 }

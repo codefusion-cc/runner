@@ -647,15 +647,24 @@ impl GitHubApp {
         let mut now = QueueCache::default();
         let mut total = 0;
         let mut runs = Vec::new();
-        for (path, (tag, page)) in [(queued, queued_page?), (running, running_page?)] {
+        for (rank, (path, (tag, page))) in [(queued, queued_page?), (running, running_page?)]
+            .into_iter()
+            .enumerate()
+        {
             total += page.total;
-            runs.extend(page.runs.iter().cloned());
+            runs.extend(page.runs.iter().map(|run| (rank, run.clone())));
             if !tag.is_empty() {
                 now.listings.insert(path, (tag, page));
             }
         }
-        runs.sort_unstable_by_key(|run| run.id);
-        runs.dedup_by_key(|run| run.id);
+        // Queued runs first, whose jobs all wait, then those under way, each the oldest first; a run in both
+        // listings (it started between them) once, as queued.
+        runs.sort_unstable_by_key(|(rank, run)| (*rank, run.id));
+        let mut seen = std::collections::HashSet::new();
+        let mut runs: Vec<_> = runs
+            .into_iter()
+            .filter_map(|(_, run)| seen.insert(run.id).then_some(run))
+            .collect();
         let mut waiting = Waiting::default();
         if total.max(runs.len()) > WAITING_RUNS {
             waiting.left_out.push(format!(
