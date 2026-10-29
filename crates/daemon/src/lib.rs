@@ -50,7 +50,8 @@ pub use service::{
     ServiceParts, SetState, iso, job_event,
 };
 pub use traits::{
-    Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
+    Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, SetKey, Slots,
+    Ticket,
 };
 pub use turns::turn_of;
 pub use vms::{Seen, VmError, VmHosts, Vms};

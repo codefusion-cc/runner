@@ -1326,7 +1326,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 .iter()
                 .filter_map(|view| {
                     let set = sets.iter().find(|set| set.name == view.name)?;
-                    (set.id != 0).then_some((set.id, !view.queued.is_empty()))
+                    (set.id != 0).then_some(((set.repo.clone(), set.id), !view.queued.is_empty()))
                 })
                 .collect(),
         );

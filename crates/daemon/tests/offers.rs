@@ -10,9 +10,9 @@ use std::time::Duration;
 use cf_budget::{GIB, Size};
 use cf_daemon::OFFER_STANDS;
 use cf_daemon::testing::pass;
-use cf_daemon::{Claim, Slots, Ticket};
+use cf_daemon::{Claim, SetKey, Slots, Ticket};
 use proptest::prelude::*;
-use support::world::{SIZE, World};
+use support::world::{REPO, SIZE, World};
 
 /// One thing that happens. A number picks among what is there at that moment.
 #[derive(Debug, Clone)]
@@ -66,7 +66,7 @@ impl Listeners {
     }
 
     fn ask(&mut self, w: &World, i: usize) {
-        self.offers[i] = w.m.offer_room(set(i), SIZE) > 0;
+        self.offers[i] = w.m.offer_room(&set(i), SIZE) > 0;
     }
 
     fn all_ask(&mut self, w: &World) {
@@ -89,8 +89,8 @@ impl Listeners {
     }
 }
 
-fn set(i: usize) -> i64 {
-    100 + i64::try_from(i).expect("few")
+fn set(i: usize) -> SetKey {
+    (REPO.to_string(), 100 + i64::try_from(i).expect("few"))
 }
 
 fn free(w: &World) -> usize {
@@ -183,15 +183,15 @@ fn one_free() -> World {
 #[test]
 fn scale_sets_share_the_room_their_polls_offer() {
     let w = one_free();
-    assert_eq!(w.m.offer_room(set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
     assert_eq!(
-        w.m.offer_room(set(1), SIZE),
+        w.m.offer_room(&set(1), SIZE),
         0,
         "the one free machine is offered by the first poll already"
     );
-    assert_eq!(w.m.offer_room(set(2), SIZE), 0);
+    assert_eq!(w.m.offer_room(&set(2), SIZE), 0);
     assert_eq!(
-        w.m.offer_room(set(0), SIZE),
+        w.m.offer_room(&set(0), SIZE),
         1,
         "a poll that asks again offers what its last one did"
     );
@@ -200,17 +200,17 @@ fn scale_sets_share_the_room_their_polls_offer() {
 #[test]
 fn room_a_poll_offered_is_offered_again_once_its_job_starts_or_the_room_goes() {
     let w = one_free();
-    assert_eq!(w.m.offer_room(set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
     // GitHub assigns the job: the machine is full, and no poll offers anything.
     let Claim::Start(job) = w.m.claim(SIZE, None) else {
         panic!("the offered room was there");
     };
-    assert_eq!(w.m.offer_room(set(0), SIZE), 0);
-    assert_eq!(w.m.offer_room(set(1), SIZE), 0);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 0);
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 0);
     // It ends: the next poll to ask gets the room.
     w.m.release(job);
-    assert_eq!(w.m.offer_room(set(1), SIZE), 1);
-    assert_eq!(w.m.offer_room(set(0), SIZE), 0);
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 0);
 }
 
 #[test]
@@ -218,9 +218,9 @@ fn a_size_offered_counts_against_every_other_size() {
     // Room for two machines of the size, or one twice as large.
     let w = World::new(2);
     assert_eq!(Size::G4.vm_bytes(), 2 * SIZE.vm_bytes());
-    assert_eq!(w.m.offer_room(set(0), Size::G4), 1);
+    assert_eq!(w.m.offer_room(&set(0), Size::G4), 1);
     assert_eq!(
-        w.m.offer_room(set(1), SIZE),
+        w.m.offer_room(&set(1), SIZE),
         0,
         "the large machine offered takes the room of two"
     );
@@ -231,42 +231,69 @@ fn a_scale_set_with_jobs_queued_goes_before_those_without() {
     let w = one_free();
     w.m.set_demand(BTreeMap::from([(set(0), false), (set(1), true), (set(2), false)]));
     assert_eq!(
-        w.m.offer_room(set(0), SIZE),
+        w.m.offer_room(&set(0), SIZE),
         1,
         "with no other poll offering, one without jobs offers too"
     );
     assert_eq!(
-        w.m.offer_room(set(1), SIZE),
+        w.m.offer_room(&set(1), SIZE),
         1,
         "one with jobs queued is not kept out by it"
     );
     assert_eq!(
-        w.m.offer_room(set(2), SIZE),
+        w.m.offer_room(&set(2), SIZE),
         0,
         "one without jobs is kept out by both"
     );
     assert_eq!(
-        w.m.offer_room(set(3), SIZE),
+        w.m.offer_room(&set(3), SIZE),
         0,
         "nor does one whose queue was not read get past them"
     );
 }
 
 #[test]
+fn scale_sets_of_two_repositories_with_the_same_number_are_two() {
+    // GitHub numbers each repository's scale sets from its own start: on one host, a busy repository's set and an idle
+    // one's can both be 15.
+    let w = one_free();
+    let busy = ("codefusion-cc/busy".to_string(), 15);
+    let idle = ("codefusion-cc/idle".to_string(), 15);
+    w.m.set_demand(BTreeMap::from([(busy.clone(), true), (idle.clone(), false)]));
+    assert_eq!(w.m.offer_room(&busy, SIZE), 1);
+    assert_eq!(
+        w.m.offer_room(&idle, SIZE),
+        0,
+        "the other repository's poll neither ends the offer nor gets the room"
+    );
+    assert_eq!(
+        w.m.offer_room(&busy, SIZE),
+        1,
+        "the busy set's second poll offers the room again, so GitHub sees it twice"
+    );
+    w.m.withdraw_offer(&idle);
+    assert_eq!(
+        w.m.offer_room(&busy, SIZE),
+        1,
+        "nor does the other one's withdrawal take the room from it"
+    );
+}
+
+#[test]
 fn an_offer_github_never_fills_stands_no_longer_than_a_poll() {
     let w = one_free();
-    assert_eq!(w.m.offer_room(set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
     // Its listener asks no more: it stopped, or lost its session. The Mac's own clock may race meanwhile.
     pass(&w.m, 600);
     w.clock.advance(OFFER_STANDS - Duration::from_secs(1));
     assert_eq!(
-        w.m.offer_room(set(1), SIZE),
+        w.m.offer_room(&set(1), SIZE),
         0,
         "the first poll may still be in flight"
     );
     w.clock.advance(Duration::from_secs(1));
     assert_eq!(
-        w.m.offer_room(set(1), SIZE),
+        w.m.offer_room(&set(1), SIZE),
         1,
         "it has ended by now, and its room is offered again"
     );
@@ -289,19 +316,19 @@ fn a_machine_with_room_still_fills_every_slot_and_a_full_one_takes_nothing() {
     let room = free_of(&w, Size::G4);
     assert_eq!(room, 3, "the pool's hosts run three cf-4g at once");
     // Every scale set asks: as many offer as there are slots, however many sets there are.
-    let offered = (0..8).filter(|&i| w.m.offer_room(set(i), Size::G4) > 0).count();
+    let offered = (0..8).filter(|&i| w.m.offer_room(&set(i), Size::G4) > 0).count();
     assert_eq!(offered, 3);
     // Two of the jobs come: the third slot is still offered, by one poll.
     for _ in 0..2 {
         assert!(matches!(w.m.claim(Size::G4, None), Claim::Start(_)));
     }
-    let offered = (0..8).filter(|&i| w.m.offer_room(set(i), Size::G4) > 0).count();
+    let offered = (0..8).filter(|&i| w.m.offer_room(&set(i), Size::G4) > 0).count();
     assert_eq!(offered, 1);
     // What else runs takes the memory: no poll offers anything, and no job is acquired.
     let floor = w.parts.settings.away.floor_bytes;
     w.m.with_host(|host| host.set(|r| r.available_bytes = floor + GIB));
     pass(&w.m, 1);
-    let offered = (0..8).filter(|&i| w.m.offer_room(set(i), Size::G4) > 0).count();
+    let offered = (0..8).filter(|&i| w.m.offer_room(&set(i), Size::G4) > 0).count();
     assert_eq!(offered, 0);
     assert!(w.m.reserve(Size::G4).is_err(), "a full machine acquires no job");
 }
@@ -314,21 +341,21 @@ fn free_of(w: &World, size: Size) -> usize {
 fn jobs_queued_for_a_scale_set_end_the_polls_of_those_without() {
     let w = one_free();
     w.m.set_demand(BTreeMap::from([(set(0), false), (set(1), false)]));
-    assert_eq!(w.m.offer_room(set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
     let rung = w.nudges();
     w.m.set_demand(BTreeMap::from([(set(0), false), (set(1), false)]));
     assert_eq!(w.nudges(), rung, "nothing new is queued");
     w.m.set_demand(BTreeMap::from([(set(0), false), (set(1), true)]));
     assert_eq!(w.nudges(), rung + 1, "the polls ask again");
-    assert_eq!(w.m.offer_room(set(1), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 1);
 }
 
 #[test]
 fn a_scale_set_that_stops_offering_gives_its_room_back_at_once() {
     let w = one_free();
-    assert_eq!(w.m.offer_room(set(0), SIZE), 1);
-    assert_eq!(w.m.offer_room(set(1), SIZE), 0);
+    assert_eq!(w.m.offer_room(&set(0), SIZE), 1);
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 0);
     // Its job waited too long, or its listener went away: it offers nothing from now on.
-    w.m.withdraw_offer(set(0));
-    assert_eq!(w.m.offer_room(set(1), SIZE), 1, "not a minute later");
+    w.m.withdraw_offer(&set(0));
+    assert_eq!(w.m.offer_room(&set(1), SIZE), 1, "not a minute later");
 }

@@ -27,7 +27,7 @@ use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, TestRun
 use crate::roster::{JobInfo, Roster, Runner};
 use crate::test_run::{self, StartError, TestRun};
 use crate::traits::{
-    Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
+    Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, SetKey, Slots, Ticket,
 };
 use crate::vms::{Seen, Vms};
 use crate::{secs, time_of};
@@ -374,11 +374,11 @@ struct Inner<H> {
     /// What the polls in flight may be offering GitHub.
     offer: Offer,
     /// The room each scale set's poll in flight offers GitHub for a job not assigned yet, by scale set.
-    standing: BTreeMap<i64, Standing>,
+    standing: BTreeMap<SetKey, Standing>,
     /// The scale sets whose polls found the room offered to others: they go next, the longest passed over first.
-    passed_over: BTreeMap<i64, PassedOver>,
+    passed_over: BTreeMap<SetKey, PassedOver>,
     /// Whether each scale set has jobs queued at GitHub, as the queue was last read; one not named is not known.
-    demand: BTreeMap<i64, bool>,
+    demand: BTreeMap<SetKey, bool>,
     /// For which size room is made.
     making: Making,
     /// The slots of Docker jobs; one given back leaves at the next count.
@@ -686,7 +686,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
 
     /// Which scale sets have jobs queued at GitHub, by scale set, as the queue was just read: they go first when the
     /// machine's room is offered ([`Slots::offer_room`]). One not named counts as having some.
-    pub fn set_demand(&self, demand: BTreeMap<i64, bool>) {
+    pub fn set_demand(&self, demand: BTreeMap<SetKey, bool>) {
         let mut inner = self.lock();
         // A scale set whose jobs were just queued need not wait for the turn of one without: the polls ask again.
         let queued_now = demand
@@ -2082,26 +2082,26 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         0
     }
 
-    fn offer_room(&self, set: i64, size: Size) -> usize {
+    fn offer_room(&self, set: &SetKey, size: Size) -> usize {
         let open = self.open_slots(size);
         let mut inner = self.lock();
         let now = inner.host.now();
         let wall = self.clock.now();
         // The poll this one replaces offers nothing any more, nor does one that has surely ended, nor waits a scale
         // set that no longer asks.
-        let before = inner.standing.remove(&set);
+        let before = inner.standing.remove(set);
         let fresh = |at: SystemTime| wall.duration_since(at).unwrap_or(Duration::ZERO) < OFFER_STANDS;
         inner.standing.retain(|_, standing| fresh(standing.at));
         inner.passed_over.retain(|_, passed| fresh(passed.asked));
         if open == 0 {
-            inner.passed_over.remove(&set);
+            inner.passed_over.remove(set);
             return 0;
         }
-        let wants = |id: &i64| inner.demand.get(id).copied().unwrap_or(true);
+        let wants = |id: &SetKey| inner.demand.get(id).copied().unwrap_or(true);
         // A scale set with jobs queued takes no notice of the room offered to those without: they had none queued
         // when it was offered.
-        let mine = wants(&set);
-        let counts = |id: &i64| *id != set && (!mine || wants(id));
+        let mine = wants(set);
+        let counts = |id: &SetKey| id != set && (!mine || wants(id));
         let mut others: Vec<Size> = inner
             .standing
             .iter()
@@ -2112,7 +2112,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         // a scale set's last two polls, so the room of one alone is never assigned.
         let tenure = before.is_some_and(|standing| standing.polls < 2);
         if !tenure {
-            let since = inner.passed_over.get(&set).map(|passed| passed.since);
+            let since = inner.passed_over.get(set).map(|passed| passed.since);
             others.extend(
                 inner
                     .passed_over
@@ -2128,7 +2128,7 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             !others.contains(&size)
         };
         if !fits {
-            let passed = inner.passed_over.entry(set).or_insert(PassedOver {
+            let passed = inner.passed_over.entry(set.clone()).or_insert(PassedOver {
                 size,
                 since: wall,
                 asked: wall,
@@ -2142,9 +2142,9 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             }
             return 0;
         }
-        inner.passed_over.remove(&set);
+        inner.passed_over.remove(set);
         inner.standing.insert(
-            set,
+            set.clone(),
             Standing {
                 size,
                 at: wall,
@@ -2154,10 +2154,10 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
         1
     }
 
-    fn withdraw_offer(&self, set: i64) {
+    fn withdraw_offer(&self, set: &SetKey) {
         let mut inner = self.lock();
-        inner.standing.remove(&set);
-        inner.passed_over.remove(&set);
+        inner.standing.remove(set);
+        inner.passed_over.remove(set);
     }
 
     fn held(&self) -> bool {
