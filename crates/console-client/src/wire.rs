@@ -304,7 +304,9 @@ pub struct Status {
     pub app_key_file: Option<String>,
     /// Why this host still holds the GitHub App's key and signs with it: the console's scale set calls have not
     /// answered it yet (an older console, GitHub through the console off for the host, a failure), or the key could
-    /// not be taken out. Left out on a host that goes through the console alone; a console from before ignores it.
+    /// not be taken out. On a host that goes through the console, why its settings still name the key's folder: its
+    /// key file is missing and the Runner did not delete it, or the settings file could not be written once it did.
+    /// Left out on a host that goes through the console alone; a console from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_key_kept: Option<String>,
     /// Whether the Runner's first look at GitHub since it started has not ended yet: its scale sets are not listed

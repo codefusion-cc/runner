@@ -110,6 +110,10 @@ pub struct ServiceConfig {
     /// Where a GitHub App key this host held before the console held it would be (`<the old app_dir>/app.pem`), as
     /// the update that deleted it remembered: reported to the console while a file is there (`appKeyFile`).
     pub app_key_file: Option<PathBuf>,
+    /// What the report says of the GitHub App's key from the start (`appKeyKept`) on a host that holds no key it
+    /// signs with: why its settings still name the key's folder (its key file is missing and no take-out of this
+    /// Runner deleted it, or the settings file could not be written once one did).
+    pub app_key_said: Option<String>,
     /// How often a trusted host asks the console for an Actions runner while it has none: the console answers
     /// that no trusted job waits, with a time to ask again, until one does.
     pub trusted_every: Duration,
@@ -144,6 +148,7 @@ impl ServiceConfig {
             queued_keep: Duration::from_secs(30 * 60),
             queued_bounds: (8, 32),
             app_key_file: None,
+            app_key_said: None,
             trusted_every: Duration::from_secs(15),
         }
     }
@@ -160,8 +165,9 @@ pub struct HeldKey {
     /// The key file, which the report names while the host holds it (`appKeyFile`).
     pub file: PathBuf,
     /// Deletes the key file and takes its folder out of the settings, so that the Runner that starts next goes
-    /// through the console: what it did, or why it could not. Called only right after a call of the console's scale
-    /// set calls that this host made was answered.
+    /// through the console: what it did once the key is gone (the settings may still name its folder, and say why),
+    /// or why the key stays. Called only right after a call of the console's scale set calls that this host made was
+    /// answered.
     pub take_out: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
 }
 
@@ -172,6 +178,9 @@ impl std::fmt::Debug for HeldKey {
             .finish_non_exhaustive()
     }
 }
+
+/// The most characters of `appKeyKept` the console reads.
+const KEY_KEPT_MAX: usize = 300;
 
 /// What the report says while a host keeps the key because the console's scale set calls were not asked yet.
 pub const KEY_NOT_ASKED: &str = "the console's scale set calls were not asked yet";
@@ -627,6 +636,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let paused = parts.console.is_some() && kept_pause(parts.pause.as_deref());
         // Before any listener opens: a host the console paused stays closed until the console answers.
         parts.machines.pause(paused);
+        let app_key_said = parts.config.app_key_said.clone();
         Service {
             shared: Arc::new(Shared {
                 app: parts.app,
@@ -659,7 +669,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 looked: AtomicBool::new(false),
                 test_run: Mutex::new(None),
                 docker_refused: AtomicBool::new(false),
-                key_kept: Mutex::new(parts.held_key.as_ref().map(|_| KEY_NOT_ASKED.to_string())),
+                key_kept: Mutex::new(match &parts.held_key {
+                    Some(_) => Some(KEY_NOT_ASKED.to_string()),
+                    None => app_key_said.map(|said| cut(said, KEY_KEPT_MAX)),
+                }),
                 held_key: parts.held_key,
                 rediscover: Notify::new(),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
@@ -784,16 +797,17 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     }
 
     /// On a host that still holds the Runners App's key: asks the console's scale set calls for this host's scale
-    /// sets of a repository it serves, and once they answered, takes the key out and starts again, through the
-    /// console. Otherwise the key stays and serves, and the report says why.
+    /// sets of each repository it serves in turn, until they answered about one; then takes the key out and starts
+    /// again, through the console. Otherwise the key stays and serves, and the report says why the last one asked
+    /// was not answered: one repository the console refuses keeps no key. A console that cannot be reached, is busy
+    /// or has no such calls would answer the same about every repository, and is asked about one.
     async fn ask_for_the_key(&self) {
         let shared = &self.shared;
         let Some(key) = &shared.held_key else {
             return;
         };
         let keep = |why: String| {
-            // The console reads at most 300 characters of it.
-            let why = cut(why, 300);
+            let why = cut(why, KEY_KEPT_MAX);
             let mut kept = shared.key_kept.lock().expect("key kept");
             if kept.as_deref() != Some(why.as_str()) {
                 tracing::warn!(file = %key.file.display(), %why, "the GitHub App's key stays on this host and serves");
@@ -803,21 +817,47 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let Some(console) = &shared.console else {
             return keep("this Runner is not enrolled with a console".into());
         };
-        let repo = shared
+        let repos: Vec<String> = shared
             .main
             .lock()
             .expect("main")
             .as_ref()
-            .and_then(|read| read.repos.first().map(|(repo, _)| repo.full_name.clone()));
-        let Some(repo) = repo else {
-            return keep("no repository is served yet to ask the console's scale set calls about".into());
-        };
-        if let Err(error) = console.client.scaleset_list(&repo).await {
-            return keep(format!(
-                "the console's scale set calls did not answer: {}",
-                why_not(&error)
-            ));
+            .map(|read| {
+                read.repos
+                    .iter()
+                    .map(|(repo, _)| repo.full_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut not_answered = None;
+        let mut answered = None;
+        for repo in repos {
+            match console.client.scaleset_list(&repo).await {
+                Ok(_) => {
+                    answered = Some(repo);
+                    break;
+                }
+                Err(error) => {
+                    let of_this_repo = matches!(
+                        &error,
+                        cf_console_client::Error::Refused { status, code, .. } if !(*status == 404 && code.is_none())
+                    );
+                    not_answered = Some(error);
+                    if !of_this_repo {
+                        break;
+                    }
+                }
+            }
         }
+        let Some(repo) = answered else {
+            return keep(match not_answered {
+                Some(error) => format!(
+                    "the console's scale set calls did not answer: {}",
+                    why_not(&error)
+                ),
+                None => "no repository is served yet to ask the console's scale set calls about".into(),
+            });
+        };
         let take_out = key.take_out.clone();
         match tokio::task::spawn_blocking(move || take_out()).await {
             Ok(Ok(done)) => {
@@ -1649,7 +1689,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             Ok(runner) => tracing::info!(%runner, %repo, "a trusted job waits: an Actions runner takes it"),
             Err(error) => {
                 machines.release(ticket);
-                if error.retry_after().is_some() {
+                // Only the console's 409 says no trusted job waits; a 429 or a 5xx says when to ask again too.
+                if error.is_no_job_yet() {
                     tracing::debug!(%repo, %error, "no trusted job waits yet");
                 } else {
                     tracing::warn!(%repo, %error, "an Actions runner for a trusted job could not start");

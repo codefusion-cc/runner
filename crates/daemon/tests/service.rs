@@ -4199,6 +4199,79 @@ async fn a_key_that_cannot_be_taken_out_stays_and_the_report_says_why() {
     assert_eq!(held.taken.load(Ordering::SeqCst), 2);
 }
 
+/// A host that serves two repositories and holds the key, and a console whose scale set calls refuse it the first
+/// repository asked about: the next one is asked, and once it answered, the key is taken out. A console from before the
+/// scale set calls is asked about one repository: it would answer the same about the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_key_is_taken_out_once_the_console_answered_about_any_repository_the_host_serves() {
+    const OTHER: &str = "org/other";
+    let refused = Reply::status_json(
+        403,
+        &json!({ "error": "The repository is not this machine's", "code": "not_yours" }),
+    );
+    for (case, first, asked_after, taken) in [
+        ("refused", refused, vec![403, 200], 1),
+        ("older console", FakeConsole::no_scaleset_calls(), vec![404], 0),
+    ] {
+        let mut rig = Rig::new(2).await;
+        rig.stop_pump().await;
+        rig.github.add_repo(OTHER, true);
+        rig.github.set_workflow(OTHER, "ci.yml", WORKFLOW);
+        let held = holding(&rig, None);
+        rig.console.answer_next(first);
+        held.service.discover().await;
+        let asked: Vec<(String, u16)> = rig
+            .console
+            .github_calls()
+            .into_iter()
+            .filter(|call| call.machine == MACHINE && call.route == "scaleset/list")
+            .map(|call| (call.body["repo"].as_str().unwrap_or("").to_string(), call.status))
+            .collect();
+        assert_eq!(
+            asked.iter().map(|(_, status)| *status).collect::<Vec<_>>(),
+            asked_after,
+            "{case}: {asked:?}"
+        );
+        if let [one, two] = asked.as_slice() {
+            assert_ne!(one.0, two.0, "{case}: another repository");
+        }
+        assert_eq!(held.taken.load(Ordering::SeqCst), taken, "{case}");
+        assert_eq!(held.service.restart_requested(), taken == 1, "{case}");
+        assert_eq!(held.service.key_kept().is_none(), taken == 1, "{case}");
+    }
+}
+
+/// A host that holds no key it signs with, and whose settings still name the key's folder: its report says why from
+/// the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_report_says_why_the_settings_still_name_a_key_the_host_does_not_hold() {
+    let mut rig = Rig::new(2).await;
+    rig.stop_pump().await;
+    const SAID: &str = "no key file is at /app/app.pem; the settings still name its folder (`app_dir`)";
+    let service = service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |config| config.app_key_said = Some(SAID.into()),
+    );
+    assert_eq!(service.key_kept().as_deref(), Some(SAID));
+    service.report().await;
+    assert_eq!(last_status(&rig.console)["appKeyKept"], json!(SAID));
+    // A key the host holds says why it is kept instead.
+    rig.service.report().await;
+    assert!(last_status(&rig.console).get("appKeyKept").is_none());
+}
+
 fn changed(id: &str) -> SettingsLook {
     SettingsLook::Changed { id: id.into() }
 }
@@ -5885,36 +5958,15 @@ async fn passes_until(machines: &TestMachines, what: &str, done: impl Fn() -> bo
     panic!("{what} never came");
 }
 
-/// A trusted host (`cf_trusted`): it makes no scale set whatever the workflows ask for, and asks for one Actions
-/// runner with the label `trusted` at a time, outside any scale set, in the largest machine it has, whose machine
-/// carries the rules each job is checked against before its first step. One that waited five minutes for a job is
-/// removed. It takes no test run and says its class; the shared host beside it never serves a set with `trusted`,
-/// from a list or a variable, and says no class.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_carries_the_rules() {
-    // Room for two of its largest machines: one at a time is the trusted host's own rule.
-    let mut rig = Rig::new(20).await;
-    rig.stop_pump().await;
+/// A trusted host of [`REPO`] on the rig's machines, which carry its rules; its settings still list [`REPO`] for
+/// Docker, as a shared host's file left over. The rules and the service.
+fn trusted_host(rig: &mut Rig) -> (cf_trusted::Policy, TestService) {
     let rules = cf_trusted::Policy::new(
         json!({ "repository": REPO, "allow": { "deploy.yml": ["workflow_dispatch"] } }),
     );
     rig.machines = rig
         .parts
         .machines_with(|config| config.trusted = Some(rules.clone()));
-    rig.github.set_workflow(
-        REPO,
-        "deploy.yml",
-        "on: workflow_dispatch\njobs:\n  image:\n    runs-on: [self-hosted, cf-2g, cf-docker]\n    steps: []\n  listed:\n    runs-on: [cf-8g, trusted]\n    steps: []\n  deploy:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED || 'ubuntu-latest' }}\n    steps: []\n",
-    );
-    rig.github.set_variable(REPO, "CI_RUNNER_TRUSTED", "trusted");
-    let (shared, _) = rig.service.survey().await;
-    assert!(
-        !shared.is_empty() && shared.iter().all(|line| !line.contains("trusted")),
-        "{shared:?}"
-    );
-    let report = serde_json::to_value(rig.service.status()).expect("a report");
-    assert_eq!(report.get("class"), None, "a shared host says no class");
-
     let trusted = service_with(
         &rig.github,
         &rig.console,
@@ -5935,6 +5987,74 @@ async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_ca
             config.policy.docker_repos = vec![REPO.into()];
         },
     );
+    (rules, trusted)
+}
+
+/// A trusted host asks the console for an Actions runner and is told no trusted job waits yet (a 409 that says when
+/// to ask again): that is no failure, and no warning in the log. A console that answers 429 or 503, even with a time
+/// to ask again, failed the ask, and the log warns of it. Nothing is registered either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_host_warns_of_a_console_that_failed_its_ask_and_not_of_no_trusted_job_yet() {
+    for (status, code, warned) in [
+        (409, "no_trusted_job", false),
+        (429, "rate_limited", true),
+        (503, "github_busy", true),
+    ] {
+        let mut rig = Rig::new(20).await;
+        rig.stop_pump().await;
+        let (_, trusted) = trusted_host(&mut rig);
+        trusted.discover().await;
+        let log = rig.folder.path().join("trusted.log");
+        rig.console.answer_next(
+            Reply::status_json(status, &json!({ "error": "not now", "code": code }))
+                .with_header("retry-after", "1"),
+        );
+        {
+            let _logged = tracing::subscriber::set_default(cf_daemon::Lines::new(&log, cf_daemon::ROLL_AT));
+            trusted.ask_trusted().await;
+        }
+        let asked: Vec<u16> = rig
+            .console
+            .github_calls()
+            .into_iter()
+            .filter(|call| call.route == "jit")
+            .map(|call| call.status)
+            .collect();
+        assert_eq!(asked.first(), Some(&status), "{code}: {asked:?}");
+        let lines = std::fs::read_to_string(&log).unwrap_or_default();
+        let warning = lines
+            .lines()
+            .any(|line| line.contains(" WARN ") && line.contains("a trusted job could not start"));
+        assert_eq!(warning, warned, "{code}: {lines}");
+        assert!(rig.github.plain_runners().is_empty(), "{code}");
+    }
+}
+
+/// A trusted host (`cf_trusted`): it makes no scale set whatever the workflows ask for, and asks for one Actions
+/// runner with the label `trusted` at a time, outside any scale set, in the largest machine it has, whose machine
+/// carries the rules each job is checked against before its first step. One that waited five minutes for a job is
+/// removed. It takes no test run and says its class; the shared host beside it never serves a set with `trusted`,
+/// from a list or a variable, and says no class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_carries_the_rules() {
+    // Room for two of its largest machines: one at a time is the trusted host's own rule.
+    let mut rig = Rig::new(20).await;
+    rig.stop_pump().await;
+    let (rules, trusted) = trusted_host(&mut rig);
+    rig.github.set_workflow(
+        REPO,
+        "deploy.yml",
+        "on: workflow_dispatch\njobs:\n  image:\n    runs-on: [self-hosted, cf-2g, cf-docker]\n    steps: []\n  listed:\n    runs-on: [cf-8g, trusted]\n    steps: []\n  deploy:\n    runs-on: ${{ vars.CI_RUNNER_TRUSTED || 'ubuntu-latest' }}\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER_TRUSTED", "trusted");
+    let (shared, _) = rig.service.survey().await;
+    assert!(
+        !shared.is_empty() && shared.iter().all(|line| !line.contains("trusted")),
+        "{shared:?}"
+    );
+    let report = serde_json::to_value(rig.service.status()).expect("a report");
+    assert_eq!(report.get("class"), None, "a shared host says no class");
+
     let (served, problems) = trusted.survey().await;
     assert_eq!(served, Vec::<String>::new());
     assert_eq!(problems, Vec::<String>::new());

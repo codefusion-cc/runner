@@ -153,6 +153,9 @@ pub struct HostSetup {
     pub settings: Option<Arc<dyn SettingsFile>>,
     /// Where the GitHub App's key file was when the host held the key: the report names it while it is there.
     pub app_key_file: Option<PathBuf>,
+    /// Why the settings still name the key's folder though the host holds no key it signs with: the report says it
+    /// (`appKeyKept`). See [`ServiceConfig::app_key_said`].
+    pub app_key_said: Option<String>,
     /// The GitHub App's key the host still holds until the console's scale set calls answered it; `app` signs with
     /// it too. None on a host that goes through the console alone.
     pub held_key: Option<crate::HeldKey>,
@@ -220,6 +223,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     let mut service = ServiceConfig::new(&setup.machine, &hostname, &P::model(), &setup.version);
     service.policy = setup.policy;
     service.app_key_file = setup.app_key_file;
+    service.app_key_said = setup.app_key_said;
     let service = Service::new(ServiceParts {
         app: setup.app,
         machines: machines.clone(),
