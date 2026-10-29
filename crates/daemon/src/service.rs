@@ -1431,6 +1431,16 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .unwrap_or_default(),
             })
             .collect();
+        // The room the polls offer goes first to the scale sets with jobs queued.
+        shared.machines.set_demand(
+            views
+                .iter()
+                .filter_map(|view| {
+                    let set = sets.iter().find(|set| set.name == view.name)?;
+                    (set.id != 0).then_some(((set.repo.clone(), set.id), !view.queued.is_empty()))
+                })
+                .collect(),
+        );
         let found = held::held(now, &views);
         // The slots are taken, and the tries counted, under the lock: a look at the same time starts none twice.
         let starts: Vec<(&SetState, &HeldSet, Ticket)> = {
@@ -1829,7 +1839,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         drop(updating);
         let settings_error = shared.applying.lock().expect("applying").warning.clone();
         let not_serving = if shared.ending.load(Ordering::SeqCst) {
-            Some("the Runner ends; the one that starts next serves them again".to_string())
+            // Only a Runner that ends to start again knows another follows: one stopped from outside, as its machine
+            // shuts down or Google takes a spot VM back, may be the last for good.
+            Some(if shared.restart.load(Ordering::SeqCst) {
+                ENDS_TO_START_AGAIN.to_string()
+            } else {
+                STOPS.to_string()
+            })
         } else {
             shared.not_serving.lock().expect("not serving").clone()
         };
@@ -2685,6 +2701,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         }
     }
 }
+
+/// What the last report of a Runner that ends to start again says it serves.
+const ENDS_TO_START_AGAIN: &str = "the Runner ends; the one that starts next serves them again";
+
+/// What the last report of a Runner stopped from outside says it serves: its machine shuts down, or its service
+/// manager stopped it, and nothing here says another Runner follows.
+const STOPS: &str = "the Runner stopped: its machine shuts down or its service was stopped";
 
 /// One scale set's listener, for as long as it is wanted: the scale set is made, a session opened, and the scaler
 /// hears its messages; a session that fails is opened again after a wait.

@@ -30,6 +30,10 @@ pub enum Claim {
     Never(String),
 }
 
+/// One scale set of this host: its repository and GitHub's number for it. The number alone names none: GitHub numbers
+/// the scale sets of each repository from its own start, so two repositories' sets share numbers on the same host.
+pub type SetKey = (String, i64);
+
 /// The machine's slots, which every scale set together share: the budget, from the scaler's side.
 ///
 /// A slot is promised before a job is acquired ([`Slots::reserve`]), made an Actions runner's when the service says
@@ -71,6 +75,18 @@ pub trait Slots: Send + Sync {
 
     /// How many more slots of this size would open now; 0 while the machine takes no new jobs.
     fn open_slots(&self, size: Size) -> usize;
+
+    /// Whether the poll scale set `set` is about to send may offer GitHub room for one more job of `size`: 1 or 0.
+    /// The machine's scale sets share its room: a slot one poll in flight offers is offered by no other until that
+    /// poll ends, so GitHub never assigns the machine more jobs than it can start. Scale sets with jobs queued go
+    /// before those without.
+    fn offer_room(&self, _set: &SetKey, size: Size) -> usize {
+        self.open_slots(size).min(1)
+    }
+
+    /// The poll scale set `set` is about to send offers no room, for its own reasons, or none follows: the room its
+    /// last poll offered is the others' again.
+    fn withdraw_offer(&self, _set: &SetKey) {}
 
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);

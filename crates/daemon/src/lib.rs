@@ -35,7 +35,7 @@ pub use ends::{EndKind, machine_end};
 pub use log::{Lines, ROLL_AT};
 pub use machines::{
     Answer, DOCKER_FULL, JobReport, MachineConfig, MachineFacts, MachineParts, MachineStatus, Machines,
-    RESULT_WAIT, Registration, Reports, SizeRoom, Snapshot,
+    OFFER_STANDS, RESULT_WAIT, Registration, Reports, SizeRoom, Snapshot,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use platform::{HostMachines, HostService, HostSetup, Platform, This, host_service, records_dir};
@@ -50,7 +50,8 @@ pub use service::{
     Service, ServiceConfig, ServiceParts, SetState, iso, job_event,
 };
 pub use traits::{
-    Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, Slots, Ticket,
+    Claim, EventKind, Events, HostError, Hosts, JobEvent, Jobs, Refusal, Registry, RunnerSpec, SetKey, Slots,
+    Ticket,
 };
 pub use turns::turn_of;
 pub use vms::{Seen, VmError, VmHosts, Vms};

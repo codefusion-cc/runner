@@ -741,22 +741,30 @@ impl Budget {
     /// How many more slots of each size would fit now, each size counted alone. This is what the Runner tells
     /// GitHub it has; a slot still needs [`Budget::claim`].
     pub fn free(&self, now: Now) -> Free {
+        self.free_beside(now, &[])
+    }
+
+    /// [`Budget::free`] with a slot of each of `offered` counted as held: the room the Runner has offered GitHub
+    /// for jobs not assigned yet, which another offer must not offer again.
+    pub fn free_beside(&self, now: Now, offered: &[Size]) -> Free {
         let Ok(reading) = self.takes_jobs(now) else {
             return Free::default();
         };
         let limits = profile_for(&self.settings, Some(reading));
-        let held = self.charges();
+        let unstarted = |size: Size| Charge {
+            vm_bytes: size.vm_bytes(),
+            host_bytes: self.settings.host_bytes(size),
+            resident_bytes: 0,
+            cpus: self.settings.vcpus_of(size),
+        };
+        let mut held = self.charges();
+        held.extend(offered.iter().copied().map(unstarted));
         Free(Size::ALL.map(|size| {
             if self.in_turn(size).is_err() {
                 return 0;
             }
             let mut charges = held.clone();
-            let one_more = Charge {
-                vm_bytes: size.vm_bytes(),
-                host_bytes: self.settings.host_bytes(size),
-                resident_bytes: 0,
-                cpus: self.settings.vcpus_of(size),
-            };
+            let one_more = unstarted(size);
             let mut more = 0;
             // The cap is at most the Mac's memory, so this ends; the bound is for a setting that slipped through.
             while more < 1024

@@ -71,6 +71,22 @@ pub fn resident(current: u64, stat: &str) -> u64 {
     current.saturating_sub(file.saturating_sub(shared))
 }
 
+/// What a machine read from and wrote to the disks: the sum of the `/proc/<pid>/io` of its processes that could be
+/// read. The monitor's are what count; pasta's are not this user's to read, and it touches no disk. `None` when not
+/// one of them could be read.
+pub fn disk_io(files: impl IntoIterator<Item = impl AsRef<str>>) -> Option<cf_vmm::DiskIo> {
+    files
+        .into_iter()
+        .filter_map(|text| {
+            let text = text.as_ref();
+            Some(cf_vmm::DiskIo {
+                read_bytes: counter(text, "read_bytes:")?,
+                written_bytes: counter(text, "write_bytes:")?,
+            })
+        })
+        .reduce(cf_vmm::DiskIo::plus)
+}
+
 /// The controllers a cgroup's children must have for machines: memory and pids always, cpuset where the delegation
 /// has it. `None` when one that must be there is not.
 pub fn wanted(available: &str) -> Option<Vec<&'static str>> {
@@ -458,6 +474,16 @@ mod linux {
             cf_host_linux::parse::psi(&fs::read_to_string(self.path.join("cpu.pressure")).ok()?).ok()
         }
 
+        /// What its processes read from and wrote to the disks ([`super::disk_io`]).
+        pub fn disk_io(&self) -> Option<cf_vmm::DiskIo> {
+            let pids = fs::read_to_string(self.path.join("cgroup.procs")).ok()?;
+            super::disk_io(
+                pids.lines().filter_map(|pid| {
+                    fs::read_to_string(Path::new("/proc").join(pid.trim()).join("io")).ok()
+                }),
+            )
+        }
+
         /// The most memory it held since it was made, `memory.peak` (kernel 5.19 and later).
         pub fn peak(&self) -> Option<u64> {
             fs::read_to_string(self.path.join("memory.peak"))
@@ -503,6 +529,65 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cf_vmm::DiskIo;
+
+    /// `/proc/<pid>/io` as Linux writes it.
+    fn proc_io(read: u64, written: u64) -> String {
+        format!(
+            "rchar: 7340032\nwchar: 1048576\nsyscr: 120\nsyscw: 40\nread_bytes: {read}\nwrite_bytes: {written}\n\
+             cancelled_write_bytes: 4096\n"
+        )
+    }
+
+    #[test]
+    fn a_machines_disk_bytes_are_its_processes_storage_bytes_added_up() {
+        let monitor = proc_io(289_129_984, 4_573_347_840);
+        let helper = proc_io(4096, 0);
+        assert_eq!(
+            disk_io([monitor.as_str(), helper.as_str()]),
+            Some(DiskIo {
+                read_bytes: 289_129_984 + 4096,
+                written_bytes: 4_573_347_840,
+            })
+        );
+        assert_eq!(
+            disk_io([monitor.as_str()]),
+            Some(DiskIo {
+                read_bytes: 289_129_984,
+                written_bytes: 4_573_347_840,
+            }),
+            "rchar and wchar count the page cache's bytes too: only the disk's count"
+        );
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_read_counts_nothing_and_none_read_is_none() {
+        let monitor = proc_io(1 << 30, 2 << 30);
+        let expected = Some(DiskIo {
+            read_bytes: 1 << 30,
+            written_bytes: 2 << 30,
+        });
+        // A kernel without task I/O accounting, a file cut short, a number that is not one.
+        for broken in [
+            "",
+            "read_bytes: 5\n",
+            "read_bytes: -1\nwrite_bytes: 2\n",
+            "read_bytes 5\nwrite_bytes 6\n",
+        ] {
+            assert_eq!(disk_io([broken, monitor.as_str()]), expected, "{broken:?}");
+            assert_eq!(disk_io([broken]), None, "{broken:?}");
+        }
+        assert_eq!(disk_io([""; 0]), None);
+        let full = format!("read_bytes: {}\nwrite_bytes: {}\n", u64::MAX, u64::MAX);
+        assert_eq!(
+            disk_io([full.as_str(), monitor.as_str()]),
+            Some(DiskIo {
+                read_bytes: u64::MAX,
+                written_bytes: u64::MAX,
+            }),
+            "a sum past what a number holds stays at the most"
+        );
+    }
 
     #[test]
     fn a_machine_is_capped_at_its_size_and_overhead_without_swap() {

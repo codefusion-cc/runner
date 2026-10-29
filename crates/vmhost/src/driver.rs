@@ -10,7 +10,7 @@ use crate::task::{describe, now_ns, now_s, put_down};
 use cf_guest_proto::{
     HostMessage, Job, PORT, PROTOCOL, Start, Stop, StopReason, Task, read_guest_message, write_message,
 };
-use cf_vmm::{Channel, Network, Vm, Vmm};
+use cf_vmm::{Channel, DiskIo, Network, Vm, Vmm};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
@@ -207,6 +207,8 @@ fn run_in(
         pressure_peak: machine.and_then(Machine::pressure_peak),
         host_cpu: None,
         host_cpu_peak: None,
+        disk_read_bytes: None,
+        disk_written_bytes: None,
         oom: machine.and_then(Machine::oom).cloned(),
         end: machine
             .filter(|_| stage == Stage::Ended)
@@ -298,6 +300,9 @@ fn run_in(
     let (mut machine, first) = Machine::new(limits, started.elapsed());
     // The worst wait of the machine's vCPUs for the host's CPUs: only the host sees it, so the guest's peaks have it not.
     let mut host_cpu_peak: Option<cf_vmm::Psi> = None;
+    // What the job's machines read and wrote: the earlier boots' machines, and the last look at the current one. A
+    // machine that ended can no longer be read, so each is looked at before it is put down.
+    let mut disk = Disk::default();
     let generation = Arc::new(AtomicU32::new(0));
     let mut vm: Option<Arc<dyn Vm>> = None;
     let mut channel: Option<Box<dyn Channel>> = None;
@@ -314,6 +319,8 @@ fn run_in(
                         channel.shutdown();
                     }
                     if let Some(old) = vm.take() {
+                        disk.look(old.as_ref());
+                        disk.next_machine();
                         put_down(old.as_ref(), Duration::from_secs(3));
                     }
                     match vmm.start(&spec) {
@@ -359,6 +366,9 @@ fn run_in(
                     }
                 }
                 Action::StopVm => {
+                    if let Some(vm) = &vm {
+                        disk.look(vm.as_ref());
+                    }
                     // A machine that takes no stop has ended by itself, which a look finds out, or never will.
                     if let Some(vm) = &vm
                         && vm.stop().is_err()
@@ -372,10 +382,16 @@ fn run_in(
                     host_cpu_peak = host_cpu
                         .map(|now| host_cpu_peak.map_or(now, |peak| peak.max(now)))
                         .or(host_cpu_peak);
+                    if let Some(vm) = &vm {
+                        disk.look(vm.as_ref());
+                    }
+                    let io = disk.total();
                     publish(&JobState {
                         resident_bytes: vm.as_ref().and_then(|vm| vm.resident()),
                         host_cpu,
                         host_cpu_peak,
+                        disk_read_bytes: io.map(|io| io.read_bytes),
+                        disk_written_bytes: io.map(|io| io.written_bytes),
                         ..snapshot(Some(&machine), machine.stage())
                     })
                 }
@@ -386,10 +402,14 @@ fn run_in(
                         channel.shutdown();
                     }
                     if let Some(vm) = vm.take() {
+                        disk.look(vm.as_ref());
                         put_down(vm.as_ref(), Duration::from_secs(2));
                     }
+                    let io = disk.total();
                     let state = JobState {
                         host_cpu_peak,
+                        disk_read_bytes: io.map(|io| io.read_bytes),
+                        disk_written_bytes: io.map(|io| io.written_bytes),
                         ..snapshot(Some(&machine), Stage::Ended)
                     };
                     publish(&state);
@@ -447,6 +467,45 @@ fn run_in(
             (event, _) => event,
         };
         actions.extend(machine.handle(event, started.elapsed()));
+    }
+}
+
+/// What a job's machines read from and wrote to their disks. A machine's counts start at nothing, so a job booted
+/// twice adds the first machine's last look to the second's.
+#[derive(Default)]
+struct Disk {
+    earlier: Option<DiskIo>,
+    current: Option<DiskIo>,
+}
+
+impl Disk {
+    /// Takes the machine's counts, unless it can no longer be read: then its last look stands. A machine's counts
+    /// only grow, so a look that found less (its monitor gone, its network helper left) keeps the most seen.
+    fn look(&mut self, vm: &dyn Vm) {
+        if let Some(io) = vm.disk_io() {
+            let seen = self.current.unwrap_or_default();
+            self.current = Some(DiskIo {
+                read_bytes: seen.read_bytes.max(io.read_bytes),
+                written_bytes: seen.written_bytes.max(io.written_bytes),
+            });
+        }
+    }
+
+    /// The machine looked at so far is done with; the next one starts at nothing.
+    fn next_machine(&mut self) {
+        self.earlier = add(self.earlier, self.current.take());
+    }
+
+    /// Over the whole job; `None` while no machine of it could be read.
+    fn total(&self) -> Option<DiskIo> {
+        add(self.earlier, self.current)
+    }
+}
+
+fn add(a: Option<DiskIo>, b: Option<DiskIo>) -> Option<DiskIo> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.plus(b)),
+        (a, b) => a.or(b),
     }
 }
 

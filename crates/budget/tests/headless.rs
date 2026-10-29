@@ -428,3 +428,14 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_4_cpu_cloud_vm_with_16_gb_runs_two_cf_4g() {
+    // An n2-standard-4: 4 vCPUs alike, 15.6 GB. Keeping two cores back, as a Mac does, left CI two CPUs, one cf-4g,
+    // and 9 GB idle.
+    let settings = Settings::for_headless(host(15_600 * MIB, 4), 0);
+    assert_eq!(settings.away.cpus, 4);
+    assert_eq!(settings.vcpus_of(G4), 2);
+    assert_eq!(settings.side_by_side(&settings.away, G4), 2);
+    assert_eq!(grants(settings, &[G4, G4, G4])[..2], [Ok(2), Ok(2)]);
+}

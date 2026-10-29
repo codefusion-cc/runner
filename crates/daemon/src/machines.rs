@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use cf_budget::{
     Assigned, Budget, Grant, Hold, Host, HostReading, Level, Millis, Now, Settings, Size, SlotId, Status,
@@ -27,7 +27,7 @@ use crate::records::{Disagrees, Ending, GithubJob, RULES, Record, Store, TestRun
 use crate::roster::{JobInfo, Roster, Runner};
 use crate::test_run::{self, StartError, TestRun};
 use crate::traits::{
-    Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, Slots, Ticket,
+    Claim, EventKind, Events, HostError, Hosts, JobEvent, Refusal, RunnerSpec, SetKey, Slots, Ticket,
 };
 use crate::vms::{Seen, Vms};
 use crate::{secs, time_of};
@@ -297,6 +297,27 @@ struct Offer {
     said: [Option<Millis>; 4],
 }
 
+/// Room for one job of `size` a scale set's poll offered GitHub at `at`, the last of `polls` in a row that did.
+#[derive(Clone, Copy, Debug)]
+struct Standing {
+    size: Size,
+    at: SystemTime,
+    polls: u32,
+}
+
+/// A scale set whose polls found the room offered to others, since `since`; it last asked at `asked`.
+#[derive(Clone, Copy, Debug)]
+struct PassedOver {
+    size: Size,
+    since: SystemTime,
+    asked: SystemTime,
+}
+
+/// How long a poll's offer stands at most, on the wall clock a poll ends by: the service ends a long poll after about
+/// a minute, and the listener's own timeout is a little longer. An offer whose listener stopped asking holds no room
+/// past it.
+pub const OFFER_STANDS: Duration = Duration::from_secs(70);
+
 struct Job {
     record: Record,
     /// The budget's slot while the machine holds memory.
@@ -352,6 +373,12 @@ struct Inner<H> {
     door: Option<(bool, &'static str)>,
     /// What the polls in flight may be offering GitHub.
     offer: Offer,
+    /// The room each scale set's poll in flight offers GitHub for a job not assigned yet, by scale set.
+    standing: BTreeMap<SetKey, Standing>,
+    /// The scale sets whose polls found the room offered to others: they go next, the longest passed over first.
+    passed_over: BTreeMap<SetKey, PassedOver>,
+    /// Whether each scale set has jobs queued at GitHub, as the queue was last read; one not named is not known.
+    demand: BTreeMap<SetKey, bool>,
     /// For which size room is made.
     making: Making,
     /// The slots of Docker jobs; one given back leaves at the next count.
@@ -467,6 +494,9 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
                 looked: None,
                 door: None,
                 offer: Offer::default(),
+                standing: BTreeMap::new(),
+                passed_over: BTreeMap::new(),
+                demand: BTreeMap::new(),
                 making: Making::default(),
                 docker: BTreeSet::new(),
                 // A failure the Runner before found holds until a check passes: nothing Docker comes meanwhile. A
@@ -652,6 +682,22 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         inner.budget.hold(Hold::Paused, inner.paused);
         inner.budget.hold(Hold::Draining, inner.draining || inner.holding);
         inner.making.check(&mut inner.budget, now);
+    }
+
+    /// Which scale sets have jobs queued at GitHub, by scale set, as the queue was just read: they go first when the
+    /// machine's room is offered ([`Slots::offer_room`]). One not named counts as having some.
+    pub fn set_demand(&self, demand: BTreeMap<SetKey, bool>) {
+        let mut inner = self.lock();
+        // A scale set whose jobs were just queued need not wait for the turn of one without: the polls ask again.
+        let queued_now = demand
+            .iter()
+            .any(|(id, &wants)| wants && inner.demand.get(id) != Some(&true));
+        let others_offer = inner.standing.keys().any(|id| demand.get(id) == Some(&false));
+        inner.demand = demand;
+        drop(inner);
+        if queued_now && others_offer {
+            self.ring();
+        }
     }
 
     /// Takes new jobs or not, as the console or the person asks. The polls in flight are told, since each still
@@ -1135,6 +1181,8 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             wall_ms: summary.map(|s| s.wall_ms),
             pressure_peak: job.last.as_ref().and_then(|s| s.pressure_peak),
             host_cpu_peak: job.last.as_ref().and_then(|s| s.host_cpu_peak),
+            disk_read_bytes: job.last.as_ref().and_then(|s| s.disk_read_bytes),
+            disk_written_bytes: job.last.as_ref().and_then(|s| s.disk_written_bytes),
             message: vm_end.and_then(|e| e.message.clone()),
         });
         job.record.slot = Some(job.life.saved().into());
@@ -1169,7 +1217,16 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
         };
         let oom = job.record.oom;
         let runner = job.record.runner.clone();
-        tracing::info!(%runner, job = %name, end = kind.name(), ran_job, "machine gone");
+        let ended = job.record.ended.as_ref();
+        tracing::info!(
+            %runner,
+            job = %name,
+            end = kind.name(),
+            ran_job,
+            disk_read_bytes = ended.and_then(|e| e.disk_read_bytes),
+            disk_written_bytes = ended.and_then(|e| e.disk_written_bytes),
+            "machine gone"
+        );
         self.roster.remove(&runner);
         self.store.save(&job.record);
         self.vms.clean(name);
@@ -2023,6 +2080,84 @@ impl<H: Host + Send, V: Vms> Slots for Machines<H, V> {
             );
         }
         0
+    }
+
+    fn offer_room(&self, set: &SetKey, size: Size) -> usize {
+        let open = self.open_slots(size);
+        let mut inner = self.lock();
+        let now = inner.host.now();
+        let wall = self.clock.now();
+        // The poll this one replaces offers nothing any more, nor does one that has surely ended, nor waits a scale
+        // set that no longer asks.
+        let before = inner.standing.remove(set);
+        let fresh = |at: SystemTime| wall.duration_since(at).unwrap_or(Duration::ZERO) < OFFER_STANDS;
+        inner.standing.retain(|_, standing| fresh(standing.at));
+        inner.passed_over.retain(|_, passed| fresh(passed.asked));
+        if open == 0 {
+            inner.passed_over.remove(set);
+            return 0;
+        }
+        let wants = |id: &SetKey| inner.demand.get(id).copied().unwrap_or(true);
+        // A scale set with jobs queued takes no notice of the room offered to those without: they had none queued
+        // when it was offered.
+        let mine = wants(set);
+        let counts = |id: &SetKey| id != set && (!mine || wants(id));
+        let mut others: Vec<Size> = inner
+            .standing
+            .iter()
+            .filter(|&(id, _)| counts(id))
+            .map(|(_, standing)| standing.size)
+            .collect();
+        // Those passed over before go first, but not before a poll offered room twice: GitHub counts the smaller of
+        // a scale set's last two polls, so the room of one alone is never assigned.
+        let tenure = before.is_some_and(|standing| standing.polls < 2);
+        if !tenure {
+            let since = inner.passed_over.get(set).map(|passed| passed.since);
+            others.extend(
+                inner
+                    .passed_over
+                    .iter()
+                    .filter(|&(id, passed)| counts(id) && since.is_none_or(|since| passed.since < since))
+                    .map(|(_, passed)| passed.size),
+            );
+        }
+        let fits = if inner.budget.fits(now, size).is_ok() {
+            inner.budget.free_beside(now, &others).of(size) > 0
+        } else {
+            // A place in line, made room for: one scale set offers it.
+            !others.contains(&size)
+        };
+        if !fits {
+            let passed = inner.passed_over.entry(set.clone()).or_insert(PassedOver {
+                size,
+                since: wall,
+                asked: wall,
+            });
+            passed.size = size;
+            passed.asked = wall;
+            // A poll that gave its room up to those passed over ends theirs, so that the room is offered at once.
+            if before.is_some() {
+                drop(inner);
+                self.ring();
+            }
+            return 0;
+        }
+        inner.passed_over.remove(set);
+        inner.standing.insert(
+            set.clone(),
+            Standing {
+                size,
+                at: wall,
+                polls: before.map_or(1, |standing| standing.polls.saturating_add(1)),
+            },
+        );
+        1
+    }
+
+    fn withdraw_offer(&self, set: &SetKey) {
+        let mut inner = self.lock();
+        inner.standing.remove(set);
+        inner.passed_over.remove(set);
     }
 
     fn held(&self) -> bool {
