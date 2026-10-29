@@ -96,6 +96,8 @@ fn a_job_assigned_while_the_clock_was_behind_does_not_pass_one_that_waited_longe
     // The clock goes back before the next job comes: by its time it came first, and it would reach the defer
     // limit before the job that waited longer.
     let later = queue(&mut budget, 100, pull("acme/shop"));
+    // A calm minute is watched before the room comes, so a job may start then.
+    watch(&mut budget, 40 + limit, 99 + limit, |_| {});
     assert_eq!(budget.line(secs(100 + limit)), [old, later]);
     assert_eq!(drain(&mut budget, running, 100 + limit), [old, later]);
 }
