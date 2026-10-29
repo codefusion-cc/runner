@@ -30,6 +30,10 @@ pub enum Claim {
     Never(String),
 }
 
+/// One scale set of this host: its repository and GitHub's number for it. The number alone names none: GitHub numbers
+/// the scale sets of each repository from its own start, so two repositories' sets share numbers on the same host.
+pub type SetKey = (String, i64);
+
 /// The machine's slots, which every scale set together share: the budget, from the scaler's side.
 ///
 /// A slot is promised before a job is acquired ([`Slots::reserve`]), made an Actions runner's when the service says
@@ -38,10 +42,6 @@ pub enum Claim {
 /// and never while it may still run. The scaler gives back the promises nobody claims (the job went elsewhere, the
 /// acquire failed, no assignment came within [`crate::PROMISE_TTL`], the scaler went away); the budget lets them run
 /// out as well and loses nothing, since a claim then asks anew.
-/// One scale set of this host: its repository and GitHub's number for it. The number alone names none: GitHub numbers
-/// the scale sets of each repository from its own start, so two repositories' sets share numbers on the same host.
-pub type SetKey = (String, i64);
-
 pub trait Slots: Send + Sync {
     /// Promises a slot of this size to a job about to be acquired. A refusal says why: the machine takes no new
     /// jobs now (someone works on it, memory is short), or it is full.
