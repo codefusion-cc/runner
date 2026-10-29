@@ -5602,6 +5602,9 @@ async fn a_trusted_host_asks_for_one_actions_runner_at_a_time_and_its_machine_ca
     trusted.discover().await;
     trusted.look_at_queue().await;
     assert_eq!(trusted.sets().len(), 0, "no scale set");
+    // No Docker, its check neither: the check's machine would hold the one slot a trusted job waits for.
+    trusted.look_at_docker();
+    assert_eq!(rig.parts.vms.started().len(), 0, "a Docker check machine");
 
     trusted.ask_trusted().await;
     let registered = rig.github.plain_runners();

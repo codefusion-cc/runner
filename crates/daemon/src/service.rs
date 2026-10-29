@@ -2263,7 +2263,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         if shared.docker_refused.swap(refused, Ordering::SeqCst) != refused {
             shared.rediscover.notify_one();
         }
-        if machines.probing()
+        // A trusted host gives no job Docker, so it has nothing to check.
+        if shared.config.policy.trusted.is_some()
+            || machines.probing()
             || self.restart_requested()
             || self.update_under_way()
             || shared.applying.lock().expect("applying").under_way
