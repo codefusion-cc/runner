@@ -38,6 +38,10 @@ pub enum Claim {
 /// and never while it may still run. The scaler gives back the promises nobody claims (the job went elsewhere, the
 /// acquire failed, no assignment came within [`crate::PROMISE_TTL`], the scaler went away); the budget lets them run
 /// out as well and loses nothing, since a claim then asks anew.
+/// One scale set of this host: its repository and GitHub's number for it. The number alone names none: GitHub numbers
+/// the scale sets of each repository from its own start, so two repositories' sets share numbers on the same host.
+pub type SetKey = (String, i64);
+
 pub trait Slots: Send + Sync {
     /// Promises a slot of this size to a job about to be acquired. A refusal says why: the machine takes no new
     /// jobs now (someone works on it, memory is short), or it is full.
@@ -76,13 +80,13 @@ pub trait Slots: Send + Sync {
     /// The machine's scale sets share its room: a slot one poll in flight offers is offered by no other until that
     /// poll ends, so GitHub never assigns the machine more jobs than it can start. Scale sets with jobs queued go
     /// before those without.
-    fn offer_room(&self, _set: i64, size: Size) -> usize {
+    fn offer_room(&self, _set: &SetKey, size: Size) -> usize {
         self.open_slots(size).min(1)
     }
 
     /// The poll scale set `set` is about to send offers no room, for its own reasons, or none follows: the room its
     /// last poll offered is the others' again.
-    fn withdraw_offer(&self, _set: i64) {}
+    fn withdraw_offer(&self, _set: &SetKey) {}
 
     /// Whether the machine takes new jobs, and why not.
     fn state(&self) -> (bool, String);
