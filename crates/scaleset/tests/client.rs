@@ -608,6 +608,58 @@ async fn a_registration_whose_answer_is_lost_leaves_no_runner_without_a_machine(
     assert_eq!(removes(&h), before, "nothing was made, so nothing is looked for");
 }
 
+/// A trusted host's Actions runner outside any scale set: the console's 409 with a wait (`no_trusted_job`) made
+/// nothing, so nothing is looked for; a 409 without one is a name GitHub has, whose registration may be the one just
+/// made, so it is removed.
+#[tokio::test]
+async fn a_plain_registration_that_waits_for_a_trusted_job_leaves_nothing_to_remove() {
+    let h = harness().await;
+    let removes = |h: &Harness| {
+        h.console
+            .github_calls()
+            .iter()
+            .filter(|c| c.route == "scaleset/remove")
+            .count()
+    };
+    let trusted = labels(&["trusted"]);
+    h.console.answer_next(
+        Reply::status_json(
+            409,
+            &serde_json::json!({"error": "No trusted job is queued", "code": "no_trusted_job"}),
+        )
+        .with_header("retry-after", "15"),
+    );
+    let error = h
+        .client
+        .generate_plain_jit_config("mac-a-j0000002", &trusted)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status(), error.retry_after()),
+        (Some(409), Some(std::time::Duration::from_secs(15))),
+        "{error:?}"
+    );
+    assert_eq!(removes(&h), 0, "nothing was made, so nothing is looked for");
+
+    // Past the wait, a 409 without one is a name already taken.
+    h.clock.advance(std::time::Duration::from_secs(15));
+    h.console.answer_next(Reply::status_json(
+        409,
+        &serde_json::json!({"error": "Taken", "code": "name_taken"}),
+    ));
+    let error = h
+        .client
+        .generate_plain_jit_config("mac-a-j0000003", &trusted)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.status(), error.retry_after()),
+        (Some(409), None),
+        "{error:?}"
+    );
+    assert_eq!(removes(&h), 1, "a name taken may be this call's own registration");
+}
+
 #[tokio::test]
 async fn removing_by_name_or_id_says_whether_it_was_there() {
     let h = harness().await;

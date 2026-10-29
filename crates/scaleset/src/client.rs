@@ -427,10 +427,10 @@ impl ScaleSetClient {
                 // A 429 is a limit that refused the call before anything was made (GitHub's, or the console's own, or
                 // a wait the console asked for that kept it unsent), and so is a 409 that says when to ask again (the
                 // console has no job for a trusted machine yet): there is nothing to look for.
-                let no_job_yet = e.status() == Some(409) && e.retry_after().is_some();
-                let leftover =
-                    !no_job_yet && (e.status() == Some(409) || (e.is_transient() && e.status() != Some(429)));
-                (Error::from(e), leftover)
+                let e = Error::from(e);
+                let leftover = !e.is_no_job_yet()
+                    && (e.status() == Some(409) || (e.is_transient() && e.status() != Some(429)));
+                (e, leftover)
             });
         self.registered(name, answer).await
     }

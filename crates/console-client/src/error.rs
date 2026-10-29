@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use cf_ghapp::{Error as HttpError, StatusError};
 
+use crate::scaleset::{NAME_TAKEN, SESSION_EXISTS};
+
 /// The code of the console's 403 while the owner has not turned GitHub through the console on for the machine, or
 /// turned it off (`brokerOff` in its `worker/runners/github.ts`).
 pub const BROKER_OFF: &str = "broker_off";
@@ -160,12 +162,17 @@ impl From<HttpError> for Error {
                     code: code_of(&s.body),
                 },
                 // A 409 that says when to ask again is a trusted machine's `no_trusted_job`: no job for it yet, and
-                // nothing was made.
-                409 if s.retry_after.is_some() => Error::Busy {
-                    status: 409,
-                    message: message_of(&s.body),
-                    retry_after: s.retry_after.unwrap_or_default().min(RETRY_AFTER_MAX),
-                },
+                // nothing was made. One whose code says a name or a session is taken stays that refusal, wait or
+                // not: GitHub may have made what it names.
+                409 if s.retry_after.is_some()
+                    && !matches!(code_of(&s.body).as_deref(), Some(NAME_TAKEN | SESSION_EXISTS)) =>
+                {
+                    Error::Busy {
+                        status: 409,
+                        message: message_of(&s.body),
+                        retry_after: s.retry_after.unwrap_or_default().min(RETRY_AFTER_MAX),
+                    }
+                }
                 429 | 500..=599 => match s.retry_after {
                     Some(wait) => Error::Busy {
                         status: s.status,

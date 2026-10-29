@@ -250,6 +250,19 @@ async fn refusals_keep_their_status_their_code_and_their_wait() {
             other => panic!("{status} {code}: {other:?}"),
         }
     }
+    // A name or a session taken stays that refusal with its code, even when it says when to ask again: only a 409
+    // without either code and with a wait is the console's word that nothing was made.
+    for code in [SESSION_EXISTS, NAME_TAKEN] {
+        rig.console
+            .answer_next(refusal(409, code).with_header("retry-after", "15"));
+        let error = rig.client.scaleset_delete(REPO, id).await.unwrap_err();
+        assert_eq!(error.code(), Some(code), "{error:?}");
+        assert!(!error.is_transient(), "{error:?}");
+    }
+    rig.console
+        .answer_next(refusal(409, "no_trusted_job").with_header("retry-after", "15"));
+    let error = rig.client.scaleset_delete(REPO, id).await.unwrap_err();
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(15)), "{error:?}");
     // A code that is not one is left out; the refusal stays.
     rig.console.answer_next(refusal(409, "Not A Code!"));
     assert!(matches!(

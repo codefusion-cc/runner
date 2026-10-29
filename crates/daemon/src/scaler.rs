@@ -670,7 +670,7 @@ pub async fn start_runner<R: Registry, H: Hosts>(
                 // so the name is taken by a try of this call whose answer was lost on the way.
                 // A 409 that says when to ask again is no taken name but the console's word that no job waits for
                 // this one yet (a trusted host's `no_trusted_job`): nothing was made.
-                let no_job_yet = e.status() == Some(409) && e.retry_after().is_some();
+                let no_job_yet = e.is_no_job_yet();
                 let refused = e
                     .status()
                     .is_some_and(|status| (400..500).contains(&status) && (status != 409 || no_job_yet));
