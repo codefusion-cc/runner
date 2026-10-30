@@ -2564,9 +2564,12 @@ fn story_of(rig: &Rig, timeline: &[(usize, String)], runner: &str) -> String {
     for (at, request) in requests.iter().enumerate() {
         let about = request.body.contains(runner)
             || request.query.iter().any(|(_, value)| value == runner)
-            || id
-                .as_ref()
-                .is_some_and(|id| request.line.split('/').any(|part| part == id));
+            || id.as_ref().is_some_and(|id| {
+                let parts: Vec<&str> = request.line.split('/').collect();
+                parts
+                    .windows(2)
+                    .any(|pair| matches!(pair[0], "agents" | "runners") && pair[1] == id)
+            });
         if about {
             let step = timeline
                 .iter()

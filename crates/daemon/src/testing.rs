@@ -634,7 +634,7 @@ impl CrashingStore {
     /// lock until `on_crash` returned, so a write of another thread meanwhile finds the daemon dead.
     fn write(&self, job: &str, what: String, apply: impl FnOnce()) {
         let mut crash = self.crash.lock().expect("crash");
-        let kept = match crash.armed {
+        let fate = match crash.armed {
             _ if crash.dead => "lost: the daemon is dead",
             None => {
                 apply();
@@ -664,7 +664,7 @@ impl CrashingStore {
         self.history
             .lock()
             .expect("history")
-            .push((job.to_string(), format!("{what}: {kept}")));
+            .push((job.to_string(), format!("{what}: {fate}")));
     }
 }
 
