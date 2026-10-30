@@ -72,7 +72,8 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
 
 - No call to the scale set service makes GitHub hand over a job it holds. A Mac whose room comes back gets the job
   at GitHub's next look: the next job queued or ended in the repository, or GitHub's own, which can take many
-  minutes (K2). So a job that waited two minutes while its scale set's polls showed room for as long gets an Actions
+  minutes (K2). So a job that waited two minutes while its scale set's polls showed room for as long, or found it offered by
+  another scale set's poll while the offer went round those with jobs queued, gets an Actions
   runner of its own (`held.rs`): registered for its repository outside the scale set, with exactly the scale set's
   labels (M), in a slot the budget gives as to any job. Its arrival makes GitHub look (N); the job goes to the scale
   set or to it. Whichever gets it runs it. The other waits for nothing, so at the next look at the queue that finds

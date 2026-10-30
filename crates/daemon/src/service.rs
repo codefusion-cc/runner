@@ -30,7 +30,7 @@ use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::queued::{Bounds, Look, Queued, QueuedSet};
 use crate::roster::{Roster, Runner};
-use crate::scaler::{Scaler, ScalerConfig, Start, reconcile, start_runner};
+use crate::scaler::{Room, Scaler, ScalerConfig, Start, reconcile, start_runner};
 use crate::secs;
 use crate::test_run::{self, Admission, TestRun, Waited};
 use crate::traits::{Claim, EventKind, Hosts, Slots, Ticket};
@@ -233,8 +233,8 @@ pub struct SetState {
     pub statistics: Option<Statistics>,
     /// Why a job assigned to it can never start on this Mac, when one cannot.
     pub never: Option<String>,
-    /// Since when every poll of its listener offered GitHub room beyond the jobs GitHub counts as assigned to it;
-    /// none while the last did not, or none listens.
+    /// Since when every poll of its listener offered GitHub room beyond the jobs GitHub counts as assigned to it, or
+    /// found the room offered by another scale set's poll; none while the last found none, or none listens.
     pub room_since: Option<SystemTime>,
 }
 
@@ -2942,14 +2942,17 @@ async fn serve<H: Host + Send + 'static, V: Vms + 'static>(
                         let mut state = state.lock().expect("set");
                         state.statistics.clone_from(&statistics.lock().expect("statistics"));
                         state.never.clone_from(&never.lock().expect("never"));
-                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here; a place in
-                        // line is none, so a full host names no job held back from it.
+                        // The room the next poll offers GitHub beyond the jobs it counts as assigned here, or the
+                        // room another scale set's poll offers while this one waits its turn: the offer goes round the
+                        // scale sets with jobs queued, and a clock that began again at each turn would never reach
+                        // [`held::HELD_AFTER`]. A place in line is none, so a full host names no job held back from it.
                         let assigned = state.statistics.as_ref().map_or(0, Statistics::assigned);
                         let room = *room.lock().expect("room");
-                        state.room_since = match capacity {
-                            Some(capacity) if room && capacity > assigned => {
+                        state.room_since = match (capacity, room) {
+                            (Some(capacity), Room::Offered) if capacity > assigned => {
                                 state.room_since.or_else(|| Some(clock.now()))
                             }
+                            (Some(_), Room::Elsewhere) => state.room_since.or_else(|| Some(clock.now())),
                             _ => None,
                         };
                     }

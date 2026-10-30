@@ -5501,6 +5501,51 @@ async fn a_held_job_gets_none_of_its_own_while_one_with_fewer_labels_waits() {
     );
 }
 
+// added: two scale sets of one size with jobs queued share the Mac's one free slot, and its offer goes round them. Each
+// set's clock of room runs on while the other's poll offers the slot, so GitHub holding both jobs still gets one an
+// Actions runner of its own after two minutes, however often the offer went round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobs_held_while_the_offer_goes_round_their_scale_sets_get_an_actions_runner_of_their_own() {
+    let rig = Rig::new(1).await;
+    rig.github.set_workflow(
+        REPO,
+        "lanes.yml",
+        "on: push\njobs:\n  a:\n    runs-on: [self-hosted, cf-2g, lane-a]\n    steps: []\n  b:\n    runs-on: [self-hosted, cf-2g, lane-b]\n    steps: []\n",
+    );
+    rig.service.discover().await;
+    rig.settles("three sessions", || {
+        rig.github.scale_sets().iter().filter(|s| s.has_session).count() == 3
+    })
+    .await;
+    let lanes: [&[&str]; 2] = [
+        &["self-hosted", "cf-2g", "lane-a"],
+        &["self-hosted", "cf-2g", "lane-b"],
+    ];
+    let jobs = hold(&rig, &lanes).await;
+    rig.service.look_at_queue().await;
+    rig.later(Duration::from_secs(130));
+    // The polls go on: the offer goes round the two sets many times over.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    rig.service.look_at_queue().await;
+    let own: Vec<Vec<String>> = rig
+        .github
+        .plain_runners()
+        .into_iter()
+        .map(|(_, repo, labels)| {
+            assert_eq!(repo, REPO);
+            labels
+        })
+        .collect();
+    assert_eq!(own.len(), 1, "one slot, one Actions runner of its own: {own:?}");
+    assert!(own[0].iter().any(|label| label.starts_with("lane-")), "{own:?}");
+    let held = rig.report()["status"]["heldJobs"].clone();
+    let held = held.as_array().expect("heldJobs");
+    assert_eq!(held.len(), 2, "both sets hold a job: {held:?}");
+    for job in jobs {
+        assert_eq!(rig.github.job_state(job), Some(JobState::Available));
+    }
+}
+
 // added: a job with fewer labels that already runs elsewhere is no job GitHub could give an Actions runner of the held
 // job's own: the held job gets one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

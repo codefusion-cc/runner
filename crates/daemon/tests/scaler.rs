@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use cf_daemon::testing::{pass, settings_for};
-use cf_daemon::{Claim, EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Runner, Slots, Ticket};
+use cf_daemon::{Claim, EventKind, IDLE_GRACE, JobInfo, PROMISE_TTL, Room, Runner, Slots, Ticket};
 use cf_fake_github::httpd::Reply;
 use cf_fake_github::{JobState, Options};
 use cf_scaleset::{JobBase, JobCompleted, JobStarted, Message, Scaler as _, Statistics};
@@ -1542,10 +1542,10 @@ async fn a_poll_says_whether_it_offered_room_a_machine_fits_in() {
     let room = h.scaler.room_handle();
     let capacity = h.scaler.scale(None).await.unwrap();
     assert_eq!(capacity, 1, "an empty Mac offers a slot");
-    assert!(*room.lock().unwrap(), "a free slot is room");
+    assert_eq!(*room.lock().unwrap(), Room::Offered, "a free slot is room");
 
     let (mut h, _running) = busy_mac().await;
     let room = h.scaler.room_handle();
     assert_eq!(h.scaler.scale(None).await.unwrap(), 1, "the running job only");
-    assert!(!*room.lock().unwrap(), "a full Mac offers no room");
+    assert_eq!(*room.lock().unwrap(), Room::None, "a full Mac offers no room");
 }
