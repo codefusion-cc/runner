@@ -32,6 +32,19 @@ const NAME_TRIES: usize = 3;
 /// How many offered jobs the scaler remembers first seeing, for [`DEFER_LIMIT`].
 const OFFERS_KEPT: usize = 512;
 
+/// What the last poll of a scale set found of the machine's room for its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Room {
+    /// No machine of the size fits now, or the poll offered nothing for its own reasons.
+    #[default]
+    None,
+    /// The poll offered GitHub room a machine fits in now.
+    Offered,
+    /// A machine fits, but another scale set's poll offers the room ([`Slots::offer_room`]): GitHub hands this one
+    /// none of it until the offer comes round.
+    Elsewhere,
+}
+
 /// What one scale set's scaler needs to know about itself.
 #[derive(Debug, Clone)]
 pub struct ScalerConfig {
@@ -94,8 +107,8 @@ pub struct Scaler<J, R, H> {
     never: Arc<Mutex<Option<String>>>,
     /// The counts as the service last reported them.
     last: Arc<Mutex<Option<Statistics>>>,
-    /// Whether the last poll offered room a machine fits in now, not only a place in line.
-    room: Arc<Mutex<bool>>,
+    /// The room the last poll found, a place in line none.
+    room: Arc<Mutex<Room>>,
     /// How many Actions runners the scale set's assigned jobs need now: the service's count, less the jobs that ended
     /// since without a new one. None before the first report.
     wanted: Option<usize>,
@@ -129,7 +142,7 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
             offered: vec![],
             never: Arc::new(Mutex::new(None)),
             last: Arc::new(Mutex::new(None)),
-            room: Arc::new(Mutex::new(false)),
+            room: Arc::new(Mutex::new(Room::None)),
             wanted: None,
         }
     }
@@ -158,9 +171,10 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
         self.never.clone()
     }
 
-    /// Whether the last poll offered GitHub room a machine of the scale set's size fits in now: a place in line
-    /// ([`Slots::offers_place`]) is none. The handle stays valid while the scaler is lent to the listener.
-    pub fn room_handle(&self) -> Arc<Mutex<bool>> {
+    /// The room for a machine of the scale set's size the last poll found, offered by it or by another scale set's: a
+    /// place in line ([`Slots::offers_place`]) is none. The handle stays valid while the scaler is lent to the
+    /// listener.
+    pub fn room_handle(&self) -> Arc<Mutex<Room>> {
         self.room.clone()
     }
 
@@ -595,19 +609,30 @@ impl<J: Jobs, R: Registry, H: Hosts> Scaler<J, R, H> {
     pub fn capacity(&self) -> usize {
         let held = self.active() + self.promised.len();
         let set = (self.config.repo.clone(), self.config.scale_set_id);
-        *self.room.lock().expect("room") = false;
+        *self.room.lock().expect("room") = Room::None;
         if self.slots.held() {
             self.slots.withdraw_offer(&set);
             return held;
         }
         let overdue = self.overdue();
-        let open = if overdue > 0 || (self.config.docker && self.slots.docker_room() == 0) {
+        let size = self.config.size;
+        let (open, room) = if overdue > 0 || (self.config.docker && self.slots.docker_room() == 0) {
             self.slots.withdraw_offer(&set);
-            0
+            (0, Room::None)
         } else {
-            self.slots.offer_room(&set, self.config.size)
+            let open = self.slots.offer_room(&set, size);
+            let room = if self.slots.offers_place(size) {
+                Room::None
+            } else if open > 0 {
+                Room::Offered
+            } else if self.slots.open_slots(size) > 0 {
+                Room::Elsewhere
+            } else {
+                Room::None
+            };
+            (open, room)
         };
-        *self.room.lock().expect("room") = open > 0 && !self.slots.offers_place(self.config.size);
+        *self.room.lock().expect("room") = room;
         held + self.waiting.len() - overdue + open
     }
 

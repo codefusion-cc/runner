@@ -40,8 +40,8 @@ pub struct SetView {
     pub repo: String,
     /// Its labels.
     pub labels: Vec<String>,
-    /// Since when every poll of its listener offered GitHub room beyond the jobs GitHub counts as assigned to it;
-    /// none while the last did not.
+    /// Since when every poll of its listener offered GitHub room beyond the jobs GitHub counts as assigned to it, or
+    /// found the room offered by another scale set's poll; none while the last found none.
     pub room_since: Option<SystemTime>,
     /// The jobs GitHub assigned to it that no Actions runner of it runs yet: GitHub's REST view still calls them
     /// queued.
