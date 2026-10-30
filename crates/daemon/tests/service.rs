@@ -2216,7 +2216,10 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     let mut causes = vec![1usize; sets.len()];
     // Registrations GitHub removed at the Runner's request whose answer died with a Runner.
     let mut lost = BTreeSet::new();
+    // Each step with the count of GitHub's requests before it, for the story of a failure.
+    let mut timeline: Vec<(usize, String)> = Vec::new();
     for step in script {
+        timeline.push((rig.github.requests().len(), format!("{step:?}")));
         if rig.store.crashed() {
             lost.extend(start_again(&mut rig, &sets, &mut causes).await);
         }
@@ -2400,13 +2403,19 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
                 }
             }
         });
+        timeline.push((rig.github.requests().len(), "the uninstall".to_string()));
         let left = rig.service.retire(Duration::from_secs(8), false).await;
         ends.await.expect("GitHub ends the jobs");
         prop_assert!(left.is_empty(), "the uninstall left {left:?}");
+        let registered = rig.github.runners();
         prop_assert!(
-            rig.github.runners().is_empty(),
-            "registrations left: {:?}",
-            rig.github.runners()
+            registered.is_empty(),
+            "registrations left: {registered:?}\n{}",
+            registered
+                .iter()
+                .map(|runner| story_of(&rig, &timeline, runner))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         prop_assert!(
             rig.parts.store.load().is_empty(),
@@ -2544,6 +2553,36 @@ async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -
         );
     }
     Ok(())
+}
+
+/// What GitHub was asked of an Actions runner's registration, step by step, and each write of its record: the story of
+/// one the Runner left registered.
+fn story_of(rig: &Rig, timeline: &[(usize, String)], runner: &str) -> String {
+    let requests = rig.github.requests();
+    let id = rig.github.runner_id(runner).map(|id| id.to_string());
+    let mut story = format!("{runner} (id {id:?}):");
+    for (at, request) in requests.iter().enumerate() {
+        let about = request.body.contains(runner)
+            || request.query.iter().any(|(_, value)| value == runner)
+            || id.as_ref().is_some_and(|id| {
+                let parts: Vec<&str> = request.line.split('/').collect();
+                parts
+                    .windows(2)
+                    .any(|pair| matches!(pair[0], "agents" | "runners") && pair[1] == id)
+            });
+        if about {
+            let step = timeline
+                .iter()
+                .rev()
+                .find(|(before, _)| *before <= at)
+                .map_or("before the first step", |(_, step)| step.as_str());
+            story.push_str(&format!("\n  request {at}, in {step}: {}", request.line));
+        }
+    }
+    for write in rig.store.history(job_name(runner)) {
+        story.push_str(&format!("\n  record: {write}"));
+    }
+    story
 }
 
 /// The Actions runners whose job runs at GitHub.

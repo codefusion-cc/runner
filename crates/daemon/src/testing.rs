@@ -571,6 +571,8 @@ pub struct CrashingStore {
     crash: Mutex<Crash>,
     /// Every write of a record whose facts disagree ([`Record::agrees`]), as it was written.
     disagreements: Mutex<Vec<String>>,
+    /// Every write asked for, in order, and whether it was kept: what a test that fails says of a record.
+    history: Mutex<Vec<(String, String)>>,
 }
 
 #[derive(Default)]
@@ -607,6 +609,17 @@ impl CrashingStore {
         self.disagreements.lock().expect("disagreements").clone()
     }
 
+    /// The writes asked for of this job's record, in order, each with whether it was kept or died with the daemon.
+    pub fn history(&self, job: &str) -> Vec<String> {
+        self.history
+            .lock()
+            .expect("history")
+            .iter()
+            .filter(|(of, _)| of == job)
+            .map(|(_, write)| write.clone())
+            .collect()
+    }
+
     /// Writes a record as another Runner left it: an older one's write is not this one's, and is not checked.
     pub fn plant(&self, record: &Record) {
         self.records.save(record);
@@ -619,14 +632,18 @@ impl CrashingStore {
 
     /// Writes with `apply` unless the daemon is dead, counting the write towards the crash. The crash holds the
     /// lock until `on_crash` returned, so a write of another thread meanwhile finds the daemon dead.
-    fn write(&self, apply: impl FnOnce()) {
+    fn write(&self, job: &str, what: String, apply: impl FnOnce()) {
         let mut crash = self.crash.lock().expect("crash");
-        match crash.armed {
-            _ if crash.dead => {}
-            None => apply(),
+        let fate = match crash.armed {
+            _ if crash.dead => "lost: the daemon is dead",
+            None => {
+                apply();
+                "kept"
+            }
             Some((left, kept)) if left > 1 => {
                 crash.armed = Some((left - 1, kept));
                 apply();
+                "kept"
             }
             Some((_, kept)) => {
                 crash.armed = None;
@@ -637,8 +654,17 @@ impl CrashingStore {
                 if let Some(on_crash) = &crash.on_crash {
                     on_crash();
                 }
+                if kept {
+                    "kept, the daemon's last"
+                } else {
+                    "lost: the daemon died at it"
+                }
             }
-        }
+        };
+        self.history
+            .lock()
+            .expect("history")
+            .push((job.to_string(), format!("{what}: {fate}")));
     }
 }
 
@@ -651,11 +677,19 @@ impl Store for CrashingStore {
                 record.runner, record.github, record.unregistered
             ));
         }
-        self.write(|| self.records.save(record));
+        let what = format!(
+            "save id {:?}, slot {}, unregistered {}, github {:?}, ended {:?}",
+            record.runner_id,
+            record.slot.is_some(),
+            record.unregistered,
+            record.github,
+            record.ended
+        );
+        self.write(&record.job, what, || self.records.save(record));
     }
 
     fn remove(&self, job: &str) {
-        self.write(|| self.records.remove(job));
+        self.write(job, "remove".to_string(), || self.records.remove(job));
     }
 
     fn load(&self) -> Vec<Record> {
@@ -667,7 +701,9 @@ impl Store for CrashingStore {
     }
 
     fn keep_docker_failure(&self, check: Option<&crate::docker_check::DockerCheck>) {
-        self.write(|| self.records.keep_docker_failure(check));
+        self.write("", "docker failure".to_string(), || {
+            self.records.keep_docker_failure(check)
+        });
     }
 }
 
