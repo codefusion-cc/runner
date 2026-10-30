@@ -1055,6 +1055,11 @@ impl FakeGithub {
         self.lock().runners.iter().map(|r| r.name.clone()).collect()
     }
 
+    /// The ID of the Actions runner registered under this name now.
+    pub fn runner_id(&self, name: &str) -> Option<i64> {
+        self.lock().runners.iter().find(|r| r.name == name).map(|r| r.id)
+    }
+
     /// The Actions runners currently registered outside any scale set, each with its repository and labels.
     pub fn plain_runners(&self) -> Vec<(String, String, Vec<String>)> {
         self.lock()
