@@ -102,6 +102,9 @@ pub struct Waiting {
 #[derive(Clone)]
 struct Run {
     id: i64,
+    /// When it last changed. It moves with the run's status, not when one of its jobs starts or ends while the run
+    /// is under way (run 42595725821 kept 09:45:03 while its jobs started until 09:46:12).
+    updated: String,
     from_fork: bool,
 }
 
@@ -120,6 +123,8 @@ fn read_runs(repo: &str, response: &Response) -> Result<Listing, Error> {
     #[derive(Deserialize)]
     struct RunJson {
         id: i64,
+        #[serde(default)]
+        updated_at: String,
         head_repository: Option<Head>,
     }
     #[derive(Deserialize)]
@@ -135,6 +140,7 @@ fn read_runs(repo: &str, response: &Response) -> Result<Listing, Error> {
             .into_iter()
             .map(|r| Run {
                 id: r.id,
+                updated: r.updated_at,
                 from_fork: !r
                     .head_repository
                     .is_some_and(|head| head.full_name.eq_ignore_ascii_case(repo)),
@@ -241,6 +247,8 @@ struct QueueCache {
 
 /// A run's jobs as last read.
 struct RunJobs {
+    /// The run's `updated_at` when they were read.
+    updated: String,
     /// The ETag of the answer they were read from; empty when it had none.
     etag: String,
     read: Arc<RunRead>,
@@ -569,11 +577,14 @@ impl GitHubApp {
     /// [`Waiting::left_out`] says what the bounds left out.
     ///
     /// The listings name the ETag of their last answer, so a queue that did not change costs 304s, which do not
-    /// count against the rate limit. Each run's jobs are asked for with the ETag of their last answer too, every time:
-    /// a run's `updated_at` does not move when one of its jobs starts or ends (run 42595725821 kept 09:45:03 while its
-    /// jobs started until 09:46:12), so a job read as queued would wait on here after it started. Needs the App's `Actions: read`
-    /// permission: without it GitHub answers 403 (or 404), which comes back as the error. Any failure is an error,
-    /// not an empty queue; only a run gone between its listing and the read of its jobs is left out.
+    /// count against the rate limit. A run's jobs are asked for again, with their ETag, when its `updated_at` moved,
+    /// and on every look while a run under way had a job queued when they were last read: its `updated_at` does not
+    /// move when one of its jobs starts ([`Run::updated`]), so a job read as queued would wait on here after it
+    /// started. Those of a queued run (all its jobs wait; its first start moves its `updated_at`) and of a run under
+    /// way with none queued are kept while its `updated_at` stays. The jobs of a running run change with each step,
+    /// so each of those reads is answered in full and counts against the rate limit. Needs the App's
+    /// `Actions: read` permission: without it GitHub answers 403 (or 404), which comes back as the error. Any failure
+    /// is an error, not an empty queue; only a run gone between its listing and the read of its jobs is left out.
     pub async fn waiting_jobs(&self, installation: i64, repo: &str) -> Result<Waiting, Error> {
         // Taken out while the look lasts: a look that fails forgets it, and the next one asks without ETags.
         let mut last = self
@@ -610,9 +621,9 @@ impl GitHubApp {
         // listings (it started between them) once, as queued.
         runs.sort_unstable_by_key(|(rank, run)| (*rank, run.id));
         let mut seen = std::collections::HashSet::new();
-        let mut runs: Vec<_> = runs
+        let mut runs: Vec<(bool, Run)> = runs
             .into_iter()
-            .filter_map(|(_, run)| seen.insert(run.id).then_some(run))
+            .filter_map(|(rank, run)| seen.insert(run.id).then_some((rank == 1, run)))
             .collect();
         let mut waiting = Waiting::default();
         if total.max(runs.len()) > WAITING_RUNS {
@@ -622,14 +633,20 @@ impl GitHubApp {
             ));
             runs.truncate(WAITING_RUNS);
         }
-        for run in runs {
-            let jobs = match self
-                .run_jobs(installation, repo, &run, last.runs.remove(&run.id))
-                .await
-            {
-                Ok(jobs) => jobs,
-                Err(Error::Status(s)) if s.status == 404 => continue,
-                Err(e) => return Err(e),
+        for (under_way, run) in runs {
+            let jobs = match last.runs.remove(&run.id) {
+                Some(known)
+                    if !run.updated.is_empty()
+                        && known.updated == run.updated
+                        && !(under_way && known.read.jobs.iter().any(|job| !job.queued.is_empty())) =>
+                {
+                    known
+                }
+                known => match self.run_jobs(installation, repo, &run, known).await {
+                    Ok(jobs) => jobs,
+                    Err(Error::Status(s)) if s.status == 404 => continue,
+                    Err(e) => return Err(e),
+                },
             };
             waiting.jobs.extend(jobs.read.jobs.iter().cloned());
             waiting.left_out.extend(jobs.read.left_out.iter().cloned());
@@ -693,7 +710,11 @@ impl GitHubApp {
                 (known.etag, known.read)
             }
         };
-        Ok(RunJobs { etag, read })
+        Ok(RunJobs {
+            updated: run.updated.clone(),
+            etag,
+            read,
+        })
     }
 
     /// A GET as an installation that names the ETag of the answer known: `None` when GitHub says it is unchanged.

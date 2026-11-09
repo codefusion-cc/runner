@@ -716,7 +716,8 @@ async fn waiting_jobs_are_the_unfinished_jobs_of_queued_and_running_runs() {
 }
 
 // added: a look that finds nothing changed costs nothing of the rate limit: the listings name the ETag of their last
-// answer, GitHub answers 304 to them and to each run's jobs, and the last result stands.
+// answer, GitHub answers 304, a run that did not change since its jobs were read is not asked about again, and the
+// last result stands.
 #[tokio::test]
 async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
     let h = harness().await;
@@ -727,8 +728,8 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
 
     let again = h.app.waiting_jobs(1, "org/app").await.unwrap();
     let asked = h.fake.requests().len() - requests;
-    assert_eq!(asked, 3, "the two listings and the run's jobs");
-    assert_eq!(h.fake.not_modified(), 3, "each 304");
+    assert_eq!(asked, 2, "the two listings, not the run's jobs");
+    assert_eq!(h.fake.not_modified(), 2, "both 304");
     assert_eq!(waiting(&again), waiting(&before));
     assert_eq!(waiting(&again), [(first, key(&["self-hosted", "cf-2g"]))]);
 
@@ -764,8 +765,10 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
         ]
     );
 
-    // A run under way whose jobs change while its updated_at stays put, as GitHub's does, is read again: a job that
-    // ended no longer waits, though the run's time did not move.
+    // A run under way whose jobs change while its updated_at stays put, as GitHub's does, is read again while it had
+    // a job queued: a job that ended or started no longer waits, though the run's time did not move. (The run before
+    // ends first, so the only one under way is this one.)
+    h.fake.end_job(run[1], "success");
     let run = h.fake.queue_run(
         "org/app",
         &[
@@ -786,6 +789,15 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
         waiting(&read)
     );
     assert!(waiting(&read).contains(&(run[2], key(&["self-hosted", "cf-2g"]))));
+    h.fake.take_job(run[2]);
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    let queued: Vec<_> = read.jobs.iter().filter(|job| !job.queued.is_empty()).collect();
+    assert!(queued.iter().all(|job| job.id != run[2]), "{queued:?}");
+    // With none of its jobs queued, a run under way whose updated_at stays is not asked about again: its jobs'
+    // steps change all the time, and each answer in full counts against the rate limit.
+    let jobs = h.fake.count("/jobs");
+    h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(h.fake.count("/jobs"), jobs, "no run's jobs asked for");
 
     // A queue forgotten is asked about without ETags.
     let h = harness().await;
@@ -795,7 +807,7 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
     h.app.waiting_jobs(1, "org/app").await.unwrap();
     assert_eq!(h.fake.not_modified(), 0);
     h.app.waiting_jobs(1, "org/app").await.unwrap();
-    assert_eq!(h.fake.not_modified(), 3, "kept again once read");
+    assert_eq!(h.fake.not_modified(), 2, "kept again once read");
 }
 
 // added: the App without "Actions: read" is refused, and the caller hears it to say what is missing.

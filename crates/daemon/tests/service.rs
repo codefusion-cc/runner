@@ -5222,8 +5222,7 @@ async fn without_actions_read_from_the_start_mains_sets_are_served() {
     until("main's job runs", || rig.standing().len() == 1).await;
 }
 
-// added: a queue that did not change costs only 304s: both listings and the run's jobs, which are asked for on every
-// look (a job's start or end moves no run's updated_at), and it still counts as seeing them.
+// added: a queue that did not change costs 304s and no read of a run's jobs, and still counts as seeing them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unchanged_queue_is_answered_304_and_its_sets_stay() {
     let rig = Rig::new(2).await;
@@ -5234,15 +5233,11 @@ async fn an_unchanged_queue_is_answered_304_and_its_sets_stay() {
         rig.later(Duration::from_secs(29 * 60));
         rig.service.look_at_queue().await;
     }
-    assert_eq!(
-        rig.github.not_modified(),
-        before + 6,
-        "both listings and the run's jobs, twice"
-    );
+    assert_eq!(rig.github.not_modified(), before + 4, "both listings, twice");
     assert_eq!(
         rig.github.count("/jobs"),
-        jobs + 2,
-        "the run's jobs are asked for on each look, with their ETag"
+        jobs,
+        "the run did not change: its jobs are not asked for"
     );
     serving(&rig, PR_LABEL).await;
 }
