@@ -458,10 +458,11 @@ impl State {
 
     /// A run's status as its REST view says it: `queued` while every job waits, `completed` once all ended,
     /// `in_progress` between.
-    /// When a run last changed, as its REST view says: a time that moves whenever the status of one of its jobs
-    /// does. (GitHub's moves with more; what counts is that it moves with that.)
+    /// When a run last changed, as its REST view says: a time that moves with the run's own status, not with each
+    /// job's. GitHub's stays put while a run under way starts or ends one of its jobs (run 42595725821: 09:45:03
+    /// while its jobs started until 09:46:12), so a reader cannot tell from it that the jobs changed.
     fn run_updated(&self, run_id: i64, created: i64) -> i64 {
-        let digest = sha_of(&self.run_states(run_id).join(","));
+        let digest = sha_of(self.run_status(run_id));
         created + 1 + i64::from_str_radix(&digest[..5], 16).unwrap_or(0)
     }
 

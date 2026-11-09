@@ -716,8 +716,7 @@ async fn waiting_jobs_are_the_unfinished_jobs_of_queued_and_running_runs() {
 }
 
 // added: a look that finds nothing changed costs nothing of the rate limit: the listings name the ETag of their last
-// answer, GitHub answers 304, a run that did not change since its jobs were read is not asked about again, and the
-// last result stands.
+// answer, GitHub answers 304 to them and to each run's jobs, and the last result stands.
 #[tokio::test]
 async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
     let h = harness().await;
@@ -728,8 +727,8 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
 
     let again = h.app.waiting_jobs(1, "org/app").await.unwrap();
     let asked = h.fake.requests().len() - requests;
-    assert_eq!(asked, 2, "the two listings, not the run's jobs");
-    assert_eq!(h.fake.not_modified(), 2, "both 304");
+    assert_eq!(asked, 3, "the two listings and the run's jobs");
+    assert_eq!(h.fake.not_modified(), 3, "each 304");
     assert_eq!(waiting(&again), waiting(&before));
     assert_eq!(waiting(&again), [(first, key(&["self-hosted", "cf-2g"]))]);
 
@@ -765,6 +764,29 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
         ]
     );
 
+    // A run under way whose jobs change while its updated_at stays put, as GitHub's does, is read again: a job that
+    // ended no longer waits, though the run's time did not move.
+    let run = h.fake.queue_run(
+        "org/app",
+        &[
+            (&["self-hosted", "cf-6g"], "c"),
+            (&["self-hosted", "cf-8g"], "d"),
+            (&["self-hosted", "cf-2g"], "e"),
+        ],
+        "refs/heads/main",
+    );
+    h.fake.end_job(run[0], "success");
+    let before = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert!(waiting(&before).contains(&(run[1], key(&["self-hosted", "cf-8g"]))));
+    h.fake.end_job(run[1], "cancelled");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert!(
+        !waiting(&read).iter().any(|(job, _)| *job == run[1]),
+        "the job that ended is not waiting: {:?}",
+        waiting(&read)
+    );
+    assert!(waiting(&read).contains(&(run[2], key(&["self-hosted", "cf-2g"]))));
+
     // A queue forgotten is asked about without ETags.
     let h = harness().await;
     h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "build");
@@ -773,7 +795,7 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
     h.app.waiting_jobs(1, "org/app").await.unwrap();
     assert_eq!(h.fake.not_modified(), 0);
     h.app.waiting_jobs(1, "org/app").await.unwrap();
-    assert_eq!(h.fake.not_modified(), 2, "kept again once read");
+    assert_eq!(h.fake.not_modified(), 3, "kept again once read");
 }
 
 // added: the App without "Actions: read" is refused, and the caller hears it to say what is missing.
