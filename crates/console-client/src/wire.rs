@@ -152,6 +152,23 @@ pub struct HeldJobs {
     pub oldest_wait_seconds: u64,
 }
 
+/// The most entries of [`Status::holds`].
+pub const MAX_HOLDS: usize = 8;
+
+/// A hold set on the machine itself, in [`Status::holds`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineHold {
+    /// Its name: 1 to 32 of `a`-`z`, `0`-`9` and `-`.
+    pub name: String,
+    /// Why it was set, at most 200 characters; left out when its holder said nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// When it was first set, RFC 3339; left out when its file could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
 /// The job an Actions runner has.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -346,6 +363,11 @@ pub struct Status {
     /// first check ended, and by a Runner from before it checked; a console from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docker: Option<DockerStatus>,
+    /// The holds set on the machine itself (`codefusion-runner pause --hold`), by name, at most [`MAX_HOLDS`]: the
+    /// host takes no new job while any is set, whatever the console says, and the console's resume lifts none.
+    /// Left out while none is set, and by a Runner from before them; a console from before ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<MachineHold>,
     /// Its scale sets, at most 500.
     pub scale_sets: Vec<ScaleSetStatus>,
     /// Its Actions runners, at most 64.

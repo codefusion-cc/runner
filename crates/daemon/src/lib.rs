@@ -11,6 +11,7 @@ mod adapters;
 pub mod docker_check;
 mod ends;
 pub mod held;
+pub mod holds;
 mod log;
 mod machines;
 mod making;

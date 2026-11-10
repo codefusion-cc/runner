@@ -236,6 +236,8 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
         updates: setup.updates,
         results: Some(state.join("results.json")),
         pause: Some(state.join("pause")),
+        holds: Some(crate::holds::holds_dir(state)),
+        status: Some(crate::holds::status_file(state)),
         settings: setup.settings,
         held_key: setup.held_key,
     });
