@@ -765,6 +765,40 @@ async fn an_unchanged_queue_is_answered_304_and_the_last_result_stands() {
         ]
     );
 
+    // A run under way whose jobs change while its updated_at stays put, as GitHub's does, is read again while it had
+    // a job queued: a job that ended or started no longer waits, though the run's time did not move. (The run before
+    // ends first, so the only one under way is this one.)
+    h.fake.end_job(run[1], "success");
+    let run = h.fake.queue_run(
+        "org/app",
+        &[
+            (&["self-hosted", "cf-6g"], "c"),
+            (&["self-hosted", "cf-8g"], "d"),
+            (&["self-hosted", "cf-2g"], "e"),
+        ],
+        "refs/heads/main",
+    );
+    h.fake.end_job(run[0], "success");
+    let before = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert!(waiting(&before).contains(&(run[1], key(&["self-hosted", "cf-8g"]))));
+    h.fake.end_job(run[1], "cancelled");
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert!(
+        !waiting(&read).iter().any(|(job, _)| *job == run[1]),
+        "the job that ended is not waiting: {:?}",
+        waiting(&read)
+    );
+    assert!(waiting(&read).contains(&(run[2], key(&["self-hosted", "cf-2g"]))));
+    h.fake.take_job(run[2]);
+    let read = h.app.waiting_jobs(1, "org/app").await.unwrap();
+    let queued: Vec<_> = read.jobs.iter().filter(|job| !job.queued.is_empty()).collect();
+    assert!(queued.iter().all(|job| job.id != run[2]), "{queued:?}");
+    // With none of its jobs queued, a run under way whose updated_at stays is not asked about again: its jobs'
+    // steps change all the time, and each answer in full counts against the rate limit.
+    let jobs = h.fake.count("/jobs");
+    h.app.waiting_jobs(1, "org/app").await.unwrap();
+    assert_eq!(h.fake.count("/jobs"), jobs, "no run's jobs asked for");
+
     // A queue forgotten is asked about without ETags.
     let h = harness().await;
     h.fake.queue_job("org/app", &["self-hosted", "cf-2g"], "build");
