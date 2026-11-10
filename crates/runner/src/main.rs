@@ -9,6 +9,8 @@ mod commands;
 mod config;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod hidden;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod holds;
 #[cfg(target_os = "macos")]
 mod launchd;
 #[cfg(target_os = "linux")]
@@ -39,6 +41,10 @@ fn main() -> ExitCode {
         }
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(code) = commands::on_machine(&args) {
+        return code;
+    }
     match commands::run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {

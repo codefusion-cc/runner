@@ -94,6 +94,11 @@ pub struct Config {
     /// for the default, 2 GB on a 16 GB Mac nobody works at.
     #[serde(default)]
     pub min_free_memory_percent: Option<u32>,
+    /// The most memory CI's machines may hold at once, in GB of 2^30 bytes as the sizes are (`10.6`), each machine
+    /// counted with its size and its vm-host's overhead: for a host that runs other work and keeps the rest for it.
+    /// More than 0 and no more than the host has; left out for what the budget's defaults give.
+    #[serde(default)]
+    pub ci_memory_gb: Option<serde_json::Number>,
     /// vCPUs of a machine of each size named, by its label (`{"cf-4g": 3}`), 1 to 64 and no more than CI may use;
     /// the sizes left out keep the host's defaults.
     #[serde(default)]
@@ -238,6 +243,15 @@ impl Config {
                 Settings::FLOOR_PERCENT.end()
             ));
         }
+        if let Some(gb) = &self.ci_memory_gb
+            && !gb
+                .as_f64()
+                .is_some_and(|gb| gb.is_finite() && gb > 0.0 && gb <= CI_MEMORY_GB_MAX)
+        {
+            return Err(format!(
+                "ci_memory_gb: more than 0 and at most {CI_MEMORY_GB_MAX}"
+            ));
+        }
         if self.labels.len() > 8 {
             return Err("labels: 8 at most".into());
         }
@@ -344,6 +358,11 @@ impl Config {
             idle_after: self.idle_minutes.map(|minutes| Millis::mins(minutes.into())),
             floor_percent: self.min_free_memory_percent,
             vcpus: Size::ALL.map(|size| self.vcpus.get(size.label()).copied()),
+            ci_bytes: self
+                .ci_memory_gb
+                .as_ref()
+                .and_then(serde_json::Number::as_f64)
+                .map(ci_bytes),
         }
     }
 
@@ -431,6 +450,20 @@ pub fn check_beside_old_manager(config: &Config, home: &Path, hostname: &str) ->
         )),
         _ => Ok(()),
     }
+}
+
+/// The most `ci_memory_gb` may say, far above any host's memory: the budget refuses more than the host has.
+const CI_MEMORY_GB_MAX: f64 = 4096.0;
+
+/// `ci_memory_gb` in bytes, to the byte below.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn ci_bytes(gb: f64) -> u64 {
+    // In range by the check: a finite number above 0 and at most CI_MEMORY_GB_MAX.
+    (gb * cf_budget::GIB as f64).floor() as u64
 }
 
 #[cfg(test)]
@@ -875,6 +908,40 @@ mod tests {
         }
         assert!(with(|v| v["vcpus"] = serde_json::json!({"cf-4g": -1})).is_err());
         assert!(with(|v| v["vcpus"] = serde_json::json!([3])).is_err());
+    }
+
+    #[test]
+    fn memory_for_ci_is_read_in_gigabytes_of_the_sizes_and_only_within_reason() {
+        assert_eq!(Config::parse(WHOLE).expect("config").limits().ci_bytes, None);
+        let gib = cf_budget::GIB;
+        for (gb, bytes) in [
+            (serde_json::json!(10.6), 11_381_663_334),
+            (serde_json::json!(6.4), 6_871_947_673),
+            (serde_json::json!(10), 10 * gib),
+            (serde_json::json!(4096), 4096 * gib),
+        ] {
+            assert_eq!(
+                with(|v| v["ci_memory_gb"] = gb.clone()).map(|c| c.limits().ci_bytes),
+                Ok(Some(bytes)),
+                "{gb}"
+            );
+        }
+        for gb in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(4096.01),
+            serde_json::json!(1e300),
+        ] {
+            let error = with(|v| v["ci_memory_gb"] = gb.clone()).expect_err("refused");
+            assert!(error.contains("ci_memory_gb"), "{gb}: {error}");
+        }
+        for gb in [serde_json::json!("10.6"), serde_json::json!([10])] {
+            assert!(with(|v| v["ci_memory_gb"] = gb.clone()).is_err(), "{gb}");
+        }
+        assert_eq!(
+            with(|v| v["ci_memory_gb"] = serde_json::Value::Null).map(|c| c.limits().ci_bytes),
+            Ok(None)
+        );
     }
 
     #[test]

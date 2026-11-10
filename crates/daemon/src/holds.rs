@@ -15,6 +15,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
+
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -27,6 +29,10 @@ pub fn holds_dir(state_dir: &Path) -> PathBuf {
 pub fn status_file(state_dir: &Path) -> PathBuf {
     state_dir.join("status.json")
 }
+
+/// How often at most the status goes unwritten while nothing in it changes, so a reader can tell a Runner that
+/// writes it from one that stopped.
+pub const STATUS_EVERY: Duration = Duration::from_secs(10);
 
 /// The longest name of a hold.
 pub const NAME_MAX: usize = 32;
@@ -113,7 +119,8 @@ pub struct StatusSize {
 }
 
 /// A moment as the holds and the status write it: RFC 3339, UTC, to the millisecond.
-pub fn moment(at: OffsetDateTime) -> String {
+pub fn moment(at: SystemTime) -> String {
+    let at = OffsetDateTime::from(at);
     let at = at
         .replace_nanosecond(at.millisecond() as u32 * 1_000_000)
         .unwrap_or(at);
@@ -122,7 +129,7 @@ pub fn moment(at: OffsetDateTime) -> String {
 
 /// Sets the hold `name`, or sets it again with this reason, keeping when it was first set. Errors are the file
 /// system's, with the path: the hold is then not set, or set as before.
-pub fn set(dir: &Path, name: &str, reason: Option<&str>, now: OffsetDateTime) -> Result<Hold, String> {
+pub fn set(dir: &Path, name: &str, reason: Option<&str>, now: SystemTime) -> Result<Hold, String> {
     if !is_name(name) {
         return Err(format!(
             "{name:?} names no hold: 1 to {NAME_MAX} of a-z, 0-9 and -"
@@ -203,6 +210,16 @@ pub fn read(dir: &Path) -> Vec<Hold> {
     holds
 }
 
+/// Whether a status written at `at` ([`moment`]) is fresh at `now`: written no more than three times
+/// [`STATUS_EVERY`] before, and not after it by more than a little clock drift. A moment that cannot be read is not.
+pub fn fresh(at: &str, now: SystemTime) -> bool {
+    let Ok(at) = OffsetDateTime::parse(at, &Rfc3339) else {
+        return false;
+    };
+    let age = OffsetDateTime::from(now) - at;
+    age >= -time::Duration::seconds(5) && age <= time::Duration::seconds(3 * STATUS_EVERY.as_secs() as i64)
+}
+
 /// The status the daemon wrote; none before its first, or one that cannot be read.
 pub fn read_status(path: &Path) -> Option<LocalStatus> {
     let bytes = std::fs::read(path).ok()?;
@@ -274,8 +291,21 @@ fn put(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn at(seconds: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(seconds).expect("a moment")
+    fn at(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_status_is_fresh_for_three_of_its_intervals_and_a_little_drift() {
+        let now = at(1_800_000_000);
+        let ago = |seconds: u64| moment(now - Duration::from_secs(seconds));
+        assert!(fresh(&ago(0), now));
+        assert!(fresh(&ago(30), now));
+        assert!(!fresh(&ago(31), now));
+        assert!(fresh(&moment(now + Duration::from_secs(5)), now));
+        assert!(!fresh(&moment(now + Duration::from_secs(6)), now));
+        assert!(!fresh("yesterday", now));
+        assert!(!fresh("", now));
     }
 
     #[test]

@@ -704,8 +704,11 @@ fn room_line(facts: HostFacts, settings: &Settings, whose: &str, when: &str) -> 
         .filter(|size| settings.can_run(*size).is_ok())
         .map(|size| format!("{} with {} CPUs", size.label(), settings.vcpus_of(size)))
         .collect();
+    let ci = settings.ci_bytes.map_or(String::new(), |bytes| {
+        format!(" (memory for CI {}, each machine with its overhead)", gib(bytes))
+    });
     format!(
-        "{} and {} cores, {whose}: {} for machines{when}; {}; {} cf-4g side by side",
+        "{} and {} cores, {whose}: {} for machines{ci}{when}; {}; {} cf-4g side by side",
         gib(facts.total_bytes),
         facts.cores,
         gib(settings.away.cap_bytes),

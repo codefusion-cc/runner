@@ -1179,7 +1179,7 @@ async fn holds_on_the_machine_take_no_new_job_until_every_one_is_lifted() {
         holds::holds_dir(rig.folder.path()),
         holds::status_file(rig.folder.path()),
     );
-    let now = time::OffsetDateTime::now_utc();
+    let now = std::time::SystemTime::now();
     holds::set(&dir, "bots", Some("bot run 42"), now).expect("set");
     holds::set(&dir, "stress", None, now).expect("set");
     rig.settles("the console hears the holds", || {
@@ -1268,13 +1268,7 @@ async fn a_held_host_that_starts_again_takes_no_job() {
     let mut rig = Rig::new(2).await;
     rig.service.discover().await;
     let dir = holds::holds_dir(rig.folder.path());
-    holds::set(
-        &dir,
-        "deploy",
-        Some("world update"),
-        time::OffsetDateTime::now_utc(),
-    )
-    .expect("set");
+    holds::set(&dir, "deploy", Some("world update"), std::time::SystemTime::now()).expect("set");
     rig.restart().await;
     for set in rig.github.scale_sets() {
         rig.github.lose_session(set.id);

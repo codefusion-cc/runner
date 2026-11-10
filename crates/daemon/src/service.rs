@@ -374,7 +374,7 @@ struct Shared<H, V> {
     holds_dir: Option<PathBuf>,
     status_file: Option<PathBuf>,
     /// The status last written, but for its time, and when: written again when it changes, and at least every
-    /// [`STATUS_EVERY`] so a reader can tell a Runner that writes from one that stopped.
+    /// [`local::STATUS_EVERY`] so a reader can tell a Runner that writes from one that stopped.
     status_written: Mutex<Option<(LocalStatus, Instant)>>,
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
@@ -501,9 +501,6 @@ fn kept_results(path: Option<&std::path::Path>) -> Vec<CommandResult> {
             Vec::new()
         })
 }
-
-/// How often at most the status for the commands on the machine goes unwritten while nothing in it changes.
-pub const STATUS_EVERY: Duration = Duration::from_secs(10);
 
 /// The holds' names, for the log.
 fn names(holds: &[Hold]) -> String {
@@ -826,7 +823,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         self.write_status();
     }
 
-    /// Writes [`LocalStatus`] when it changed, or [`STATUS_EVERY`] after it was last written.
+    /// Writes [`LocalStatus`] when it changed, or [`local::STATUS_EVERY`] after it was last written.
     fn write_status(&self) {
         let shared = &self.shared;
         let Some(path) = &shared.status_file else {
@@ -871,12 +868,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let mut written = shared.status_written.lock().expect("status");
         let due = written
             .as_ref()
-            .is_none_or(|(last, at)| *last != status || at.elapsed() >= STATUS_EVERY);
+            .is_none_or(|(last, at)| *last != status || at.elapsed() >= local::STATUS_EVERY);
         if !due {
             return;
         }
         let at = status.clone();
-        status.at = local::moment(OffsetDateTime::from(shared.clock.now()));
+        status.at = local::moment(shared.clock.now());
         match local::write_status(path, &status) {
             Ok(()) => *written = Some((at, Instant::now())),
             Err(error) => {
