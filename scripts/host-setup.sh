@@ -345,15 +345,15 @@ install_host() {
     lift_setup_hold || fail "the hold $SETUP_HOLD could not be lifted"
   fi
   step=packages
-  local wanted=("${PACKAGES[@]}") missing=() package installed
+  local wanted=("${PACKAGES[@]}") missing=() package present
   ((!built_here)) || wanted+=("${BUILD_PACKAGES[@]}")
   # One question for all: a package dpkg does not know is left out of its answer, and so is missing.
-  installed=$(
+  present=$(
     trap - ERR
     dpkg-query -W -f='${Package} ${Status}\n' "${wanted[@]}" 2>/dev/null
   ) || true
   for package in "${wanted[@]}"; do
-    grep -qx "$package install ok installed" <<<"$installed" || missing+=("$package")
+    grep -qx "$package install ok installed" <<<"$present" || missing+=("$package")
   done
   if ((${#missing[@]})); then
     change "install ${missing[*]}"
