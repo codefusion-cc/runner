@@ -2,9 +2,9 @@ name: Runner release
 
 # The Runner's Linux program for each architecture a host runs: one file that holds all of it (the guest bundle and
 # cloud-hypervisor are built in), released as `runner-<version>` (`0.1.0-446125c0a1b2` for the version
-# `0.1.0+446125c0a1b2` the program says), with `codefusion-runner-linux-amd64`, `-arm64` and their SHA256SUMS. A host
-# takes one with `scripts/host-setup.sh install --version <version> --sha256 <its line>`, so it needs no Rust and builds
-# nothing. Built in Debian 12, the oldest system a host runs, so the program runs on its glibc and on Ubuntu 24.04's.
+# `0.1.0+446125c0a1b2` the program says), with `codefusion-runner-linux-amd64`, `-arm64`, the `host-setup.sh` of the
+# same commit and their SHA256SUMS. A host takes them with `host-setup.sh install --version <version> --sha256 <its
+# line>`, the script checked against its own line first, so it needs no Rust, no checkout and builds nothing. Built in Debian 12, the oldest system a host runs, so the program runs on its glibc and on Ubuntu 24.04's.
 #
 # `build` holds no secret, so a pull request that changes this workflow runs it too. `publish` runs only on main,
 # needs nothing but `gh`, and never replaces a release: a host's settings name its SHA-256, so the bytes of a version
@@ -19,6 +19,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
+      - scripts/host-setup.sh
       - .github/workflows/release.yml
   pull_request:
     paths:
@@ -75,6 +76,8 @@ jobs:
           [[ ${version#*+} == "${GITHUB_SHA:0:12}" ]] || { echo "::error::$said is not of $GITHUB_SHA"; exit 1; }
           mkdir out
           cp "$program" "out/codefusion-runner-linux-${{ matrix.platform }}"
+          # One copy of the script, from one of the two builds, so the merged artifacts hold it once.
+          if [[ ${{ matrix.platform }} == amd64 ]]; then cp scripts/host-setup.sh out/; fi
           echo "$version" > "out/version-${{ matrix.platform }}"
       - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -108,12 +111,13 @@ jobs:
           version=$(cat version-amd64)
           tag="runner-${version/+/-}"
           rm version-*
-          sha256sum codefusion-runner-linux-* > SHA256SUMS
+          [ -f host-setup.sh ] || { echo "::error::no host-setup.sh among the builds"; exit 1; }
+          sha256sum codefusion-runner-linux-* host-setup.sh > SHA256SUMS
           cat SHA256SUMS
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "::notice::$tag is out already; its files stay as they are"
             exit 0
           fi
-          gh release create "$tag" codefusion-runner-linux-* SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+          gh release create "$tag" codefusion-runner-linux-* host-setup.sh SHA256SUMS --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" --latest=false --title "$tag" \
-            --notes "The Runner $version for Linux. A host takes it with \`scripts/host-setup.sh install --version ${version/+/-} --sha256 <its line in SHA256SUMS>\`."
+            --notes "The Runner $version for Linux. A host checks host-setup.sh against its line in SHA256SUMS, then takes the Runner with \`host-setup.sh install --version ${version/+/-} --sha256 <its line in SHA256SUMS>\`."
