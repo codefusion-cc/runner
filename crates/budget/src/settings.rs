@@ -100,6 +100,9 @@ pub struct Limits {
     pub vcpus: [Option<u32>; 4],
     /// The most the machines of CI may hold at once, overheads included: [`Settings::ci_bytes`].
     pub ci_bytes: Option<u64>,
+    /// The CPUs CI's machines may take together, from 1 to every core: for a host whose other work leaves CI more
+    /// (or fewer) than the defaults give, such as a game server that takes CI jobs only while it is idle.
+    pub ci_cpus: Option<u32>,
 }
 
 /// A setting the budget refuses, with what is wrong. Settings come from a file, the tray and the console, so a bad
@@ -127,6 +130,9 @@ pub enum SettingsError {
         cpus: u32,
         cores: u32,
     },
+    /// CPUs for CI set to none, or to more than the host has.
+    #[error("{cpus} CPUs for CI on a host with {cores}")]
+    CiCpus { cpus: u32, cores: u32 },
     /// The limits while the person is there are looser than while away.
     #[error("the limits while the Mac is in use are looser than while its person is away")]
     InUseLooser,
@@ -415,6 +421,21 @@ impl Settings {
                 self.in_use = self.away;
             }
         }
+        // CPUs for CI, set: the most every profile gives, and the sizes' vCPUs follow, as on a host with that many.
+        if let Some(cpus) = limits.ci_cpus {
+            if !(1..=self.cores).contains(&cpus) {
+                return Err(SettingsError::CiCpus {
+                    cpus,
+                    cores: self.cores,
+                });
+            }
+            self.away.cpus = cpus;
+            self.in_use.cpus = self.in_use.cpus.min(cpus);
+            self.vcpus = vcpus_for(cpus, self.away.cap_bytes, self.headless);
+            if self.mode == Mode::Dedicated {
+                self.in_use = self.away;
+            }
+        }
         // Memory for CI, set: the host keeps the rest for itself, and never less than the least floor. A floor set as
         // a share stays. The sizes alone add up to no more than it leaves after one machine's overhead, and `admit`
         // counts each machine's overhead on top. It may be more than the default cap: whoever set it knows the host.
@@ -447,9 +468,10 @@ impl Settings {
             }
             self.vcpus[size.index()] = vcpus;
         }
-        // A headless host's cap keeps the overhead of as many machines as its CPUs run: fewer vCPUs run more.
+        // A headless host's cap keeps the overhead of as many machines as its CPUs run: fewer vCPUs run more. Memory
+        // for CI counts each machine's overhead as it starts already.
         let more = self.most_side_by_side().saturating_sub(side_by_side);
-        if self.headless && more > 0 {
+        if self.headless && more > 0 && self.ci_bytes.is_none() {
             let overheads = u64::from(more).saturating_mul(self.vm_host_overhead_bytes);
             self.away.cap_bytes = self.away.cap_bytes.saturating_sub(overheads);
             self.in_use.cap_bytes = self.in_use.cap_bytes.min(self.away.cap_bytes);

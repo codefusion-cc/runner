@@ -99,6 +99,10 @@ pub struct Config {
     /// More than 0 and no more than the host has; left out for what the budget's defaults give.
     #[serde(default)]
     pub ci_memory_gb: Option<serde_json::Number>,
+    /// The CPUs CI's machines may take together, from 1 to every core the host has; left out for the budget's
+    /// defaults (all but two on a host of its own). The sizes' vCPUs follow it unless `vcpus` names them.
+    #[serde(default)]
+    pub ci_cpus: Option<u32>,
     /// vCPUs of a machine of each size named, by its label (`{"cf-4g": 3}`), 1 to 64 and no more than CI may use;
     /// the sizes left out keep the host's defaults.
     #[serde(default)]
@@ -252,6 +256,12 @@ impl Config {
                 "ci_memory_gb: more than 0 and at most {CI_MEMORY_GB_MAX}"
             ));
         }
+        if self
+            .ci_cpus
+            .is_some_and(|cpus| !(1..=CI_CPUS_MAX).contains(&cpus))
+        {
+            return Err(format!("ci_cpus: between 1 and {CI_CPUS_MAX}"));
+        }
         if self.labels.len() > 8 {
             return Err("labels: 8 at most".into());
         }
@@ -363,6 +373,7 @@ impl Config {
                 .as_ref()
                 .and_then(serde_json::Number::as_f64)
                 .map(ci_bytes),
+            ci_cpus: self.ci_cpus,
         }
     }
 
@@ -451,6 +462,9 @@ pub fn check_beside_old_manager(config: &Config, home: &Path, hostname: &str) ->
         _ => Ok(()),
     }
 }
+
+/// The most `ci_cpus` may say, above any host's cores: the budget refuses more than the host has.
+const CI_CPUS_MAX: u32 = 1024;
 
 /// The most `ci_memory_gb` may say, far above any host's memory: the budget refuses more than the host has.
 const CI_MEMORY_GB_MAX: f64 = 4096.0;
@@ -942,6 +956,28 @@ mod tests {
             with(|v| v["ci_memory_gb"] = serde_json::Value::Null).map(|c| c.limits().ci_bytes),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn cpus_for_ci_are_whole_and_within_reason() {
+        assert_eq!(Config::parse(WHOLE).expect("config").limits().ci_cpus, None);
+        for cpus in [1, 6, 1024] {
+            assert_eq!(
+                with(|v| v["ci_cpus"] = cpus.into()).map(|c| c.limits().ci_cpus),
+                Ok(Some(cpus)),
+            );
+        }
+        for cpus in [serde_json::json!(0), serde_json::json!(1025)] {
+            let error = with(|v| v["ci_cpus"] = cpus.clone()).expect_err("refused");
+            assert!(error.contains("ci_cpus"), "{cpus}: {error}");
+        }
+        for cpus in [
+            serde_json::json!(-1),
+            serde_json::json!(5.5),
+            serde_json::json!("6"),
+        ] {
+            assert!(with(|v| v["ci_cpus"] = cpus.clone()).is_err(), "{cpus}");
+        }
     }
 
     #[test]

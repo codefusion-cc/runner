@@ -179,3 +179,87 @@ fn none_set_changes_nothing() {
     assert_eq!(defaults.clone().limited(&Limits::default()), Ok(defaults.clone()));
     assert_eq!(defaults.ci_bytes, None);
 }
+
+fn limited(
+    settings: Settings,
+    ci_bytes: Option<u64>,
+    ci_cpus: Option<u32>,
+) -> Result<Settings, SettingsError> {
+    settings.limited(&Limits {
+        ci_bytes,
+        ci_cpus,
+        ..Limits::default()
+    })
+}
+
+/// Whether these sizes start one after the other on an empty host, its CPUs counted as the settings give them.
+fn starts(settings: &Settings, sizes: &[Size]) -> Result<(), Refusal> {
+    let mut charges = Vec::new();
+    for &size in sizes {
+        admit(settings, &settings.away, settings.total_bytes, &charges, size)?;
+        charges.push(Charge {
+            vm_bytes: size.vm_bytes(),
+            host_bytes: settings.host_bytes(size),
+            resident_bytes: 0,
+            cpus: settings.vcpus_of(size),
+        });
+    }
+    Ok(())
+}
+
+#[test]
+fn a_six_core_game_host_runs_the_agreed_mixes_with_every_core_and_two_vcpus_a_cf_4g() {
+    // The defaults keep two cores for the host; every core still gives a cf-4g 3 vCPUs, so two of them fill it.
+    for ci_cpus in [None, Some(6)] {
+        let settings = limited(headless(12 * GIB, 6), Some(gb(106)), ci_cpus).unwrap();
+        assert!(
+            matches!(starts(&settings, &[G4, G4, G2]), Err(Refusal::Cpus { .. })),
+            "{ci_cpus:?}"
+        );
+    }
+    let set = headless(12 * GIB, 6)
+        .limited(&Limits {
+            ci_bytes: Some(gb(106)),
+            ci_cpus: Some(6),
+            vcpus: [None, Some(2), None, None],
+            ..Limits::default()
+        })
+        .unwrap();
+    assert_eq!(set.away.cpus, 6);
+    for mix in [&[G4, G4, G2][..], &[G6, G4], &[G8, G2]] {
+        assert_eq!(starts(&set, mix), Ok(()), "{mix:?}");
+    }
+    assert!(starts(&set, &[G4, G4, G2, G2]).is_err());
+    // The 8 GB host on its 4 cores: a cf-4g beside a cf-2g, or a cf-6g.
+    let small = limited(headless(8 * GIB, 4), Some(gb(64)), Some(4)).unwrap();
+    assert_eq!(starts(&small, &[G4, G2]), Ok(()));
+    assert_eq!(starts(&small, &[G6]), Ok(()));
+}
+
+#[test]
+fn fewer_vcpus_for_a_size_leave_memory_for_ci_whole() {
+    // Memory for CI counts each machine's overhead as it starts: fewer vCPUs take nothing more off the cap.
+    let settings = headless(12 * GIB, 6)
+        .limited(&Limits {
+            ci_bytes: Some(gb(106)),
+            ci_cpus: Some(6),
+            vcpus: [Some(1), Some(1), None, None],
+            ..Limits::default()
+        })
+        .unwrap();
+    assert_eq!(settings.away.cap_bytes, gb(106) - OVERHEAD);
+    assert_eq!(starts(&settings, &[G4, G4, G2]), Ok(()));
+}
+
+#[test]
+fn cpus_for_ci_of_none_or_more_than_the_host_has_are_refused() {
+    for cpus in [0, 7] {
+        assert_eq!(
+            limited(headless(12 * GIB, 6), None, Some(cpus)),
+            Err(SettingsError::CiCpus { cpus, cores: 6 })
+        );
+    }
+    let fewer = limited(headless(12 * GIB, 6), None, Some(2)).unwrap();
+    assert_eq!((fewer.away.cpus, fewer.in_use.cpus), (2, 2));
+    assert!(matches!(starts(&fewer, &[G2, G2]), Err(Refusal::Cpus { .. })));
+}
