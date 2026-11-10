@@ -216,6 +216,12 @@ impl SettingsFile for ConfigFile {
             "deadline_minutes",
             change.deadline_minutes.map(|v| v.map(Into::into)),
         );
+        set("labels", change.labels.clone().map(|v| v.map(Into::into)));
+        set(
+            "only_labels",
+            change.only_labels.clone().map(|v| v.map(Into::into)),
+        );
+        set("repos", change.repos.clone().map(|v| v.map(Into::into)));
         if file == was {
             // Rewritten, the same settings would read as new ones, and the Runner would start again for nothing.
             return Ok(false);
@@ -288,6 +294,7 @@ fn service(
             docker_repos: config.docker_repos.clone(),
             docker_max_jobs: config.docker_max_jobs,
             host_labels: config.labels.clone(),
+            only_labels: config.only_labels.clone(),
             trusted: config.trusted_policy(),
         },
         console: console(config)?,
@@ -1321,6 +1328,74 @@ mod tests {
             assert!(keys.get(key).is_none(), "{key} is out: {keys}");
         }
         assert!(!here.path.with_extension("json.next").exists());
+    }
+
+    /// The console's labels, kept labels and repositories go into the file as the config's own lists, and null takes
+    /// each out again; a kept label the host does not have is refused before the file changes.
+    #[test]
+    fn labels_and_repositories_are_written_into_the_file_and_taken_out_with_null() {
+        let here = Startable::new();
+        here.write(&here.text("2026.10.1", r#", "repos": ["org/app"]"#));
+        let file = here.file();
+        let names = |list: &[&str]| Some(Some(list.iter().map(|name| name.to_string()).collect::<Vec<_>>()));
+        let wrote = file
+            .change(&SettingsChange {
+                labels: names(&["cf-linux", "cf-ops"]),
+                only_labels: names(&["cf-ops"]),
+                repos: names(&["org/app", "org/ops"]),
+                ..SettingsChange::default()
+            })
+            .expect("written");
+        assert!(wrote);
+        let config = startable(&here.path).expect("a Runner starts on it");
+        assert_eq!(
+            (config.labels, config.only_labels, config.repos),
+            (
+                vec!["cf-linux".to_string(), "cf-ops".to_string()],
+                vec!["cf-ops".to_string()],
+                vec!["org/app".to_string(), "org/ops".to_string()]
+            )
+        );
+
+        let before = std::fs::read(&here.path).expect("read");
+        let refused = here.file().change(&SettingsChange {
+            only_labels: names(&["cf-gpu"]),
+            ..SettingsChange::default()
+        });
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("only_labels: `cf-gpu` is not one of the host's labels")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(&here.path).expect("read"),
+            before,
+            "the file is as it was"
+        );
+
+        let wrote = here
+            .file()
+            .change(&SettingsChange {
+                labels: Some(None),
+                only_labels: Some(None),
+                repos: Some(None),
+                ..SettingsChange::default()
+            })
+            .expect("written");
+        assert!(wrote);
+        let keys: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&here.path).expect("read")).expect("JSON");
+        for key in ["labels", "only_labels", "repos"] {
+            assert!(keys.get(key).is_none(), "{key} is out: {keys}");
+        }
+        let config = startable(&here.path).expect("a Runner starts on it");
+        assert_eq!(config.only_labels, Vec::<String>::new());
+        assert_eq!(
+            config.repos,
+            Vec::<String>::new(),
+            "every private repository again"
+        );
     }
 
     /// A value the Runner could not start on is refused before the file changes, so the Runner keeps running

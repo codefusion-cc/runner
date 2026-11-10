@@ -116,6 +116,11 @@ pub struct Config {
     /// on Linux.
     #[serde(default = "labels")]
     pub labels: Vec<String>,
+    /// Host labels of [`Config::labels`] that this host keeps for itself: when set, it serves only the jobs that ask
+    /// for one of them (`runs-on: [cf-2g, cf-ops]` with `["cf-ops"]` here), so its room is always there for those.
+    /// Left out, it serves every job its labels allow.
+    #[serde(default)]
+    pub only_labels: Vec<String>,
     /// What jobs the host is for; left out, `shared`.
     #[serde(default)]
     pub class: Class,
@@ -274,6 +279,14 @@ impl Config {
             }
             if self.labels[..i].contains(label) {
                 return Err(format!("labels: `{label}` is listed twice"));
+            }
+        }
+        for (i, label) in self.only_labels.iter().enumerate() {
+            if !self.labels.contains(label) {
+                return Err(format!("only_labels: `{label}` is not one of the host's labels"));
+            }
+            if self.only_labels[..i].contains(label) {
+                return Err(format!("only_labels: `{label}` is listed twice"));
             }
         }
         for (label, vcpus) in &self.vcpus {
@@ -849,6 +862,52 @@ mod tests {
             assert!(with(|v| v["docker_max_jobs"] = max.into()).is_err(), "{max}");
         }
         assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
+    }
+
+    #[test]
+    fn a_host_keeps_itself_only_for_labels_it_has() {
+        assert_eq!(
+            with(|_| ()).expect("config").only_labels,
+            Vec::<String>::new(),
+            "left out, it keeps itself for nothing"
+        );
+        let set = |labels: serde_json::Value, only: serde_json::Value| {
+            with(|v| {
+                v["labels"] = labels;
+                v["only_labels"] = only;
+            })
+        };
+        assert_eq!(
+            set(
+                serde_json::json!(["cf-linux", "cf-ops"]),
+                serde_json::json!(["cf-ops"])
+            )
+            .expect("set")
+            .only_labels,
+            ["cf-ops"]
+        );
+        assert_eq!(
+            set(serde_json::json!(["cf-linux"]), serde_json::json!(["cf-ops"]))
+                .err()
+                .as_deref(),
+            Some("only_labels: `cf-ops` is not one of the host's labels")
+        );
+        assert_eq!(
+            set(
+                serde_json::json!(["cf-ops"]),
+                serde_json::json!(["cf-ops", "cf-ops"])
+            )
+            .err()
+            .as_deref(),
+            Some("only_labels: `cf-ops` is listed twice")
+        );
+        assert_eq!(
+            set(serde_json::json!(["cf-ops"]), serde_json::json!(["cf-2g"]))
+                .err()
+                .as_deref(),
+            Some("only_labels: `cf-2g` is not one of the host's labels"),
+            "a size is no host label"
+        );
     }
 
     #[test]

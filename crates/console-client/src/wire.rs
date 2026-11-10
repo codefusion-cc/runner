@@ -445,6 +445,15 @@ pub struct JobLimits {
     pub min_free_memory_percent: f64,
     /// The longest a job may run, in hours.
     pub max_job_hours: f64,
+    /// The host labels it has (`cf-linux`, `cf-ops`).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// The host labels it is kept for: it serves only the jobs that ask for one of them. Empty for none.
+    #[serde(default)]
+    pub only_labels: Vec<String>,
+    /// The `owner/name` repositories it serves; empty for every private one the Runners App sees.
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 /// The settings of the cf-runners manager, which the console can change with a `settings` command. The Runner

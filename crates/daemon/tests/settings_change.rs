@@ -17,6 +17,7 @@ fn each_key_the_runner_has_is_read_and_null_puts_it_back() {
             idle_minutes: Some(Some(20)),
             min_free_memory_percent: Some(Some(8)),
             deadline_minutes: Some(Some(360)),
+            ..SettingsChange::default()
         })
     );
     assert_eq!(
@@ -28,6 +29,7 @@ fn each_key_the_runner_has_is_read_and_null_puts_it_back() {
             idle_minutes: Some(None),
             min_free_memory_percent: Some(None),
             deadline_minutes: Some(None),
+            ..SettingsChange::default()
         })
     );
     assert_eq!(
@@ -38,6 +40,57 @@ fn each_key_the_runner_has_is_read_and_null_puts_it_back() {
         }),
         "a key left out is left as it is"
     );
+}
+
+#[test]
+fn labels_kept_labels_and_repositories_are_lists_of_names_and_null_puts_them_back() {
+    let names = |list: &[&str]| Some(Some(list.iter().map(|name| name.to_string()).collect::<Vec<_>>()));
+    assert_eq!(
+        read(
+            json!({"labels": ["cf-linux", "cf-ops"], "onlyLabels": ["cf-ops"], "repos": ["codefusion-cc/heimforge"]})
+        ),
+        Ok(SettingsChange {
+            labels: names(&["cf-linux", "cf-ops"]),
+            only_labels: names(&["cf-ops"]),
+            repos: names(&["codefusion-cc/heimforge"]),
+            ..SettingsChange::default()
+        })
+    );
+    assert_eq!(
+        read(json!({"labels": null, "onlyLabels": null, "repos": null})),
+        Ok(SettingsChange {
+            labels: Some(None),
+            only_labels: Some(None),
+            repos: Some(None),
+            ..SettingsChange::default()
+        })
+    );
+    assert_eq!(
+        read(json!({"onlyLabels": []})).map(|change| change.only_labels),
+        Ok(Some(Some(Vec::new()))),
+        "an empty list is a list"
+    );
+    let hundred: Vec<String> = (0..100).map(|i| format!("org/app{i}")).collect();
+    assert!(read(json!({"repos": hundred})).is_ok(), "a hundred names");
+    let too_many: Vec<String> = (0..101).map(|i| format!("org/app{i}")).collect();
+    assert_eq!(
+        read(json!({"repos": too_many})),
+        Err("repositories: a list of owner/name".into())
+    );
+    for bad in [
+        json!("cf-ops"),
+        json!(["cf-ops", 3]),
+        json!([null]),
+        json!({"cf-ops": true}),
+        json!(["x".repeat(201)]),
+        json!(3),
+    ] {
+        assert_eq!(
+            read(json!({"onlyLabels": bad})),
+            Err("only labels: a list of host labels".into()),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -170,6 +223,7 @@ proptest! {
                 idle_minutes: idle,
                 min_free_memory_percent: floor,
                 deadline_minutes: half_hours.map(|v| v.map(|h| h * 30)),
+                ..SettingsChange::default()
             }));
         }
     }

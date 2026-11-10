@@ -2667,6 +2667,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             min_free_memory_percent: (floor * 100.0).round() / 100.0,
             // Not rounded: hours that come back as they went are whole minutes again.
             max_job_hours: self.shared.machines.deadline().as_secs_f64() / 3600.0,
+            labels: self.shared.config.policy.host_labels.clone(),
+            only_labels: self.shared.config.policy.only_labels.clone(),
+            repos: self.shared.config.policy.repos.clone(),
         })
     }
 

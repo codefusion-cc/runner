@@ -1765,6 +1765,46 @@ async fn a_set_that_asks_for_host_labels_is_served_only_by_a_host_that_has_them(
     assert_eq!(problems, Vec::<String>::new());
 }
 
+/// A host kept for a label (`only_labels: ["cf-ops"]`) serves the jobs that ask for it and leaves every other one,
+/// the default `[cf-2g, self-hosted]` too, to the other hosts, so its room is there when such a job comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_kept_for_a_label_serves_only_the_jobs_that_ask_for_it() {
+    let rig = Rig::new(3).await;
+    rig.github.set_workflow(
+        REPO,
+        "ops.yml",
+        "on: push\njobs:\n  plan:\n    runs-on: [cf-2g, cf-ops]\n    steps: []\n  tests:\n    runs-on: cf-4g\n    steps: []\n  linux:\n    runs-on: [cf-2g, cf-linux]\n    steps: []\n",
+    );
+    let ops = service_with(
+        &rig.github,
+        &rig.console,
+        &rig.parts,
+        &rig.machines,
+        &rig.token,
+        &rig.battery,
+        (
+            &rig.outbox,
+            None,
+            &rig.settings,
+            rig.folder.path(),
+            rig.update_limit,
+        ),
+        |config| {
+            config.policy.host_labels = vec!["cf-linux".into(), "cf-ops".into()];
+            config.policy.only_labels = vec!["cf-ops".into()];
+        },
+    );
+    let (served, problems) = ops.survey().await;
+    assert_eq!(served, ["org/app: [cf-2g, cf-ops] as cf-2g"]);
+    assert_eq!(problems, Vec::<String>::new());
+    // A host kept for nothing serves the jobs the other one left.
+    let (served, _) = rig.service.survey().await;
+    assert!(
+        served.contains(&"org/app: [cf-4g] as cf-4g".to_string()),
+        "{served:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_survey_says_what_would_be_served_and_what_cannot_be_read_and_changes_nothing_at_github() {
     let rig = Rig::new(3).await;
@@ -4829,6 +4869,7 @@ async fn a_settings_command_is_written_to_the_file_and_the_runner_starts_again_o
             idle_minutes: Some(None),
             min_free_memory_percent: Some(Some(8)),
             deadline_minutes: Some(Some(90)),
+            ..SettingsChange::default()
         }]
     );
     // The machine of the running job stands until its job is over; then the Runner starts again.
@@ -4919,6 +4960,10 @@ async fn the_report_says_the_commands_the_runner_does_and_its_limits() {
             // The 5 GiB floor of a 64 GiB dedicated Mac, 7.8125% of its memory, to two places.
             "minFreeMemoryPercent": 7.81,
             "maxJobHours": 6.0,
+            // The rig's host labels, kept for none, serving every private repository.
+            "labels": ["cf-macos"],
+            "onlyLabels": [],
+            "repos": [],
         }),
         "a dedicated Mac waits for no person"
     );
