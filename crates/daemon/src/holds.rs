@@ -11,7 +11,6 @@
 //! The daemon reads the folder at its start, before any listener opens, and on every tick, and writes what it sees
 //! with its machines to `<state>/status.json` ([`LocalStatus`]), which `pause --wait` and `status --json` read.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -151,7 +150,7 @@ pub fn set(dir: &Path, name: &str, reason: Option<&str>, now: SystemTime) -> Res
     };
     let mut bytes = serde_json::to_vec(&hold).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
-    put(&path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    cf_secret::replace_private(&path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(hold)
 }
 
@@ -198,7 +197,14 @@ pub fn read(dir: &Path) -> Vec<Hold> {
             continue;
         }
         holds.push(match read_one(&entry.path()) {
-            Some(Ok(hold)) if hold.name == name => hold,
+            // A reason as `set` keeps it, whoever wrote the file: the console refuses a report with a longer one.
+            Some(Ok(hold)) if hold.name == name => Hold {
+                reason: hold
+                    .reason
+                    .map(|reason| cut(reason.trim()))
+                    .filter(|reason| !reason.is_empty()),
+                ..hold
+            },
             Some(Ok(_)) => unreadable(name, "its file names another hold"),
             Some(Err(why)) => unreadable(name, &why),
             // Lifted between the listing and the read.
@@ -208,6 +214,15 @@ pub fn read(dir: &Path) -> Vec<Hold> {
     holds.sort_by(|a, b| a.name.cmp(&b.name));
     holds.dedup_by(|a, b| a.name == b.name);
     holds
+}
+
+/// The holds' names, `bots, stress`, for a log or a line on the terminal.
+pub fn names(holds: &[Hold]) -> String {
+    holds
+        .iter()
+        .map(|hold| hold.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether a status written at `at` ([`moment`]) is fresh at `now`: written no more than three times
@@ -230,7 +245,7 @@ pub fn read_status(path: &Path) -> Option<LocalStatus> {
 pub fn write_status(path: &Path, status: &LocalStatus) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(status).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
-    put(path, &bytes)
+    cf_secret::replace_private(path, &bytes)
 }
 
 /// A hold's file, read: none when it is not there.
@@ -257,34 +272,6 @@ fn cut(text: &str) -> String {
         .filter(|c| !c.is_control())
         .take(REASON_MAX)
         .collect()
-}
-
-/// Puts `bytes` at `path` whole: written to a temporary file of this process's own (mode 0600, synced) in the same
-/// folder, then renamed over it. Two writers never share the temporary file, and a reader sees the old file or the
-/// new one.
-fn put(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let file = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
-    let temporary = dir.join(format!(
-        ".{file}.{}.{}.tmp",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    let written = (|| {
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        out.write_all(bytes)?;
-        out.sync_all()?;
-        std::fs::rename(&temporary, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
 }
 
 #[cfg(test)]
@@ -417,7 +404,7 @@ mod tests {
         let folder = tempfile::tempdir().expect("a folder");
         let dir = holds_dir(folder.path());
         set(&dir, "deploy", None, at(1)).expect("set");
-        std::fs::write(dir.join(".deploy.json.123.456.tmp"), "{").expect("a temporary file");
+        std::fs::write(dir.join(".deploy.json.123.4.partial"), "{").expect("a temporary file");
         std::fs::write(dir.join("notes.txt"), "x").expect("something else");
         std::fs::write(dir.join("Upper.json"), "{}").expect("no name of a hold");
         let names: Vec<String> = read(&dir).into_iter().map(|hold| hold.name).collect();
@@ -442,6 +429,21 @@ mod tests {
         let long = format!("a\u{1b}[31m{}", "x".repeat(500));
         let hold = set(&dir, "bots", Some(&long), at(1)).expect("set");
         let reason = hold.reason.expect("a reason");
+        assert_eq!(reason.chars().count(), REASON_MAX);
+        assert!(!reason.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_reason_written_by_hand_is_read_back_cut() {
+        let folder = tempfile::tempdir().expect("a folder");
+        let dir = holds_dir(folder.path());
+        set(&dir, "bots", None, at(1)).expect("set");
+        let long = format!(
+            "{{\"name\":\"bots\",\"reason\":\"a\\u001b{}\",\"since\":\"x\"}}",
+            "x".repeat(500)
+        );
+        std::fs::write(dir.join("bots.json"), long).expect("written by hand");
+        let reason = read(&dir)[0].reason.clone().expect("a reason");
         assert_eq!(reason.chars().count(), REASON_MAX);
         assert!(!reason.contains('\u{1b}'));
     }

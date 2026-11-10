@@ -190,9 +190,9 @@ fn resume(state: &Path, name: &str) -> Result<(), String> {
     let left = holds::read(&holds::holds_dir(state));
     match (was, left.is_empty()) {
         (false, true) => println!("{name} was not set; nothing holds the host"),
-        (false, false) => println!("{name} was not set; still held by {}", names(&left)),
+        (false, false) => println!("{name} was not set; still held by {}", holds::names(&left)),
         (true, true) => println!("lifted {name}; nothing holds the host"),
-        (true, false) => println!("lifted {name}; still held by {}", names(&left)),
+        (true, false) => println!("lifted {name}; still held by {}", holds::names(&left)),
     }
     Ok(())
 }
@@ -206,12 +206,14 @@ enum Look {
     Busy(String),
 }
 
-/// Whether nothing runs any more under `hold`. Only a status the Runner wrote after it took up this very hold says
-/// so: before it saw the hold a job could still start. A Runner that is not running starts nothing, but its
+/// Whether nothing runs any more under `hold`. Only a fresh status the Runner wrote after it took up this very hold
+/// says so: before it saw the hold a job could still start. A Runner that is not running starts nothing, but its
 /// machines may stand until the next one adopts them: their records say.
 fn look(state: &Path, hold: &Hold) -> Look {
     let status = holds::read_status(&holds::status_file(state));
-    if let Some(status) = status.as_ref().filter(|status| seen(status, hold)) {
+    // A status the Runner stopped writing says nothing of now: one that ended with machines may have none left.
+    let fresh = |status: &&LocalStatus| holds::fresh(&status.at, std::time::SystemTime::now());
+    if let Some(status) = status.as_ref().filter(fresh).filter(|status| seen(status, hold)) {
         return if status.idle() {
             Look::Idle
         } else {
@@ -292,14 +294,6 @@ fn machine_records(state: &Path) -> usize {
             })
             .count()
     })
-}
-
-fn names(holds: &[Hold]) -> String {
-    holds
-        .iter()
-        .map(|hold| hold.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// What `status --json` prints.
@@ -554,6 +548,22 @@ mod tests {
     }
 
     #[test]
+    fn a_status_the_runner_stopped_writing_ends_no_wait() {
+        let mine = hold("bots", "2026-11-10T12:00:00.123Z");
+        let mut stale = status_with(vec![mine.clone()], 1, 0);
+        stale.at = holds::moment(std::time::SystemTime::now() - Duration::from_secs(60));
+        // A Runner runs, but not the one that wrote it: what it said then is not what runs now.
+        let (folder, _lock) = folder_with(Some(&stale), 1, true);
+        assert_eq!(
+            look(folder.path(), &mine),
+            Look::Busy("the Runner has not taken up the hold yet".into())
+        );
+        // None runs and its machines are gone: nothing runs, whatever the old status said.
+        let (folder, _) = folder_with(Some(&stale), 0, false);
+        assert_eq!(look(folder.path(), &mine), Look::Idle);
+    }
+
+    #[test]
     fn with_no_runner_running_a_wait_ends_once_no_machine_it_left_may_stand() {
         let mine = hold("bots", "2026-11-10T12:00:00.123Z");
         let (folder, _) = folder_with(None, 0, false);
@@ -595,6 +605,9 @@ mod tests {
         pause(folder.path(), "stress", None, None).expect("held");
         assert_eq!(resume(folder.path(), "bots"), Ok(()));
         assert_eq!(resume(folder.path(), "bots"), Ok(()));
-        assert_eq!(names(&holds::read(&holds::holds_dir(folder.path()))), "stress");
+        assert_eq!(
+            holds::names(&holds::read(&holds::holds_dir(folder.path()))),
+            "stress"
+        );
     }
 }

@@ -421,6 +421,9 @@ impl Settings {
                 self.in_use = self.away;
             }
         }
+        // As many machines side by side as the cap kept the overhead of: more CPUs for CI, or fewer vCPUs a size, run
+        // more.
+        let side_by_side = self.most_side_by_side();
         // CPUs for CI, set: the most every profile gives, and the sizes' vCPUs follow, as on a host with that many.
         if let Some(cpus) = limits.ci_cpus {
             if !(1..=self.cores).contains(&cpus) {
@@ -456,7 +459,6 @@ impl Settings {
                 self.in_use = self.away;
             }
         }
-        let side_by_side = self.most_side_by_side();
         for (size, vcpus) in Size::ALL.into_iter().zip(limits.vcpus) {
             let Some(vcpus) = vcpus else { continue };
             if vcpus > self.away.cpus {
@@ -468,8 +470,8 @@ impl Settings {
             }
             self.vcpus[size.index()] = vcpus;
         }
-        // A headless host's cap keeps the overhead of as many machines as its CPUs run: fewer vCPUs run more. Memory
-        // for CI counts each machine's overhead as it starts already.
+        // A headless host's cap keeps the overhead of as many machines as its CPUs run: more CPUs for CI or fewer vCPUs
+        // run more. Memory for CI counts each machine's overhead as it starts already.
         let more = self.most_side_by_side().saturating_sub(side_by_side);
         if self.headless && more > 0 && self.ci_bytes.is_none() {
             let overheads = u64::from(more).saturating_mul(self.vm_host_overhead_bytes);

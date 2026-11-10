@@ -263,3 +263,21 @@ fn cpus_for_ci_of_none_or_more_than_the_host_has_are_refused() {
     assert_eq!((fewer.away.cpus, fewer.in_use.cpus), (2, 2));
     assert!(matches!(starts(&fewer, &[G2, G2]), Err(Refusal::Cpus { .. })));
 }
+
+#[test]
+fn more_cpus_for_ci_on_a_headless_host_keep_the_overhead_of_the_machines_they_add() {
+    let defaults = headless(12 * GIB, 6);
+    assert_eq!(defaults.away.cpus, 4, "the defaults run two cf-2g side by side");
+    let wider = limited(defaults.clone(), None, Some(6)).unwrap();
+    assert_eq!(wider.away.cpus, 6);
+    assert_eq!(
+        wider.away.cap_bytes,
+        defaults.away.cap_bytes - OVERHEAD,
+        "a third cf-2g side by side takes its overhead off the cap"
+    );
+    let fewer = limited(defaults.clone(), None, Some(2)).unwrap();
+    assert_eq!(
+        fewer.away.cap_bytes, defaults.away.cap_bytes,
+        "fewer give nothing back"
+    );
+}

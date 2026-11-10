@@ -305,6 +305,7 @@ pub fn admit(
     let mut committed_bytes = 0u64;
     let mut committed_cpus = 0u32;
     let mut to_come = 0u64;
+    let mut held_bytes = 0u64;
     if let Some(cap) = settings.max_machines
         && charges.len() >= cap as usize
     {
@@ -314,6 +315,7 @@ pub fn admit(
         committed_bytes = committed_bytes.saturating_add(charge.vm_bytes);
         committed_cpus = committed_cpus.saturating_add(charge.cpus);
         to_come = to_come.saturating_add(charge.host_bytes.saturating_sub(charge.resident_bytes));
+        held_bytes = held_bytes.saturating_add(charge.host_bytes);
     }
     if committed_bytes.saturating_add(size.vm_bytes()) > limits.cap_bytes {
         return Err(Refusal::Full {
@@ -322,17 +324,13 @@ pub fn admit(
         });
     }
     // Memory for CI counts every machine with its overhead, the new one too.
-    if let Some(ci_bytes) = settings.ci_bytes {
-        let overheads = u64::try_from(charges.len())
-            .unwrap_or(u64::MAX)
-            .saturating_mul(settings.vm_host_overhead_bytes);
-        let held = committed_bytes.saturating_add(overheads);
-        if held.saturating_add(settings.host_bytes(size)) > ci_bytes {
-            return Err(Refusal::Full {
-                cap_bytes: ci_bytes,
-                committed_bytes: held,
-            });
-        }
+    if let Some(ci_bytes) = settings.ci_bytes
+        && held_bytes.saturating_add(settings.host_bytes(size)) > ci_bytes
+    {
+        return Err(Refusal::Full {
+            cap_bytes: ci_bytes,
+            committed_bytes: held_bytes,
+        });
     }
     if committed_cpus.saturating_add(settings.vcpus_of(size)) > limits.cpus {
         return Err(Refusal::Cpus {

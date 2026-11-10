@@ -40,7 +40,9 @@
 # Each step is skipped when it is done already. Run again on an enrolled host with neither --binary nor --version (a
 # reboot's startup script), both steps only make sure the service runs. It says each step on standard output; a
 # failure ends it with one line on standard error, `host-setup: <step>: <why>`, and a status other than 0.
-set -euo pipefail
+# Errors end it from inside functions too (-E). A command substitution that may fail on purpose, and says so with
+# `|| …`, starts with `trap - ERR`, which keeps the trap's line out of what it says.
+set -Eeuo pipefail
 
 USER_NAME=codefusion-runner
 GITHUB_REPO=https://github.com/codefusion-cc/runner
@@ -93,6 +95,7 @@ github_get() {
   headers=$(mktemp) body=$(mktemp)
   while :; do
     status=$(
+      trap - ERR
       {
         echo 'header = "Accept: application/vnd.github+json"'
         [[ -z ${GITHUB_TOKEN:-} ]] || echo "header = \"Authorization: Bearer $GITHUB_TOKEN\""
@@ -210,14 +213,6 @@ if [[ -n $code_file && ( -e $code_file || -L $code_file ) ]]; then
     fail "--code-file: $code_file must be root's, readable by root alone (chmod 600)"
 fi
 ((EUID == 0)) || fail "run it as root"
-built_here=1
-[[ -n $binary$version ]] && built_here=0
-if [[ $mode != enroll ]] && ((built_here)) && [[ -z $ref ]]; then
-  if [[ -z $here ]] || ! ref=$(git -C "$here" rev-parse HEAD 2>/dev/null); then
-    fail "--ref: this script is not in a clone; name the commit"
-  fi
-fi
-[[ -z $ref || $ref =~ ^[0-9a-f]{7,40}$ ]] || fail "--ref: a commit, 7 to 40 lowercase hex characters"
 case $(uname -m) in
   x86_64) image_prefix=amd64-image- platform=amd64 ;;
   aarch64) image_prefix=image- platform=arm64 ;;
@@ -235,11 +230,28 @@ installed=$state/bin/$USER_NAME
 last_settings=$state/host-setup-settings.json
 enrolled=0
 [[ -e $state/console-token ]] && enrolled=1
+
+built_here=1
+[[ -n $binary$version ]] && built_here=0
+# An enrolled host that runs a build brought along keeps it: a run with neither --binary nor --version (new settings,
+# a reboot) builds nothing and leaves its program be.
+keep_program=0
 if [[ $mode == enroll ]]; then
   [[ -f $config ]] || fail "no configuration at $config: install first"
-  built_here=0
-  jq -e '.build_folder' "$config" >/dev/null 2>&1 && built_here=1
+  jq -e 'has("build_folder")' "$config" >/dev/null 2>&1 || built_here=0
+elif ((enrolled && built_here)) && [[ -f $config ]] && ! jq -e 'has("build_folder")' "$config" >/dev/null 2>&1; then
+  [[ -z $ref ]] || fail "--ref: this host runs a build brought along; give it a new one with --binary or --version"
+  built_here=0 keep_program=1
 fi
+if [[ $mode != enroll ]] && ((built_here)) && [[ -z $ref ]]; then
+  if [[ -z $here ]] || ! ref=$(
+    trap - ERR
+    git -C "$here" rev-parse HEAD 2>/dev/null
+  ); then
+    fail "--ref: this script is not in a clone; name the commit"
+  fi
+fi
+[[ -z $ref || $ref =~ ^[0-9a-f]{7,40}$ ]] || fail "--ref: a commit, 7 to 40 lowercase hex characters"
 if ((built_here)); then program=$checkout/target/release/$USER_NAME; else program=$staged; fi
 
 # A command as the Runner's user, in its home, with its own systemd reachable and its Rust on the path.
@@ -262,13 +274,34 @@ start_service() {
     fail "the service is not running: journalctl --user -u $USER_NAME as $USER_NAME"
 }
 
-sha256_of() { sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1; }
+# A file's SHA-256, or nothing for a file that is not there.
+sha256_of() {
+  [[ -f $1 ]] || return 0
+  sha256sum -- "$1" | cut -d' ' -f1
+}
 
 # The service runs the staged program from now on. `install` is refused while a machine stands, so new jobs are held
-# back and the running ones waited for; the hold goes again however this ends.
+# back and the running ones waited for; the hold goes again however this ends. A Runner from before holds writes no
+# status and takes no hold: `install` is tried again until it finds no machine standing.
 replace_running() {
   step=restart
   local status=0
+  if [[ ! -e $state/status.json ]]; then
+    local tries=0 said
+    until said=$(
+      trap - ERR
+      as_user "'$staged' install --config '$config'" 2>&1
+    ); do
+      [[ $said == *"machines stand"* ]] || fail "the new Runner was not installed: $said"
+      if ((++tries >= 120)); then
+        echo "host-setup: $step: jobs still run; the Runner of before goes on, and a run later tries again" >&2
+        failed=1
+        exit $TIMED_OUT
+      fi
+      sleep 30
+    done
+    return
+  fi
   as_user "'$staged' pause --config '$config' --hold $SETUP_HOLD --reason 'a new Runner from host-setup' --wait" ||
     status=$?
   if ((status == 0)); then
@@ -344,7 +377,7 @@ install_host() {
   # Ubuntu 24.04 keeps unprivileged user namespaces from programs without an AppArmor profile; the vm-host needs them.
   local sysctl_file=/etc/sysctl.d/60-codefusion-runner.conf line=kernel.apparmor_restrict_unprivileged_userns=0
   if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] &&
-    { [[ $(cat "$sysctl_file" 2>/dev/null) != "$line" ]] || [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) != 0 ]]; }; then
+    { [[ $(cat "$sysctl_file" 2>/dev/null || true) != "$line" ]] || [[ $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns) != 0 ]]; }; then
     change "let unprivileged programs make user namespaces"
     if ((!dry)); then
       echo "$line" >"$sysctl_file"
@@ -408,6 +441,10 @@ build_here() {
 # in the service.
 place_binary() {
   step=program
+  if ((keep_program)); then
+    say "the Runner it runs stays; a new one comes with --binary or --version"
+    return
+  fi
   local named=${version:+release runner-$version}
   named=${named:-$binary}
   if [[ $(sha256_of "$staged") != "$sha256" ]]; then
@@ -433,7 +470,10 @@ place_binary() {
       rm -rf "$download"
       mv -f -- "$staged.new" "$staged"
       local said
-      said=$(as_user "'$staged' version") || fail "$named does not run on this host"
+      said=$(
+        trap - ERR
+        as_user "'$staged' version"
+      ) || fail "$named does not run on this host"
       say "it is $said"
     fi
   fi
@@ -476,9 +516,9 @@ place_image() {
 write_config() {
   step=config
   local now='{}' last='{}' given='{}' owned wanted
-  [[ ! -f $config ]] || now=$(jq -c . "$config") || fail "$config is no JSON"
-  [[ ! -f $last_settings ]] || last=$(jq -c . "$last_settings") || fail "$last_settings is no JSON"
-  [[ -z $settings ]] || given=$(jq -c . "$settings") || fail "--settings: $settings is no JSON"
+  [[ ! -f $config ]] || now=$(trap - ERR; jq -c . "$config") || fail "$config is no JSON"
+  [[ ! -f $last_settings ]] || last=$(trap - ERR; jq -c . "$last_settings") || fail "$last_settings is no JSON"
+  [[ -z $settings ]] || given=$(trap - ERR; jq -c . "$settings") || fail "--settings: $settings is no JSON"
   owned=$(jq -n -c --arg machine "$machine" --arg class "$class" --arg state "$state" --arg image "$image" \
     --arg console "$console" --arg github_api "$github_api" --arg build "$checkout" --argjson built "$built_here" '{
       machine: $machine,
@@ -490,7 +530,10 @@ write_config() {
       github_api: (if $github_api == "" then null else $github_api end),
       use: "dedicated"
     }')
-  wanted=$(merged_config "$now" "$last" "$owned" "$given" 2>&1) || fail "${wanted#jq: error (at <unknown>): }"
+  wanted=$(
+    trap - ERR
+    merged_config "$now" "$last" "$owned" "$given" 2>&1
+  ) || fail "${wanted#jq: error (at <unknown>): }"
   if [[ $(jq -S . <<<"$now") != $(jq -S . <<<"$wanted") || $(jq -S . <<<"$last") != $(jq -S . <<<"$given") ]]; then
     if [[ $(jq -S . <<<"$now") != $(jq -S . <<<"$wanted") ]]; then
       change "write $config:"

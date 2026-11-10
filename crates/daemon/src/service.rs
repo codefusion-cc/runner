@@ -502,15 +502,6 @@ fn kept_results(path: Option<&std::path::Path>) -> Vec<CommandResult> {
         })
 }
 
-/// The holds' names, for the log.
-fn names(holds: &[Hold]) -> String {
-    holds
-        .iter()
-        .map(|hold| hold.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Why a host held on the machine takes no job, as the console shows it: `held on the machine: bots (bot run 42),
 /// stress`.
 fn held_reason(holds: &[Hold]) -> String {
@@ -681,7 +672,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let paused = parts.console.is_some() && kept_pause(parts.pause.as_deref());
         let holds = parts.holds.as_deref().map(local::read).unwrap_or_default();
         if !holds.is_empty() {
-            tracing::info!(holds = %names(&holds), "held on the machine: no new job until every hold is lifted");
+            tracing::info!(holds = %local::names(&holds), "held on the machine: no new job until every hold is lifted");
         }
         // Before any listener opens: a host the console paused, or held on the machine, stays closed.
         parts.machines.pause(paused || !holds.is_empty());
@@ -804,7 +795,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
 
     /// Reads the holds set on the machine, takes new jobs or not by them, and then writes the status the commands
     /// on the machine read: a status that names a hold is written only once the host takes no new job for it.
-    pub fn look_at_holds(&self) {
+    /// Gives back the snapshot of the machines it wrote, taken after the pause, for the tick's other looks.
+    pub fn look_at_holds(&self) -> Snapshot {
         let shared = &self.shared;
         if let Some(dir) = &shared.holds_dir {
             let now = local::read(dir);
@@ -813,23 +805,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if now.is_empty() {
                     tracing::info!("every hold on the machine is lifted");
                 } else {
-                    tracing::info!(holds = %names(&now), "held on the machine: no new job until every hold is lifted");
+                    tracing::info!(holds = %local::names(&now), "held on the machine: no new job until every hold is lifted");
                 }
                 *holds = now;
                 drop(holds);
                 self.apply_pause();
             }
         }
-        self.write_status();
+        let snapshot = self.shared.machines.snapshot();
+        self.write_status(&snapshot);
+        snapshot
     }
 
     /// Writes [`LocalStatus`] when it changed, or [`local::STATUS_EVERY`] after it was last written.
-    fn write_status(&self) {
+    fn write_status(&self, snapshot: &Snapshot) {
         let shared = &self.shared;
         let Some(path) = &shared.status_file else {
             return;
         };
-        let snapshot = shared.machines.snapshot();
         let holds = shared.local_holds.lock().expect("holds").clone();
         let console_paused = *shared.console_paused.lock().expect("paused");
         let (open, reason) = if !holds.is_empty() {
@@ -2926,9 +2919,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // A job that was queued, started or ended is on the console's page within a moment, not with
                 // the next report in its turn.
                 _ = news.tick() => {
-                    self.look_at_holds();
+                    let snapshot = self.look_at_holds();
                     self.look_at_docker();
-                    self.watch_stall(&self.sets(), &self.shared.machines.snapshot());
+                    self.watch_stall(&self.sets(), &snapshot);
                     if self.has_news() {
                         let next = self.report().await;
                         report.as_mut().reset(tokio::time::Instant::now() + next);
