@@ -15,8 +15,10 @@ pub fn private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Writes a file for this user alone and puts it in place in one step, so that a reader never sees half of it.
 ///
-/// The bytes go to `<path with extension partial>` (mode 0600, synced) and that file is renamed over `path`. A crash
-/// leaves the old file whole, or the new one, and at worst a `.partial` file beside it. The folder must exist.
+/// The bytes go to a file of their own beside `path`, `.<name>.<pid>.<n>.partial` (mode 0600, synced), which is
+/// renamed over `path`: writers in several processes or threads at once each put a whole file in place, the last
+/// one's staying. A crash leaves the old file whole, or the new one, and at worst a `.partial` file beside it. The
+/// folder must exist.
 pub fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     replace_private_as(path, bytes, 0o600)
 }
@@ -24,21 +26,30 @@ pub fn replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// [`replace_private`] with the file's mode `mode`, of which only the user's own bits are kept: `0o500` for a
 /// program only this user may run.
 pub fn replace_private_as(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    let partial = path.with_extension("partial");
-    // A file a crash left here keeps its permissions when opened again, so it goes first.
-    match std::fs::remove_file(&partial) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a path with no file name"))?;
+    let partial = path.with_file_name(format!(
+        ".{}.{}.{}.partial",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode & 0o700)
+            .open(&partial)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&partial, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode & 0o700)
-        .open(&partial)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&partial, path)
+    written
 }
 
 #[cfg(test)]
@@ -92,6 +103,38 @@ mod tests {
             mode & 0o777,
             0o600,
             "a file that held a secret must not stay readable by others"
+        );
+    }
+
+    #[test]
+    fn writers_at_once_each_put_a_whole_file_in_place_and_leave_nothing_beside_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("hold.json");
+        let writes: Vec<Vec<u8>> = (0..16u8).map(|n| vec![n; 4096]).collect();
+        std::thread::scope(|scope| {
+            for bytes in &writes {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        replace_private(path, bytes).expect("each write succeeds");
+                    }
+                });
+            }
+        });
+        let read = std::fs::read(&path).expect("read");
+        assert!(writes.contains(&read), "a whole write, not a mix");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("hold.json")]);
+    }
+
+    #[test]
+    fn a_path_with_no_file_name_is_refused() {
+        assert_eq!(
+            replace_private(Path::new("/"), b"x").map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::InvalidInput)
         );
     }
 }

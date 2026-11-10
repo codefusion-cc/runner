@@ -19,6 +19,12 @@ const USAGE: &str = "usage: codefusion-runner
                                         stop every machine and remove the service; --leave the console too,
                                         --purge the state folder
   daemon --config <file>                the service (what the service manager runs)
+  pause --config <file> --hold <name> [--reason <text>] [--wait [--timeout <minutes>]]
+                                        take no new job until the hold <name> is lifted (a-z, 0-9, -; 32 at
+                                        most); --wait until no job runs, for 60 minutes or --timeout, and
+                                        exit 75 with the hold still set when the time runs out
+  resume --config <file> --hold <name>  lift the hold <name>; one not set is no error
+  status --config <file> [--json]       the holds, whether the host takes jobs, and the machines that run
   image verify <folder> --version <v>
   image install <folder> --version <v> --state-dir <folder>
   vm --state-dir <folder> [--host-cpus <list>]
@@ -26,6 +32,23 @@ const USAGE: &str = "usage: codefusion-runner
                                         machine runs on (such as 4-7), by default the fastest
   vmm                                   the virtual machine monitor this build carries (Linux)
   boot-proof [--memory-mb N] [--timeout-s N, at most 3600] [--host-cpus <list>]";
+
+/// The commands on the machine for its holds (`pause`, `resume`, `status`), which end with an exit code of their
+/// own ([`crate::holds::TIMED_OUT`]); none for any other command.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn on_machine(args: &[String]) -> Option<std::process::ExitCode> {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let [command, "--config", config, options @ ..] = words.as_slice() else {
+        return None;
+    };
+    Some(match crate::holds::Asked::from_args(command, options)? {
+        Ok(asked) => crate::holds::run(Path::new(config), asked),
+        Err(message) => {
+            eprintln!("codefusion-runner: {message}\n{USAGE}");
+            std::process::ExitCode::FAILURE
+        }
+    })
+}
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();

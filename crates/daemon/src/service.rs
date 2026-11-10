@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cf_budget::{Battery, Host, Pressure, Size};
 use cf_console_client::{
     Activity, Answer, Client, Command, CommandResult, DockerStatus, HeldJobs, HostStatus, JobKind, JobLimits,
-    MAX_RUNNERS, MAX_SCALE_SETS, MachineInfo, Os, Outbox, Power, Report, RunnerJob, RunnerStatus,
-    RunnerUsage, ScaleSetStatus, Share, SizeStatus, Stalls, Status, Update,
+    MAX_HOLDS, MAX_RUNNERS, MAX_SCALE_SETS, MachineHold, MachineInfo, Os, Outbox, Power, Report, RunnerJob,
+    RunnerStatus, RunnerUsage, ScaleSetStatus, Share, SizeStatus, Stalls, Status, Update,
 };
 use cf_ghapp::{Clock, GitHubApp, KeyTokens, Repo};
 use cf_scaleset::{Backoff, ScaleSetClient, Shutdown, ShutdownTrigger, Statistics, listen_nudged, supervise};
@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::adapters::SetRegistry;
 use crate::held::{self, HeldSet, OwnRunners, SetView};
+use crate::holds::{self as local, Hold, LocalStatus, StatusMachine, StatusSize};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
 use crate::queued::{Bounds, Look, Queued, QueuedSet};
@@ -329,6 +330,12 @@ pub struct ServiceParts<H, V> {
     /// Where the console's last word on the pause is kept, so that a Runner that starts again (after an update, a
     /// crash) takes no job on a paused host before the console says so again; none to keep it in memory only.
     pub pause: Option<PathBuf>,
+    /// The folder of the holds set on the machine itself ([`crate::holds`]), read at the start and on every tick;
+    /// none for a service that has none.
+    pub holds: Option<PathBuf>,
+    /// Where the service writes what it sees for the commands on the machine ([`LocalStatus`]); none to write
+    /// nothing.
+    pub status: Option<PathBuf>,
     /// The Runners App's key the host still holds, until the console's scale set calls answered it; none on a host
     /// that goes through the console alone. `app` signs with it too.
     pub held_key: Option<HeldKey>,
@@ -362,6 +369,13 @@ struct Shared<H, V> {
     /// Held through a sweep: the service's own and an uninstall's take turns, so no removal is sent twice.
     sweeping: AsyncMutex<()>,
     console_paused: Mutex<bool>,
+    /// The holds set on the machine itself, as last read.
+    local_holds: Mutex<Vec<Hold>>,
+    holds_dir: Option<PathBuf>,
+    status_file: Option<PathBuf>,
+    /// The status last written, but for its time, and when: written again when it changes, and at least every
+    /// [`local::STATUS_EVERY`] so a reader can tell a Runner that writes from one that stopped.
+    status_written: Mutex<Option<(LocalStatus, Instant)>>,
     /// The outbox's count of queued events as of the last report, and whether the console took that report: news
     /// goes to a console that answers at once, and to one that does not with the next report in its turn.
     told: Mutex<(u64, bool)>,
@@ -486,6 +500,33 @@ fn kept_results(path: Option<&std::path::Path>) -> Vec<CommandResult> {
             tracing::warn!(%error, "the results kept for the console cannot be read");
             Vec::new()
         })
+}
+
+/// Why a host held on the machine takes no job, as the console shows it: `held on the machine: bots (bot run 42),
+/// stress`.
+fn held_reason(holds: &[Hold]) -> String {
+    let each: Vec<String> = holds
+        .iter()
+        .map(|hold| match &hold.reason {
+            Some(reason) => format!("{} ({reason})", hold.name),
+            None => hold.name.clone(),
+        })
+        .collect();
+    format!("held on the machine: {}", each.join(", "))
+}
+
+/// Whether the host takes new jobs and why not, by the holds on the machine first and the machines' own word next.
+fn openness(holds: &[Hold], snapshot: &Snapshot) -> (bool, Option<String>) {
+    if holds.is_empty() {
+        (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone()))
+    } else {
+        (false, Some(held_reason(holds)))
+    }
+}
+
+/// Logs the holds on the machine the host now takes no job for.
+fn log_holds(holds: &[Hold]) {
+    tracing::info!(holds = %local::names(holds), "held on the machine: no new job until every hold is lifted");
 }
 
 /// The console's last word on the pause, as a Runner before kept it. None kept, or a file that cannot be read, is no
@@ -643,8 +684,12 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     pub fn new(parts: ServiceParts<H, V>) -> Service<H, V> {
         // Only an enrolled Runner keeps the console's pause: one that left the console takes its own way.
         let paused = parts.console.is_some() && kept_pause(parts.pause.as_deref());
-        // Before any listener opens: a host the console paused stays closed until the console answers.
-        parts.machines.pause(paused);
+        let holds = parts.holds.as_deref().map(local::read).unwrap_or_default();
+        if !holds.is_empty() {
+            log_holds(&holds);
+        }
+        // Before any listener opens: a host the console paused, or held on the machine, stays closed.
+        parts.machines.pause(paused || !holds.is_empty());
         let app_key_said = parts.config.app_key_said.clone();
         Service {
             shared: Arc::new(Shared {
@@ -666,6 +711,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 refused: Mutex::new(BTreeMap::new()),
                 sweeping: AsyncMutex::new(()),
                 console_paused: Mutex::new(paused),
+                local_holds: Mutex::new(holds),
+                holds_dir: parts.holds,
+                status_file: parts.status,
+                status_written: Mutex::new(None),
                 told: Mutex::new((0, false)),
                 unanswered: AtomicUsize::new(0),
                 stall: Mutex::new(None),
@@ -744,6 +793,96 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             at: iso(secs(shared.clock.now())),
         });
         self.keep(&results);
+    }
+
+    /// Whether a hold set on the machine holds the host.
+    fn held(&self) -> bool {
+        !self.shared.local_holds.lock().expect("holds").is_empty()
+    }
+
+    /// Takes new jobs or not: not while the console paused the host or a hold on the machine holds it.
+    fn apply_pause(&self) {
+        let shared = &self.shared;
+        let paused = *shared.console_paused.lock().expect("paused") || self.held();
+        shared.machines.pause(paused);
+    }
+
+    /// Reads the holds set on the machine, takes new jobs or not by them, and then writes the status the commands
+    /// on the machine read: a status that names a hold is written only once the host takes no new job for it.
+    /// Gives back the snapshot of the machines it wrote, taken after the pause, for the tick's other looks.
+    pub fn look_at_holds(&self) -> Snapshot {
+        let shared = &self.shared;
+        if let Some(dir) = &shared.holds_dir {
+            let now = local::read(dir);
+            let mut holds = shared.local_holds.lock().expect("holds");
+            if *holds != now {
+                if now.is_empty() {
+                    tracing::info!("every hold on the machine is lifted");
+                } else {
+                    log_holds(&now);
+                }
+                *holds = now;
+                drop(holds);
+                self.apply_pause();
+            }
+        }
+        let snapshot = self.shared.machines.snapshot();
+        self.write_status(&snapshot);
+        snapshot
+    }
+
+    /// Writes [`LocalStatus`] when it changed, or [`local::STATUS_EVERY`] after it was last written.
+    fn write_status(&self, snapshot: &Snapshot) {
+        let shared = &self.shared;
+        let Some(path) = &shared.status_file else {
+            return;
+        };
+        let holds = shared.local_holds.lock().expect("holds").clone();
+        let console_paused = *shared.console_paused.lock().expect("paused");
+        let (open, reason) = openness(&holds, snapshot);
+        let mut status = LocalStatus {
+            at: String::new(),
+            pid: std::process::id(),
+            version: shared.config.version.clone(),
+            open,
+            reason,
+            console_paused,
+            holds,
+            machines: snapshot
+                .machines
+                .iter()
+                .map(|machine| StatusMachine {
+                    runner: machine.runner.clone(),
+                    size: machine.size.map(|size| size.label().to_string()),
+                    state: machine.state.to_string(),
+                    started: iso(machine.started),
+                })
+                .collect(),
+            coming: shared.machines.coming(),
+            sizes: snapshot
+                .rooms
+                .iter()
+                .map(|room| StatusSize {
+                    size: room.size.label().to_string(),
+                    free: room.free,
+                })
+                .collect(),
+        };
+        let mut written = shared.status_written.lock().expect("status");
+        let due = written
+            .as_ref()
+            .is_none_or(|(last, at)| *last != status || at.elapsed() >= local::STATUS_EVERY);
+        if !due {
+            return;
+        }
+        let at = status.clone();
+        status.at = local::moment(shared.clock.now());
+        match local::write_status(path, &status) {
+            Ok(()) => *written = Some((at, Instant::now())),
+            Err(error) => {
+                tracing::warn!(%error, "the status for the commands on the machine could not be written")
+            }
+        }
     }
 
     /// Writes the console's word on the pause to its file, when there is one. A write that fails is logged: a Runner
@@ -1855,7 +1994,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     /// and only it decides when to hand them over (`docs/github-protocol.md`).
     fn stall_reason(&self, sets: &[SetState], snapshot: &Snapshot) -> Option<String> {
         let shared = &self.shared;
-        if *shared.console_paused.lock().expect("paused") {
+        if *shared.console_paused.lock().expect("paused") || self.held() {
             return None;
         }
         if snapshot.waiting == 0 || !snapshot.machines.is_empty() {
@@ -1950,10 +2089,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .min_by_key(|size| size.index())
             .and_then(|smallest| snapshot.short_of(smallest));
         let updating = shared.update.lock().expect("update");
+        let holds = shared.local_holds.lock().expect("holds").clone();
         let (open, reason) = match (&updating.doing, no_room) {
             (Some(doing), _) => (false, Some(doing.clone())),
-            (None, Some(why)) => (false, Some(why.to_string())),
-            (None, None) => (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone())),
+            (None, Some(why)) if holds.is_empty() => (false, Some(why.to_string())),
+            (None, _) => {
+                let (open, reason) = openness(&holds, &snapshot);
+                (open, reason.map(|reason| cut(reason, STATUS_TEXT_MAX)))
+            }
         };
         let update = shared.updates.as_ref().map(|updates| Update {
             source: updates.source(),
@@ -2031,6 +2174,15 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     .collect(),
                 commands: self.commands(),
                 held_jobs: self.held_report(),
+                holds: holds
+                    .iter()
+                    .take(MAX_HOLDS)
+                    .map(|hold| MachineHold {
+                        name: hold.name.clone(),
+                        reason: hold.reason.clone(),
+                        since: (!hold.since.is_empty()).then(|| hold.since.clone()),
+                    })
+                    .collect(),
                 docker: shared.machines.docker_check().map(|check| DockerStatus {
                     ok: check.ok,
                     checked_at: iso(check.at),
@@ -2208,7 +2360,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         {
             wanted.store(false, Ordering::SeqCst);
         }
-        shared.machines.pause(answer.paused);
+        self.apply_pause();
         shared
             .machines
             .make_room_for(answer.make_room_for.as_deref().and_then(Size::from_label));
@@ -2779,8 +2931,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 // A job that was queued, started or ended is on the console's page within a moment, not with
                 // the next report in its turn.
                 _ = news.tick() => {
+                    let snapshot = self.look_at_holds();
                     self.look_at_docker();
-                    self.watch_stall(&self.sets(), &self.shared.machines.snapshot());
+                    self.watch_stall(&self.sets(), &snapshot);
                     if self.has_news() {
                         let next = self.report().await;
                         report.as_mut().reset(tokio::time::Instant::now() + next);

@@ -223,6 +223,7 @@ impl Rig {
                 pass(&machines, 1);
                 service.sweep().await;
                 service.look_at_settings();
+                service.look_at_holds();
                 service.report().await;
                 done.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(15)).await;
@@ -550,6 +551,8 @@ fn parts_with(
         updates: updates.map(|updates| updates.clone() as Arc<dyn cf_daemon::update::SelfUpdate>),
         results: Some(folder.join("results.json")),
         pause: Some(folder.join("pause")),
+        holds: Some(cf_daemon::holds::holds_dir(folder)),
+        status: Some(cf_daemon::holds::status_file(folder)),
         settings: Some(settings.clone()),
         held_key: None,
     }
@@ -1157,6 +1160,138 @@ async fn a_paused_host_that_starts_again_takes_no_job_before_the_console_answers
         || !rig.standing().is_empty(),
     )
     .await;
+}
+
+fn hold_names(status: &cf_daemon::holds::LocalStatus) -> Vec<&str> {
+    status.holds.iter().map(|hold| hold.name.as_str()).collect()
+}
+
+// added: holds set on the machine itself (a bot run, a stress run) take no new job whatever the console says; the job
+// that runs finishes, the console's resume lifts no hold, and jobs start again only once every hold is lifted. The
+// status the commands on the machine read names a hold only once the host takes no new job for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn holds_on_the_machine_take_no_new_job_until_every_one_is_lifted() {
+    use cf_daemon::holds;
+    let rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let runner = rig.job_running().await;
+    let (dir, status) = (
+        holds::holds_dir(rig.folder.path()),
+        holds::status_file(rig.folder.path()),
+    );
+    let now = std::time::SystemTime::now();
+    holds::set(&dir, "bots", Some("bot run 42"), now).expect("set");
+    holds::set(&dir, "stress", None, now).expect("set");
+    rig.settles("the console hears the holds", || {
+        rig.console.reports().last().is_some_and(|r| {
+            r["status"]["open"] == json!(false)
+                && r["status"]["reason"] == json!("held on the machine: bots (bot run 42), stress")
+                && r["status"]["paused"] == json!(false)
+                && r["status"]["holds"][0]["name"] == json!("bots")
+                && r["status"]["holds"][0]["reason"] == json!("bot run 42")
+                && r["status"]["holds"][1]["name"] == json!("stress")
+                && r["status"]["holds"][1].get("reason").is_none()
+        })
+    })
+    .await;
+    let seen = holds::read_status(&status).expect("the status");
+    assert_eq!(hold_names(&seen), ["bots", "stress"]);
+    assert_eq!(seen.machines.len(), 1, "the job that runs goes on: {seen:?}");
+    assert!(!seen.idle() && !seen.open && !seen.console_paused, "{seen:?}");
+
+    rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        rig.standing(),
+        [runner.as_str()],
+        "a held host starts nothing new"
+    );
+
+    // The console pauses and resumes: the holds stay.
+    rig.console.pause(true);
+    rig.settles("the console's pause", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["paused"] == json!(true))
+    })
+    .await;
+    rig.console.pause(false);
+    rig.settles("the console's resume", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["paused"] == json!(false) && r["status"]["open"] == json!(false))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        rig.standing(),
+        [runner.as_str()],
+        "the console's resume lifts no hold"
+    );
+
+    rig.finish(&runner, "succeeded");
+    rig.settles("nothing runs while held", || {
+        holds::read_status(&status).is_some_and(|s| s.idle() && hold_names(&s) == ["bots", "stress"])
+    })
+    .await;
+    assert_eq!(holds::lift(&dir, "bots"), Ok(true));
+    rig.settles("one hold left", || {
+        holds::read_status(&status).is_some_and(|s| hold_names(&s) == ["stress"])
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(rig.standing().is_empty(), "one hold still holds");
+
+    assert_eq!(holds::lift(&dir, "stress"), Ok(true));
+    rig.settles("the console hears the host is open", || {
+        rig.console.reports().last().is_some_and(|r| {
+            r["status"].get("holds").is_none()
+                && r["status"]["reason"] != json!("held on the machine: stress")
+        })
+    })
+    .await;
+    // The job was queued while the host offered no room: it is held until the Runner looks at the queue again.
+    rig.later(Duration::from_secs(130));
+    rig.service.look_at_queue().await;
+    until("the job that waited gets its machine", || {
+        rig.standing().len() == 1
+    })
+    .await;
+}
+
+// added: a hold outlives the Runner: one that starts again on a held host takes no job, and says why at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_host_that_starts_again_takes_no_job() {
+    use cf_daemon::holds;
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    let dir = holds::holds_dir(rig.folder.path());
+    holds::set(&dir, "deploy", Some("world update"), std::time::SystemTime::now()).expect("set");
+    rig.restart().await;
+    for set in rig.github.scale_sets() {
+        rig.github.lose_session(set.id);
+    }
+    rig.service.discover().await;
+    rig.github.queue_job(REPO, &["self-hosted", "cf-2g"], "build");
+    rig.settles("the first report says why", || {
+        rig.console
+            .reports()
+            .last()
+            .is_some_and(|r| r["status"]["reason"] == json!("held on the machine: deploy (world update)"))
+    })
+    .await;
+    for _ in 0..3 {
+        rig.later(Duration::from_secs(150));
+        rig.service.look_at_queue().await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.github.offers_room(REPO), "a held host offers no room");
+    assert!(
+        rig.standing().is_empty(),
+        "a held host that started again starts nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3383,9 +3518,12 @@ async fn a_stop_for_no_job_left_by_a_runner_before_is_asked_of_github_first() {
 const RUNNING: &str = "0.1.0+446125c0a1b2";
 const NEWER: &str = "0.1.0+5c0ffee0a1b2";
 
-/// The newest status the console has.
+/// The newest status the console has; null before the first report, so a wait on it goes on waiting.
 fn last_status(console: &FakeConsole) -> Value {
-    console.reports().last().expect("a report")["status"].clone()
+    console
+        .reports()
+        .last()
+        .map_or(Value::Null, |report| report["status"].clone())
 }
 
 /// What the console heard of one command, each time it heard of it.
