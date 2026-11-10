@@ -88,6 +88,12 @@ pub struct SettingsChange {
     pub min_free_memory_percent: Option<Option<u32>>,
     /// The longest a job may run, in minutes (`maxJobHours`, in hours).
     pub deadline_minutes: Option<Option<u64>>,
+    /// The host labels the host has (`labels`); `Some(None)` for its system's.
+    pub labels: Option<Option<Vec<String>>>,
+    /// The host labels it is kept for (`onlyLabels`); `Some(None)` for none.
+    pub only_labels: Option<Option<Vec<String>>>,
+    /// The `owner/name` repositories it serves (`repos`); `Some(None)` for every private one the App sees.
+    pub repos: Option<Option<Vec<String>>>,
 }
 
 impl SettingsChange {
@@ -113,6 +119,11 @@ impl SettingsChange {
                     change.deadline_minutes =
                         Some(scaled(value, 60.0, "the longest job: hours in whole minutes")?.map(u64::from));
                 }
+                "labels" => change.labels = Some(names(value, "labels: a list of host labels")?),
+                "onlyLabels" => {
+                    change.only_labels = Some(names(value, "only labels: a list of host labels")?);
+                }
+                "repos" => change.repos = Some(names(value, "repositories: a list of owner/name")?),
                 "jobMemoryGb" => {
                     return Err(
                         "memory per job: each job gets the memory its label names, cf-2g to cf-8g".into(),
@@ -137,6 +148,30 @@ impl SettingsChange {
 /// A key of the console's arguments that is not known here, cut to fit in what the Runner says of it.
 fn key_said(key: &str) -> String {
     key.chars().take(40).collect()
+}
+
+/// The most names one list setting carries; the settings file checks each name.
+const NAMES_MAX: usize = 100;
+
+/// A list of names of a setting, or `None` for `null`; else `wrong`. Whether each name is one the Runner takes is the
+/// settings file's to say.
+fn names(value: &serde_json::Value, wrong: &str) -> Result<Option<Vec<String>>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let list = value
+        .as_array()
+        .filter(|list| list.len() <= NAMES_MAX)
+        .ok_or_else(|| wrong.to_string())?;
+    list.iter()
+        .map(|name| {
+            name.as_str()
+                .filter(|name| name.len() <= 200)
+                .map(str::to_string)
+                .ok_or_else(|| wrong.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// A whole number of a setting, or `None` for `null`; else `wrong`.

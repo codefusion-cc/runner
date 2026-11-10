@@ -1431,9 +1431,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             // purpose is no problem of discovery.
             return Err(Some("Docker is only for the repositories in docker_repos"));
         }
-        if !policy.serves_labels(set) {
-            // Pinned to hosts of another kind: left to them, as a size this host never runs.
-            return Err(Some("it asks for host labels this host does not have"));
+        if let Some(why) = policy.labels_refusal(set) {
+            // Pinned to hosts of another kind, or this host is kept for others: left to them, as a size this host
+            // never runs.
+            return Err(Some(why));
         }
         // `cf-docker` alone is a machine of the size `self-hosted` means.
         let size = Size::of_labels(set.labels().iter().map(String::as_str))
@@ -2667,7 +2668,20 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             min_free_memory_percent: (floor * 100.0).round() / 100.0,
             // Not rounded: hours that come back as they went are whole minutes again.
             max_job_hours: self.shared.machines.deadline().as_secs_f64() / 3600.0,
+            labels: self.shared.config.policy.host_labels.clone(),
+            only_labels: self.shared.config.policy.only_labels.clone(),
+            repos: self.served_repos(),
         })
+    }
+
+    /// The repositories the report says the host serves: a trusted host's one repository, else the config's list
+    /// (empty for every private repository the Runners App sees).
+    fn served_repos(&self) -> Vec<String> {
+        let policy = &self.shared.config.policy;
+        match &policy.trusted {
+            Some(trusted) => trusted.repository().map(|name| vec![name]).unwrap_or_default(),
+            None => policy.repos.clone(),
+        }
     }
 
     /// Starts an update in the background, to the head of the branch or to the commit asked for, or says at once

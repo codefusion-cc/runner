@@ -86,6 +86,8 @@ pub struct ServePolicy {
     /// The host labels this host has ([`cf_workflows::is_host_label`]): a set that asks for others is left to
     /// the hosts that have them.
     pub host_labels: Vec<String>,
+    /// The host labels it keeps itself for: when not empty, only a set that asks for one of them is served.
+    pub only_labels: Vec<String>,
     /// A trusted host's rules (`cf_trusted`): it serves their repository alone, with no scale set but one Actions
     /// runner of the label `trusted` at a time, and its machines refuse every job the rules do not accept. None on a
     /// shared host.
@@ -100,6 +102,7 @@ impl Default for ServePolicy {
             docker_repos: Vec::new(),
             docker_max_jobs: 1,
             host_labels: Vec::new(),
+            only_labels: Vec::new(),
             trusted: None,
         }
     }
@@ -131,12 +134,30 @@ impl ServePolicy {
         self.trusted.is_none() && repo.private && self.serves(repo) && listed(&self.docker_repos, repo)
     }
 
-    /// Whether this host serves a label set: it has every host label the set asks for.
+    /// Whether this host serves a label set: it has every host label the set asks for, and the set asks for one it
+    /// keeps itself for, when it keeps any.
     pub fn serves_labels(&self, set: &LabelSet) -> bool {
-        set.host_labels().all(|wanted| {
-            // Both lowercase: a LabelSet's and the config's own, which takes no other.
-            self.host_labels.iter().any(|label| label == wanted)
-        })
+        self.labels_refusal(set).is_none()
+    }
+
+    /// Why this host leaves a label set to others for its host labels, or none when it serves it
+    /// ([`ServePolicy::serves_labels`]).
+    pub fn labels_refusal(&self, set: &LabelSet) -> Option<&'static str> {
+        // Both lowercase: a LabelSet's and the config's own, which takes no other.
+        if !set
+            .host_labels()
+            .all(|wanted| self.host_labels.iter().any(|label| label == wanted))
+        {
+            return Some("it asks for host labels this host does not have");
+        }
+        if !self.only_labels.is_empty()
+            && !set
+                .host_labels()
+                .any(|wanted| self.only_labels.iter().any(|label| label == wanted))
+        {
+            return Some("it asks for none of the host labels this host is kept for");
+        }
+        None
     }
 }
 
@@ -367,5 +388,41 @@ mod tests {
         // A host with no labels serves only the sets that ask for none.
         assert!(ServePolicy::default().serves_labels(&set(&["cf-8g"])));
         assert!(!ServePolicy::default().serves_labels(&set(&["cf-8g", "cf-macos"])));
+    }
+
+    #[test]
+    fn a_host_that_keeps_itself_for_a_label_serves_only_the_sets_that_ask_for_it() {
+        let ops = ServePolicy {
+            host_labels: vec!["cf-linux".into(), "cf-ops".into()],
+            only_labels: vec!["cf-ops".into()],
+            ..ServePolicy::default()
+        };
+        let set = |labels: &[&str]| LabelSet::new(labels);
+        for labels in [
+            &["cf-2g", "cf-ops"][..],
+            &["CF-2G", "CF-OPS"],
+            &["cf-4g", "cf-linux", "cf-ops"],
+            &["self-hosted", "cf-ops"],
+        ] {
+            assert!(ops.serves_labels(&set(labels)), "{labels:?}");
+        }
+        for labels in [
+            &["cf-2g"][..],
+            &["self-hosted"],
+            &["cf-2g", "self-hosted"],
+            &["cf-2g", "cf-linux"],
+            &["cf-docker"],
+            &["cf-2g", "cf-ops", "cf-macos"],
+        ] {
+            assert!(!ops.serves_labels(&set(labels)), "{labels:?}");
+        }
+        assert_eq!(
+            ops.labels_refusal(&set(&["cf-2g"])),
+            Some("it asks for none of the host labels this host is kept for")
+        );
+        assert_eq!(
+            ops.labels_refusal(&set(&["cf-2g", "cf-ops", "cf-macos"])),
+            Some("it asks for host labels this host does not have")
+        );
     }
 }

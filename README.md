@@ -95,8 +95,10 @@ A configuration file says what the Mac is:
 - `use` is `dedicated` for a Mac nobody works on and `workstation` for someone's own.
 - Optional: `repos` (serve only these), `public_repos` (public ones, on purpose), `deadline_minutes` (360),
   `github_api`, `build_folder` (see the update below), `docker_repos` (the private repositories whose `cf-docker`
-  jobs get Docker), `docker_max_jobs` (1) and `labels` (the host labels this host has, 8 at most; `["cf-macos"]`
-  on a Mac, `["cf-linux"]` on Linux).
+  jobs get Docker), `docker_max_jobs` (1), `labels` (the host labels this host has, 8 at most; `["cf-macos"]`
+  on a Mac, `["cf-linux"]` on Linux) and `only_labels` (labels of `labels` the host is kept for: it then serves only
+  the jobs that ask for one of them, so a host with `"labels": ["cf-linux", "cf-ops"], "only_labels": ["cf-ops"]`
+  is always free for `runs-on: [cf-2g, cf-ops]`, and the tests go elsewhere).
 - The file names where the console's token goes, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
