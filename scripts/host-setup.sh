@@ -56,6 +56,8 @@ SETUP_HOLD=host-setup
 TIMED_OUT=75
 # The keys of the configuration this script writes itself; --settings sets the others.
 OWNED_KEYS='["machine", "class", "state_dir", "build_folder", "image", "console", "github_api", "use"]'
+# Keys --settings may not set although this script leaves them be: a trusted host's rules and the Mac app's folder.
+REFUSED_SETTINGS='["trusted", "app_dir"]'
 
 mode=both machine='' console='' code_file='' class=shared ref='' image='' home=/home/$USER_NAME repo=$GITHUB_REPO
 github_api='' check=0 dry=0 settings='' binary='' version='' sha256=''
@@ -71,12 +73,18 @@ fail() {
   exit 1
 }
 trap 'fail "the command on line $LINENO failed"' ERR
-# A command that fails inside a function (as_user) ends the script without the ERR trap.
+# A command that fails inside a function (as_user) ends the script without the ERR trap. A hold this run set is lifted
+# however it ends: killed outright, the next run lifts it.
+holding=0
 ended() {
   local status=$?
   ((status == 0 || failed)) || echo "host-setup: $step: a command failed with status $status" >&2
+  ((!holding)) || lift_setup_hold || echo "host-setup: $step: the hold $SETUP_HOLD stays; resume it by hand" >&2
 }
 trap ended EXIT
+trap 'exit 143' TERM HUP INT
+# What this script writes is no one else's to change, whatever umask it was started with.
+umask 022
 say() { echo "host-setup: $step: $*"; }
 
 # A change this run makes, or with --dry-run would make: said, and counted for the last line.
@@ -126,12 +134,14 @@ github_get() {
 # The configuration a run writes, on standard output: the one there now ($1, `{}` for none) without the keys the last
 # run's settings set ($2) and every key this script owns, then the owned keys this run gives ($3, nulls left out) and
 # its settings ($4), sorted on one line. The keys the Runner or the console set themselves stay. Fails for settings that
-# are no JSON object or that name a key this script owns.
+# are no JSON object, that name a key this script owns, or one of REFUSED_SETTINGS.
 merged_config() {
-  jq -n -S -c --argjson now "$1" --argjson last "$2" --argjson owned "$3" --argjson settings "$4" --argjson keys "$OWNED_KEYS" '
+  jq -n -S -c --argjson now "$1" --argjson last "$2" --argjson owned "$3" --argjson settings "$4" \
+    --argjson keys "$OWNED_KEYS" --argjson refused "$REFUSED_SETTINGS" '
+    def named($list): [$settings | keys[] | select(. as $k | $list | index($k))];
     if ($settings | type) != "object" then error("--settings: no JSON object")
-    elif ([$settings | keys[] | select(. as $k | $keys | index($k))] | length) > 0 then
-      error("--settings: \([$settings | keys[] | select(. as $k | $keys | index($k))] | join(", ")) only this script sets")
+    elif (named($keys) | length) > 0 then error("--settings: \(named($keys) | join(", ")) only this script sets")
+    elif (named($refused) | length) > 0 then error("--settings: \(named($refused) | join(", ")) is not set this way")
     else
       ($now | with_entries(select(.key as $k | (($last | has($k)) or ($keys | index($k))) | not)))
       + ($owned | with_entries(select(.value != null)))
@@ -219,6 +229,18 @@ case $(uname -m) in
   *) fail "this host is $(uname -m); the Runner runs on x86_64 and arm64" ;;
 esac
 
+# A command as the Runner's user, in its home, with its own systemd reachable and its Rust on the path.
+as_user() {
+  local uid
+  uid=$(id -u "$USER_NAME")
+  runuser -u "$USER_NAME" -- env -i HOME="$home" USER="$USER_NAME" LOGNAME="$USER_NAME" \
+    PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" XDG_RUNTIME_DIR="/run/user/$uid" \
+    bash -euo pipefail -c "cd \"\$HOME\"; $1"
+}
+
+# A file in the Runner's user's folders, read as that user: root never follows a link that user put there.
+user_file() { as_user "cat '$1'"; }
+
 state=$home/.local/state/$USER_NAME
 config_dir=$home/.config/$USER_NAME
 config=$config_dir/config.json
@@ -238,8 +260,8 @@ built_here=1
 keep_program=0
 if [[ $mode == enroll ]]; then
   [[ -f $config ]] || fail "no configuration at $config: install first"
-  jq -e 'has("build_folder")' "$config" >/dev/null 2>&1 || built_here=0
-elif ((enrolled && built_here)) && [[ -f $config ]] && ! jq -e 'has("build_folder")' "$config" >/dev/null 2>&1; then
+  user_file "$config" | jq -e 'has("build_folder")' >/dev/null 2>&1 || built_here=0
+elif ((enrolled && built_here)) && [[ -f $config ]] && ! user_file "$config" | jq -e 'has("build_folder")' >/dev/null 2>&1; then
   [[ -z $ref ]] || fail "--ref: this host runs a build brought along; give it a new one with --binary or --version"
   built_here=0 keep_program=1
 fi
@@ -253,15 +275,6 @@ if [[ $mode != enroll ]] && ((built_here)) && [[ -z $ref ]]; then
 fi
 [[ -z $ref || $ref =~ ^[0-9a-f]{7,40}$ ]] || fail "--ref: a commit, 7 to 40 lowercase hex characters"
 if ((built_here)); then program=$checkout/target/release/$USER_NAME; else program=$staged; fi
-
-# A command as the Runner's user, in its home, with its own systemd reachable and its Rust on the path.
-as_user() {
-  local uid
-  uid=$(id -u "$USER_NAME")
-  runuser -u "$USER_NAME" -- env -i HOME="$home" USER="$USER_NAME" LOGNAME="$USER_NAME" \
-    PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" XDG_RUNTIME_DIR="/run/user/$uid" \
-    bash -euo pipefail -c "cd \"\$HOME\"; $1"
-}
 
 start_service() {
   step=service
@@ -278,6 +291,13 @@ start_service() {
 sha256_of() {
   [[ -f $1 ]] || return 0
   sha256sum -- "$1" | cut -d' ' -f1
+}
+# The same of a file in the Runner's user's folders, read as that user.
+user_sha256() { as_user "if [ -f '$1' ]; then sha256sum -- '$1' | cut -d' ' -f1; fi"; }
+
+# Lifts the hold this script sets, with the Runner that set it.
+lift_setup_hold() {
+  as_user "'$installed' resume --config '$config' --hold $SETUP_HOLD" >/dev/null
 }
 
 # The jobs ran longer than a run waits for them: the Runner of before goes on, and the run ends with TIMED_OUT.
@@ -305,17 +325,25 @@ replace_running() {
     done
     return
   fi
+  holding=1
   as_user "'$staged' pause --config '$config' --hold $SETUP_HOLD --reason 'a new Runner from host-setup' --wait" ||
     status=$?
   if ((status == 0)); then
     as_user "'$staged' install --config '$config'" || status=$?
   fi
-  as_user "'$staged' resume --config '$config' --hold $SETUP_HOLD" >/dev/null || true
+  lift_setup_hold || fail "the hold $SETUP_HOLD could not be lifted; resume it by hand"
+  holding=0
   ((status != TIMED_OUT)) || jobs_outlasted
   ((status == 0)) || fail "the new Runner was not installed (status $status)"
 }
 
 install_host() {
+  # A run killed while it held the host left its hold: the host takes jobs again before anything else.
+  if ((enrolled && !dry)) && [[ -e $state/holds/$SETUP_HOLD.json ]]; then
+    step=hold
+    say "lifting the hold $SETUP_HOLD a run before left"
+    lift_setup_hold || fail "the hold $SETUP_HOLD could not be lifted"
+  fi
   step=packages
   local wanted=("${PACKAGES[@]}") missing=() package installed
   ((!built_here)) || wanted+=("${BUILD_PACKAGES[@]}")
@@ -451,7 +479,7 @@ place_binary() {
   fi
   local named=${version:+release runner-$version}
   named=${named:-$binary}
-  if [[ $(sha256_of "$staged") != "$sha256" ]]; then
+  if [[ $(user_sha256 "$staged") != "$sha256" ]]; then
     change "place the Runner of $named"
     if ((!dry)); then
       local download
@@ -469,10 +497,10 @@ place_binary() {
         rm -rf "$download"
         fail "$named has the SHA-256 $got, not $sha256"
       fi
-      as_user "mkdir -p '$(dirname "$staged")'"
-      install -o "$USER_NAME" -g "$USER_NAME" -m 0755 "$download/$USER_NAME" "$staged.new"
+      # Written by the Runner's user into its own folder: root writing there would follow a link that user put in.
+      as_user "mkdir -p '$(dirname "$staged")' && cat > '$staged.new' && chmod 755 '$staged.new' && mv -f '$staged.new' '$staged'" \
+        <"$download/$USER_NAME"
       rm -rf "$download"
-      mv -f -- "$staged.new" "$staged"
       local said
       said=$(
         trap - ERR
@@ -481,7 +509,7 @@ place_binary() {
       say "it is $said"
     fi
   fi
-  if ((enrolled)) && [[ $(sha256_of "$installed") != "$sha256" ]]; then
+  if ((enrolled)) && [[ $(user_sha256 "$installed") != "$sha256" ]]; then
     change "run it in the service, once running jobs end"
     ((dry)) || replace_running
   fi
@@ -491,7 +519,7 @@ place_image() {
   step=image
   if ((enrolled)); then
     # The Runner keeps its image up to date itself; the configuration keeps the one it named.
-    image=$(jq -r '.image // empty' "$config")
+    image=$(user_file "$config" | jq -r '.image // empty')
     return
   fi
   if [[ -z $image ]]; then
@@ -520,8 +548,8 @@ place_image() {
 write_config() {
   step=config
   local now='{}' last='{}' given='{}' owned wanted
-  [[ ! -f $config ]] || now=$(trap - ERR; jq -S -c . "$config") || fail "$config is no JSON"
-  [[ ! -f $last_settings ]] || last=$(trap - ERR; jq -S -c . "$last_settings") || fail "$last_settings is no JSON"
+  [[ ! -f $config ]] || now=$(trap - ERR; user_file "$config" | jq -S -c .) || fail "$config is no JSON"
+  [[ ! -f $last_settings ]] || last=$(trap - ERR; user_file "$last_settings" | jq -S -c .) || fail "$last_settings is no JSON"
   [[ -z $settings ]] || given=$(trap - ERR; jq -S -c . "$settings") || fail "--settings: $settings is no JSON"
   owned=$(jq -n -c --arg machine "$machine" --arg class "$class" --arg state "$state" --arg image "$image" \
     --arg console "$console" --arg github_api "$github_api" --arg build "$checkout" --argjson built "$built_here" '{
@@ -548,7 +576,7 @@ write_config() {
     local tmp
     tmp=$(mktemp)
     jq . <<<"$wanted" >"$tmp"
-    as_user "mkdir -p '$config_dir' '$state' && umask 022 && cat > '$config.new' && chmod go-w '$config.new' && mv '$config.new' '$config'" <"$tmp"
+    as_user "mkdir -p '$config_dir' && (umask 077 && mkdir -p '$state') && umask 022 && cat > '$config.new' && chmod go-w '$config.new' && mv '$config.new' '$config'" <"$tmp"
     as_user "umask 077 && cat > '$last_settings.new' && mv '$last_settings.new' '$last_settings'" <<<"$given"
     rm -f "$tmp"
   fi
@@ -565,7 +593,7 @@ enroll_host() {
   step=enroll
   [[ -n $code_file ]] || fail "--code-file is needed"
   [[ -f $code_file ]] || fail "--code-file: $code_file is not there"
-  say "enrolling at $(jq -r .console "$config")"
+  say "enrolling at $(user_file "$config" | jq -r .console)"
   # The code goes to enroll on standard input, never on a command line.
   as_user "'$program' enroll --config '$config'" <"$code_file"
   rm -f -- "$code_file"

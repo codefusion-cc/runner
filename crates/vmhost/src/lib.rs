@@ -40,7 +40,7 @@ pub mod task;
 
 pub use driver::{Guest, RunError, run};
 pub use host_net::{Network as HostNetwork, host_networks, network_of};
-pub use layout::{Layout, write_private};
+pub use layout::{Layout, private, write_private};
 pub use machine::{Action, Event, Limits, Machine};
 pub use request::{JobRequest, RequestError, VM_OVERHEAD};
 pub use state::{End, Ended, JobState, OutOfMemory, Stage, StateError, out_of_memory};

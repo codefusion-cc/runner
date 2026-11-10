@@ -290,6 +290,17 @@ fn settings_that_name_an_owned_key_or_are_no_object_are_refused() {
         refused.contains("--settings: machine, use only this script sets"),
         "{refused}"
     );
+    let refused = merged(
+        "{}",
+        "{}",
+        OWNED,
+        r#"{"trusted": {}, "app_dir": "/x", "ci_cpus": 6}"#,
+    )
+    .expect_err("refused");
+    assert!(
+        refused.contains("--settings: app_dir, trusted is not set this way"),
+        "{refused}"
+    );
     for settings in ["[]", "6", "null", r#""ci_cpus""#] {
         let refused = merged("{}", "{}", OWNED, settings).expect_err(settings);
         assert!(

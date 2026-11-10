@@ -129,23 +129,23 @@ enum Ended {
     Failed(String),
 }
 
-/// The configuration's state folder, which must be there and this user's: a hold another user wrote would be one
-/// the Runner cannot read, and root's would be one it cannot lift.
+/// The configuration's state folder, which must be there, this user's, and no other user's to write to: a hold
+/// another user wrote would be one the Runner cannot read, root's one it cannot lift, and a status another user
+/// could write would end a wait early.
 fn state_folder(config: &Path) -> Result<PathBuf, Ended> {
-    use std::os::unix::fs::MetadataExt as _;
     let config = Config::load(config).map_err(Ended::Failed)?;
     let state = config.state_dir;
-    let owner = std::fs::metadata(&state)
-        .map_err(|error| Ended::Failed(format!("{}: {error}; is the Runner installed?", state.display())))?
-        .uid();
-    // SAFETY: no pointer; it only asks for this process's effective user.
-    let me = unsafe { libc::geteuid() };
-    if owner != me {
+    if let Err(error) = std::fs::metadata(&state) {
         return Err(Ended::Failed(format!(
-            "{} belongs to user {owner}: run this as that user (sudo -u <the Runner's user> codefusion-runner …)",
+            "{}: {error}; is the Runner installed?",
             state.display()
         )));
     }
+    cf_vmhost::private(&state).map_err(|error| {
+        Ended::Failed(format!(
+            "{error}: run this as the Runner's user (sudo -u <the Runner's user> codefusion-runner …)"
+        ))
+    })?;
     Ok(state)
 }
 

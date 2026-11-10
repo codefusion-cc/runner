@@ -204,6 +204,10 @@ pub fn read(dir: &Path) -> Vec<Hold> {
         }
         holds.push(match read_one(&entry.path()) {
             // A reason as `set` keeps it, whoever wrote the file: the console refuses a report with a longer one.
+            // A moment that is none could be anything at all, and the status and the console show it as it is.
+            Some(Ok(hold)) if hold.name == name && OffsetDateTime::parse(&hold.since, &Rfc3339).is_err() => {
+                unreadable(name, "its file names no moment it was set")
+            }
             Some(Ok(hold)) if hold.name == name => Hold {
                 reason: hold.reason.as_deref().and_then(clean),
                 ..hold
@@ -438,12 +442,32 @@ mod tests {
     }
 
     #[test]
+    fn a_hold_whose_moment_is_none_still_holds_and_shows_nothing_of_its_file() {
+        let folder = tempfile::tempdir().expect("a folder");
+        let dir = holds_dir(folder.path());
+        set(&dir, "bots", None, at(1)).expect("set");
+        std::fs::write(
+            dir.join("bots.json"),
+            r#"{"name":"bots","since":"\u001b]0;pwned\u0007"}"#,
+        )
+        .expect("written by hand");
+        assert_eq!(
+            read(&dir),
+            vec![Hold {
+                name: "bots".into(),
+                reason: Some("its file names no moment it was set".into()),
+                since: String::new(),
+            }]
+        );
+    }
+
+    #[test]
     fn a_reason_written_by_hand_is_read_back_cut() {
         let folder = tempfile::tempdir().expect("a folder");
         let dir = holds_dir(folder.path());
         set(&dir, "bots", None, at(1)).expect("set");
         let long = format!(
-            "{{\"name\":\"bots\",\"reason\":\"a\\u001b{}\",\"since\":\"x\"}}",
+            "{{\"name\":\"bots\",\"reason\":\"a\\u001b{}\",\"since\":\"2026-11-10T12:00:00.000Z\"}}",
             "x".repeat(500)
         );
         std::fs::write(dir.join("bots.json"), long).expect("written by hand");
