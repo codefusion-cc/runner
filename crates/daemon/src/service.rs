@@ -515,6 +515,20 @@ fn held_reason(holds: &[Hold]) -> String {
     format!("held on the machine: {}", each.join(", "))
 }
 
+/// Whether the host takes new jobs and why not, by the holds on the machine first and the machines' own word next.
+fn openness(holds: &[Hold], snapshot: &Snapshot) -> (bool, Option<String>) {
+    if holds.is_empty() {
+        (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone()))
+    } else {
+        (false, Some(held_reason(holds)))
+    }
+}
+
+/// Logs the holds on the machine the host now takes no job for.
+fn log_holds(holds: &[Hold]) {
+    tracing::info!(holds = %local::names(holds), "held on the machine: no new job until every hold is lifted");
+}
+
 /// The console's last word on the pause, as a Runner before kept it. None kept, or a file that cannot be read, is no
 /// pause: the console's first answer says it again within a report.
 fn kept_pause(path: Option<&std::path::Path>) -> bool {
@@ -672,7 +686,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let paused = parts.console.is_some() && kept_pause(parts.pause.as_deref());
         let holds = parts.holds.as_deref().map(local::read).unwrap_or_default();
         if !holds.is_empty() {
-            tracing::info!(holds = %local::names(&holds), "held on the machine: no new job until every hold is lifted");
+            log_holds(&holds);
         }
         // Before any listener opens: a host the console paused, or held on the machine, stays closed.
         parts.machines.pause(paused || !holds.is_empty());
@@ -805,7 +819,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if now.is_empty() {
                     tracing::info!("every hold on the machine is lifted");
                 } else {
-                    tracing::info!(holds = %local::names(&now), "held on the machine: no new job until every hold is lifted");
+                    log_holds(&now);
                 }
                 *holds = now;
                 drop(holds);
@@ -825,11 +839,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         };
         let holds = shared.local_holds.lock().expect("holds").clone();
         let console_paused = *shared.console_paused.lock().expect("paused");
-        let (open, reason) = if !holds.is_empty() {
-            (false, Some(held_reason(&holds)))
-        } else {
-            (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone()))
-        };
+        let (open, reason) = openness(&holds, snapshot);
         let mut status = LocalStatus {
             at: String::new(),
             pid: std::process::id(),
@@ -2082,9 +2092,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let holds = shared.local_holds.lock().expect("holds").clone();
         let (open, reason) = match (&updating.doing, no_room) {
             (Some(doing), _) => (false, Some(doing.clone())),
-            (None, _) if !holds.is_empty() => (false, Some(cut(held_reason(&holds), STATUS_TEXT_MAX))),
-            (None, Some(why)) => (false, Some(why.to_string())),
-            (None, None) => (snapshot.open, (!snapshot.open).then(|| snapshot.reason.clone())),
+            (None, Some(why)) if holds.is_empty() => (false, Some(why.to_string())),
+            (None, _) => {
+                let (open, reason) = openness(&holds, &snapshot);
+                (open, reason.map(|reason| cut(reason, STATUS_TEXT_MAX)))
+            }
         };
         let update = shared.updates.as_ref().map(|updates| Update {
             source: updates.source(),

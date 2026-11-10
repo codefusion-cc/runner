@@ -71,12 +71,7 @@ impl Asked {
             "status" => Ok(Asked::Status { json }),
             _ => {
                 let hold = hold.ok_or_else(|| format!("{command} needs --hold <name>"))?;
-                if !holds::is_name(&hold) {
-                    return Err(format!(
-                        "--hold {hold:?}: 1 to {} of a-z, 0-9 and -",
-                        holds::NAME_MAX
-                    ));
-                }
+                holds::check_name(&hold).map_err(|error| format!("--hold: {error}"))?;
                 if command == "resume" {
                     return Ok(Asked::Resume { hold });
                 }
@@ -269,7 +264,7 @@ fn busy(status: &LocalStatus) -> String {
 /// that moment could keep a Runner that starts in the very same instant from starting, which its service manager
 /// then starts again.
 fn runner_runs(state: &Path) -> Result<bool, String> {
-    let lock = match std::fs::File::open(state.join("runner.lock")) {
+    let lock = match std::fs::File::open(holds::lock_file(state)) {
         Ok(lock) => lock,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("{}: {error}", state.display())),

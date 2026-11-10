@@ -125,10 +125,10 @@ github_get() {
 }
 # The configuration a run writes, on standard output: the one there now ($1, `{}` for none) without the keys the last
 # run's settings set ($2) and every key this script owns, then the owned keys this run gives ($3, nulls left out) and
-# its settings ($4). The keys the Runner or the console set themselves stay. Fails for settings that are no JSON
-# object or that name a key this script owns.
+# its settings ($4), sorted on one line. The keys the Runner or the console set themselves stay. Fails for settings that
+# are no JSON object or that name a key this script owns.
 merged_config() {
-  jq -n --argjson now "$1" --argjson last "$2" --argjson owned "$3" --argjson settings "$4" --argjson keys "$OWNED_KEYS" '
+  jq -n -S -c --argjson now "$1" --argjson last "$2" --argjson owned "$3" --argjson settings "$4" --argjson keys "$OWNED_KEYS" '
     if ($settings | type) != "object" then error("--settings: no JSON object")
     elif ([$settings | keys[] | select(. as $k | $keys | index($k))] | length) > 0 then
       error("--settings: \([$settings | keys[] | select(. as $k | $keys | index($k))] | join(", ")) only this script sets")
@@ -280,6 +280,13 @@ sha256_of() {
   sha256sum -- "$1" | cut -d' ' -f1
 }
 
+# The jobs ran longer than a run waits for them: the Runner of before goes on, and the run ends with TIMED_OUT.
+jobs_outlasted() {
+  echo "host-setup: $step: jobs still run; the Runner of before goes on, and a run later tries again" >&2
+  failed=1
+  exit $TIMED_OUT
+}
+
 # The service runs the staged program from now on. `install` is refused while a machine stands, so new jobs are held
 # back and the running ones waited for; the hold goes again however this ends. A Runner from before holds writes no
 # status and takes no hold: `install` is tried again until it finds no machine standing.
@@ -293,11 +300,7 @@ replace_running() {
       as_user "'$staged' install --config '$config'" 2>&1
     ); do
       [[ $said == *"machines stand"* ]] || fail "the new Runner was not installed: $said"
-      if ((++tries >= 120)); then
-        echo "host-setup: $step: jobs still run; the Runner of before goes on, and a run later tries again" >&2
-        failed=1
-        exit $TIMED_OUT
-      fi
+      ((++tries < 120)) || jobs_outlasted
       sleep 30
     done
     return
@@ -308,20 +311,21 @@ replace_running() {
     as_user "'$staged' install --config '$config'" || status=$?
   fi
   as_user "'$staged' resume --config '$config' --hold $SETUP_HOLD" >/dev/null || true
-  if ((status == TIMED_OUT)); then
-    echo "host-setup: $step: jobs still run; the Runner of before goes on, and a run later tries again" >&2
-    failed=1
-    exit $TIMED_OUT
-  fi
+  ((status != TIMED_OUT)) || jobs_outlasted
   ((status == 0)) || fail "the new Runner was not installed (status $status)"
 }
 
 install_host() {
   step=packages
-  local wanted=("${PACKAGES[@]}") missing=() package
+  local wanted=("${PACKAGES[@]}") missing=() package installed
   ((!built_here)) || wanted+=("${BUILD_PACKAGES[@]}")
+  # One question for all: a package dpkg does not know is left out of its answer, and so is missing.
+  installed=$(
+    trap - ERR
+    dpkg-query -W -f='${Package} ${Status}\n' "${wanted[@]}" 2>/dev/null
+  ) || true
   for package in "${wanted[@]}"; do
-    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
+    grep -qx "$package install ok installed" <<<"$installed" || missing+=("$package")
   done
   if ((${#missing[@]})); then
     change "install ${missing[*]}"
@@ -516,9 +520,9 @@ place_image() {
 write_config() {
   step=config
   local now='{}' last='{}' given='{}' owned wanted
-  [[ ! -f $config ]] || now=$(trap - ERR; jq -c . "$config") || fail "$config is no JSON"
-  [[ ! -f $last_settings ]] || last=$(trap - ERR; jq -c . "$last_settings") || fail "$last_settings is no JSON"
-  [[ -z $settings ]] || given=$(trap - ERR; jq -c . "$settings") || fail "--settings: $settings is no JSON"
+  [[ ! -f $config ]] || now=$(trap - ERR; jq -S -c . "$config") || fail "$config is no JSON"
+  [[ ! -f $last_settings ]] || last=$(trap - ERR; jq -S -c . "$last_settings") || fail "$last_settings is no JSON"
+  [[ -z $settings ]] || given=$(trap - ERR; jq -S -c . "$settings") || fail "--settings: $settings is no JSON"
   owned=$(jq -n -c --arg machine "$machine" --arg class "$class" --arg state "$state" --arg image "$image" \
     --arg console "$console" --arg github_api "$github_api" --arg build "$checkout" --argjson built "$built_here" '{
       machine: $machine,
@@ -534,17 +538,18 @@ write_config() {
     trap - ERR
     merged_config "$now" "$last" "$owned" "$given" 2>&1
   ) || fail "${wanted#jq: error (at <unknown>): }"
-  if [[ $(jq -S . <<<"$now") != $(jq -S . <<<"$wanted") || $(jq -S . <<<"$last") != $(jq -S . <<<"$given") ]]; then
-    if [[ $(jq -S . <<<"$now") != $(jq -S . <<<"$wanted") ]]; then
+  # All four are sorted and on one line, so equal ones are equal strings.
+  if [[ $now != "$wanted" || $last != "$given" ]]; then
+    if [[ $now != "$wanted" ]]; then
       change "write $config:"
-      diff -u --label before --label after <(jq -S . <<<"$now") <(jq -S . <<<"$wanted") | tail -n +3 || true
+      diff -u --label before --label after <(jq . <<<"$now") <(jq . <<<"$wanted") | tail -n +3 || true
     fi
     ((dry)) && return
     local tmp
     tmp=$(mktemp)
     jq . <<<"$wanted" >"$tmp"
     as_user "mkdir -p '$config_dir' '$state' && umask 022 && cat > '$config.new' && chmod go-w '$config.new' && mv '$config.new' '$config'" <"$tmp"
-    jq -c . <<<"$given" | as_user "umask 077 && cat > '$last_settings.new' && mv '$last_settings.new' '$last_settings'"
+    as_user "umask 077 && cat > '$last_settings.new' && mv '$last_settings.new' '$last_settings'" <<<"$given"
     rm -f "$tmp"
   fi
 }

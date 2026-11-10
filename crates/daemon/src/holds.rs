@@ -29,6 +29,11 @@ pub fn status_file(state_dir: &Path) -> PathBuf {
     state_dir.join("status.json")
 }
 
+/// The lock a running Runner holds in a state folder.
+pub fn lock_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("runner.lock")
+}
+
 /// How often at most the status goes unwritten while nothing in it changes, so a reader can tell a Runner that
 /// writes it from one that stopped.
 pub const STATUS_EVERY: Duration = Duration::from_secs(10);
@@ -46,6 +51,17 @@ pub fn is_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// [`is_name`], or what a name must be: an error a command shows as it is.
+pub fn check_name(name: &str) -> Result<(), String> {
+    if is_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name:?} names no hold: 1 to {NAME_MAX} of a-z, 0-9 and -"
+        ))
+    }
 }
 
 /// One hold, as its file keeps it and the status and the console's report show it.
@@ -129,11 +145,7 @@ pub fn moment(at: SystemTime) -> String {
 /// Sets the hold `name`, or sets it again with this reason, keeping when it was first set. Errors are the file
 /// system's, with the path: the hold is then not set, or set as before.
 pub fn set(dir: &Path, name: &str, reason: Option<&str>, now: SystemTime) -> Result<Hold, String> {
-    if !is_name(name) {
-        return Err(format!(
-            "{name:?} names no hold: 1 to {NAME_MAX} of a-z, 0-9 and -"
-        ));
-    }
+    check_name(name)?;
     let said = |error: std::io::Error| format!("{}: {error}", dir.display());
     cf_secret::private_dir(dir).map_err(said)?;
     let path = dir.join(format!("{name}.json"));
@@ -143,9 +155,7 @@ pub fn set(dir: &Path, name: &str, reason: Option<&str>, now: SystemTime) -> Res
     };
     let hold = Hold {
         name: name.to_string(),
-        reason: reason
-            .map(|reason| cut(reason.trim()))
-            .filter(|reason| !reason.is_empty()),
+        reason: reason.and_then(clean),
         since,
     };
     let mut bytes = serde_json::to_vec(&hold).map_err(|error| error.to_string())?;
@@ -157,11 +167,7 @@ pub fn set(dir: &Path, name: &str, reason: Option<&str>, now: SystemTime) -> Res
 /// Lifts the hold `name`. One that is not set is no error: a holder's cleanup may run twice. Says whether it was
 /// set.
 pub fn lift(dir: &Path, name: &str) -> Result<bool, String> {
-    if !is_name(name) {
-        return Err(format!(
-            "{name:?} names no hold: 1 to {NAME_MAX} of a-z, 0-9 and -"
-        ));
-    }
+    check_name(name)?;
     let path = dir.join(format!("{name}.json"));
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
@@ -199,10 +205,7 @@ pub fn read(dir: &Path) -> Vec<Hold> {
         holds.push(match read_one(&entry.path()) {
             // A reason as `set` keeps it, whoever wrote the file: the console refuses a report with a longer one.
             Some(Ok(hold)) if hold.name == name => Hold {
-                reason: hold
-                    .reason
-                    .map(|reason| cut(reason.trim()))
-                    .filter(|reason| !reason.is_empty()),
+                reason: hold.reason.as_deref().and_then(clean),
                 ..hold
             },
             Some(Ok(_)) => unreadable(name, "its file names another hold"),
@@ -262,16 +265,17 @@ fn read_one(path: &Path) -> Option<Result<Hold, String>> {
 fn unreadable(name: &str, why: &str) -> Hold {
     Hold {
         name: name.to_string(),
-        reason: Some(cut(why)),
+        reason: Some(cf_guest_proto::clip(why, REASON_MAX)),
         since: String::new(),
     }
 }
 
-fn cut(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(REASON_MAX)
-        .collect()
+/// A reason as a hold keeps it: at most [`REASON_MAX`] characters, none that could steer how the console or a
+/// terminal shows it, none at all when nothing but blanks is left.
+fn clean(reason: &str) -> Option<String> {
+    let reason = cf_guest_proto::clip(reason.trim(), REASON_MAX);
+    let reason = reason.trim();
+    (!reason.is_empty()).then(|| reason.to_string())
 }
 
 #[cfg(test)]
@@ -423,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_is_cut_and_loses_control_characters() {
+    fn a_reason_is_cut_and_its_control_characters_are_blanked() {
         let folder = tempfile::tempdir().expect("a folder");
         let dir = holds_dir(folder.path());
         let long = format!("a\u{1b}[31m{}", "x".repeat(500));

@@ -18,11 +18,21 @@ fn headless(total_bytes: u64, cores: u32) -> Settings {
     Settings::for_headless(HostFacts { total_bytes, cores }, cores)
 }
 
-fn with_ci(settings: Settings, ci_bytes: u64) -> Result<Settings, SettingsError> {
+fn limited(
+    settings: Settings,
+    ci_bytes: Option<u64>,
+    ci_cpus: Option<u32>,
+) -> Result<Settings, SettingsError> {
     settings.limited(&Limits {
-        ci_bytes: Some(ci_bytes),
+        ci_bytes,
+        ci_cpus,
         ..Limits::default()
     })
+}
+
+/// Memory for CI alone.
+fn with_ci(settings: Settings, ci_bytes: u64) -> Result<Settings, SettingsError> {
+    limited(settings, Some(ci_bytes), None)
 }
 
 /// Whether these sizes fit one after the other on an empty host with all its memory available and CPUs to spare:
@@ -178,18 +188,6 @@ fn none_set_changes_nothing() {
     let defaults = headless(12 * GIB, 6);
     assert_eq!(defaults.clone().limited(&Limits::default()), Ok(defaults.clone()));
     assert_eq!(defaults.ci_bytes, None);
-}
-
-fn limited(
-    settings: Settings,
-    ci_bytes: Option<u64>,
-    ci_cpus: Option<u32>,
-) -> Result<Settings, SettingsError> {
-    settings.limited(&Limits {
-        ci_bytes,
-        ci_cpus,
-        ..Limits::default()
-    })
 }
 
 /// Whether these sizes start one after the other on an empty host, its CPUs counted as the settings give them.

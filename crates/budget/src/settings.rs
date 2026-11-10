@@ -416,10 +416,6 @@ impl Settings {
                 .in_use
                 .cap_bytes
                 .min(self.total_bytes.saturating_sub(self.in_use.floor_bytes));
-            // Nobody is ever there on a dedicated host: one set of limits.
-            if self.mode == Mode::Dedicated {
-                self.in_use = self.away;
-            }
         }
         // As many machines side by side as the cap kept the overhead of: more CPUs for CI, or fewer vCPUs a size, run
         // more.
@@ -435,9 +431,6 @@ impl Settings {
             self.away.cpus = cpus;
             self.in_use.cpus = self.in_use.cpus.min(cpus);
             self.vcpus = vcpus_for(cpus, self.away.cap_bytes, self.headless);
-            if self.mode == Mode::Dedicated {
-                self.in_use = self.away;
-            }
         }
         // Memory for CI, set: the host keeps the rest for itself, and never less than the least floor. A floor set as
         // a share stays. The sizes alone add up to no more than it leaves after one machine's overhead, and `admit`
@@ -455,9 +448,6 @@ impl Settings {
             self.away.cap_bytes = sizes;
             self.vcpus = vcpus_for(self.away.cpus, sizes, self.headless);
             self.in_use.cap_bytes = self.in_use.cap_bytes.min(sizes);
-            if self.mode == Mode::Dedicated {
-                self.in_use = self.away;
-            }
         }
         for (size, vcpus) in Size::ALL.into_iter().zip(limits.vcpus) {
             let Some(vcpus) = vcpus else { continue };
@@ -477,6 +467,10 @@ impl Settings {
             let overheads = u64::from(more).saturating_mul(self.vm_host_overhead_bytes);
             self.away.cap_bytes = self.away.cap_bytes.saturating_sub(overheads);
             self.in_use.cap_bytes = self.in_use.cap_bytes.min(self.away.cap_bytes);
+        }
+        // Nobody is ever there on a dedicated host: one set of limits.
+        if self.mode == Mode::Dedicated {
+            self.in_use = self.away;
         }
         self.check()?;
         Ok(self)

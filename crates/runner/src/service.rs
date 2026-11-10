@@ -312,7 +312,7 @@ fn only_runner(config: &Config) -> Result<std::fs::File, String> {
         .truncate(false)
         .write(true)
         .mode(0o600)
-        .open(folder.join("runner.lock"))
+        .open(cf_daemon::holds::lock_file(folder))
         .map_err(said)?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
