@@ -341,6 +341,11 @@ impl Config {
         if !self.docker_repos.is_empty() {
             return Err("docker_repos: a trusted host gives no job Docker".into());
         }
+        if !self.only_labels.is_empty() {
+            return Err(
+                "only_labels: a trusted host takes its `trusted` jobs alone; leave only_labels out".into(),
+            );
+        }
         if !self.public_repos.is_empty() {
             return Err(format!(
                 "public_repos: a trusted host serves {repository} alone; leave public_repos out"
@@ -622,6 +627,13 @@ mod tests {
                 "repos",
             ),
             (|v| v["repos"] = serde_json::json!(["org/app"]), "repos"),
+            (
+                |v| {
+                    v["labels"] = serde_json::json!(["cf-ops"]);
+                    v["only_labels"] = serde_json::json!(["cf-ops"]);
+                },
+                "only_labels",
+            ),
             (
                 |v| v["trusted"] = serde_json::json!({ "repository": "codefusion", "allow": {} }),
                 "repository",

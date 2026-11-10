@@ -6295,6 +6295,18 @@ fn trusted_host(rig: &mut Rig) -> (cf_trusted::Policy, TestService) {
     (rules, trusted)
 }
 
+/// A trusted host serves its one repository, whatever its settings file lists: the report says so, not every private
+/// repository, which an empty list would mean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_host_reports_its_one_repository() {
+    let mut rig = Rig::new(2).await;
+    let (_, trusted) = trusted_host(&mut rig);
+    pass(&rig.machines, 1);
+    let report = serde_json::to_value(trusted.status()).expect("a report");
+    assert_eq!(report["limits"]["repos"], json!([REPO]));
+    assert_eq!(report["limits"]["onlyLabels"], json!([]));
+}
+
 /// A trusted host asks the console for an Actions runner and is told no trusted job waits yet (a 409 that says when
 /// to ask again): that is no failure, and no warning in the log. A console that answers 429 or 503, even with a time
 /// to ask again, failed the ask, and the log warns of it. Nothing is registered either way.

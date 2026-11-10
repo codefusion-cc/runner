@@ -137,13 +137,27 @@ impl ServePolicy {
     /// Whether this host serves a label set: it has every host label the set asks for, and the set asks for one it
     /// keeps itself for, when it keeps any.
     pub fn serves_labels(&self, set: &LabelSet) -> bool {
+        self.labels_refusal(set).is_none()
+    }
+
+    /// Why this host leaves a label set to others for its host labels, or none when it serves it
+    /// ([`ServePolicy::serves_labels`]).
+    pub fn labels_refusal(&self, set: &LabelSet) -> Option<&'static str> {
         // Both lowercase: a LabelSet's and the config's own, which takes no other.
-        set.host_labels()
+        if !set
+            .host_labels()
             .all(|wanted| self.host_labels.iter().any(|label| label == wanted))
-            && (self.only_labels.is_empty()
-                || set
-                    .host_labels()
-                    .any(|wanted| self.only_labels.iter().any(|label| label == wanted)))
+        {
+            return Some("it asks for host labels this host does not have");
+        }
+        if !self.only_labels.is_empty()
+            && !set
+                .host_labels()
+                .any(|wanted| self.only_labels.iter().any(|label| label == wanted))
+        {
+            return Some("it asks for none of the host labels this host is kept for");
+        }
+        None
     }
 }
 
@@ -402,5 +416,13 @@ mod tests {
         ] {
             assert!(!ops.serves_labels(&set(labels)), "{labels:?}");
         }
+        assert_eq!(
+            ops.labels_refusal(&set(&["cf-2g"])),
+            Some("it asks for none of the host labels this host is kept for")
+        );
+        assert_eq!(
+            ops.labels_refusal(&set(&["cf-2g", "cf-ops", "cf-macos"])),
+            Some("it asks for host labels this host does not have")
+        );
     }
 }
