@@ -291,8 +291,8 @@ pub struct Charge {
 
 /// Whether one more VM of `size` fits: the arithmetic of admission, with no memory of its own.
 ///
-/// It fits when the VMs stay within [`Settings::max_machines`], the sizes within `limits.cap_bytes`, the vCPUs
-/// within `limits.cpus`, and
+/// It fits when the VMs stay within [`Settings::max_machines`], the sizes within `limits.cap_bytes`, the sizes with
+/// their overheads within [`Settings::ci_bytes`], the vCPUs within `limits.cpus`, and
 /// `available_bytes` covers what the VMs in `charges` may still grow by, the new VM in full with its overhead,
 /// and the floor. More available memory, fewer charges or looser limits never turn a yes into a no.
 pub fn admit(
@@ -320,6 +320,19 @@ pub fn admit(
             cap_bytes: limits.cap_bytes,
             committed_bytes,
         });
+    }
+    // Memory for CI counts every machine with its overhead, the new one too.
+    if let Some(ci_bytes) = settings.ci_bytes {
+        let overheads = u64::try_from(charges.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(settings.vm_host_overhead_bytes);
+        let held = committed_bytes.saturating_add(overheads);
+        if held.saturating_add(settings.host_bytes(size)) > ci_bytes {
+            return Err(Refusal::Full {
+                cap_bytes: ci_bytes,
+                committed_bytes: held,
+            });
+        }
     }
     if committed_cpus.saturating_add(settings.vcpus_of(size)) > limits.cpus {
         return Err(Refusal::Cpus {

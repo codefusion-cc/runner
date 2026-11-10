@@ -55,6 +55,10 @@ pub struct Settings {
     pub headless: bool,
     /// The most VMs at once, whatever the caps leave room for; `None` for as many as they do.
     pub max_machines: Option<u32>,
+    /// The most the machines of CI may hold at once, each counted with its size and its overhead
+    /// ([`Settings::host_bytes`]), whatever the caps leave room for; `None` for as much as they do. A host that
+    /// runs other work beside CI keeps the rest for it.
+    pub ci_bytes: Option<u64>,
     /// Once the Mac was under its floor, it must be this far above it before that counts as over.
     pub recover_margin_bytes: u64,
     /// How long nothing may be wrong before slots open again.
@@ -94,6 +98,8 @@ pub struct Limits {
     pub floor_percent: Option<u32>,
     /// vCPUs of a VM of each size, in the order of [`Size::ALL`]: [`Settings::vcpus`].
     pub vcpus: [Option<u32>; 4],
+    /// The most the machines of CI may hold at once, overheads included: [`Settings::ci_bytes`].
+    pub ci_bytes: Option<u64>,
 }
 
 /// A setting the budget refuses, with what is wrong. Settings come from a file, the tray and the console, so a bad
@@ -146,6 +152,12 @@ pub enum SettingsError {
     /// A duration of zero where the budget waits or measures.
     #[error("{what} is zero")]
     ZeroDuration { what: &'static str },
+    /// More memory for CI than the host has.
+    #[error("memory for CI of {ci_bytes} bytes on a host with {total_bytes}")]
+    CiOverHost { ci_bytes: u64, total_bytes: u64 },
+    /// Memory for CI that holds not even the smallest machine.
+    #[error("memory for CI of {ci_bytes} bytes holds no machine: the smallest needs {least_bytes}")]
+    CiUnderSmallest { ci_bytes: u64, least_bytes: u64 },
     /// Jobs would be stopped for a full disk before slots stop opening for it.
     #[error("the disk limit that stops a job is above the one that stops new slots")]
     DiskLimitsCrossed,
@@ -225,6 +237,7 @@ impl Settings {
             vcpus: vcpus_for(all_but_two, away.cap_bytes, false),
             headless: false,
             max_machines: None,
+            ci_bytes: None,
             recover_margin_bytes: GIB,
             calm_for: Millis::secs(60),
             swap_quiet: Millis::secs(30),
@@ -374,6 +387,8 @@ impl Settings {
     /// - The floor as a share of the memory, 1% to 90%, and never under [`Settings::LEAST_FLOOR`]. It is the floor
     ///   on a dedicated host and on a workstation whose person is away; while a workstation's person is there the
     ///   floor stays the higher of the two. A cap that would leave the host less than its floor is lowered to what is left.
+    /// - The memory for CI ([`Settings::ci_bytes`]), when set: the cap becomes what it leaves after one machine's
+    ///   overhead, and a floor not set as a share becomes what it leaves the host, at least [`Settings::LEAST_FLOOR`].
     pub fn limited(mut self, limits: &Limits) -> Result<Settings, SettingsError> {
         self.max_machines = limits.max_machines.or(self.max_machines);
         if let Some(idle_after) = limits.idle_after {
@@ -396,6 +411,26 @@ impl Settings {
                 .cap_bytes
                 .min(self.total_bytes.saturating_sub(self.in_use.floor_bytes));
             // Nobody is ever there on a dedicated host: one set of limits.
+            if self.mode == Mode::Dedicated {
+                self.in_use = self.away;
+            }
+        }
+        // Memory for CI, set: the host keeps the rest for itself, and never less than the least floor. A floor set as
+        // a share stays. The sizes alone add up to no more than it leaves after one machine's overhead, and `admit`
+        // counts each machine's overhead on top. It may be more than the default cap: whoever set it knows the host.
+        if let Some(ci) = limits.ci_bytes {
+            self.ci_bytes = Some(ci);
+            if limits.floor_percent.is_none() {
+                let rest = self.total_bytes.saturating_sub(ci).max(Self::LEAST_FLOOR);
+                self.away.floor_bytes = self.away.floor_bytes.min(rest);
+                self.in_use.floor_bytes = self.in_use.floor_bytes.min(rest).max(self.away.floor_bytes);
+            }
+            let sizes = ci
+                .saturating_sub(self.vm_host_overhead_bytes)
+                .min(self.total_bytes.saturating_sub(self.away.floor_bytes));
+            self.away.cap_bytes = sizes;
+            self.vcpus = vcpus_for(self.away.cpus, sizes, self.headless);
+            self.in_use.cap_bytes = self.in_use.cap_bytes.min(sizes);
             if self.mode == Mode::Dedicated {
                 self.in_use = self.away;
             }
@@ -491,6 +526,21 @@ impl Settings {
         if self.max_machines == Some(0) {
             return Err(SettingsError::NoMachines);
         }
+        if let Some(ci_bytes) = self.ci_bytes {
+            if ci_bytes > self.total_bytes {
+                return Err(SettingsError::CiOverHost {
+                    ci_bytes,
+                    total_bytes: self.total_bytes,
+                });
+            }
+            let least_bytes = self.host_bytes(Size::G2);
+            if ci_bytes < least_bytes {
+                return Err(SettingsError::CiUnderSmallest {
+                    ci_bytes,
+                    least_bytes,
+                });
+            }
+        }
         if self.disk_evict_bytes > self.disk_hold_bytes {
             return Err(SettingsError::DiskLimitsCrossed);
         }
@@ -507,7 +557,11 @@ impl Settings {
     /// the Mac has the memory for each is decided when it is asked for.
     pub fn side_by_side(&self, limits: &Profile, size: Size) -> u32 {
         let by_cap = u32::try_from(limits.cap_bytes / size.vm_bytes().max(1)).unwrap_or(u32::MAX);
+        let by_ci = self.ci_bytes.map_or(u32::MAX, |ci| {
+            u32::try_from(ci / self.host_bytes(size).max(1)).unwrap_or(u32::MAX)
+        });
         by_cap
+            .min(by_ci)
             .min(limits.cpus / self.vcpus_of(size).max(1))
             .min(self.max_machines.unwrap_or(u32::MAX))
     }
