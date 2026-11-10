@@ -3518,9 +3518,12 @@ async fn a_stop_for_no_job_left_by_a_runner_before_is_asked_of_github_first() {
 const RUNNING: &str = "0.1.0+446125c0a1b2";
 const NEWER: &str = "0.1.0+5c0ffee0a1b2";
 
-/// The newest status the console has.
+/// The newest status the console has; null before the first report, so a wait on it goes on waiting.
 fn last_status(console: &FakeConsole) -> Value {
-    console.reports().last().expect("a report")["status"].clone()
+    console
+        .reports()
+        .last()
+        .map_or(Value::Null, |report| report["status"].clone())
 }
 
 /// What the console heard of one command, each time it heard of it.
