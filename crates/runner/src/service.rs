@@ -312,7 +312,7 @@ fn only_runner(config: &Config) -> Result<std::fs::File, String> {
         .truncate(false)
         .write(true)
         .mode(0o600)
-        .open(folder.join("runner.lock"))
+        .open(cf_daemon::holds::lock_file(folder))
         .map_err(said)?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
@@ -704,11 +704,15 @@ fn room_line(facts: HostFacts, settings: &Settings, whose: &str, when: &str) -> 
         .filter(|size| settings.can_run(*size).is_ok())
         .map(|size| format!("{} with {} CPUs", size.label(), settings.vcpus_of(size)))
         .collect();
+    let ci = settings.ci_bytes.map_or(String::new(), |bytes| {
+        format!(" (memory for CI {}, each machine with its overhead)", gib(bytes))
+    });
     format!(
-        "{} and {} cores, {whose}: {} for machines{when}; {}; {} cf-4g side by side",
+        "{} and {} cores, {whose}: {} and {} CPUs for machines{ci}{when}; {}; {} cf-4g side by side",
         gib(facts.total_bytes),
         facts.cores,
         gib(settings.away.cap_bytes),
+        settings.away.cpus,
         if sizes.is_empty() {
             "no size fits".to_string()
         } else {
@@ -1498,7 +1502,7 @@ mod tests {
         };
         assert_eq!(
             room_line(board, &Settings::for_headless(board, 4), "nobody sits at it", ""),
-            "7.75 GiB and 8 cores, nobody sits at it: 5.64 GiB for machines; cf-2g with 2 CPUs, cf-4g with 4 CPUs; \
+            "7.75 GiB and 8 cores, nobody sits at it: 5.64 GiB and 4 CPUs for machines; cf-2g with 2 CPUs, cf-4g with 4 CPUs; \
              1 cf-4g side by side"
         );
         let mac = HostFacts {
@@ -1512,7 +1516,7 @@ mod tests {
                 "someone's own Mac",
                 " while the person is away, none otherwise"
             ),
-            "16.00 GiB and 8 cores, someone's own Mac: 9.60 GiB for machines while the person is away, none \
+            "16.00 GiB and 8 cores, someone's own Mac: 9.60 GiB and 6 CPUs for machines while the person is away, none \
              otherwise; cf-2g with 2 CPUs, cf-4g with 3 CPUs, cf-6g with 4 CPUs, cf-8g with 4 CPUs; \
              2 cf-4g side by side"
         );

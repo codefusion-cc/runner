@@ -1,0 +1,119 @@
+name: Runner release
+
+# The Runner's Linux program for each architecture a host runs: one file that holds all of it (the guest bundle and
+# cloud-hypervisor are built in), released as `runner-<version>` (`0.1.0-446125c0a1b2` for the version
+# `0.1.0+446125c0a1b2` the program says), with `codefusion-runner-linux-amd64`, `-arm64` and their SHA256SUMS. A host
+# takes one with `scripts/host-setup.sh install --version <version> --sha256 <its line>`, so it needs no Rust and builds
+# nothing. Built in Debian 12, the oldest system a host runs, so the program runs on its glibc and on Ubuntu 24.04's.
+#
+# `build` holds no secret, so a pull request that changes this workflow runs it too. `publish` runs only on main,
+# needs nothing but `gh`, and never replaces a release: a host's settings name its SHA-256, so the bytes of a version
+# never change. Each run builds from nothing, without a cache another run could have written.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/**
+      - xtask/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/release.yml
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build the ${{ matrix.platform }} Runner on Debian 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+          - platform: amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    container: debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends build-essential pkg-config libssl-dev curl git ca-certificates
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 https://sh.rustup.rs |
+            sh -s -- -y -q --profile minimal --default-toolchain none --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The checkout belongs to another user than the container's root; the build reads its commit.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rustup toolchain install
+          cargo xtask build
+          program=target/release/codefusion-runner
+          said=$("$program" version)
+          echo "$said"
+          version=${said#codefusion-runner }
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9a-f]{12}$ ]] || { echo "::error::version $said"; exit 1; }
+          [[ ${version#*+} == "${GITHUB_SHA:0:12}" ]] || { echo "::error::$said is not of $GITHUB_SHA"; exit 1; }
+          mkdir out
+          cp "$program" "out/codefusion-runner-linux-${{ matrix.platform }}"
+          echo "$version" > "out/version-${{ matrix.platform }}"
+      - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runner-${{ matrix.platform }}
+          path: out
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Publish the Runner release
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: runner-*
+          merge-multiple: true
+          path: out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd out
+          [ "$(cat version-amd64)" = "$(cat version-arm64)" ] || { echo "::error::the two builds differ in version"; exit 1; }
+          version=$(cat version-amd64)
+          tag="runner-${version/+/-}"
+          rm version-*
+          sha256sum codefusion-runner-linux-* > SHA256SUMS
+          cat SHA256SUMS
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::notice::$tag is out already; its files stay as they are"
+            exit 0
+          fi
+          gh release create "$tag" codefusion-runner-linux-* SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --latest=false --title "$tag" \
+            --notes "The Runner $version for Linux. A host takes it with \`scripts/host-setup.sh install --version ${version/+/-} --sha256 <its line in SHA256SUMS>\`."

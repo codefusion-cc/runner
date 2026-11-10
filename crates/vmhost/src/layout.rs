@@ -28,7 +28,7 @@ pub(crate) fn open_private(path: &Path) -> std::io::Result<fs::File> {
 
 /// Refuses a file or folder another user could change: one that is not this user's, or that its group or
 /// everybody may write to. The error says which and why.
-pub(crate) fn private(path: &Path) -> Result<(), String> {
+pub fn private(path: &Path) -> Result<(), String> {
     let found = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     // SAFETY: geteuid takes nothing and cannot fail.
     let me = unsafe { libc::geteuid() };

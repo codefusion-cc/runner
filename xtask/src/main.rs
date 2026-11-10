@@ -81,6 +81,7 @@ fn build(root: &Path) -> Result<()> {
     run_command(Command::new(cargo()).current_dir(root).args([
         "build",
         "--release",
+        "--locked",
         "-p",
         "codefusion-runner",
     ]))?;
