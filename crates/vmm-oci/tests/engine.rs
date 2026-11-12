@@ -132,6 +132,8 @@ fn job(
     };
     let state = run(vmm, &layout, guest, request, limits(deadline), cancel).expect("the job runs");
     let console = std::fs::read_to_string(layout.console(&name)).unwrap_or_default();
+    // Shown when the test fails: how the job ended, and what its container wrote.
+    eprintln!("{name}: {state:?}\n{console}");
     (state, console)
 }
 
