@@ -153,7 +153,10 @@ jobs:
           export CF_ENGINE_SOCKET="$XDG_RUNTIME_DIR/podman/podman.sock"
           export CF_SUPERVISOR="$PWD/target/${{ matrix.guest }}/debug/supervisor"
           podman build -q -t "codefusion-runner-guest:$CF_GUEST_IMAGE" crates/vmm-oci/tests/image
-          cargo test --locked -p cf-vmm-oci --test engine -j4 -- --ignored --test-threads=2
+          # Three times: Podman takes a network down after its container, on its own time.
+          for run in 1 2 3; do
+            cargo test --locked -p cf-vmm-oci --test engine -j4 -- --ignored --test-threads=2
+          done
 
   fresh-host:
     # A fresh Ubuntu host set up the way a cloud VM is (scripts/host-setup.sh as root: a connect code, no App key),

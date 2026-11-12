@@ -140,8 +140,10 @@ fn job(
 /// Nothing of the machine's is left in the engine: no container, no network.
 fn nothing_left(vmm: &OciVmm) {
     assert_eq!(vmm.containers(), [], "the container is gone with the job");
-    for (network, _) in vmm.networks() {
-        // Shown when the test fails: what the engine says of the network, and to its removal now.
+    let left = vmm.networks();
+    for (network, _) in &left {
+        // Shown when the test fails: what the engine says of the network, and to its removal now. The test fails on
+        // what was left, whatever this removal does.
         let engine = Engine::new(socket());
         let call = Some(Duration::from_secs(60));
         let found = engine.request("GET", &format!("/networks/{network}"), Body::Empty, call);
@@ -152,7 +154,7 @@ fn nothing_left(vmm: &OciVmm) {
             removed.map(|answer| (answer.status, answer.message()))
         );
     }
-    assert_eq!(vmm.networks(), [], "the network is gone with the job");
+    assert_eq!(left, [], "the network is gone with the job");
 }
 
 fn end(state: &JobState) -> Option<End> {
