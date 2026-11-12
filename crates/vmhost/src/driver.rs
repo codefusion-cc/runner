@@ -56,6 +56,10 @@ pub enum RunError {
     Scratch(String),
 }
 
+/// What a container's guest waits past its vm-host's longest life before it ends the job by itself
+/// ([`cf_guest_proto::Job::end_by_ms`]): the guest counts from its workload's start, a little before the host's `ready`.
+pub const GUEST_GRACE: Duration = Duration::from_secs(30);
+
 /// How often the machine is asked what time it is when nothing else happens.
 const TICK: Duration = Duration::from_millis(200);
 /// A Unix socket's path may be this long on macOS, the shorter of the two systems.
@@ -200,6 +204,7 @@ fn run_in(
         limits: guest_limits,
         env: std::mem::take(&mut request.env),
         oom_grace_ms: 15_000,
+        end_by_ms: containers.then(|| (limits.longest_life() + GUEST_GRACE).as_millis() as u64),
         blocked: crate::host_net::host_networks(),
         docker: request.docker,
         trusted: request.trusted.clone(),

@@ -637,10 +637,11 @@ impl<'a> Watch<'a> {
         loop {
             match events.recv_timeout(TICK.saturating_sub(looked.elapsed())) {
                 Ok(Event::Ended(status)) => return status,
-                Ok(Event::Host(HostMessage::Stop(stop))) => {
-                    self.stop(stop.reason, Duration::from_millis(stop.grace_ms))
+                Ok(Event::Host(message)) => {
+                    if let HostMessage::Stop(stop) = *message {
+                        self.stop(stop.reason, Duration::from_millis(stop.grace_ms));
+                    }
                 }
-                Ok(Event::Host(HostMessage::Start(_))) => {}
                 Ok(Event::HostGone) | Err(RecvTimeoutError::Disconnected) => {
                     // Nobody is left to tell how the job ends, and nothing of it may outlive its host.
                     say("the host is gone");

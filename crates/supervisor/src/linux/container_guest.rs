@@ -26,7 +26,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The folder the workload finds its hooks and the job's facts in, as in a machine's container. The host made it,
 /// the job's user's, before the container started.
@@ -114,7 +114,7 @@ pub fn run() -> ! {
         loop {
             match read_message::<HostMessage>(&mut from_host) {
                 Ok(Some(message)) => {
-                    if to_watch.send(Event::Host(message)).is_err() {
+                    if to_watch.send(Event::Host(Box::new(message))).is_err() {
                         return;
                     }
                 }
@@ -248,6 +248,9 @@ fn run_job(
     );
     let workload = start(&argv, &env, &home).map_err(container)?;
     drop((argv, env));
+    if let Some(ms) = job.end_by_ms {
+        end_by(Duration::from_millis(ms), sender.clone());
+    }
     reap(workload, sender);
     host.send(&GuestMessage::Ready {
         boot_ms: since_start_ms(),
@@ -320,6 +323,19 @@ fn start(argv: &[String], env: &[(String, String)], home: &str) -> Result<u32, S
     forward_output(output_read);
     // The child is reaped by `reap`, which takes every process's end as the container's first must.
     Ok(child.id())
+}
+
+/// Ends the job at its latest end, as if its host were gone: a host that has not ended it by then hangs or died,
+/// and the engine would keep the container for ever.
+fn end_by(after: Duration, sender: Sender<Event>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(after);
+        say(&format!(
+            "the host did not end the job within {} s of its start: it ends here",
+            after.as_secs()
+        ));
+        let _ = sender.send(Event::HostGone);
+    });
 }
 
 /// Takes the end of every process that ends in the container, as its first process must, and says when the

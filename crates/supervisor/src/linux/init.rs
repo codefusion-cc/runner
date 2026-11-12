@@ -87,7 +87,7 @@ impl Host {
 /// What reaches the supervisor from outside.
 pub enum Event {
     /// A message of the host's.
-    Host(HostMessage),
+    Host(Box<HostMessage>),
     /// The host closed the connection or sent what is no message.
     HostGone,
     /// The job's launcher ended, with this wait status.
@@ -149,7 +149,7 @@ pub fn run() -> ! {
         loop {
             match read_message::<HostMessage>(&mut reader) {
                 Ok(Some(message)) => {
-                    if from_host.send(Event::Host(message)).is_err() {
+                    if from_host.send(Event::Host(Box::new(message))).is_err() {
                         return;
                     }
                 }

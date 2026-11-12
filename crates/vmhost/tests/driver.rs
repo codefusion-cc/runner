@@ -6,7 +6,9 @@ use cf_guest_proto::{
     read_message, write_message,
 };
 use cf_vmhost::control::{self, Request};
-use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run};
+use cf_vmhost::{
+    End, GUEST_GRACE, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run,
+};
 use cf_vmm::testing::{FakeVmm, PowerSwitch, Script, Stop};
 use cf_vmm::{DiskIo, Network, Psi, VmmError};
 use std::os::unix::fs::PermissionsExt as _;
@@ -220,6 +222,7 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
         (task.name.as_str(), task.host.as_str(), task.oom_grace_ms),
         ("job-1", "mac-1", 15_000)
     );
+    assert_eq!(task.end_by_ms, None, "a machine ends with its vm-host");
     assert_eq!(
         (
             task.limits.memory_bytes,
@@ -1319,6 +1322,12 @@ fn in_a_container_the_job_starts_at_once_with_its_whole_size_and_no_disk() {
         panic!("the guest was not given a job")
     };
     assert_eq!(task.limits.memory_bytes, 4 << 30);
+    // A container whose vm-host hangs or dies outlives it unless its guest ends it: by then the host would have
+    // stopped it, let it end and killed it.
+    assert_eq!(
+        task.end_by_ms,
+        Some((quick().longest_life() + GUEST_GRACE).as_millis() as u64)
+    );
     let specs = vmm.started();
     assert_eq!(specs.len(), 1, "no machine formats a disk");
     let disks: Vec<_> = specs[0]

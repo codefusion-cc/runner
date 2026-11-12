@@ -68,6 +68,11 @@ pub struct Job {
     /// (`cf_supervisor::gate`), which refuses every job they do not let run before any step of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<cf_trusted::Policy>,
+    /// The longest the job may run, in milliseconds from its workload's start, after which the guest ends it by
+    /// itself: past it the host, which would have stopped it and killed it by then, hangs or is gone. A machine
+    /// ends with its vm-host and gets none; a container, which an engine keeps, does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_by_ms: Option<u64>,
 }
 
 /// A job's limits, enforced by the guest kernel on the job's control group.

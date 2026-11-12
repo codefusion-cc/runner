@@ -38,7 +38,7 @@ pub mod scratch;
 mod state;
 pub mod task;
 
-pub use driver::{Guest, RunError, run};
+pub use driver::{GUEST_GRACE, Guest, RunError, run};
 pub use host_net::{Network as HostNetwork, host_networks, network_of};
 pub use layout::{Layout, private, write_private};
 pub use machine::{Action, Event, Limits, Machine};
