@@ -31,7 +31,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The label every container of the Runner's carries, with its machine's name.
 pub const LABEL_MACHINE: &str = "cc.codefusion.runner.machine";
@@ -45,6 +45,9 @@ pub const SUPERVISOR: &str = "/run/codefusion/supervisor";
 const PIDS: u64 = 4096;
 /// How long a call to the engine may take before it counts as a failure, but for a container's end.
 const CALL: Duration = Duration::from_secs(60);
+/// How long a network still in use is asked for again: Podman takes a container's network down in a process of its
+/// own once the container has gone, so the network may still be busy just after.
+const NETWORK_IN_USE: Duration = Duration::from_secs(10);
 
 /// The engine image of an installed image version.
 pub fn image_tag(version: &str) -> String {
@@ -355,12 +358,28 @@ fn alive(pid: u32) -> bool {
 
 /// Removes a network; what is not there is not an error.
 fn remove_network(engine: &Engine, id: &str) {
-    let _ = engine.request(
-        "DELETE",
-        &format!("/networks/{}", escape(id)),
-        Body::Empty,
-        Some(CALL),
-    );
+    remove_network_within(engine, id, NETWORK_IN_USE);
+}
+
+/// Removes a network, asked again while the engine says it is in use (Docker 403, Podman 409 or 500), for `limit`.
+fn remove_network_within(engine: &Engine, id: &str, limit: Duration) {
+    let began = Instant::now();
+    let mut wait = Duration::from_millis(50);
+    loop {
+        let Ok(answer) = engine.request(
+            "DELETE",
+            &format!("/networks/{}", escape(id)),
+            Body::Empty,
+            Some(CALL),
+        ) else {
+            return;
+        };
+        if !matches!(answer.status, 403 | 409 | 500) || began.elapsed() + wait > limit {
+            return;
+        }
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_secs(1));
+    }
 }
 
 /// A container's own network, removed when this goes out of scope: after the container, which is dropped first.
@@ -760,6 +779,55 @@ impl Drop for OciVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine that answers each request with the next status of `statuses` (the last again once they run out),
+    /// and counts them.
+    fn scripted_engine(statuses: Vec<u16>) -> (tempfile::TempDir, Engine, Arc<AtomicU64>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let asked = Arc::new(AtomicU64::new(0));
+        let counted = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                let n = counted.fetch_add(1, Ordering::SeqCst) as usize;
+                let status = statuses[n.min(statuses.len() - 1)];
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        (folder, Engine::new(&socket), asked)
+    }
+
+    #[test]
+    fn a_network_still_in_use_is_asked_for_again_until_it_goes_or_the_wait_ends() {
+        let (_folder, engine, asked) = scripted_engine(vec![500, 409, 403, 204]);
+        remove_network_within(&engine, "codefusion-dal1-vm-7-0", Duration::from_secs(10));
+        assert_eq!(asked.load(Ordering::SeqCst), 4, "asked until it was removed");
+
+        let (_folder, engine, asked) = scripted_engine(vec![404]);
+        remove_network_within(&engine, "gone", Duration::from_secs(10));
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "one that is not there is not asked for again"
+        );
+
+        let (_folder, engine, asked) = scripted_engine(vec![500]);
+        let began = Instant::now();
+        remove_network_within(&engine, "busy", Duration::from_millis(300));
+        assert!(began.elapsed() < Duration::from_secs(1), "the wait ends");
+        assert!(asked.load(Ordering::SeqCst) >= 2, "asked again within it");
+    }
 
     #[test]
     fn only_an_engine_whose_root_is_not_the_hosts_is_taken() {
