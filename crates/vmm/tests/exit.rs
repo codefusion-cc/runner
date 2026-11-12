@@ -37,6 +37,24 @@ fn a_machine_found_stopped_after_the_host_asked_was_stopped_by_the_host() {
 }
 
 #[test]
+fn a_machine_found_failed_was_stopped_only_if_the_host_asked() {
+    // A container killed by the host's stop ends with a code a failure ends with too.
+    let cell = ExitCell::default();
+    cell.stop_asked();
+    cell.found_failed("ended with 137".into());
+    assert_eq!(cell.wait(Duration::ZERO), Some(VmExit::Stopped));
+
+    let cell = ExitCell::default();
+    cell.found_failed("ended with 137".into());
+    cell.stop_asked();
+    cell.found_stopped();
+    assert_eq!(
+        cell.wait(Duration::ZERO),
+        Some(VmExit::Error("ended with 137".into()))
+    );
+}
+
+#[test]
 fn a_wait_ends_with_its_time_or_with_the_machine_whichever_is_first() {
     let cell = Arc::new(ExitCell::default());
     let started = Instant::now();

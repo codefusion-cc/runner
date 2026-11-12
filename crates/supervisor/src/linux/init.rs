@@ -20,7 +20,7 @@ const CONSOLE: &str = "/dev/hvc0";
 /// A machine no host talks to powers itself off after this long.
 const HOST_WAIT: Duration = Duration::from_secs(120);
 /// After the last message, how long the host has to take it before the power goes.
-const LAST_WORDS: Duration = Duration::from_secs(3);
+pub(super) const LAST_WORDS: Duration = Duration::from_secs(3);
 /// The host is this address on the machine's socket.
 const HOST_CID: u32 = 2;
 /// The supervisor's own copy, which the job's container and its hooks run.
@@ -70,6 +70,11 @@ pub fn spawn_self(
 pub struct Host(Arc<Mutex<File>>);
 
 impl Host {
+    /// The host at the other end of this stream.
+    pub fn new(stream: File) -> Self {
+        Self(Arc::new(Mutex::new(stream)))
+    }
+
     /// Sends a message; a host that is gone is found by the reader, not here.
     pub fn send(&self, message: &GuestMessage) {
         if let Ok(mut stream) = self.0.lock() {
@@ -82,7 +87,7 @@ impl Host {
 /// What reaches the supervisor from outside.
 pub enum Event {
     /// A message of the host's.
-    Host(HostMessage),
+    Host(Box<HostMessage>),
     /// The host closed the connection or sent what is no message.
     HostGone,
     /// The job's launcher ended, with this wait status.
@@ -144,7 +149,7 @@ pub fn run() -> ! {
         loop {
             match read_message::<HostMessage>(&mut reader) {
                 Ok(Some(message)) => {
-                    if from_host.send(Event::Host(message)).is_err() {
+                    if from_host.send(Event::Host(Box::new(message))).is_err() {
                         return;
                     }
                 }
@@ -220,7 +225,7 @@ fn perform(
     }
 }
 
-fn describe(read: &Result<Option<HostMessage>, cf_guest_proto::ProtoError>) -> String {
+pub(super) fn describe(read: &Result<Option<HostMessage>, cf_guest_proto::ProtoError>) -> String {
     match read {
         Ok(Some(_)) => "another message came first".into(),
         Ok(None) => "it closed the connection".into(),

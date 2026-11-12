@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cf_budget::{HostError, HostFacts, Mode, Settings};
+use cf_budget::{HostError, HostFacts, Mode, Sandbox, Settings};
 use cf_host_macos::{
     MacHost, battery, boot_session, boot_time, cpu_percent, host_name, load, model, performance_cores,
     program_of,
@@ -33,9 +33,13 @@ impl Platform for Mac {
         MacHost::new(state_dir)
     }
 
-    fn settings(facts: HostFacts, mode: Mode, trusted: bool) -> Settings {
+    fn settings(facts: HostFacts, mode: Mode, trusted: bool, sandbox: Sandbox) -> Settings {
         let fast = performance_cores();
         let settings = Settings::for_host(facts, mode).on_fast_cores(fast);
+        let settings = match sandbox {
+            Sandbox::Vm => settings,
+            Sandbox::Container => settings.in_containers(),
+        };
         if trusted {
             settings.one_at_a_time(fast)
         } else {

@@ -289,6 +289,14 @@ journalctl --user -u codefusion-runner     # when systemd started and stopped it
 
 `uninstall`, `update` and `restart` work as on a Mac.
 
+A host without KVM runs each job in a container of its own instead (`docs/containers.md`): `--sandbox container`
+sets up the Runner user's rootless Podman and its image, and the host takes only private repositories' `cf-container`
+jobs, with no Docker.
+
+```sh
+sudo scripts/host-setup.sh --machine <name> --console <url> --code-file <file> --sandbox container
+```
+
 ## Build and try it
 
 You need an Apple silicon Mac and Rust (`rustup`).

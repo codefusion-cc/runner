@@ -92,6 +92,7 @@ mod linux {
             disks: Vec::new(),
             network: Network::None,
             console: base.path().join(format!("{name}.console")),
+            layer_bytes: None,
         };
         let spec = |initramfs: &Path, name: &str| spec_of(&kernel, initramfs, name);
         let checks: [(&str, &Check); 6] = [

@@ -56,6 +56,10 @@ pub enum RunError {
     Scratch(String),
 }
 
+/// What a container's guest waits past its vm-host's longest life before it ends the job by itself
+/// ([`cf_guest_proto::Job::end_by_ms`]): the guest counts from its workload's start, a little before the host's `ready`.
+pub const GUEST_GRACE: Duration = Duration::from_secs(30);
+
 /// How often the machine is asked what time it is when nothing else happens.
 const TICK: Duration = Duration::from_millis(200);
 /// A Unix socket's path may be this long on macOS, the shorter of the two systems.
@@ -106,12 +110,23 @@ pub fn run(
         let path = path.display().to_string();
         move |error| RunError::Io(path, error)
     };
-    let rootfs = layout.rootfs(&request.image);
-    if !rootfs.is_file() {
-        return Err(RunError::Image(request.image));
-    }
-    for trusted in layout.trusted_for(&request.image) {
-        private(&trusted).map_err(RunError::NotPrivate)?;
+    if vmm.containers() {
+        // The engine holds the image, and a container has none of a machine's walls: no Docker beside the job, which
+        // would need a privileged container, and no trusted job, whose gate stands on a kernel of its own.
+        if request.docker {
+            return Err(RequestError::Refused("a job in a container gets no Docker").into());
+        }
+        if request.trusted.is_some() {
+            return Err(RequestError::Refused("a trusted job runs in a virtual machine only").into());
+        }
+    } else {
+        let rootfs = layout.rootfs(&request.image);
+        if !rootfs.is_file() {
+            return Err(RunError::Image(request.image));
+        }
+        for trusted in layout.trusted_for(&request.image) {
+            private(&trusted).map_err(RunError::NotPrivate)?;
+        }
     }
     let (state_path, socket_path, job_dir) = (layout.state(&job), layout.socket(&job), layout.job_dir(&job));
     for folder in [layout.run(), layout.logs()] {
@@ -149,6 +164,7 @@ fn run_in(
     cancel: &AtomicBool,
 ) -> Result<JobState, RunError> {
     let job = request.job.clone();
+    let containers = vmm.containers();
     let (state_path, socket_path, job_dir, console) = (
         layout.state(&job),
         layout.socket(&job),
@@ -176,6 +192,8 @@ fn run_in(
 
     // The registration leaves this process with the guest's task; nothing here keeps a second copy for longer
     // than a second boot may need it.
+    let guest_limits = request.limits_in(containers);
+    let limit_bytes = guest_limits.memory_bytes;
     let mut task = Some(Job {
         name: job.clone(),
         host: request.host.clone(),
@@ -183,9 +201,10 @@ fn run_in(
             &mut request.workload,
             cf_guest_proto::Workload::Command { argv: Vec::new() },
         ),
-        limits: request.limits(),
+        limits: guest_limits,
         env: std::mem::take(&mut request.env),
         oom_grace_ms: 15_000,
+        end_by_ms: containers.then(|| (limits.longest_life() + GUEST_GRACE).as_millis() as u64),
         blocked: crate::host_net::host_networks(),
         docker: request.docker,
         trusted: request.trusted.clone(),
@@ -197,7 +216,7 @@ fn run_in(
         started_at: now_s() - started.elapsed().as_secs(),
         stage,
         vm_bytes: request.memory_bytes,
-        limit_bytes: request.limits().memory_bytes,
+        limit_bytes,
         cpus: request.cpus,
         image: request.image.clone(),
         boots: machine.map_or(0, Machine::boots),
@@ -263,16 +282,21 @@ fn run_in(
         stopped.get().is_some()
     };
     let scratch_disk = job_dir.join("scratch.img");
-    let prepared = scratch::template(
-        vmm,
-        layout,
-        &files,
-        &request.image,
-        request.scratch_bytes,
-        &console,
-        &stop_asked,
-    )
-    .and_then(|template| scratch::copy(&template, &scratch_disk));
+    // A container writes into its own layer, which goes with it: there is no disk to make.
+    let prepared = if containers {
+        Ok(())
+    } else {
+        scratch::template(
+            vmm,
+            layout,
+            &files,
+            &request.image,
+            request.scratch_bytes,
+            &console,
+            &stop_asked,
+        )
+        .and_then(|template| scratch::copy(&template, &scratch_disk))
+    };
     if stop_asked() {
         done.store(true, Ordering::Relaxed);
         let mut state = snapshot(None, Stage::Ended);
@@ -290,13 +314,23 @@ fn run_in(
         let _ = fs::remove_file(&state_path);
         return Err(RunError::Scratch(error));
     }
-    let spec = files.machine(
-        &scratch_disk,
-        request.memory_bytes,
-        request.cpus as usize,
-        Network::Nat,
-        &console,
-    );
+    let spec = if containers {
+        files.container(
+            request.memory_bytes,
+            request.cpus as usize,
+            request.scratch_bytes,
+            Network::Nat,
+            &console,
+        )
+    } else {
+        files.machine(
+            &scratch_disk,
+            request.memory_bytes,
+            request.cpus as usize,
+            Network::Nat,
+            &console,
+        )
+    };
     // The job's clock starts here: the wait for a guest's `ready` is for the boot, not for a disk made before it.
     let (mut machine, first) = Machine::new(limits, started.elapsed());
     // The worst wait of the machine's vCPUs for the host's CPUs: only the host sees it, so the guest's peaks have it not.
@@ -323,11 +357,21 @@ fn run_in(
                         disk.look(old.as_ref());
                         disk.next_machine();
                         put_down(old.as_ref(), Duration::from_secs(3));
+                        let_go(old);
                     }
                     match vmm.start(&spec) {
                         Ok(machine) => {
                             let machine: Arc<dyn Vm> = Arc::from(machine);
                             watch(machine.clone(), current, generation.clone(), sender.clone());
+                            if containers {
+                                measure(
+                                    machine.clone(),
+                                    current,
+                                    generation.clone(),
+                                    sender.clone(),
+                                    limits.layer_look,
+                                );
+                            }
                             vm = Some(machine);
                         }
                         Err(error) => events.push_back(Event::StartFailed(error.to_string())),
@@ -405,6 +449,7 @@ fn run_in(
                     if let Some(vm) = vm.take() {
                         disk.look(vm.as_ref());
                         put_down(vm.as_ref(), Duration::from_secs(2));
+                        let_go(vm);
                     }
                     let io = disk.total();
                     let state = JobState {
@@ -467,6 +512,12 @@ fn run_in(
                 .map_or(Event::ChannelClosed, |exit| Event::VmExited(describe(&exit))),
             (event, _) => event,
         };
+        // A container's layer is on the host's disk, which it may fill no more than its own disk would hold.
+        if let Event::Layer(bytes) = event
+            && bytes > request.scratch_bytes
+        {
+            events.push_back(Event::DiskFull(request.scratch_bytes));
+        }
         actions.extend(machine.handle(event, started.elapsed()));
     }
 }
@@ -510,6 +561,16 @@ fn add(a: Option<DiskIo>, b: Option<DiskIo>) -> Option<DiskIo> {
     }
 }
 
+/// Lets go of a machine that was put down once its watcher has, which sees the new generation within a nap: the
+/// last hold removes what the machine still had (a container and its network), and that is gone before the job's
+/// end is told. A watcher held up by a full queue is waited for no longer than a second.
+fn let_go(vm: Arc<dyn Vm>) {
+    let since = Instant::now();
+    while Arc::strong_count(&vm) > 1 && since.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// Watches one machine: opens the channel as soon as the guest listens, and says when the machine is gone.
 fn watch(vm: Arc<dyn Vm>, of: u32, generation: Arc<AtomicU32>, sender: SyncSender<Message>) {
     std::thread::spawn(move || {
@@ -526,6 +587,29 @@ fn watch(vm: Arc<dyn Vm>, of: u32, generation: Arc<AtomicU32>, sender: SyncSende
             if let Some(exit) = vm.wait(nap) {
                 let _ = sender.send(Message::Machine(of, Event::VmExited(describe(&exit))));
                 return;
+            }
+        }
+    });
+}
+
+/// Measures a container's writable layer every `look` while the machine is the job's. A look that cannot be
+/// queued is dropped: the next one tells the same, and the watcher is never held up by the queue.
+fn measure(
+    vm: Arc<dyn Vm>,
+    of: u32,
+    generation: Arc<AtomicU32>,
+    sender: SyncSender<Message>,
+    look: Duration,
+) {
+    std::thread::spawn(move || {
+        while generation.load(Ordering::SeqCst) == of {
+            if let Some(bytes) = vm.layer_bytes() {
+                let _ = sender.try_send(Message::Machine(of, Event::Layer(bytes)));
+            }
+            // Naps short enough that a machine let go of is not held for long.
+            let since = Instant::now();
+            while since.elapsed() < look && generation.load(Ordering::SeqCst) == of {
+                std::thread::sleep(look.min(Duration::from_millis(50)));
             }
         }
     });

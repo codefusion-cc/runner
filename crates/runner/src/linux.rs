@@ -188,8 +188,10 @@ fn noexec_mount(folder: &Path) -> Option<PathBuf> {
     Some(mount.to_path_buf())
 }
 
-/// The lines of `check` for what a Linux host needs, in the order they are best fixed in.
-pub fn lines(facts: &Facts) -> Vec<Result<String, String>> {
+/// The lines of `check` for what a Linux host needs, in the order they are best fixed in. A host whose jobs run in
+/// `containers` needs no KVM, pasta or disk of a machine's: its engine does what they do, and `check` asks it
+/// ([`cf_vmm_oci::probe`]). Lingering, the cgroups and user namespaces it needs as a rootless engine does.
+pub fn lines(facts: &Facts, containers: bool) -> Vec<Result<String, String>> {
     let Facts { user, uid, .. } = facts;
     let restart_manager = format!("sudo systemctl restart user@{uid}.service");
     let mut lines = vec![match &facts.kvm {
@@ -270,6 +272,11 @@ pub fn lines(facts: &Facts) -> Vec<Result<String, String>> {
             ))
         }
     });
+    if containers {
+        // No machine starts here, so /dev/kvm is not asked for.
+        drop(lines.remove(0));
+        return lines;
+    }
     lines.push(match &facts.pasta {
         Ok(path) => Ok(format!("pasta at {}", path.display())),
         Err(error) => Err(format!(
@@ -326,14 +333,46 @@ mod tests {
     }
 
     fn missing(facts: &Facts) -> Vec<String> {
-        lines(facts).into_iter().filter_map(Result::err).collect()
+        lines(facts, false).into_iter().filter_map(Result::err).collect()
     }
 
     #[test]
     fn a_ready_host_misses_nothing() {
-        let lines = lines(&ready());
+        let lines = lines(&ready(), false);
         assert_eq!(lines.len(), 7);
         assert!(lines.iter().all(Result::is_ok), "{lines:?}");
+    }
+
+    /// A host with no KVM, no pasta and a state folder that takes no direct I/O runs containers all the same; what
+    /// a rootless engine needs too is still asked for.
+    #[test]
+    fn a_container_host_needs_no_kvm_pasta_or_machine_disk() {
+        let bare = Facts {
+            kvm: Err(Kvm::Missing),
+            pasta: Err("not installed".into()),
+            noexec: Some("/var".into()),
+            direct_io: Err("tmpfs".into()),
+            ..ready()
+        };
+        let lines = lines(&bare, true);
+        assert!(lines.iter().all(Result::is_ok), "{lines:?}");
+        assert_eq!(
+            lines.len(),
+            3,
+            "lingering, the cgroups and user namespaces: {lines:?}"
+        );
+        let said = super::lines(
+            &Facts {
+                linger: false,
+                ..bare.clone()
+            },
+            true,
+        );
+        assert!(
+            said[0].as_ref().is_err_and(|line| line.contains("enable-linger")),
+            "{said:?}"
+        );
+        assert_eq!(missing(&bare).len(), 4, "a host of machines misses all four");
     }
 
     #[test]

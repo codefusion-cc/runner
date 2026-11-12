@@ -247,7 +247,7 @@ fn merged(now: &str, last: &str, owned: &str, settings: &str) -> Result<serde_js
     }
 }
 
-const OWNED: &str = r#"{"machine": "lon1", "class": null, "state_dir": "/s", "build_folder": null, "image": "i1",
+const OWNED: &str = r#"{"machine": "lon1", "class": null, "sandbox": null, "engine": null, "state_dir": "/s", "build_folder": null, "image": "i1",
     "console": "https://c", "github_api": null, "use": "dedicated"}"#;
 
 #[test]
@@ -275,6 +275,125 @@ fn keys_the_runner_or_the_console_set_stay_and_settings_left_out_go() {
         })),
         "the console's max_jobs stays; ci_cpus and vcpus, set by the last run alone, go; an owned key now null goes"
     );
+}
+
+#[test]
+fn a_host_moved_from_containers_to_machines_loses_its_engine() {
+    let container = OWNED.replace(
+        r#""sandbox": null, "engine": null"#,
+        r#""sandbox": "container", "engine": "/run/user/1001/podman/podman.sock""#,
+    );
+    let now = merged("{}", "{}", &container, "{}").expect("a container host");
+    assert_eq!(
+        (&now["sandbox"], &now["engine"]),
+        (
+            &serde_json::json!("container"),
+            &serde_json::json!("/run/user/1001/podman/podman.sock")
+        )
+    );
+    let vm = merged(&now.to_string(), "{}", OWNED, "{}").expect("a machine host");
+    assert!(vm.get("sandbox").is_none() && vm.get("engine").is_none(), "{vm}");
+    let refused = merged("{}", "{}", OWNED, r#"{"engine": "/x.sock"}"#).expect_err("refused");
+    assert!(
+        refused.contains("--settings: engine only this script sets"),
+        "{refused}"
+    );
+}
+
+/// `kept_image` of the script, sourced: the image an enrolled host keeps of the one configured, for this prefix.
+fn kept(configured: &str, prefix: &str) -> String {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/host-setup.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\" && kept_image \"$2\" \"$3\"",
+            "bash",
+            script,
+            configured,
+            prefix,
+        ])
+        .output()
+        .expect("bash runs");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).expect("UTF-8")
+}
+
+#[test]
+fn an_enrolled_host_keeps_its_image_only_while_its_sandbox_runs_that_kind() {
+    assert_eq!(
+        kept("amd64-image-2026.11.12-1", "amd64-image-"),
+        "amd64-image-2026.11.12-1\n"
+    );
+    assert_eq!(
+        kept("container-image-2026.11.12-1", "container-image-"),
+        "container-image-2026.11.12-1\n"
+    );
+    assert_eq!(
+        kept("amd64-image-2026.11.12-1", "amd64-container-image-"),
+        "",
+        "moved to containers"
+    );
+    assert_eq!(
+        kept("container-image-2026.11.12-1", "image-"),
+        "",
+        "moved to machines"
+    );
+    assert_eq!(kept("", "image-"), "", "none configured");
+}
+
+/// `modules_wanted` of the script, sourced: what a container host still needs of `modules`, given its boot list's
+/// text (none: no file) and the modules loaded now.
+fn wanted(boot_list: Option<&str>, loaded: &[&str], modules: &[&str]) -> String {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/host-setup.sh");
+    let dir = tempfile::tempdir().expect("a folder");
+    let list = dir.path().join("codefusion-runner.conf");
+    if let Some(text) = boot_list {
+        std::fs::write(&list, text).expect("the boot list");
+    }
+    let sys = dir.path().join("module");
+    for module in loaded {
+        std::fs::create_dir_all(sys.join(module)).expect("a loaded module");
+    }
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\" && shift && modules_wanted \"$@\"",
+            "bash",
+            script,
+        ])
+        .arg(&list)
+        .arg(&sys)
+        .args(modules)
+        .output()
+        .expect("bash runs");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).expect("UTF-8")
+}
+
+#[test]
+fn a_container_host_loads_the_firewalls_modules_now_and_at_every_boot() {
+    let modules = ["nf_tables", "nft_ct"];
+    assert_eq!(
+        wanted(None, &[], &modules),
+        "boot nf_tables\nnow nf_tables\nboot nft_ct\nnow nft_ct\n",
+        "a new host"
+    );
+    assert_eq!(
+        wanted(Some("nf_tables\nnft_ct\n"), &["nf_tables", "nft_ct"], &modules),
+        "",
+        "a host that has them"
+    );
+    assert_eq!(
+        wanted(Some("nf_tables\n"), &["nf_tables"], &modules),
+        "boot nft_ct\nnow nft_ct\n",
+        "a host with one of them"
+    );
+    assert_eq!(
+        wanted(Some("# nft_ct\nnft_ct_extra\n"), &["nf_tables"], &["nft_ct"]),
+        "boot nft_ct\nnow nft_ct\n",
+        "a comment or a longer name is not the module"
+    );
+    assert_eq!(wanted(None, &[], &[]), "", "no modules asked for");
 }
 
 #[test]
@@ -429,6 +548,23 @@ fn each_step_takes_only_its_own_options() {
         ),
         (base.to_vec(), "--code-file is needed (or --check)"),
         (vec!["enroll", "--home", "relative"], "--home: an absolute path"),
+        (
+            vec!["enroll", "--sandbox", "container"],
+            "enroll takes --sandbox from the configuration",
+        ),
+        (
+            [&["install"][..], &base, &["--sandbox", "chroot"]].concat(),
+            "--sandbox: vm or container",
+        ),
+        (
+            [
+                &["install"][..],
+                &base,
+                &["--sandbox", "container", "--class", "trusted"],
+            ]
+            .concat(),
+            "--sandbox: a trusted host runs its jobs in machines",
+        ),
         (vec!["install", "--machine"], "--machine needs a value"),
     ];
     for (args, said) in cases {
@@ -461,6 +597,19 @@ fn right_options_get_as_far_as_asking_for_root() {
         [
             &base[..],
             &["--version", "0.1.0-446125c0a1b2", "--sha256", SHA, "--check"],
+        ]
+        .concat(),
+        [
+            &["install"][..],
+            &base,
+            &[
+                "--sandbox",
+                "container",
+                "--version",
+                "0.1.0-446125c0a1b2",
+                "--sha256",
+                SHA,
+            ],
         ]
         .concat(),
         vec!["enroll", "--code-file", "/nowhere/code", "--home", "/home/x"],

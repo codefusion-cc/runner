@@ -11,6 +11,7 @@ cf-budget = { path = "../budget" }
 cf-guest-proto = { path = "../guest-proto" }
 cf-lifecycle = { path = "../lifecycle" }
 cf-vmhost = { path = "../vmhost" }
+cf-vmm-oci = { path = "../vmm-oci" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -37,6 +38,7 @@ cf-host-linux = { path = "../host-linux" }
 cf-fake-console = { path = "../fake-console" }
 cf-fake-github = { path = "../fake-github" }
 cf-harness = { path = "../harness" }
+cf-vmm = { path = "../vmm" }
 proptest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

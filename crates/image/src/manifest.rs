@@ -45,6 +45,39 @@ pub struct Asset {
     pub sha256: String,
 }
 
+/// What a root filesystem is, and so which hosts install it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootfsKind {
+    /// An erofs image a machine boots from read-only.
+    #[default]
+    #[serde(rename = "erofs")]
+    Erofs,
+    /// A gzip-compressed tar of the same files, which a container engine imports as an image (container mode).
+    #[serde(rename = "tar.gz")]
+    TarGz,
+}
+
+impl RootfsKind {
+    /// Its name in a manifest and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            RootfsKind::Erofs => "erofs",
+            RootfsKind::TarGz => "tar.gz",
+        }
+    }
+
+    /// The kind of this name.
+    pub fn named(name: &str) -> Option<Self> {
+        [RootfsKind::Erofs, RootfsKind::TarGz]
+            .into_iter()
+            .find(|kind| kind.name() == name)
+    }
+
+    fn is_erofs(&self) -> bool {
+        *self == RootfsKind::Erofs
+    }
+}
+
 /// The root filesystem, whole and in the parts it was published in (the order is the order to join them).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rootfs {
@@ -54,6 +87,9 @@ pub struct Rootfs {
     pub sha256: String,
     /// The parts, each at most as large as a release asset may be.
     pub parts: Vec<Asset>,
+    /// What the whole is. Signed with the rest; left out for erofs, so a release of one reads as it always did.
+    #[serde(default, skip_serializing_if = "RootfsKind::is_erofs")]
+    pub kind: RootfsKind,
 }
 
 /// `image.json`: what a release is made of.

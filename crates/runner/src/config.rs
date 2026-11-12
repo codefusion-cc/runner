@@ -5,10 +5,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cf_budget::{Limits, Millis, Mode, Settings, Size};
+use cf_budget::{Limits, Millis, Mode, Sandbox, Settings, Size};
 use cf_console_client::Os;
 use cf_daemon::names::slug;
 use serde::Deserialize;
+
+/// The host label a host that runs jobs in containers has and keeps itself for: only a job that asks for it runs
+/// there, so deploy, release and signing jobs, which never do, stay on hosts whose jobs have machines of their own.
+pub const CONTAINER_LABEL: &str = "cf-container";
 
 /// The label of the cf-runners manager's launchd agent, which the Runner may run beside and never touches.
 #[cfg(target_os = "macos")]
@@ -129,6 +133,28 @@ pub struct Config {
     /// host all the same, and every job it is given is refused with the reason.
     #[serde(default)]
     pub trusted: Option<cf_trusted::Policy>,
+    /// What keeps each job from the host: `vm`, a virtual machine of its own (left out, this), or `container`, a
+    /// container of its own in a Docker-compatible engine ([`Config::engine`]), for a host that gives no
+    /// virtualization. A container shares the host's kernel, so such a host serves private repositories only, gives
+    /// no job Docker, is never trusted, and takes only the jobs that ask for [`CONTAINER_LABEL`], which it adds to
+    /// `labels` and `only_labels` itself.
+    #[serde(default, deserialize_with = "sandbox")]
+    pub sandbox: Sandbox,
+    /// The API socket of the engine jobs run in with `sandbox: container`, such as
+    /// `/run/user/1001/docker.sock` for a rootless Docker or `/run/user/1001/podman/podman.sock`: an absolute path.
+    /// Only with `container`, and required there.
+    #[serde(default)]
+    pub engine: Option<PathBuf>,
+}
+
+fn sandbox<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Sandbox, D::Error> {
+    match String::deserialize(deserializer)?.as_str() {
+        "vm" => Ok(Sandbox::Vm),
+        "container" => Ok(Sandbox::Container),
+        other => Err(serde::de::Error::custom(format!(
+            "sandbox: `{other}` is neither `vm` nor `container`"
+        ))),
+    }
 }
 
 fn github_api() -> String {
@@ -166,7 +192,15 @@ impl Config {
 
     /// Reads and checks the file's text.
     pub fn parse(text: &str) -> Result<Config, String> {
-        let config: Config = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let mut config: Config = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        if config.sandbox == Sandbox::Container {
+            // Only the jobs that ask for a container run on a container host, whoever wrote its file.
+            for list in [&mut config.labels, &mut config.only_labels] {
+                if !list.iter().any(|label| label == CONTAINER_LABEL) {
+                    list.push(CONTAINER_LABEL.into());
+                }
+            }
+        }
         config.check()?;
         Ok(config)
     }
@@ -313,7 +347,47 @@ impl Config {
                 return Err(format!("`{repo}` is no `owner/name` repository"));
             }
         }
+        self.check_sandbox()?;
         self.check_class()
+    }
+
+    /// What a host whose jobs run in containers must have, and what one whose jobs have machines may not.
+    fn check_sandbox(&self) -> Result<(), String> {
+        let has_label = self.labels.iter().any(|label| label == CONTAINER_LABEL);
+        if self.sandbox == Sandbox::Vm {
+            if self.engine.is_some() {
+                return Err("engine: only with `\"sandbox\": \"container\"`".into());
+            }
+            if has_label {
+                return Err(format!(
+                    "labels: `{CONTAINER_LABEL}` names hosts whose jobs run in containers; this one's have machines"
+                ));
+            }
+            return Ok(());
+        }
+        match &self.engine {
+            None => return Err("engine: a container host names its engine's socket".into()),
+            Some(socket) if !socket.is_absolute() => {
+                return Err(format!("engine: `{}` is not an absolute path", socket.display()));
+            }
+            Some(_) => {}
+        }
+        if self.class == Class::Trusted || self.trusted.is_some() {
+            return Err(
+                "class: a trusted host runs its jobs in machines; a container host is `shared`".into(),
+            );
+        }
+        if !self.docker_repos.is_empty() {
+            return Err("docker_repos: a container host gives no job Docker; leave docker_repos out".into());
+        }
+        if !self.public_repos.is_empty() {
+            return Err(
+                "public_repos: a container shares the host's kernel, so a stranger's pull request runs only in a \
+                 machine; leave public_repos out"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// What a trusted host may not have: anything that serves more than one repository's `trusted` jobs, one at a
@@ -874,6 +948,84 @@ mod tests {
             assert!(with(|v| v["docker_max_jobs"] = max.into()).is_err(), "{max}");
         }
         assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
+    }
+
+    /// A container host: its engine.
+    fn container(v: &mut serde_json::Value) {
+        v["sandbox"] = "container".into();
+        v["engine"] = "/run/user/1001/docker.sock".into();
+    }
+
+    #[test]
+    fn a_host_runs_jobs_in_machines_unless_it_names_an_engine_and_keeps_itself_for_containers() {
+        let vm = with(|_| ()).expect("config");
+        assert_eq!((vm.sandbox, vm.engine), (Sandbox::Vm, None));
+        let host = with(container).expect("a container host");
+        assert_eq!(host.sandbox, Sandbox::Container);
+        assert_eq!(
+            (host.labels, host.only_labels),
+            (
+                [labels(), vec!["cf-container".into()]].concat(),
+                vec!["cf-container".into()]
+            ),
+            "it takes only the jobs that ask for a container"
+        );
+        let kept = with(|v| {
+            container(v);
+            v["labels"] = serde_json::json!(["cf-linux", "cf-container", "cf-ops"]);
+            v["only_labels"] = serde_json::json!(["cf-ops"]);
+        })
+        .expect("labels of its own");
+        assert_eq!(
+            (kept.labels, kept.only_labels),
+            (
+                vec!["cf-linux".into(), "cf-container".into(), "cf-ops".into()],
+                vec!["cf-ops".into(), "cf-container".into()]
+            )
+        );
+        assert_eq!(
+            host.engine.as_deref(),
+            Some(Path::new("/run/user/1001/docker.sock"))
+        );
+        assert_eq!(
+            with(|v| v["sandbox"] = "vm".into()).expect("said").sandbox,
+            Sandbox::Vm
+        );
+
+        let refused = |change: fn(&mut serde_json::Value)| {
+            with(|v| {
+                container(v);
+                change(v);
+            })
+            .err()
+            .unwrap_or_else(|| "taken".into())
+        };
+        let said = refused(|v| v["sandbox"] = "chroot".into());
+        assert!(said.contains("neither `vm` nor `container`"), "{said}");
+        for (change, word) in [
+            (
+                (|v| v["engine"] = serde_json::Value::Null) as fn(&mut serde_json::Value),
+                "engine:",
+            ),
+            (|v| v["engine"] = "docker.sock".into(), "not an absolute path"),
+            (
+                |v| v["docker_repos"] = serde_json::json!(["org/app"]),
+                "docker_repos",
+            ),
+            (
+                |v| v["public_repos"] = serde_json::json!(["org/site"]),
+                "public_repos",
+            ),
+            (|v| v["class"] = "trusted".into(), "class:"),
+        ] {
+            let said = refused(change);
+            assert!(said != "taken" && said.contains(word), "{word}: {said}");
+        }
+        // A host whose jobs have machines names no engine and does not pass for a container host.
+        let said = with(|v| v["engine"] = "/run/docker.sock".into()).expect_err("an engine for nothing");
+        assert!(said.starts_with("engine:"), "{said}");
+        let said = with(|v| v["labels"] = serde_json::json!(["cf-container"])).expect_err("a machine host");
+        assert!(said.contains("`cf-container` names hosts"), "{said}");
     }
 
     #[test]

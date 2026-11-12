@@ -24,6 +24,7 @@ fn job(secret: &str) -> Job {
         },
         env: vec![("CI".into(), String::from("true").into())],
         oom_grace_ms: 15_000,
+        end_by_ms: None,
         blocked: vec![([203, 0, 113, 0], 24)],
         docker: true,
         trusted: None,

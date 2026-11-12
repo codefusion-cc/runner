@@ -5,6 +5,9 @@ name: Image
 # list of their hashes. One release for each architecture a host runs, each built on a runner of that architecture:
 # arm64 under `image-<date>-<run>`, amd64 under `amd64-image-<date>-<run>`. The amd64 tag does not start with `image-`
 # on purpose: what takes the newest `image-` release (the console's connect steps) takes arm64's, as before.
+# Beside each, a container-image release (`container-image-…`, `amd64-container-image-…`) for hosts in container mode:
+# the same files as a gzip tar, which `image install --engine` gives the host's container engine, and the same kernel
+# and initramfs, signed the same way.
 #
 # `build` makes all of it and proves the result verifies, signed with a key made for the run. It holds no secret, so
 # a pull request that touches the image runs it too. `publish` runs only on main: it signs what `build` made with
@@ -44,10 +47,12 @@ jobs:
             arch: aarch64
             runner: ubuntu-24.04-arm
             tag: image-
+            container_tag: container-image-
           - platform: amd64
             arch: x86_64
             runner: ubuntu-24.04
             tag: amd64-image-
+            container_tag: amd64-container-image-
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -68,21 +73,21 @@ jobs:
           set -euo pipefail
           docker build -t cf-guest-rootfs image
           docker create --name cf-guest-rootfs cf-guest-rootfs
-          docker export cf-guest-rootfs > "$RUNNER_TEMP/rootfs.tar"
+          mkdir payload
+          # The tar is the container-image release's root file system, as an engine imports it.
+          docker export cf-guest-rootfs | gzip -1 > payload/rootfs.tar.gz
           # The tar holds everything from here on; the image's layers only take the disk the next steps need.
           docker rm cf-guest-rootfs
           docker system prune --all --force > /dev/null
           # mkfs.erofs 1.7.1 on this runner writes an image fsck.erofs refuses when it compresses straight
           # from a tar, so the tar is unpacked first. Root keeps owners, modes and file capabilities.
           sudo mkdir "$RUNNER_TEMP/rootfs"
-          sudo tar -xf "$RUNNER_TEMP/rootfs.tar" -C "$RUNNER_TEMP/rootfs" --numeric-owner --xattrs --xattrs-include='*'
-          rm "$RUNNER_TEMP/rootfs.tar"
-          mkdir payload
+          sudo tar -xzf payload/rootfs.tar.gz -C "$RUNNER_TEMP/rootfs" --numeric-owner --xattrs --xattrs-include='*'
           sudo mkfs.erofs -zlz4hc payload/rootfs.erofs "$RUNNER_TEMP/rootfs"
           sudo chown "$(id -u):$(id -g)" payload/rootfs.erofs
           sudo rm -rf "$RUNNER_TEMP/rootfs"
           fsck.erofs payload/rootfs.erofs
-          ls -l payload/rootfs.erofs
+          ls -l payload/rootfs.erofs payload/rootfs.tar.gz
           df -h "$GITHUB_WORKSPACE"
 
       - name: Kernel and initramfs
@@ -100,19 +105,21 @@ jobs:
           mkdir tools
           cp target/debug/xtask target/debug/codefusion-runner tools/
       # Small parts on purpose: the real image is cut into several and read back as one, whatever its size.
-      - name: A release of it, signed with a key made for this run, verifies
+      - name: Both releases of it, signed with a key made for this run, verify
         run: |
           set -euo pipefail
-          tools/xtask release --ephemeral --version dry-run --out "$RUNNER_TEMP/dry-run" --arch ${{ matrix.arch }} \
-            --guest payload --rootfs payload/rootfs.erofs --max-part 268435456
-          ls -l "$RUNNER_TEMP/dry-run"
-          # The key of this run is not the committed one, so the verifier must refuse the release for its signature.
-          if refusal="$(tools/codefusion-runner image verify "$RUNNER_TEMP/dry-run" --version dry-run 2>&1)"; then
-            echo "a release signed with another key passed the committed key"
-            exit 1
-          fi
-          grep -q "signature of SHA256SUMS is not valid" <<< "$refusal" || { echo "refused for another reason: $refusal"; exit 1; }
-          rm -r "$RUNNER_TEMP/dry-run"
+          for kind in erofs tar.gz; do
+            tools/xtask release --ephemeral --version dry-run --out "$RUNNER_TEMP/dry-run" --arch ${{ matrix.arch }} \
+              --guest payload --rootfs "payload/rootfs.$kind" --rootfs-kind "$kind" --max-part 268435456
+            ls -l "$RUNNER_TEMP/dry-run"
+            # The key of this run is not the committed one, so the verifier must refuse the release for its signature.
+            if refusal="$(tools/codefusion-runner image verify "$RUNNER_TEMP/dry-run" --version dry-run 2>&1)"; then
+              echo "a release signed with another key passed the committed key"
+              exit 1
+            fi
+            grep -q "signature of SHA256SUMS is not valid" <<< "$refusal" || { echo "refused for another reason: $refusal"; exit 1; }
+            rm -r "$RUNNER_TEMP/dry-run"
+          done
       - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -161,13 +168,21 @@ jobs:
           set -euo pipefail
           chmod +x tools/xtask tools/codefusion-runner
           version="${{ matrix.tag }}${{ needs.version.outputs.stem }}"
+          container="${{ matrix.container_tag }}${{ needs.version.outputs.stem }}"
           test -n "${{ needs.version.outputs.stem }}"
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "CONTAINER_VERSION=$container" >> "$GITHUB_ENV"
           # The key goes in through standard input: never a file, an argument or a log line.
           tools/xtask release --version "$version" --out release --arch ${{ matrix.arch }} \
             --guest payload --rootfs payload/rootfs.erofs --key-file /dev/stdin <<< "$IMAGE_SIGNING_KEY"
+          tools/xtask release --version "$container" --out container-release --arch ${{ matrix.arch }} \
+            --guest payload --rootfs payload/rootfs.tar.gz --rootfs-kind tar.gz \
+            --key-file /dev/stdin <<< "$IMAGE_SIGNING_KEY"
       - name: Verify what is about to be published, as a machine would after downloading it
-        run: tools/codefusion-runner image verify release --version "$VERSION"
+        run: |
+          set -euo pipefail
+          tools/codefusion-runner image verify release --version "$VERSION"
+          tools/codefusion-runner image verify container-release --version "$CONTAINER_VERSION"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -177,3 +192,7 @@ jobs:
           gh release create "$VERSION" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$VERSION" \
             --notes "Guest image $VERSION. Check a download with \`codefusion-runner image verify <folder> --version $VERSION\`."
+          ls -l container-release
+          gh release create "$CONTAINER_VERSION" container-release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$CONTAINER_VERSION" \
+            --notes "Guest image $VERSION for hosts in container mode. Install it with \`codefusion-runner image install <folder> --version $CONTAINER_VERSION --state-dir <folder> --engine <socket>\`."

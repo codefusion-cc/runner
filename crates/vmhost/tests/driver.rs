@@ -6,14 +6,16 @@ use cf_guest_proto::{
     read_message, write_message,
 };
 use cf_vmhost::control::{self, Request};
-use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run};
+use cf_vmhost::{
+    End, GUEST_GRACE, Guest, JobRequest, JobState, Layout, Limits, RunError, Stage, VM_OVERHEAD, run,
+};
 use cf_vmm::testing::{FakeVmm, PowerSwitch, Script, Stop};
 use cf_vmm::{DiskIo, Network, Psi, VmmError};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,7 @@ fn quick() -> Limits {
         boots: 2,
         publish: ms(0),
         console_bytes: 1 << 20,
+        layer_look: ms(20),
     }
 }
 
@@ -219,6 +222,7 @@ fn a_job_gets_its_machine_its_limits_and_its_registration_and_leaves_only_its_st
         (task.name.as_str(), task.host.as_str(), task.oom_grace_ms),
         ("job-1", "mac-1", 15_000)
     );
+    assert_eq!(task.end_by_ms, None, "a machine ends with its vm-host");
     assert_eq!(
         (
             task.limits.memory_bytes,
@@ -1294,4 +1298,184 @@ fn a_trusted_jobs_folder_is_gone_after_every_end() {
     let state = go_within(&vmm, &layout, trusted("cancelled"), quick(), true).unwrap();
     assert_eq!(state.end.unwrap().end, End::Cancelled);
     assert!(!layout.job_dir("cancelled").exists() && !layout.socket("cancelled").exists());
+}
+
+/// In containers there is no disk to format and no image file to check: the engine holds the image. The job's one
+/// start is a container of its whole size, given the image's disk only, so that the engine knows its version.
+#[test]
+fn in_a_container_the_job_starts_at_once_with_its_whole_size_and_no_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let (seen, tasks) = mpsc::channel();
+    let vmm = FakeVmm::new([job(move |stream, _, task| {
+        seen.send(task).unwrap();
+        finish(stream, summary(GuestEnd::Exited, Some(0)));
+    })])
+    .of_containers();
+    let state = go(&vmm, &layout, request("job-1"), quick()).unwrap();
+    assert_eq!(state.end.as_ref().map(|ended| ended.end), Some(End::Ok));
+    assert_eq!(
+        (state.vm_bytes, state.limit_bytes, state.boots),
+        (4 << 30, 4 << 30, 1)
+    );
+    let Task::Job(task) = tasks.recv().unwrap() else {
+        panic!("the guest was not given a job")
+    };
+    assert_eq!(task.limits.memory_bytes, 4 << 30);
+    // A container whose vm-host hangs or dies outlives it unless its guest ends it: by then the host would have
+    // stopped it, let it end and killed it.
+    assert_eq!(
+        task.end_by_ms,
+        Some((quick().longest_life() + GUEST_GRACE).as_millis() as u64)
+    );
+    let specs = vmm.started();
+    assert_eq!(specs.len(), 1, "no machine formats a disk");
+    let disks: Vec<_> = specs[0]
+        .disks
+        .iter()
+        .map(|disk| (disk.id.as_str(), disk.path.clone(), disk.read_only))
+        .collect();
+    assert_eq!(disks, [("cf-image", layout.rootfs("image-1"), true)]);
+    assert_eq!((specs[0].memory_bytes, specs[0].network), (4 << 30, Network::Nat));
+    assert_eq!(
+        specs[0].layer_bytes,
+        Some(1 << 30),
+        "the engine bounds the layer where it can"
+    );
+    assert!(!layout.job_dir("job-1").exists());
+}
+
+/// Runs a container job while `daemon` plays the other side: it gets the monitor once the job runs.
+fn container_job(vmm: &Arc<FakeVmm>, layout: &Layout, daemon: impl FnOnce(&FakeVmm) + Send) -> JobState {
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(30);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            loop {
+                match control::ask(layout, "a", &Request::State, Duration::from_secs(2)) {
+                    Ok(state) if state.stage == Stage::Running => break,
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            daemon(vmm);
+        });
+        go_within(vmm, layout, request("a"), limits, false).unwrap()
+    })
+}
+
+/// A container has no disk of its own to fill: what it writes goes to its layer on the host's disk, which the
+/// vm-host measures and stops past the job's scratch size.
+#[test]
+fn a_container_that_writes_past_its_disk_size_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let vmm = Arc::new(
+        FakeVmm::new([job(|mut stream, power, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            power.wait_for_the_end();
+        })])
+        .of_containers(),
+    );
+    let state = container_job(&vmm, &layout, |vmm| vmm.layer(Some((1 << 30) + 1)));
+    let ended = state.end.unwrap();
+    assert_eq!(ended.end, End::Failed);
+    assert!(
+        ended.message.unwrap().contains("1024 MiB"),
+        "it says the size it was held to"
+    );
+    assert!(vmm.stops() >= 1);
+}
+
+/// A layer of exactly the scratch size is fine, and the most it held is the job's disk peak, whatever the guest,
+/// which sees no disk of its own, says.
+#[test]
+fn a_containers_disk_peak_is_the_most_its_layer_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let (go_on, wait) = mpsc::channel::<()>();
+    let vmm = Arc::new(
+        FakeVmm::new([job(move |mut stream, _, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            let _ = wait.recv();
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            finish(stream, summary(GuestEnd::Exited, Some(0)));
+        })])
+        .of_containers(),
+    );
+    let state = container_job(&vmm, &layout, move |vmm| {
+        vmm.layer(Some(1 << 30));
+        std::thread::sleep(Duration::from_millis(200));
+        vmm.layer(Some(5 << 20));
+        std::thread::sleep(Duration::from_millis(200));
+        go_on.send(()).unwrap();
+    });
+    let ended = state.end.unwrap();
+    assert_eq!(ended.end, End::Ok);
+    assert_eq!(ended.summary.unwrap().disk_peak_bytes, 1 << 30);
+    assert_eq!(
+        state.usage.unwrap().disk_bytes,
+        5 << 20,
+        "what the layer holds now"
+    );
+}
+
+/// A container is no place for a Docker daemon or a trusted job's gate: both are refused before anything starts.
+#[test]
+fn in_a_container_docker_and_trusted_jobs_are_refused_before_anything_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let vmm = FakeVmm::new([]).of_containers();
+    let docker = JobRequest {
+        docker: true,
+        ..request("job-1")
+    };
+    let trusted = JobRequest {
+        trusted: Some(cf_trusted::Policy::default()),
+        ..request("job-2")
+    };
+    for asked in [docker, trusted] {
+        let job = asked.job.clone();
+        let error = go(&vmm, &layout, asked, quick()).unwrap_err();
+        assert!(matches!(error, RunError::Request(_)), "{error}");
+        assert!(!layout.state(&job).exists());
+    }
+    assert!(vmm.started().is_empty());
+}
+
+#[test]
+fn every_machine_of_a_job_is_let_go_of_before_its_end_is_told() {
+    // A container and its network go when its machine is let go of, which takes a while: a job that has ended has
+    // nothing of it left, whether the end came by itself, the machine took a stop or was killed.
+    // A cancelled job's guest asks for the stop itself once it is ready, so that its machine is up when it comes.
+    let machine = |stop: Option<Stop>, cancel: Arc<AtomicBool>| match stop {
+        None => job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0)))),
+        Some(stop) => Script::Boot {
+            refuse_channel: 0,
+            guest: Box::new(move |mut stream, power| {
+                greet(&mut stream);
+                say(&mut stream, GuestMessage::Ready { boot_ms: 1 });
+                cancel.store(true, Ordering::SeqCst);
+                power.wait_for_the_end();
+            }),
+            stop,
+        },
+    };
+    let machines = [
+        (None, End::Ok),
+        (Some(Stop::Obeys), End::Cancelled),
+        (Some(Stop::Hangs), End::Cancelled),
+        (Some(Stop::Refuses), End::Cancelled),
+    ];
+    for _ in 0..3 {
+        for (stop, the_end) in machines {
+            let (_dir, layout) = state_dir();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let vmm = FakeVmm::new([formatter(), machine(stop, cancel.clone())])
+                .lingering(Duration::from_millis(100));
+            let state = run(&vmm, &layout, GUEST, request("a"), quick(), &cancel).unwrap();
+
+            assert_eq!(state.end.as_ref().map(|ended| ended.end), Some(the_end));
+            assert_eq!((vmm.started().len(), vmm.dropped()), (2, 2), "{stop:?}");
+        }
+    }
 }

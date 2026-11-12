@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cf_image::{DirFiles, ReleaseInputs, public_key_text, verify, write_release};
+use cf_image::{DirFiles, ReleaseInputs, RootfsKind, public_key_text, verify, write_release};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -112,6 +112,7 @@ pub fn build(root: &Path) -> Result<()> {
             kernel: &staging.join(pinned.file_name),
             initramfs: &staging.join(INITRAMFS_FILE),
             rootfs: None,
+            rootfs_kind: Default::default(),
             max_part: MAX_PART,
         },
         &key,
@@ -123,13 +124,14 @@ pub fn build(root: &Path) -> Result<()> {
 }
 
 /// `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--arch A]
-/// [--max-part BYTES]`: the folder the image workflow publishes, verified as a machine would verify it before this
-/// returns. The kernel, the initramfs and the root filesystem are of one architecture, the host's unless `--arch`
-/// names another; the manifest says which.
+/// [--max-part BYTES] [--rootfs-kind erofs|tar.gz]`: the folder the image workflow publishes, verified as a machine
+/// would verify it before this returns. The kernel, the initramfs and the root filesystem are of one architecture, the
+/// host's unless `--arch` names another; the manifest says which, and what the root filesystem is: an erofs image
+/// (the default) or a gzip tar for container hosts.
 pub fn release(root: &Path, args: &[String]) -> Result<()> {
     let (mut version, mut out, mut key_file, mut rootfs) = (None, None, None, None);
     let (mut guest, mut max_part, mut ephemeral) = (root.join("target/guest"), MAX_PART, false);
-    let mut arch = None;
+    let (mut arch, mut rootfs_kind) = (None, RootfsKind::Erofs);
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == "--ephemeral" {
@@ -144,6 +146,9 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
             "--guest" => guest = PathBuf::from(value),
             "--arch" => arch = Some(Arch::named(value)?),
             "--rootfs" => rootfs = Some(PathBuf::from(value)),
+            "--rootfs-kind" => {
+                rootfs_kind = RootfsKind::named(value).ok_or("--rootfs-kind is erofs or tar.gz")?;
+            }
             "--max-part" => {
                 max_part = value
                     .parse()
@@ -171,6 +176,7 @@ pub fn release(root: &Path, args: &[String]) -> Result<()> {
             kernel: &guest.join(Kernel::of(arch).file_name),
             initramfs: &guest.join(INITRAMFS_FILE),
             rootfs: Some(&rootfs),
+            rootfs_kind,
             max_part,
         },
         &key,

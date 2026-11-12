@@ -43,6 +43,7 @@ fn release_with(kernel: &[u8], initramfs: &[u8], rootfs: Option<&[u8]>, max_part
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs.cpio.gz"),
             rootfs: rootfs.map(|_| src.path().join("rootfs.erofs")).as_deref(),
+            rootfs_kind: Default::default(),
             max_part,
         },
         &key,
@@ -438,6 +439,7 @@ fn a_folder_on_disk_verifies_like_memory_and_a_missing_folder_is_missing_files()
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs"),
             rootfs: None,
+            rootfs_kind: Default::default(),
             max_part: 10,
         },
         &signing,
@@ -464,6 +466,7 @@ fn inputs<'a>(kernel: &'a std::path::Path, initramfs: &'a std::path::Path) -> Re
         kernel,
         initramfs,
         rootfs: None,
+        rootfs_kind: Default::default(),
         max_part: 1000,
     }
 }

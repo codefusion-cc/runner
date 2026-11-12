@@ -28,6 +28,9 @@ pub struct Limits {
     pub publish: Duration,
     /// The most a job's machines write to the console log on the Mac; a machine that writes more is stopped.
     pub console_bytes: u64,
+    /// How often a container's writable layer is measured against the job's scratch size. Each look is a walk
+    /// of the layer's files by the engine.
+    pub layer_look: Duration,
 }
 
 impl Limits {
@@ -44,6 +47,7 @@ impl Limits {
             boots: 2,
             publish: Duration::from_secs(10),
             console_bytes: 16 << 20,
+            layer_look: Duration::from_secs(2),
         }
     }
 
@@ -83,6 +87,10 @@ pub enum Event {
     },
     /// The machines of this job wrote more to the console than [`Limits::console_bytes`].
     ConsoleFull,
+    /// A container's writable layer holds this many bytes now.
+    Layer(u64),
+    /// A container's writable layer holds more than the job's disk of this many bytes would.
+    DiskFull(u64),
     /// Time went by.
     Tick,
 }
@@ -113,6 +121,10 @@ pub enum Action {
 
 const CONSOLE_FULL: &str = "the machine wrote more to its console than a job's log may hold";
 
+fn disk_full(most: u64) -> String {
+    format!("the job wrote more than its disk of {} MiB holds", most >> 20)
+}
+
 /// One job's state machine. Times are since the vm-host started.
 #[derive(Debug)]
 pub struct Machine {
@@ -133,6 +145,8 @@ pub struct Machine {
     cpu_load: Option<u32>,
     pressure_peak: Option<Pressure>,
     oom: Option<OomEvent>,
+    /// What a container's layer holds at the last look, and the most it held.
+    layer: Option<(u64, u64)>,
     end: Option<(End, Option<String>, Option<Summary>)>,
 }
 
@@ -154,6 +168,7 @@ impl Machine {
             cpu_load: None,
             pressure_peak: None,
             oom: None,
+            layer: None,
             end: None,
         };
         (machine, vec![Action::Publish, Action::Boot])
@@ -270,7 +285,11 @@ impl Machine {
     /// Keeps what the job uses, the CPUs it kept busy and its worst stalls. The load is over at least
     /// [`Limits::publish`], as long as each state file lasts and the kernel's own 10 s averages of the stalls: a
     /// heartbeat's 2 s would show a burst or a pause as the whole picture.
-    fn heartbeat(&mut self, usage: Usage, now: Duration) {
+    fn heartbeat(&mut self, mut usage: Usage, now: Duration) {
+        // A container's guest sees no disk of its own: what it has on the host's is its layer.
+        if let Some((bytes, _)) = self.layer {
+            usage.disk_bytes = bytes;
+        }
         match self.cpu_at {
             // A fresh guest after a reboot counts its CPU time from zero again: a window starts there.
             Some((before, _)) if usage.cpu_usec < before => self.cpu_at = Some((usage.cpu_usec, now)),
@@ -290,7 +309,11 @@ impl Machine {
         self.usage = Some(usage);
     }
 
-    fn summary(&mut self, summary: Summary, now: Duration) -> Vec<Action> {
+    fn summary(&mut self, mut summary: Summary, now: Duration) -> Vec<Action> {
+        if let Some((bytes, peak)) = self.layer {
+            summary.usage.disk_bytes = bytes;
+            summary.disk_peak_bytes = summary.disk_peak_bytes.max(peak);
+        }
         self.heartbeat(summary.usage, now);
         if self.oom.is_none() {
             self.oom = summary.oom.clone();
@@ -379,6 +402,21 @@ impl Machine {
             }
             (Stage::Done, Event::ConsoleFull) => self.kill(now),
             (Stage::Killing, Event::ConsoleFull) => Vec::new(),
+
+            (_, Event::Layer(bytes)) => {
+                let peak = self.layer.map_or(bytes, |(_, peak)| peak.max(bytes));
+                self.layer = Some((bytes, peak));
+                if let Some(usage) = &mut self.usage {
+                    usage.disk_bytes = bytes;
+                }
+                Vec::new()
+            }
+            (Stage::Booting, Event::DiskFull(most)) => self.give_up(End::BootFailed, disk_full(most), now),
+            (Stage::Running | Stage::Stopping, Event::DiskFull(most)) => {
+                self.give_up(End::Failed, disk_full(most), now)
+            }
+            (Stage::Done, Event::DiskFull(_)) => self.kill(now),
+            (Stage::Killing, Event::DiskFull(_)) => Vec::new(),
 
             (_, Event::Tick) => self.tick(now),
         }

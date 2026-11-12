@@ -30,6 +30,16 @@ async fn a_clock_that_moves_on_while_the_mac_is_read_closes_nothing() {
     assert!(matches!(w.m.claim(SIZE, None), Claim::Start(_)));
 }
 
+/// What a vm-host that died left outside the state folder (a container engine's containers) is the vm-hosts' to
+/// find: every tick asks them, and they decide how often to look.
+#[test]
+fn every_tick_asks_the_vm_hosts_to_tidy() {
+    let w = World::new(2);
+    let before = w.parts.vms.tidied();
+    pass(&w.m, 3);
+    assert_eq!(w.parts.vms.tidied() - before, 3);
+}
+
 #[test]
 fn the_log_says_when_the_mac_opens_and_closes_and_why_and_says_it_once() {
     let mut w = World::new(2);

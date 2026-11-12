@@ -34,6 +34,7 @@ fn a_release_signed_by_a_key_that_is_not_the_trusted_one_is_refused() {
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs"),
             rootfs: None,
+            rootfs_kind: Default::default(),
             max_part: 100,
         },
         &SigningKey::from_bytes(&[9; 32]),

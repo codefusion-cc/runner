@@ -11,6 +11,16 @@ pub enum Mode {
     Workstation,
 }
 
+/// What keeps each job from the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Sandbox {
+    /// A virtual machine of its own, with its own kernel: the default, and the only kind on a Mac today.
+    #[default]
+    Vm,
+    /// A container of its own in a Docker-compatible engine, on a host with no virtualization to give.
+    Container,
+}
+
 /// The limits in force at one moment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
@@ -191,6 +201,15 @@ impl Settings {
     /// The plan's estimate of what the guest's kernel and supervisor take of a VM's size.
     pub const GUEST_OVERHEAD_ESTIMATE: u64 = GIB / 4;
 
+    /// What one container costs the host on top of its size: the vm-host beside it and the engine's shim for it,
+    /// some 30 MB together, with room. The container's own memory, its supervisor's included, is its size: the
+    /// engine holds it to that.
+    pub const CONTAINER_HOST_OVERHEAD: u64 = 64 * MIB;
+
+    /// What the engine of a host that runs jobs in containers holds for itself: its daemon and containerd, and a
+    /// rootless one's network helper.
+    pub const ENGINE_USE: u64 = GIB / 4;
+
     /// No Mac keeps less than this for itself, whatever a setting asks for.
     pub const LEAST_FLOOR: u64 = GIB;
 
@@ -284,6 +303,19 @@ impl Settings {
         self
     }
 
+    /// These settings for jobs in containers ([`Sandbox::Container`]): no guest kernel takes a share of a job's
+    /// size, each job costs the host [`Settings::CONTAINER_HOST_OVERHEAD`] rather than a hypervisor's, and the
+    /// engine's own [`Settings::ENGINE_USE`] comes off the caps. A headless host counts its room with these from
+    /// the start ([`Settings::for_headless_in`]).
+    pub fn in_containers(mut self) -> Settings {
+        self.vm_host_overhead_bytes = Self::CONTAINER_HOST_OVERHEAD;
+        self.guest_overhead_bytes = 0;
+        for profile in [&mut self.away, &mut self.in_use] {
+            profile.cap_bytes = profile.cap_bytes.saturating_sub(Self::ENGINE_USE);
+        }
+        self
+    }
+
     /// These settings on a host that runs one machine at a time and nothing else but the Runner: a trusted host
     /// (`class: trusted`), which asks GitHub for one job at a time. With no second machine and nobody at it, CI takes
     /// every core: the fast ones of a host whose cores differ ([`Settings::on_fast_cores`]), all of them otherwise.
@@ -349,8 +381,22 @@ impl Settings {
     ///   4 ([`vcpus_for`]): on 7.75 GB, the four fast cores, which no other machine could use while it runs.
     /// - Times and disk limits as on a dedicated Mac.
     pub fn for_headless(facts: HostFacts, fast_cores: u32) -> Settings {
+        Settings::for_headless_in(facts, fast_cores, Sandbox::Vm)
+    }
+
+    /// [`Settings::for_headless`] for jobs in this sandbox. In containers each job costs the host
+    /// [`Settings::CONTAINER_HOST_OVERHEAD`] and the engine [`Settings::ENGINE_USE`] once
+    /// ([`Settings::in_containers`]), so the room and the cap are counted with those.
+    pub fn for_headless_in(facts: HostFacts, fast_cores: u32, sandbox: Sandbox) -> Settings {
         let total = facts.total_bytes;
         let mut settings = Settings::for_host(facts, Mode::Dedicated).on_fast_cores(fast_cores);
+        let engine = match sandbox {
+            Sandbox::Vm => 0,
+            Sandbox::Container => {
+                settings = settings.in_containers();
+                Self::ENGINE_USE
+            }
+        };
         let floor = GIB + total / 32;
         // Where the cores are alike and the memory holds two cf-4g, two of 2 vCPUs on four cores: nobody sits at the
         // host, so it needs no two cores of its own.
@@ -358,7 +404,8 @@ impl Settings {
         let two_cf_4g = 2 * (Size::G4.vm_bytes() + settings.vm_host_overhead_bytes);
         let room = total
             .saturating_sub(floor)
-            .saturating_sub(Self::HEADLESS_HOST_USE);
+            .saturating_sub(Self::HEADLESS_HOST_USE)
+            .saturating_sub(engine);
         let cpus = if alike && facts.cores >= 4 && room >= two_cf_4g {
             settings.away.cpus.max(4)
         } else {
@@ -366,10 +413,7 @@ impl Settings {
         };
         let side_by_side = u64::from(cpus / settings.vcpus_of(Size::G2));
         let limits = Profile {
-            cap_bytes: total
-                .saturating_sub(floor)
-                .saturating_sub(Self::HEADLESS_HOST_USE)
-                .saturating_sub(side_by_side.saturating_mul(settings.vm_host_overhead_bytes)),
+            cap_bytes: room.saturating_sub(side_by_side.saturating_mul(settings.vm_host_overhead_bytes)),
             floor_bytes: floor,
             cpus,
         };

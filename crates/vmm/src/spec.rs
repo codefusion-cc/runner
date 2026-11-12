@@ -20,6 +20,9 @@ pub struct VmSpec {
     pub network: Network,
     /// The file the guest's console is appended to.
     pub console: PathBuf,
+    /// The most a container may write to its own layer, for an engine whose storage can bound it. A machine's
+    /// disks are their own bound, and a monitor of machines leaves this alone.
+    pub layer_bytes: Option<u64>,
 }
 
 /// One disk image attached to the machine as a virtio block device.

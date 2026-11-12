@@ -3,7 +3,7 @@
 use cf_guest_proto::Task;
 use cf_vmhost::task::run_task;
 use cf_vmhost::{Guest, JobRequest, Layout, Limits};
-use cf_vmm::{Network, VmSpec};
+use cf_vmm::{Network, VmSpec, Vmm};
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,32 @@ pub struct Host {
     /// `--host-cpus`: the host CPUs the machines run on, a kernel CPU list such as `4-7`; by default the fastest
     /// this process may use. Linux only.
     pub cpus: Option<String>,
+    /// `--engine` and the name beside it: each machine is a container of the engine whose API answers on this
+    /// socket, in place of a virtual machine. For `vm` the name is the host's (`--machine`), which its containers
+    /// carry; for `boot-proof` the image version the engine holds (`--image`).
+    pub engine: Option<(PathBuf, String)>,
+}
+
+/// Containers of the engine at `socket`, made by the host `machine`, in place of virtual machines. Whatever an
+/// earlier vm-host of this host left in the engine, and nobody runs any more, is removed first.
+fn engine(socket: &Path, machine: &str) -> Result<cf_vmm_oci::OciVmm, String> {
+    cf_vmm_oci::OciVmm::new(cf_vmm_oci::Config {
+        socket: socket.to_path_buf(),
+        machine: machine.to_string(),
+        rootful_for_tests: false,
+    })
+    .map_err(|error| format!("the engine at {}: {error}", socket.display()))
+}
+
+/// The machines of this host: containers of its engine with `--engine`, its hypervisor's virtual machines without.
+fn machines(machines: &Path, programs: &Path, host: &Host, name: &str) -> Result<Box<dyn Vmm>, String> {
+    match &host.engine {
+        Some(_) if host.cpus.is_some() => {
+            Err("--host-cpus is for virtual machines; the engine places containers".into())
+        }
+        Some((socket, _)) => Ok(Box::new(engine(socket, name)?)),
+        None => Ok(Box::new(monitor(machines, programs, host)?)),
+    }
 }
 
 /// The monitor of this host's machines: Virtualization.framework.
@@ -96,10 +122,11 @@ pub fn host(state_dir: &str, host: &Host) -> Result<(), String> {
         unsafe { libc::signal(signal, cancel as extern "C" fn(libc::c_int) as libc::sighandler_t) };
     }
     let layout = Layout::new(state_dir);
-    let vmm = monitor(&layout.machines(), &layout.programs(), host)?;
+    let machine = host.engine.as_ref().map_or("", |(_, machine)| machine.as_str());
+    let vmm = machines(&layout.machines(), &layout.programs(), host, machine)?;
     let limits = Limits::for_deadline(Duration::from_secs(request.deadline_s));
-    let state =
-        cf_vmhost::run(&vmm, &layout, guest, request, limits, &CANCEL).map_err(|error| error.to_string())?;
+    let state = cf_vmhost::run(vmm.as_ref(), &layout, guest, request, limits, &CANCEL)
+        .map_err(|error| error.to_string())?;
     // The daemon may be gone by now; the state file has the same.
     let _ = writeln!(
         std::io::stdout(),
@@ -114,21 +141,33 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration, host: &Host) -> Result<(
     let guest = guest()?;
     let scratch = Scratch::new("proof")?;
     let console = scratch.0.join("console.log");
+    // A container runs the image its engine holds, which the folder of its image disk names; a machine boots
+    // with no disk at all.
+    let disks = match &host.engine {
+        Some((_, image)) => vec![cf_vmm::Disk {
+            path: scratch.path().join(image).join("rootfs.img"),
+            id: cf_guest_proto::IMAGE_DISK.into(),
+            read_only: true,
+        }],
+        None => Vec::new(),
+    };
     let spec = VmSpec {
         kernel: scratch.write("kernel", guest.kernel)?,
         initramfs: scratch.write("initramfs", guest.initramfs)?,
         memory_bytes,
         cpus: 1,
-        disks: Vec::new(),
+        disks,
         network: Network::None,
         console: console.clone(),
+        layer_bytes: None,
     };
-    let vmm = monitor(
+    let vmm = machines(
         &scratch.path().join("machines"),
         &scratch.path().join("programs"),
         host,
+        "proof",
     )?;
-    let report = run_task(&vmm, &spec, Task::Probe, timeout, &|| false);
+    let report = run_task(vmm.as_ref(), &spec, Task::Probe, timeout, &|| false);
     print!("{}", std::fs::read_to_string(&console).unwrap_or_default());
     let report = report?;
     println!(

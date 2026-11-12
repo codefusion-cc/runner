@@ -1044,6 +1044,7 @@ mod tests {
             ],
             network,
             console: "/var/lib/cf/logs/one.console.log".into(),
+            layer_bytes: None,
         }
     }
 

@@ -8,6 +8,7 @@
 //! panics for what a host or a guest does.
 
 mod exit;
+mod owner;
 mod spec;
 pub mod testing;
 
@@ -17,6 +18,7 @@ use std::time::Duration;
 /// A pressure file's share of the last 10 s ([`Vm::cpu_pressure`]).
 pub use cf_guest_proto::Psi;
 pub use exit::ExitCell;
+pub use owner::{Owner, boot_of, start_of_stat};
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 
 /// The guest kernel's command line, the same under every monitor of an architecture. `console=hvc0` is the virtio
@@ -101,6 +103,13 @@ pub enum VmExit {
 pub trait Vmm: Send + Sync {
     /// Starts a machine and returns once it runs. The machine holds its full memory size from here on.
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError>;
+
+    /// Whether each machine is a container of an engine rather than a virtual machine: it boots no kernel and has
+    /// no disk of its own, runs the image the engine holds by the version its image disk names, and its job has
+    /// its whole memory size.
+    fn containers(&self) -> bool {
+        false
+    }
 }
 
 /// One running (or ended) virtual machine. Dropping it ends the machine.
@@ -137,6 +146,13 @@ pub trait Vm: Send + Sync {
     /// page cache, the sum of `/proc/<pid>/io` over its cgroup on Linux. `None` once it ended, and where the host
     /// keeps no such account, as on a Mac.
     fn disk_io(&self) -> Option<DiskIo> {
+        None
+    }
+
+    /// What a container holds in its own writable layer now, in bytes: what it wrote over its image and did not
+    /// delete. It is on the host's disk, so it is the job's disk use. `None` for a machine, whose disks are files of
+    /// a fixed size, and when the engine does not say.
+    fn layer_bytes(&self) -> Option<u64> {
         None
     }
 }

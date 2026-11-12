@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,9 +79,34 @@ pub struct FakeVmm {
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
+    layers: Arc<Mutex<Option<u64>>>,
+    containers: bool,
+    linger: Duration,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl FakeVmm {
+    /// The same monitor, as an engine whose machines are containers ([`Vmm::containers`]).
+    #[must_use]
+    pub fn of_containers(self) -> Self {
+        Self {
+            containers: true,
+            ..self
+        }
+    }
+
+    /// The same monitor, whose machines take `linger` to be let go of, as a container and its network take to be
+    /// removed.
+    #[must_use]
+    pub fn lingering(self, linger: Duration) -> Self {
+        Self { linger, ..self }
+    }
+
+    /// How many of this monitor's machines were let go of (dropped) so far.
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+
     /// A monitor that will start these machines, in this order.
     pub fn new(scripts: impl IntoIterator<Item = Script>) -> Self {
         Self {
@@ -116,9 +142,19 @@ impl FakeVmm {
     pub fn disk(&self, io: Option<DiskIo>) {
         *self.disks.lock().unwrap() = io;
     }
+
+    /// What each machine of this monitor holds in its writable layer from now on ([`Vm::layer_bytes`]); `None`,
+    /// the start, when it cannot be told.
+    pub fn layer(&self, bytes: Option<u64>) {
+        *self.layers.lock().unwrap() = bytes;
+    }
 }
 
 impl Vmm for FakeVmm {
+    fn containers(&self) -> bool {
+        self.containers
+    }
+
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError> {
         spec.validate()?;
         self.started.lock().unwrap().push(spec.clone());
@@ -143,6 +179,9 @@ impl Vmm for FakeVmm {
                 resident: self.resident.clone(),
                 stalls: self.stalls.clone(),
                 disks: self.disks.clone(),
+                layers: self.layers.clone(),
+                linger: self.linger,
+                dropped: self.dropped.clone(),
             })),
         }
     }
@@ -157,6 +196,9 @@ struct FakeVm {
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
+    layers: Arc<Mutex<Option<u64>>>,
+    linger: Duration,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl Vm for FakeVm {
@@ -227,11 +269,20 @@ impl Vm for FakeVm {
         }
         *self.disks.lock().unwrap()
     }
+
+    fn layer_bytes(&self) -> Option<u64> {
+        if self.power.wait(Duration::ZERO).is_some() {
+            return None;
+        }
+        *self.layers.lock().unwrap()
+    }
 }
 
 impl Drop for FakeVm {
     fn drop(&mut self) {
         self.power.end(VmExit::Stopped);
+        std::thread::sleep(self.linger);
+        self.dropped.fetch_add(1, Ordering::SeqCst);
     }
 }
 

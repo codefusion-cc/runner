@@ -1,7 +1,8 @@
 //! The supervisor, PID 1 of the guest. See `cf_supervisor` for what it decides and `linux` for how it acts.
 //!
-//! One binary, six ways to start it: with no argument it is the machine's first process; `container` is the
-//! launcher it starts for a job's container; `docker` the launcher of a Docker job's sandbox, and
+//! One binary, seven ways to start it: with no argument it is the machine's first process; `container` is the
+//! launcher it starts for a job's container; `container-guest` the first process of a job's container in a
+//! Docker-compatible engine (the Runner's container mode); `docker` the launcher of a Docker job's sandbox, and
 //! `docker-sandbox <networks>` the sandbox's first program; `hook <name>` is what the Actions runner's job hooks call;
 //! `worker-gate …` is what a trusted machine's Actions runner starts as its Worker.
 
@@ -13,6 +14,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["container"] => linux::container::launch(),
+        ["container-guest"] => linux::container_guest::run(),
         ["docker"] => linux::docker::launch(),
         ["docker-sandbox", networks] => linux::docker::sandbox(networks),
         ["hook", name] => linux::hook::run(name),

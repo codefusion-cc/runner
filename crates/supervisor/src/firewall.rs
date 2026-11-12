@@ -33,7 +33,15 @@ pub const MOST_TOLD: usize = 64;
 /// the networks the host said the Mac is in (`told`, of which one with no prefix length an address can have is
 /// left out). This is what [`policy`] takes as `own`.
 pub fn beside(address: Ip, netmask: Ip, gateway: Option<Ip>, told: &[(Ip, u8)]) -> Vec<(Ip, u8)> {
-    std::iter::once(own_network(address, netmask))
+    own_networks(&[(address, netmask)], gateway, told)
+}
+
+/// [`beside`] for a guest with any number of addresses, each `(address, netmask)`: a container's, which the engine
+/// gave its interfaces.
+pub fn own_networks(interfaces: &[(Ip, Ip)], gateway: Option<Ip>, told: &[(Ip, u8)]) -> Vec<(Ip, u8)> {
+    interfaces
+        .iter()
+        .map(|(address, netmask)| own_network(*address, *netmask))
         .chain(gateway.map(|gateway| (gateway, 32)))
         .chain(
             told.iter()

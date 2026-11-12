@@ -35,6 +35,8 @@ struct VmState {
     cleaned: Vec<String>,
     /// Machines that went before they said they were up.
     died_booting: usize,
+    /// How often the daemon asked them to tidy ([`Vms::tidy`]).
+    tidied: usize,
     fail_start: usize,
     slow_boot: bool,
     late_state: bool,
@@ -292,6 +294,11 @@ impl FakeVms {
         self.lock().killed.clone()
     }
 
+    /// How often the daemon asked the vm-hosts to tidy.
+    pub fn tidied(&self) -> usize {
+        self.lock().tidied
+    }
+
     /// Every job whose files were removed.
     pub fn cleaned(&self) -> Vec<String> {
         self.lock().cleaned.clone()
@@ -335,6 +342,10 @@ fn finish(vm: &mut FakeVm, end: End) {
 }
 
 impl Vms for FakeVms {
+    fn tidy(&self) {
+        self.lock().tidied += 1;
+    }
+
     fn console_tail(&self, job: &str, bytes: usize) -> Option<String> {
         let text = self.lock().consoles.get(job).cloned()?;
         let mut from = text.len().saturating_sub(bytes);
@@ -364,7 +375,7 @@ impl Vms for FakeVms {
                 started_at: 0,
                 stage: if ready { Stage::Running } else { Stage::Booting },
                 vm_bytes: request.memory_bytes,
-                limit_bytes: request.limits().memory_bytes,
+                limit_bytes: request.limits_in(false).memory_bytes,
                 cpus: request.cpus,
                 image: request.image.clone(),
                 boots: 1,
