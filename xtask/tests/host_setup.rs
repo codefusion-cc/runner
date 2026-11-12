@@ -341,9 +341,10 @@ fn a_429_or_a_5xx_is_asked_again_before_it_decides() {
     );
 }
 
-/// When GitHub cannot say, at any of the three reads, the Runner that runs stays.
+/// When GitHub cannot say, at any of the three reads, the answer is `unknown`, which ends the run
+/// (`what_github_cannot_say_fails_the_run_and_changes_nothing`).
 #[test]
-fn what_github_cannot_say_keeps_the_runner_that_runs() {
+fn what_github_cannot_say_is_unknown() {
     let not_found = Reply::status_json(404, &serde_json::json!({ "message": "Not Found" }));
     for answers in [
         vec![Reply::empty(503)],
@@ -366,6 +367,85 @@ fn what_github_cannot_say_keeps_the_runner_that_runs() {
             &[("GITHUB_TRIES", "2"), ("GITHUB_WAIT_MAX", "1")],
         );
         assert_eq!(said, "unknown", "{answers:?}");
+    }
+}
+
+/// `release_stays` of the script, sourced, against the repository's API at `api`: the Runner that runs says it is
+/// `runs`, the run asks for the release of `ASKED`. It prints `stays` or `installs` when it returns.
+fn release_stays(api: &str, runs: &str, env: &[(&str, &str)]) -> Output {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/host-setup.sh");
+    let mut command = Command::new("bash");
+    command
+        .args([
+            "-c",
+            "source \"$1\" && if release_stays \"$2\" \"$3\" \"$4\" \"release runner-0.1.0-$4\"; then echo stays; \
+             else echo installs; fi",
+            "bash",
+            script,
+            api,
+            runs,
+            ASKED,
+        ])
+        .env_remove("GITHUB_TOKEN");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("bash runs")
+}
+
+#[test]
+fn a_runner_newer_on_main_stays_and_an_older_one_takes_the_release() {
+    let newer = api(vec![compared("ahead"), main_at(), compared("ahead")]);
+    let out = release_stays(&newer.server.url(), &format!("0.1.0+{RUNS}"), &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "host-setup: arguments: it runs 0.1.0+{RUNS}, newer on main than release runner-0.1.0-{ASKED}: it \
+             stays, and release runner-0.1.0-{ASKED} waits for none\nstays\n"
+        )
+    );
+
+    let older = api(vec![compared("behind")]);
+    let out = release_stays(&older.server.url(), &format!("0.1.0+{RUNS}"), &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "installs\n");
+}
+
+/// When GitHub cannot say, the run ends with a failure and changes nothing. Kept with a status of 0, the Runner that
+/// runs could be older than the release asked for (a job on the host can use up the address's rate limit of reads
+/// without a token), and the run would end `host-setup: unchanged`, as if the release were in.
+#[test]
+fn what_github_cannot_say_fails_the_run_and_changes_nothing() {
+    let not_found = Reply::status_json(404, &serde_json::json!({ "message": "Not Found" }));
+    for answers in [
+        vec![Reply::empty(503)],
+        vec![rate_limited(403)],
+        // A commit GitHub does not have, such as a --binary built from a branch never pushed.
+        vec![not_found.clone()],
+        vec![compared("ahead"), main_at(), not_found],
+    ] {
+        let api = api(answers.clone());
+        let out = release_stays(
+            &api.server.url(),
+            &format!("0.1.0+{RUNS}"),
+            &[("GITHUB_TRIES", "2"), ("GITHUB_WAIT_MAX", "1")],
+        );
+        assert_eq!(out.status.code(), Some(1), "{answers:?}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{answers:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.lines().last(),
+            Some(
+                format!(
+                    "host-setup: arguments: it runs 0.1.0+{RUNS}, and GitHub could not say whether that is newer on \
+                     main than release runner-0.1.0-{ASKED}; nothing changed: run it again once GitHub answers, or \
+                     give the Runner with --binary"
+                )
+                .as_str()
+            ),
+            "{answers:?}"
+        );
     }
 }
 

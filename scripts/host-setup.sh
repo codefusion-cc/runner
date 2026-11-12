@@ -24,7 +24,7 @@
 # running ones (at most an hour) and installs it; when they outlast the wait it exits 75, the hold lifted, and the
 # Runner of before goes on. A Runner from a release updates itself to newer releases from the console (`update-to`), so
 # a --version is a minimum: an enrolled host whose Runner runs a newer commit of main, by GitHub's compare of main's
-# history, keeps it, and so does one when GitHub cannot say.
+# history, keeps it; when GitHub cannot say, the run fails and changes nothing.
 #
 # --class      shared (the default) or trusted: a host that runs only main's deploy, release and signing jobs of
 #              codefusion-cc/codefusion, by the Runner's default rules (crates/trusted), one job at a time
@@ -233,6 +233,25 @@ runs_newer() {
     behind | diverged) echo install ;;
     *) echo unknown ;;
   esac
+}
+
+# Whether a run that asks for the release of the commit $3 (named $4) leaves the Runner that runs in place, which says
+# it is $2 (its version, `0.1.0+<12 characters>`), by `runs_newer` against the repository's API at $1: status 0, and
+# says so, when it runs a newer commit of main; 1 when the release goes in. When GitHub cannot say, the run fails and
+# changes nothing: the Runner that runs may be older than the release, and a run that ended `unchanged` would say
+# the release is in.
+release_stays() {
+  local api=$1 runs=$2 wanted=$3 named=$4
+  case $(runs_newer "$api" "${runs##*+}" "$wanted") in
+    keep)
+      say "it runs $runs, newer on main than $named: it stays, and $named waits for none"
+      return 0
+      ;;
+    unknown)
+      fail "it runs $runs, and GitHub could not say whether that is newer on main than $named; nothing changed: run it again once GitHub answers, or give the Runner with --binary"
+      ;;
+  esac
+  return 1
 }
 
 # Sourced (the tests), it only defines the above.
@@ -618,16 +637,7 @@ place_binary() {
       as_user "'$installed' version" 2>/dev/null
     ) || runs=''
     runs=${runs#codefusion-runner }
-    case $(runs_newer "$REPO_API" "${runs##*+}" "${version##*-}") in
-      keep)
-        say "it runs $runs, newer on main than $named: it stays, and $named waits for none"
-        return
-        ;;
-      unknown)
-        say "it runs $runs, and GitHub could not say whether that is newer on main than $named: it stays; a run later asks again"
-        return
-        ;;
-    esac
+    if release_stays "$REPO_API" "$runs" "${version##*-}" "$named"; then return; fi
   fi
   if [[ $(user_sha256 "$staged") != "$sha256" ]]; then
     change "place the Runner of $named"

@@ -245,8 +245,8 @@ sudo scripts/host-setup.sh --machine <name> --console <url> --code-file <file>
 
 The script's head lists its options (`--home`, `--image`, `--ref`, `--version`, `--check`). It reads GitHub's API for
 the image with `GITHUB_TOKEN` when that is set, and waits out GitHub's rate limit as the answer says. A `--version` is
-a minimum: an enrolled host whose Runner updated itself to a newer commit of main keeps it, and so does one when
-GitHub cannot say which is newer; the run says so, and a later run asks again. By hand, once, as root (Ubuntu 24.04
+a minimum: an enrolled host whose Runner updated itself to a newer commit of main keeps it, and the run says so;
+when GitHub cannot say which is newer, the run fails and changes nothing. By hand, once, as root (Ubuntu 24.04
 also needs the line about user namespaces):
 
 ```sh
