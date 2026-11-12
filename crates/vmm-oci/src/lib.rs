@@ -561,11 +561,33 @@ impl OciVmm {
                 answer.message()
             ));
         }
-        answer
-            .json()
-            .ok()
-            .and_then(|value| Some(value.get("Id")?.as_str()?.to_string()))
-            .ok_or_else(|| "the engine named no container".to_string())
+        let made = answer.json().unwrap_or_default();
+        let id = made
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("the engine named no container")?
+            .to_string();
+        // An engine that cannot give a limit makes the container without it and warns: a job is not run without
+        // its limits.
+        let warnings: Vec<String> = made
+            .get("Warnings")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|warning| {
+                warning
+                    .as_str()
+                    .map_or_else(|| warning.to_string(), str::to_string)
+            })
+            .collect();
+        if !warnings.is_empty() {
+            remove(&self.engine, &id);
+            return Err(format!(
+                "the engine made the container with a warning, so not as asked: {}",
+                warnings.join("; ")
+            ));
+        }
+        Ok(id)
     }
 
     fn make(&self, spec: &VmSpec) -> Result<OciVm, String> {
@@ -1167,6 +1189,33 @@ mod tests {
         let refused = vmm.create("c-0", &sized, "v", None).unwrap_err();
         assert!(refused.contains("no space left"), "{refused}");
         assert_eq!(engine.asked().len(), 1);
+    }
+
+    /// An engine that cannot hold a container to a limit (a kernel without the memory controller, a cgroup v1 host
+    /// with no swap account) makes the container anyway and only warns. A job without its limits is not run, and
+    /// the container that would have held it goes.
+    #[test]
+    fn a_container_the_engine_warns_of_is_removed_and_refused() {
+        let warned = "Your kernel does not support memory limit capabilities or the cgroup is not mounted. Limitation discarded.";
+        let engine = fake::FakeEngine::new(move |asked| match asked.method.as_str() {
+            "POST" => (201, json!({ "Id": "c1", "Warnings": [warned] }).to_string()),
+            _ => (204, String::new()),
+        });
+        let vmm = OciVmm::of(&engine.socket, "host-1").unwrap();
+        let refused = vmm.create("c-0", &spec(), "v", None).unwrap_err();
+        assert!(refused.contains("Limitation discarded"), "{refused}");
+        assert_eq!(engine.lines("DELETE"), ["DELETE /containers/c1?force=1&v=1"]);
+
+        for quiet in [
+            json!({ "Id": "c1", "Warnings": [] }),
+            json!({ "Id": "c1", "Warnings": null }),
+            json!({ "Id": "c1" }),
+        ] {
+            let engine = fake::FakeEngine::new(move |_| (201, quiet.to_string()));
+            let vmm = OciVmm::of(&engine.socket, "host-1").unwrap();
+            assert_eq!(vmm.create("c-0", &spec(), "v", None).unwrap(), "c1");
+            assert!(engine.lines("DELETE").is_empty());
+        }
     }
 
     #[test]
