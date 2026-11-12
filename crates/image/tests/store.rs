@@ -464,6 +464,9 @@ struct FakeEngine {
     reads_at_most: Option<usize>,
     refuses_import: bool,
     refuses_name: bool,
+    /// A folder whose root file system parts are counted after each 4096 bytes read, into `parts_seen`.
+    watches: Option<PathBuf>,
+    parts_seen: Vec<usize>,
 }
 
 impl Engine for FakeEngine {
@@ -473,8 +476,23 @@ impl Engine for FakeEngine {
         }
         let mut bytes = Vec::new();
         let limit = self.reads_at_most.map_or(size, |most| most as u64);
-        std::io::Read::read_to_end(&mut std::io::Read::take(tar, limit), &mut bytes)
-            .map_err(|error| error.to_string())?;
+        let mut tar = std::io::Read::take(tar, limit);
+        loop {
+            let mut chunk = Vec::new();
+            let read = std::io::Read::read_to_end(&mut std::io::Read::take(&mut tar, 4096), &mut chunk)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend(chunk);
+            if let Some(folder) = &self.watches {
+                let parts = names(folder)
+                    .iter()
+                    .filter(|name| name.contains("rootfs"))
+                    .count();
+                self.parts_seen.push(parts);
+            }
+        }
         let id = format!("sha256:{}", self.images.len());
         self.images.push((id.clone(), bytes));
         Ok(id)
@@ -630,4 +648,59 @@ fn a_container_image_with_a_changed_part_reaches_no_engine() {
         engine.images.is_empty() && engine.removed.is_empty(),
         "verified before anything is imported"
     );
+}
+
+#[test]
+fn each_part_leaves_the_disk_once_it_is_read_so_the_root_file_system_is_never_there_twice() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::new(state.path().join("images"));
+    let release = container_release("container-image-1", 1000, &key(1));
+    let mut engine = FakeEngine {
+        watches: Some(state.path().join("images/.container-image-1.partial")),
+        ..FakeEngine::default()
+    };
+    store
+        .install_to(
+            release.path(),
+            "container-image-1",
+            &key(1).verifying_key(),
+            Target::Engine(&mut engine),
+        )
+        .unwrap();
+    // 10000 bytes in parts of 4096: each part goes once the reader has passed its end.
+    assert_eq!(engine.parts_seen, [3, 2, 1]);
+}
+
+#[test]
+fn a_reinstall_that_cannot_take_the_folders_place_leaves_the_engine_naming_the_image_before() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = tempfile::tempdir().unwrap();
+    let images = state.path().join("images");
+    let store = Store::new(&images);
+    let release = container_release("container-image-1", 1000, &key(1));
+    let mut engine = FakeEngine::default();
+    let install = |engine: &mut FakeEngine| {
+        store.install_to(
+            release.path(),
+            "container-image-1",
+            &key(1).verifying_key(),
+            Target::Engine(engine),
+        )
+    };
+    install(&mut engine).unwrap();
+    // A folder put aside before that cannot be removed, so the installed one cannot be put aside in its place.
+    let locked = images.join(".container-image-1.old/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("file"), b"").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = install(&mut engine);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(result, Err(StoreError::Io(..))), "{result:?}");
+    assert_eq!(
+        engine.names,
+        vec![("container-image-1".to_string(), "sha256:0".to_string())],
+        "the version still names the image its folder was installed with"
+    );
+    assert!(store.installed("container-image-1").is_some());
 }

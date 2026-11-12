@@ -76,7 +76,8 @@ pub trait Engine {
     fn remove(&mut self, id: &str);
 }
 
-/// The parts of a root file system read as one, hashed as they are read.
+/// The parts of a root file system read as one, hashed as they are read. Each part is deleted once it is read
+/// whole, so the install never holds the whole twice on the disk; a failure removes the partial folder anyway.
 struct Joined<'a> {
     folder: &'a Path,
     parts: std::slice::Iter<'a, Asset>,
@@ -95,12 +96,14 @@ impl Read for Joined<'_> {
                 let path = self.folder.join(&part.name);
                 self.file = Some((File::open(&path)?, path));
             }
-            let Some((file, _)) = self.file.as_mut() else {
+            let Some((file, path)) = self.file.as_mut() else {
                 return Ok(0);
             };
             let read = file.read(buffer)?;
             if read == 0 {
+                let path = path.clone();
                 self.file = None;
+                fs::remove_file(&path)?;
                 continue;
             }
             self.hash.update(&buffer[..read]);
@@ -287,9 +290,13 @@ impl Store {
             if read != rootfs.size || format!("{:x}", hash.finalize()) != rootfs.sha256 {
                 return Err(StoreError::Refused(ImageError::HashMismatch(ROOTFS_NAME.into())));
             }
+            // A reader that stopped at the size (the engine's upload) never saw the last part's end.
             for part in &rootfs.parts {
                 let path = partial.join(&part.name);
-                fs::remove_file(&path).map_err(io(&path))?;
+                match fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(io(&path)(error)),
+                    _ => {}
+                }
             }
             self.put_in_place(partial, version, &manifest, newest, |version| {
                 match (&mut target, &imported) {
@@ -308,7 +315,7 @@ impl Store {
         result.map(|()| manifest)
     }
 
-    /// Records the release as the newest accepted, names what the engine holds of it, and moves its folder in.
+    /// Records the release as the newest accepted, moves its folder in and names what the engine holds of it.
     fn put_in_place(
         &self,
         partial: &Path,
@@ -336,18 +343,24 @@ impl Store {
                 .and_then(|()| fs::rename(&new, &accepted))
                 .map_err(io(&accepted))?;
         }
-        name(version)?;
         let installed = self.0.join(version);
-        // A version installed again is put aside, not deleted first: when the new one cannot take its place the old
-        // one comes back.
+        // A version installed again is put aside, not deleted first: when the new one cannot take its place, or the
+        // engine cannot name it, the old one comes back, and the engine's name was never moved off its image.
         let aside = self.0.join(format!(".{version}.old"));
         let _ = fs::remove_dir_all(&aside);
         let had_one = fs::rename(&installed, &aside).is_ok();
-        if let Err(error) = fs::rename(partial, &installed) {
+        let swapped = fs::rename(partial, &installed)
+            .map_err(io(&installed))
+            .and_then(|()| {
+                name(version).inspect_err(|_| {
+                    let _ = fs::rename(&installed, partial);
+                })
+            });
+        if let Err(error) = swapped {
             if had_one {
                 let _ = fs::rename(&aside, &installed);
             }
-            return Err(io(&installed)(error));
+            return Err(error);
         }
         let _ = fs::remove_dir_all(&aside);
         Ok(())
