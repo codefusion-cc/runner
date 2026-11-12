@@ -148,6 +148,13 @@ pub trait Vm: Send + Sync {
     fn disk_io(&self) -> Option<DiskIo> {
         None
     }
+
+    /// What a container holds in its own writable layer now, in bytes: what it wrote over its image and did not
+    /// delete. It is on the host's disk, so it is the job's disk use. `None` for a machine, whose disks are files of
+    /// a fixed size, and when the engine does not say.
+    fn layer_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A byte stream between the host and one port of the guest.

@@ -313,6 +313,7 @@ fn run_in(
         files.container(
             request.memory_bytes,
             request.cpus as usize,
+            request.scratch_bytes,
             Network::Nat,
             &console,
         )
@@ -357,6 +358,15 @@ fn run_in(
                         Ok(machine) => {
                             let machine: Arc<dyn Vm> = Arc::from(machine);
                             watch(machine.clone(), current, generation.clone(), sender.clone());
+                            if containers {
+                                measure(
+                                    machine.clone(),
+                                    current,
+                                    generation.clone(),
+                                    sender.clone(),
+                                    limits.layer_look,
+                                );
+                            }
                             vm = Some(machine);
                         }
                         Err(error) => events.push_back(Event::StartFailed(error.to_string())),
@@ -497,6 +507,12 @@ fn run_in(
                 .map_or(Event::ChannelClosed, |exit| Event::VmExited(describe(&exit))),
             (event, _) => event,
         };
+        // A container's layer is on the host's disk, which it may fill no more than its own disk would hold.
+        if let Event::Layer(bytes) = event
+            && bytes > request.scratch_bytes
+        {
+            events.push_back(Event::DiskFull(request.scratch_bytes));
+        }
         actions.extend(machine.handle(event, started.elapsed()));
     }
 }
@@ -566,6 +582,29 @@ fn watch(vm: Arc<dyn Vm>, of: u32, generation: Arc<AtomicU32>, sender: SyncSende
             if let Some(exit) = vm.wait(nap) {
                 let _ = sender.send(Message::Machine(of, Event::VmExited(describe(&exit))));
                 return;
+            }
+        }
+    });
+}
+
+/// Measures a container's writable layer every `look` while the machine is the job's. A look that cannot be
+/// queued is dropped: the next one tells the same, and the watcher is never held up by the queue.
+fn measure(
+    vm: Arc<dyn Vm>,
+    of: u32,
+    generation: Arc<AtomicU32>,
+    sender: SyncSender<Message>,
+    look: Duration,
+) {
+    std::thread::spawn(move || {
+        while generation.load(Ordering::SeqCst) == of {
+            if let Some(bytes) = vm.layer_bytes() {
+                let _ = sender.try_send(Message::Machine(of, Event::Layer(bytes)));
+            }
+            // Naps short enough that a machine let go of is not held for long.
+            let since = Instant::now();
+            while since.elapsed() < look && generation.load(Ordering::SeqCst) == of {
+                std::thread::sleep(look.min(Duration::from_millis(50)));
             }
         }
     });

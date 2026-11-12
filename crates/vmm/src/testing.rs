@@ -79,6 +79,7 @@ pub struct FakeVmm {
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
+    layers: Arc<Mutex<Option<u64>>>,
     containers: bool,
     linger: Duration,
     dropped: Arc<AtomicUsize>,
@@ -141,6 +142,12 @@ impl FakeVmm {
     pub fn disk(&self, io: Option<DiskIo>) {
         *self.disks.lock().unwrap() = io;
     }
+
+    /// What each machine of this monitor holds in its writable layer from now on ([`Vm::layer_bytes`]); `None`,
+    /// the start, when it cannot be told.
+    pub fn layer(&self, bytes: Option<u64>) {
+        *self.layers.lock().unwrap() = bytes;
+    }
 }
 
 impl Vmm for FakeVmm {
@@ -172,6 +179,7 @@ impl Vmm for FakeVmm {
                 resident: self.resident.clone(),
                 stalls: self.stalls.clone(),
                 disks: self.disks.clone(),
+                layers: self.layers.clone(),
                 linger: self.linger,
                 dropped: self.dropped.clone(),
             })),
@@ -188,6 +196,7 @@ struct FakeVm {
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
+    layers: Arc<Mutex<Option<u64>>>,
     linger: Duration,
     dropped: Arc<AtomicUsize>,
 }
@@ -259,6 +268,13 @@ impl Vm for FakeVm {
             return None;
         }
         *self.disks.lock().unwrap()
+    }
+
+    fn layer_bytes(&self) -> Option<u64> {
+        if self.power.wait(Duration::ZERO).is_some() {
+            return None;
+        }
+        *self.layers.lock().unwrap()
     }
 }
 

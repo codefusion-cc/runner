@@ -64,6 +64,7 @@ fn quick() -> Limits {
         boots: 2,
         publish: ms(0),
         console_bytes: 1 << 20,
+        layer_look: ms(20),
     }
 }
 
@@ -1327,7 +1328,86 @@ fn in_a_container_the_job_starts_at_once_with_its_whole_size_and_no_disk() {
         .collect();
     assert_eq!(disks, [("cf-image", layout.rootfs("image-1"), true)]);
     assert_eq!((specs[0].memory_bytes, specs[0].network), (4 << 30, Network::Nat));
+    assert_eq!(
+        specs[0].layer_bytes,
+        Some(1 << 30),
+        "the engine bounds the layer where it can"
+    );
     assert!(!layout.job_dir("job-1").exists());
+}
+
+/// Runs a container job while `daemon` plays the other side: it gets the monitor once the job runs.
+fn container_job(vmm: &Arc<FakeVmm>, layout: &Layout, daemon: impl FnOnce(&FakeVmm) + Send) -> JobState {
+    let mut limits = quick();
+    limits.heartbeat = Duration::from_secs(30);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            loop {
+                match control::ask(layout, "a", &Request::State, Duration::from_secs(2)) {
+                    Ok(state) if state.stage == Stage::Running => break,
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            daemon(vmm);
+        });
+        go_within(vmm, layout, request("a"), limits, false).unwrap()
+    })
+}
+
+/// A container has no disk of its own to fill: what it writes goes to its layer on the host's disk, which the
+/// vm-host measures and stops past the job's scratch size.
+#[test]
+fn a_container_that_writes_past_its_disk_size_is_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let vmm = Arc::new(
+        FakeVmm::new([job(|mut stream, power, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            power.wait_for_the_end();
+        })])
+        .of_containers(),
+    );
+    let state = container_job(&vmm, &layout, |vmm| vmm.layer(Some((1 << 30) + 1)));
+    let ended = state.end.unwrap();
+    assert_eq!(ended.end, End::Failed);
+    assert!(
+        ended.message.unwrap().contains("1024 MiB"),
+        "it says the size it was held to"
+    );
+    assert!(vmm.stops() >= 1);
+}
+
+/// A layer of exactly the scratch size is fine, and the most it held is the job's disk peak, whatever the guest,
+/// which sees no disk of its own, says.
+#[test]
+fn a_containers_disk_peak_is_the_most_its_layer_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let (go_on, wait) = mpsc::channel::<()>();
+    let vmm = Arc::new(
+        FakeVmm::new([job(move |mut stream, _, _| {
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            let _ = wait.recv();
+            say(&mut stream, GuestMessage::Heartbeat(usage()));
+            finish(stream, summary(GuestEnd::Exited, Some(0)));
+        })])
+        .of_containers(),
+    );
+    let state = container_job(&vmm, &layout, move |vmm| {
+        vmm.layer(Some(1 << 30));
+        std::thread::sleep(Duration::from_millis(200));
+        vmm.layer(Some(5 << 20));
+        std::thread::sleep(Duration::from_millis(200));
+        go_on.send(()).unwrap();
+    });
+    let ended = state.end.unwrap();
+    assert_eq!(ended.end, End::Ok);
+    assert_eq!(ended.summary.unwrap().disk_peak_bytes, 1 << 30);
+    assert_eq!(
+        state.usage.unwrap().disk_bytes,
+        5 << 20,
+        "what the layer holds now"
+    );
 }
 
 /// A container is no place for a Docker daemon or a trusted job's gate: both are refused before anything starts.

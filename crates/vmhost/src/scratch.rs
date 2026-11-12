@@ -54,22 +54,26 @@ impl GuestFiles {
             ],
             network,
             console: console.to_path_buf(),
+            layer_bytes: None,
         }
     }
 }
 
 impl GuestFiles {
     /// A container's specification: the image named by the disk it would be in a machine, which the engine's
-    /// container runs as its root, and no disk of the job's own.
+    /// container runs as its root, and no disk of the job's own: its layer holds what it writes, up to the size its
+    /// disk would have.
     pub(crate) fn container(
         &self,
         memory_bytes: u64,
         cpus: usize,
+        scratch_bytes: u64,
         network: Network,
         console: &Path,
     ) -> VmSpec {
         let mut spec = self.machine(Path::new("/nonexistent"), memory_bytes, cpus, network, console);
         spec.disks.retain(|disk| disk.id == IMAGE_DISK);
+        spec.layer_bytes = Some(scratch_bytes);
         spec
     }
 }

@@ -159,6 +159,7 @@ pub fn boot_proof(memory_bytes: u64, timeout: Duration, host: &Host) -> Result<(
         disks,
         network: Network::None,
         console: console.clone(),
+        layer_bytes: None,
     };
     let vmm = machines(
         &scratch.path().join("machines"),

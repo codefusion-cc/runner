@@ -177,6 +177,7 @@ mod tests {
             ],
             network: Network::Nat,
             console: "/state/logs/job.console.log".into(),
+            layer_bytes: None,
         }
     }
 

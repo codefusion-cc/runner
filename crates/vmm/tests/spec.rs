@@ -16,6 +16,7 @@ fn spec() -> VmSpec {
         disks: vec![disk("cf-image", true), disk("cf-scratch", false)],
         network: Network::Nat,
         console: PathBuf::from("console.log"),
+        layer_bytes: None,
     }
 }
 

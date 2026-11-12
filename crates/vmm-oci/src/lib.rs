@@ -10,6 +10,9 @@
 //! - as the image's user `runner`, every capability dropped, `no-new-privileges`, never privileged;
 //! - held to the machine's size of memory with no swap ([`cf_vmm::VmSpec::memory_bytes`]), its CPUs, and 4096
 //!   processes;
+//! - its writable layer, where its job's files go, held to the job's scratch size: by the engine where its storage
+//!   can bound a layer ([`layer_bound`]), and everywhere by the vm-host, which measures it ([`Vm::layer_bytes`]) and
+//!   stops a job past it;
 //! - on a network of its own, made with it and named as it is, or none;
 //! - with the guest's own supervisor, taken from the verified initramfs, put in at `/run/codefusion/supervisor`
 //!   before the container starts, as its first process (`container-guest`);
@@ -32,7 +35,7 @@ use serde_json::json;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +79,8 @@ pub struct OciVmm {
     /// This process, as what it makes is labelled.
     owner: Owner,
     next: AtomicU64,
+    /// Whether the engine's storage bounds a container's layer ([`layer_bound`]); off for good once it refuses.
+    bounds_layer: AtomicBool,
 }
 
 fn engine_error(what: &str, error: impl std::fmt::Display) -> String {
@@ -157,6 +162,7 @@ impl OciVmm {
         if !config.rootful_for_tests {
             isolation(&info).map_err(VmmError::Unsupported)?;
         }
+        vmm.bounds_layer.store(layer_bound(&info), Ordering::Relaxed);
         vmm.sweep(Owner::alive);
         Ok(vmm)
     }
@@ -171,6 +177,7 @@ impl OciVmm {
             machine: machine.to_string(),
             owner: Owner::this().ok_or("the system does not say when this process started")?,
             next: AtomicU64::new(0),
+            bounds_layer: AtomicBool::new(false),
         })
     }
 
@@ -308,6 +315,46 @@ pub fn isolation(info: &serde_json::Value) -> Result<&'static str, String> {
     ))
 }
 
+/// Whether the engine's storage, as its `/info` tells it, can hold a container's writable layer to a size
+/// (`StorageOpt.size`): overlay on xfs, by the file system's project quotas, which only root sets, so never a
+/// rootless engine. An xfs mounted without project quotas says so only when a container asks: the first refusal
+/// turns the bound off ([`OciVmm::create`]).
+pub fn layer_bound(info: &serde_json::Value) -> bool {
+    let driver = info.get("Driver").and_then(serde_json::Value::as_str);
+    let backing = info
+        .get("DriverStatus")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|pair| match pair.as_array()?.as_slice() {
+            [name, value] if name.as_str()? == "Backing Filesystem" => value.as_str(),
+            _ => None,
+        });
+    let rootless = info
+        .get("SecurityOptions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|option| option.split(',').any(|part| part == "name=rootless"));
+    matches!(driver, Some("overlay" | "overlay2")) && backing == Some("xfs") && !rootless
+}
+
+/// Whether a refused container was refused for the bound of its layer, which this engine's storage cannot give.
+fn layer_bound_refused(answer: &http::Response) -> bool {
+    let message = answer.message().to_ascii_lowercase();
+    matches!(answer.status, 400 | 500)
+        && ["storage-opt", "storage opt", "storageopt", "quota"]
+            .iter()
+            .any(|word| message.contains(word))
+}
+
+/// What a container holds in its writable layer, from the engine's look at it with its size (`SizeRw`); an engine
+/// that could not tell says -1, or nothing.
+pub fn layer_of(inspect: &serde_json::Value) -> Option<u64> {
+    u64::try_from(inspect.get("SizeRw")?.as_i64()?).ok()
+}
+
 /// Lowercase letters, digits and dashes: what goes into a container's name and a label.
 fn plain(name: &str) -> bool {
     !name.is_empty()
@@ -421,7 +468,7 @@ impl OciVmm {
     /// The container's settings: see the crate's documentation for each.
     fn create_body(&self, spec: &VmSpec, version: &str, network: Option<&str>) -> serde_json::Value {
         let memory = spec.memory_bytes;
-        json!({
+        let mut body = json!({
             "Image": image_tag(version),
             "User": "runner",
             "Entrypoint": [SUPERVISOR],
@@ -465,7 +512,60 @@ impl OciVmm {
                 "LogConfig": { "Type": "none", "Config": {} },
                 "RestartPolicy": { "Name": "no" },
             },
-        })
+        });
+        if let Some(bytes) = spec.layer_bytes
+            && self.bounds_layer.load(Ordering::Relaxed)
+        {
+            body["HostConfig"]["StorageOpt"] = json!({ "size": bytes.to_string() });
+        }
+        body
+    }
+
+    /// Makes the container `name` and returns its id. A bound of its layer the engine's storage cannot give is
+    /// dropped, for this container and every later one, which the vm-host's looks hold to their size alone.
+    fn create(
+        &self,
+        name: &str,
+        spec: &VmSpec,
+        version: &str,
+        network: Option<&str>,
+    ) -> Result<String, String> {
+        let answer = loop {
+            let bounded = spec.layer_bytes.is_some() && self.bounds_layer.load(Ordering::Relaxed);
+            let answer = self
+                .engine
+                .request(
+                    "POST",
+                    &format!("/containers/create?name={}", escape(name)),
+                    Body::Json(&self.create_body(spec, version, network)),
+                    Some(CALL),
+                )
+                .map_err(|error| engine_error("the container", error))?;
+            if bounded && layer_bound_refused(&answer) {
+                self.bounds_layer.store(false, Ordering::Relaxed);
+                continue;
+            }
+            break answer;
+        };
+        if answer.status == 404 {
+            return Err(format!(
+                "the engine has no image {}: install it first ({})",
+                image_tag(version),
+                answer.message()
+            ));
+        }
+        if !answer.ok() {
+            return Err(format!(
+                "the container was refused ({}): {}",
+                answer.status,
+                answer.message()
+            ));
+        }
+        answer
+            .json()
+            .ok()
+            .and_then(|value| Some(value.get("Id")?.as_str()?.to_string()))
+            .ok_or_else(|| "the engine named no container".to_string())
     }
 
     fn make(&self, spec: &VmSpec) -> Result<OciVm, String> {
@@ -489,44 +589,17 @@ impl OciVmm {
             Network::Nat => Some(self.network(&name)?),
             Network::None => None,
         };
-        let body = self.create_body(
-            spec,
-            &version,
-            network.as_ref().map(|network| network.name.as_str()),
-        );
-        let answer = self
-            .engine
-            .request(
-                "POST",
-                &format!("/containers/create?name={}", escape(&name)),
-                Body::Json(&body),
-                Some(CALL),
-            )
-            .map_err(|error| engine_error("the container", error))?;
         let mut made = Made {
             engine: self.engine.clone(),
             id: String::new(),
             network,
         };
-        if answer.status == 404 {
-            return Err(format!(
-                "the engine has no image {}: install it first ({})",
-                image_tag(&version),
-                answer.message()
-            ));
-        }
-        if !answer.ok() {
-            return Err(format!(
-                "the container was refused ({}): {}",
-                answer.status,
-                answer.message()
-            ));
-        }
-        let id = answer
-            .json()
-            .ok()
-            .and_then(|value| Some(value.get("Id")?.as_str()?.to_string()))
-            .ok_or("the engine named no container")?;
+        let id = self.create(
+            &name,
+            spec,
+            &version,
+            made.network.as_ref().map(|network| network.name.as_str()),
+        )?;
         made.id.clone_from(&id);
         let passwd = self
             .engine
@@ -748,6 +821,20 @@ impl Vm for OciVm {
             .ok()?;
         resident_of(&answer.json().ok()?)
     }
+
+    fn layer_bytes(&self) -> Option<u64> {
+        let answer = self
+            .engine
+            .request(
+                "GET",
+                &format!("/containers/{}/json?size=1", escape(&self.id)),
+                Body::Empty,
+                Some(CALL),
+            )
+            .ok()
+            .filter(http::Response::ok)?;
+        layer_of(&answer.json().ok()?)
+    }
 }
 
 /// What of the host's memory a container holds, from the engine's statistics: its usage less the page cache the
@@ -910,6 +997,7 @@ mod tests {
             }],
             network: Network::Nat,
             console: "/state/logs/job.console.log".into(),
+            layer_bytes: None,
         }
     }
 
@@ -989,6 +1077,127 @@ mod tests {
             body["StdinOnce"], true,
             "stdin stays open after the vm-host dies: the job outlives it"
         );
+    }
+
+    /// A machine has a scratch disk of the job's size; a container writes into its layer on the engine's own file
+    /// system. Where the engine's storage can bound a layer, the container is made with the job's size as its bound.
+    #[test]
+    fn a_containers_writable_layer_is_bounded_where_the_engines_storage_can() {
+        let sized = VmSpec {
+            layer_bytes: Some(1 << 30),
+            ..spec()
+        };
+        let bounding = vmm();
+        bounding.bounds_layer.store(true, Ordering::Relaxed);
+        let body = bounding.create_body(&sized, "image-20261112-7", Some("n"));
+        assert_eq!(body["HostConfig"]["StorageOpt"], json!({ "size": "1073741824" }));
+        let no_size = bounding.create_body(&spec(), "image-20261112-7", Some("n"));
+        assert!(
+            no_size["HostConfig"].get("StorageOpt").is_none(),
+            "no size, no bound"
+        );
+        let body = vmm().create_body(&sized, "image-20261112-7", Some("n"));
+        assert!(
+            body["HostConfig"].get("StorageOpt").is_none(),
+            "an engine whose storage cannot bound a layer refuses the container that asks"
+        );
+    }
+
+    #[test]
+    fn only_overlay_on_xfs_of_an_engine_with_root_bounds_a_layer() {
+        let info = |driver: &str, backing: &str, options: &[&str]| {
+            json!({
+                "Driver": driver,
+                "DriverStatus": [["Backing Filesystem", backing], ["Supports d_type", "true"]],
+                "SecurityOptions": options,
+            })
+        };
+        assert!(layer_bound(&info("overlay2", "xfs", &["name=userns"])));
+        assert!(layer_bound(&info(
+            "overlay",
+            "xfs",
+            &["name=seccomp,profile=default"]
+        )));
+        // Project quotas are root's: a rootless engine's overlay has no bound to give.
+        assert!(!layer_bound(&info("overlay", "xfs", &["name=rootless"])));
+        assert!(!layer_bound(&info("overlay2", "extfs", &["name=userns"])));
+        assert!(!layer_bound(&info("vfs", "xfs", &[])));
+        assert!(!layer_bound(&json!({ "Driver": "overlay2" })));
+        assert!(!layer_bound(&json!({})));
+    }
+
+    /// An xfs mounted without project quotas is found out by the first container that asks for a bound: the engine
+    /// refuses it, and that one and every later container is made without, held to its size by the vm-host's looks.
+    #[test]
+    fn a_layer_bound_the_engine_refuses_is_dropped_once_and_for_all() {
+        let engine = fake::FakeEngine::new(|asked| {
+            let body: serde_json::Value = serde_json::from_slice(&asked.body).unwrap_or_default();
+            if body["HostConfig"].get("StorageOpt").is_some() {
+                (
+                    400,
+                    json!({ "message": "--storage-opt is supported only for overlay over xfs with 'pquota' mount option" })
+                        .to_string(),
+                )
+            } else {
+                (201, json!({ "Id": "c1", "Warnings": [] }).to_string())
+            }
+        });
+        let vmm = OciVmm::of(&engine.socket, "host-1").unwrap();
+        vmm.bounds_layer.store(true, Ordering::Relaxed);
+        let sized = VmSpec {
+            layer_bytes: Some(1 << 30),
+            ..spec()
+        };
+        assert_eq!(vmm.create("c-0", &sized, "v", None).unwrap(), "c1");
+        assert_eq!(vmm.create("c-1", &sized, "v", None).unwrap(), "c1");
+        let bounds: Vec<bool> = engine
+            .asked()
+            .iter()
+            .map(|asked| {
+                let body: serde_json::Value = serde_json::from_slice(&asked.body).unwrap();
+                body["HostConfig"].get("StorageOpt").is_some()
+            })
+            .collect();
+        assert_eq!(bounds, [true, false, false]);
+
+        // Any other refusal stays an error, and asks once.
+        let engine = fake::FakeEngine::new(|_| (500, json!({ "message": "no space left" }).to_string()));
+        let vmm = OciVmm::of(&engine.socket, "host-1").unwrap();
+        vmm.bounds_layer.store(true, Ordering::Relaxed);
+        let refused = vmm.create("c-0", &sized, "v", None).unwrap_err();
+        assert!(refused.contains("no space left"), "{refused}");
+        assert_eq!(engine.asked().len(), 1);
+    }
+
+    #[test]
+    fn a_layers_size_is_what_the_engine_says_it_holds() {
+        let engine = fake::FakeEngine::new(|asked| match asked.path.as_str() {
+            "/containers/c1/json?size=1" => {
+                (200, json!({ "Id": "c1", "SizeRw": 734_003_200u64 }).to_string())
+            }
+            _ => (404, json!({ "message": "no such container" }).to_string()),
+        });
+        let vm = |id: &str| OciVm {
+            engine: Engine::new(&engine.socket),
+            id: id.into(),
+            exit: Arc::default(),
+            channel: Mutex::new(None),
+            _network: None,
+        };
+        assert_eq!(vm("c1").layer_bytes(), Some(734_003_200));
+        assert_eq!(
+            vm("c2").layer_bytes(),
+            None,
+            "a container that is gone holds nothing to tell"
+        );
+        assert_eq!(
+            layer_of(&json!({ "SizeRw": -1 })),
+            None,
+            "an engine that could not tell"
+        );
+        assert_eq!(layer_of(&json!({ "SizeRw": "1" })), None);
+        assert_eq!(layer_of(&json!({})), None);
+        assert_eq!(layer_of(&json!({ "SizeRw": 0 })), Some(0));
     }
 
     /// An engine on a rootless host that holds one container and one network of `host-1` for each owner label.
