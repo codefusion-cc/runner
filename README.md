@@ -185,7 +185,7 @@ an older one, a checksum that does not match, a missing file, a program of anoth
 room leaves the running program as it was and says why. GitHub answers 60 reads an hour to an address without a
 token; a used-up limit is waited out, at most 15 minutes a read. Releases are not signed: the checksum guards against a
 broken download, HTTPS against anyone between the host and GitHub, and the publisher's name against a release someone
-made by hand; anyone who can change this repository's workflows on main can still publish. "Runner release" puts out
+made by hand; anyone with write access to this repository can still publish or replace one. "Runner release" puts out
 a commit only once its push's CI, Image when it made one, and "Runner build" are green on main
 (`scripts/release-gate.sh`), the rule the console rolls out by, plus the build; a commit whose build failed has no
 release, and its `update-to` is refused. A Runner installed from a release before this could not update itself: one
