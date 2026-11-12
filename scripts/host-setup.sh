@@ -55,6 +55,10 @@ RELEASES_API=https://api.github.com/repos/codefusion-cc/runner/releases
 PACKAGES=(passt curl jq ca-certificates)
 # Container mode's engine: Podman, rootless, with the subordinate ids and the user's D-Bus it runs on.
 CONTAINER_PACKAGES=(podman uidmap slirp4netns dbus-user-session)
+# The kernel modules of the firewall each container's supervisor loads in its own network namespace, which can load
+# none itself; loaded now and named in MODULES_LOAD for every boot.
+CONTAINER_MODULES=(nf_tables nft_ct)
+MODULES_LOAD=/etc/modules-load.d/codefusion-runner.conf
 BUILD_PACKAGES=(git build-essential pkg-config libssl-dev)
 # The hold `install` sets while it puts a new Runner in place.
 SETUP_HOLD=host-setup
@@ -160,6 +164,17 @@ merged_config() {
 # installs the newest of its new kind.
 kept_image() {
   if [[ -n $1 && $1 == "$2"* ]]; then printf '%s\n' "$1"; fi
+}
+
+# Of the modules ($3 on), those the boot list $1 lacks, each as "boot <module>", and those not loaded now (no folder in
+# $2, /sys/module), each as "now <module>".
+modules_wanted() {
+  local list=$1 loaded=$2 module
+  shift 2
+  for module; do
+    grep -qx -- "$module" "$list" 2>/dev/null || printf 'boot %s\n' "$module"
+    [[ -d $loaded/$module ]] || printf 'now %s\n' "$module"
+  done
 }
 
 # Sourced (the tests), it only defines the above.
@@ -452,7 +467,16 @@ install_host() {
 place_engine() {
   step=engine
   engine=/run/user/$(id -u "$USER_NAME" 2>/dev/null || echo 0)/podman/podman.sock
-  local file start
+  local file start when module
+  while read -r when module; do
+    if [[ $when == boot ]]; then
+      change "load the kernel module $module at every boot ($MODULES_LOAD)"
+      ((dry)) || printf '%s\n' "$module" >>"$MODULES_LOAD"
+    else
+      change "load the kernel module $module"
+      ((dry)) || modprobe "$module"
+    fi
+  done < <(modules_wanted "$MODULES_LOAD" /sys/module "${CONTAINER_MODULES[@]}")
   for file in /etc/subuid /etc/subgid; do
     if ! grep -q "^$USER_NAME:" "$file" 2>/dev/null; then
       change "give $USER_NAME 65536 subordinate ids in $file"

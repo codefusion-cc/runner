@@ -11,6 +11,10 @@ Left out, `sandbox` is `vm` and nothing changes. `engine` is the Unix socket of 
 Podman (what `scripts/host-setup.sh --sandbox container` sets up), rootless Docker, OrbStack, or Docker with user
 namespaces. A rootful engine that maps a container's root onto the host's is refused when the Runner starts.
 
+A container's firewall is loaded in its own network namespace, which can load no kernel module: the host loads
+`nf_tables` and `nft_ct` itself. `host-setup.sh` loads them and names them in
+`/etc/modules-load.d/codefusion-runner.conf` for every boot; on another host, do the same.
+
 ## What a job gets
 
 Everything above the hypervisor is the same in both modes: the vm-host, its states, its waits and its timeout, the

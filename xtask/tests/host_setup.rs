@@ -341,6 +341,61 @@ fn an_enrolled_host_keeps_its_image_only_while_its_sandbox_runs_that_kind() {
     assert_eq!(kept("", "image-"), "", "none configured");
 }
 
+/// `modules_wanted` of the script, sourced: what a container host still needs of `modules`, given its boot list's
+/// text (none: no file) and the modules loaded now.
+fn wanted(boot_list: Option<&str>, loaded: &[&str], modules: &[&str]) -> String {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/host-setup.sh");
+    let dir = tempfile::tempdir().expect("a folder");
+    let list = dir.path().join("codefusion-runner.conf");
+    if let Some(text) = boot_list {
+        std::fs::write(&list, text).expect("the boot list");
+    }
+    let sys = dir.path().join("module");
+    for module in loaded {
+        std::fs::create_dir_all(sys.join(module)).expect("a loaded module");
+    }
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\" && shift && modules_wanted \"$@\"",
+            "bash",
+            script,
+        ])
+        .arg(&list)
+        .arg(&sys)
+        .args(modules)
+        .output()
+        .expect("bash runs");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).expect("UTF-8")
+}
+
+#[test]
+fn a_container_host_loads_the_firewalls_modules_now_and_at_every_boot() {
+    let modules = ["nf_tables", "nft_ct"];
+    assert_eq!(
+        wanted(None, &[], &modules),
+        "boot nf_tables\nnow nf_tables\nboot nft_ct\nnow nft_ct\n",
+        "a new host"
+    );
+    assert_eq!(
+        wanted(Some("nf_tables\nnft_ct\n"), &["nf_tables", "nft_ct"], &modules),
+        "",
+        "a host that has them"
+    );
+    assert_eq!(
+        wanted(Some("nf_tables\n"), &["nf_tables"], &modules),
+        "boot nft_ct\nnow nft_ct\n",
+        "a host with one of them"
+    );
+    assert_eq!(
+        wanted(Some("# nft_ct\nnft_ct_extra\n"), &["nf_tables"], &["nft_ct"]),
+        "boot nft_ct\nnow nft_ct\n",
+        "a comment or a longer name is not the module"
+    );
+    assert_eq!(wanted(None, &[], &[]), "", "no modules asked for");
+}
+
 #[test]
 fn settings_that_name_an_owned_key_or_are_no_object_are_refused() {
     let refused = merged(
