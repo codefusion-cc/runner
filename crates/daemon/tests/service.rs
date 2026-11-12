@@ -3906,6 +3906,75 @@ async fn an_update_to_a_commit_builds_that_commit_and_installs_what_it_built() {
         .await;
 }
 
+/// A Runner installed from a release offers `update-to` alone: a plain `update` is refused and fetches nothing, and
+/// an `update-to` that comes while a job runs is fetched at once and put in place only once the machine is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_from_a_release_updates_only_to_a_commit_and_waits_for_its_machines() {
+    let rig = Rig::new(2).await;
+    rig.updates.commits_only();
+    rig.service.discover().await;
+    let calls = rig.console.calls();
+    until("a report", || rig.console.calls() > calls).await;
+    let commands = last_status(&rig.console)["commands"].clone();
+    assert_eq!(
+        commands,
+        json!([
+            "pause",
+            "resume",
+            "restart",
+            "stop-runner",
+            "update-to",
+            "settings",
+            "test-run"
+        ])
+    );
+    let plain = rig.console.queue_command("update", None);
+    until("the result", || !results_of(&rig.console, &plain).is_empty()).await;
+    let heard = &results_of(&rig.console, &plain)[0];
+    assert_eq!(
+        (&heard["ok"], &heard["message"]),
+        (&json!(false), &json!(cf_daemon::update::NO_HEAD))
+    );
+    assert_eq!(rig.updates.built(), 0, "nothing was fetched");
+
+    let runner = rig.job_running().await;
+    rig.updates.build_gives(Ok(NEWER));
+    let to = rig
+        .console
+        .queue_command("update-to", Some(json!({"commit": "5c0ffee0a1b2"})));
+    rig.settles("no new job while the machine stands", || {
+        last_status(&rig.console)["reason"]
+            == json!(format!("updating to {NEWER}: waiting for 1 machine to end"))
+    })
+    .await;
+    assert_eq!(
+        rig.updates.asked(),
+        [Some("5c0ffee0a1b2".to_string())],
+        "fetched while the job runs"
+    );
+    assert_eq!(
+        rig.updates.installed(),
+        [],
+        "not put in place while the machine stands"
+    );
+    // A second one while the first waits is refused, and fetches nothing.
+    let again = rig
+        .console
+        .queue_command("update-to", Some(json!({"commit": "5c0ffee0a1b2"})));
+    until("the result", || !results_of(&rig.console, &again).is_empty()).await;
+    assert_eq!(
+        results_of(&rig.console, &again)[0]["message"],
+        json!("an update is under way already")
+    );
+    assert_eq!(rig.updates.built(), 1);
+    rig.finish(&runner, "succeeded");
+    rig.settles("installed", || rig.updates.installed().len() == 1)
+        .await;
+    assert_eq!(rig.updates.installed()[0].id, to);
+    rig.settles("the Runner is to end", || rig.service.restart_requested())
+        .await;
+}
+
 /// An `update-to` whose arguments name no commit is answered with why, and nothing is built: the Mac goes on taking
 /// jobs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

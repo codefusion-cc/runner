@@ -223,6 +223,167 @@ fn a_server_error_or_no_answer_is_asked_again() {
     assert!(said.contains("GitHub answered 000 for"), "{said}");
 }
 
+/// `runs_newer` of the script, sourced, against the repository's API at `api`: the Runner that runs at `running`,
+/// the release asked for at `wanted`. Its answer and what it said on standard error.
+fn runs_newer(api: &str, running: &str, wanted: &str, env: &[(&str, &str)]) -> (String, String) {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/host-setup.sh");
+    let mut command = Command::new("bash");
+    command
+        .args([
+            "-c",
+            "source \"$1\" && runs_newer \"$2\" \"$3\" \"$4\"",
+            "bash",
+            script,
+            api,
+            running,
+            wanted,
+        ])
+        .env_remove("GITHUB_TOKEN");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let out = command.output().expect("bash runs");
+    assert!(out.status.success(), "it always answers: {out:?}");
+    (
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+const RUNS: &str = "bbbbbbbbbbbb";
+const ASKED: &str = "aaaaaaaaaaaa";
+const MAIN: &str = "cccccccccccc0000000000000000000000000000";
+
+fn compared(status: &str) -> Reply {
+    Reply::json(&serde_json::json!({ "status": status, "commits": [] }))
+}
+
+fn main_at() -> Reply {
+    Reply::json(&serde_json::json!({ "ref": "refs/heads/main", "object": { "sha": MAIN, "type": "commit" } }))
+}
+
+fn paths(api: &Api) -> Vec<String> {
+    api.requests().iter().map(|r| r.path.clone()).collect()
+}
+
+/// A Runner that updated itself past the release a run asks for, to a commit main has, stays: the version is a
+/// minimum.
+#[test]
+fn a_runner_newer_on_main_than_the_version_asked_for_stays() {
+    for main_says in ["ahead", "identical"] {
+        let api = api(vec![compared("ahead"), main_at(), compared(main_says)]);
+        let (said, _) = runs_newer(&api.server.url(), RUNS, ASKED, &[]);
+        assert_eq!(said, "keep", "main is {main_says} of it");
+        assert_eq!(
+            paths(&api),
+            [
+                format!("/compare/{ASKED}...{RUNS}"),
+                "/git/ref/heads/main".to_string(),
+                format!("/compare/{RUNS}...{MAIN}"),
+            ]
+        );
+    }
+}
+
+#[test]
+fn a_runner_older_than_the_version_asked_for_or_off_main_takes_it() {
+    for (answers, asked) in [
+        (vec![compared("behind")], 1),
+        (vec![compared("diverged")], 1),
+        // Newer than the one asked for, but on a branch beside main, or a tag named main.
+        (vec![compared("ahead"), main_at(), compared("diverged")], 3),
+        (vec![compared("ahead"), main_at(), compared("behind")], 3),
+    ] {
+        let api = api(answers);
+        let (said, _) = runs_newer(&api.server.url(), RUNS, ASKED, &[]);
+        assert_eq!(said, "install");
+        assert_eq!(api.requests().len(), asked);
+    }
+}
+
+/// The same commit with other bytes, or a program that names no commit: the release asked for goes in, and GitHub is
+/// not asked.
+#[test]
+fn a_runner_of_no_commit_or_of_the_one_asked_for_takes_it_without_asking_github() {
+    let api = api(vec![compared("ahead")]);
+    for running in [
+        ASKED,
+        "",
+        "unknown",
+        "bbbbbbbbbbb",
+        "bbbbbbbbbbbbb",
+        "BBBBBBBBBBBB",
+        "bbbbbbbbbbb-",
+    ] {
+        let (said, _) = runs_newer(&api.server.url(), running, ASKED, &[]);
+        assert_eq!(said, "install", "{running:?}");
+    }
+    assert_eq!(api.requests().len(), 0);
+}
+
+/// GitHub's rate limit and server errors are waited out as every read of the script waits them out.
+#[test]
+fn a_429_or_a_5xx_is_asked_again_before_it_decides() {
+    let api = api(vec![
+        rate_limited(429).with_header("Retry-After", "1"),
+        compared("ahead"),
+        Reply::empty(502),
+        main_at(),
+        Reply::empty(503),
+        compared("ahead"),
+    ]);
+    let (said, stderr) = runs_newer(&api.server.url(), RUNS, ASKED, &[]);
+    assert_eq!(said, "keep");
+    assert_eq!(api.requests().len(), 6);
+    assert!(
+        stderr.contains("GitHub answered 429, asking again in 1s"),
+        "{stderr}"
+    );
+}
+
+/// When GitHub cannot say, at any of the three reads, the Runner that runs stays.
+#[test]
+fn what_github_cannot_say_keeps_the_runner_that_runs() {
+    let not_found = Reply::status_json(404, &serde_json::json!({ "message": "Not Found" }));
+    for answers in [
+        vec![Reply::empty(503)],
+        vec![not_found.clone()],
+        vec![Reply::text(200, "<html>a proxy</html>")],
+        vec![compared("sideways")],
+        vec![compared("ahead"), Reply::empty(503)],
+        vec![
+            compared("ahead"),
+            Reply::json(&serde_json::json!({ "object": { "sha": "main" } })),
+        ],
+        vec![compared("ahead"), main_at(), Reply::empty(503)],
+        vec![compared("ahead"), main_at(), not_found],
+    ] {
+        let api = api(answers.clone());
+        let (said, _) = runs_newer(
+            &api.server.url(),
+            RUNS,
+            ASKED,
+            &[("GITHUB_TRIES", "2"), ("GITHUB_WAIT_MAX", "1")],
+        );
+        assert_eq!(said, "unknown", "{answers:?}");
+    }
+}
+
+/// A ref that names no whole commit, such as a tag's or a short name, is not compared with: main is not known.
+#[test]
+fn a_main_that_names_no_whole_commit_is_not_compared_with() {
+    for sha in ["main", &MAIN[..12], &MAIN.to_uppercase(), ""] {
+        let api = api(vec![
+            compared("ahead"),
+            Reply::json(&serde_json::json!({ "object": { "sha": sha } })),
+            compared("ahead"),
+        ]);
+        let (said, _) = runs_newer(&api.server.url(), RUNS, ASKED, &[]);
+        assert_eq!(said, "unknown", "{sha:?}");
+        assert_eq!(api.requests().len(), 2, "{sha:?}");
+    }
+}
+
 /// `merged_config` of the script, sourced: the configuration's text now, the last run's settings, the keys the script
 /// owns and the settings of this run.
 fn merged(now: &str, last: &str, owned: &str, settings: &str) -> Result<serde_json::Value, String> {
@@ -625,4 +786,239 @@ fn euid_is_root() -> bool {
         .arg("-u")
         .output()
         .is_ok_and(|output| output.stdout.trim_ascii() == b"0")
+}
+
+/// `scripts/release-gate.sh` against the repository's API at `api`, for `commit`: its status, standard output and
+/// standard error.
+fn release_gate(api: &str, commit: &str, env: &[(&str, &str)]) -> (Option<i32>, String, String) {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/release-gate.sh");
+    let mut command = Command::new("bash");
+    command.args([script, api, commit]).env_remove("GITHUB_TOKEN");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let out = command.output().expect("bash runs");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+const PUSHED: &str = "dddddddddddd0000000000000000000000000000";
+
+/// A run of a workflow as GitHub lists it, of the push of `PUSHED` to main unless changed.
+fn run(id: u64, number: u64, status: &str, conclusion: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "run_number": number, "run_attempt": 1, "status": status, "conclusion": conclusion,
+        "head_sha": PUSHED, "event": "push", "head_branch": "main",
+    })
+}
+
+fn runs(list: &[serde_json::Value]) -> Reply {
+    Reply::json(&serde_json::json!({ "total_count": list.len(), "workflow_runs": list }))
+}
+
+fn green(id: u64) -> Reply {
+    runs(&[run(id, 1, "completed", Some("success"))])
+}
+
+/// The reads before the runs: main's ref, and main has the commit.
+fn on_main() -> Vec<Reply> {
+    vec![main_at(), compared("ahead")]
+}
+
+fn gate_says(answers: Vec<Reply>) -> (String, usize) {
+    let api = api(answers);
+    let (status, said, stderr) = release_gate(&api.server.url(), PUSHED, &[]);
+    assert_eq!(status, Some(0), "{said} {stderr}");
+    (said, api.requests().len())
+}
+
+/// A push whose CI, Image when it made one, and Runner build are green gets its release, with that build's programs.
+#[test]
+fn a_green_push_of_main_is_released_with_its_build() {
+    let api = api([on_main(), vec![green(10), runs(&[]), green(30)]].concat());
+    let (status, said, stderr) = release_gate(&api.server.url(), PUSHED, &[]);
+    assert_eq!((status, said.as_str()), (Some(0), "publish 30"), "{stderr}");
+    let requests = api.requests();
+    let asked: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        asked,
+        [
+            "/git/ref/heads/main",
+            &format!("/compare/{PUSHED}...{MAIN}"),
+            "/actions/workflows/ci.yml/runs",
+            "/actions/workflows/image.yml/runs",
+            "/actions/workflows/runner-build.yml/runs",
+        ]
+    );
+    for request in &requests[2..] {
+        for pair in [("head_sha", PUSHED), ("event", "push"), ("branch", "main")] {
+            assert!(
+                request.query.contains(&(pair.0.to_string(), pair.1.to_string())),
+                "{:?}",
+                request.query
+            );
+        }
+    }
+    // Main at the commit itself, and an Image run that is green.
+    let (said, _) = gate_says(vec![
+        main_at(),
+        compared("identical"),
+        green(10),
+        green(20),
+        green(30),
+    ]);
+    assert_eq!(said, "publish 30");
+}
+
+/// The red commit that went out before: a run that ended other than green keeps its commit's release back, as does
+/// a commit main does not have.
+#[test]
+fn a_push_with_a_red_run_or_off_main_gets_no_release() {
+    let red = |conclusion| runs(&[run(9, 1, "completed", Some(conclusion))]);
+    for (answers, starts) in [
+        (vec![main_at(), compared("behind")], "skip "),
+        (vec![main_at(), compared("diverged")], "skip "),
+        (
+            [on_main(), vec![red("failure")]].concat(),
+            "skip CI run 9 ended failure",
+        ),
+        (
+            [on_main(), vec![red("cancelled")]].concat(),
+            "skip CI run 9 ended cancelled",
+        ),
+        (
+            [on_main(), vec![red("timed_out")]].concat(),
+            "skip CI run 9 ended timed_out",
+        ),
+        (
+            [on_main(), vec![green(10), red("failure")]].concat(),
+            "skip Image run 9",
+        ),
+        (
+            [on_main(), vec![green(10), runs(&[]), red("failure")]].concat(),
+            "skip Runner build run 9",
+        ),
+    ] {
+        let (said, _) = gate_says(answers);
+        assert!(said.starts_with(starts), "{said}");
+    }
+}
+
+/// A run not ended, or not started, makes it wait: the workflow_run of the run that ends starts the check again.
+#[test]
+fn a_push_whose_runs_have_not_ended_waits() {
+    let going = |status| runs(&[run(9, 1, status, None)]);
+    for (answers, says) in [
+        (
+            [on_main(), vec![going("in_progress")]].concat(),
+            "wait CI run 9 is in_progress",
+        ),
+        (
+            [on_main(), vec![going("queued")]].concat(),
+            "wait CI run 9 is queued",
+        ),
+        (
+            [on_main(), vec![runs(&[])]].concat(),
+            "wait CI has not run for this push",
+        ),
+        (
+            [on_main(), vec![green(10), going("in_progress")]].concat(),
+            "wait Image run 9 is in_progress",
+        ),
+        (
+            [on_main(), vec![green(10), runs(&[]), runs(&[])]].concat(),
+            "wait Runner build has not run for this push",
+        ),
+    ] {
+        let (said, _) = gate_says(answers);
+        assert_eq!(said, says);
+    }
+}
+
+/// The newest run of a workflow counts, as on the console: a re-run that went green releases, a newer red one does
+/// not; runs of other commits, events or branches in the answer are none of this push's.
+#[test]
+fn the_newest_run_of_the_push_counts() {
+    let old_red = run(9, 4, "completed", Some("failure"));
+    let new_green = run(10, 5, "completed", Some("success"));
+    let mut rerun_green = run(9, 4, "completed", Some("success"));
+    rerun_green["run_attempt"] = 2.into();
+    let mut first_attempt_red = run(9, 4, "completed", Some("failure"));
+    first_attempt_red["run_attempt"] = 1.into();
+    for (list, says) in [
+        (vec![old_red.clone(), new_green.clone()], "publish 30"),
+        (vec![new_green.clone(), old_red.clone()], "publish 30"),
+        (vec![first_attempt_red, rerun_green], "publish 30"),
+        (
+            vec![run(11, 6, "completed", Some("failure")), new_green.clone()],
+            "skip CI run 11 ended failure",
+        ),
+    ] {
+        let (said, _) = gate_says([on_main(), vec![runs(&list), runs(&[]), green(30)]].concat());
+        assert_eq!(said, says, "{list:?}");
+    }
+    for (field, value) in [
+        ("head_sha", "eeeeeeeeeeee0000000000000000000000000000"),
+        ("event", "pull_request"),
+        ("head_branch", "main-copy"),
+    ] {
+        let mut other = run(12, 7, "completed", Some("success"));
+        other[field] = value.into();
+        let (said, _) = gate_says([on_main(), vec![runs(&[other])]].concat());
+        assert_eq!(said, "wait CI has not run for this push", "{field}");
+    }
+}
+
+/// GitHub's rate limit and server errors are waited out; when GitHub cannot say, the gate fails rather than release.
+#[test]
+fn the_gate_waits_out_429_and_5xx_and_fails_when_github_cannot_say() {
+    let (said, asked) = gate_says(vec![
+        rate_limited(429).with_header("Retry-After", "1"),
+        main_at(),
+        Reply::empty(502),
+        compared("ahead"),
+        green(10),
+        Reply::empty(503),
+        runs(&[]),
+        green(30),
+    ]);
+    assert_eq!((said.as_str(), asked), ("publish 30", 8));
+
+    let limits = [("GITHUB_TRIES", "2"), ("GITHUB_WAIT_MAX", "1")];
+    for answers in [
+        vec![Reply::empty(503)],
+        vec![Reply::json(&serde_json::json!({ "object": { "sha": "main" } }))],
+        vec![main_at(), compared("sideways")],
+        vec![main_at(), Reply::status_json(404, &serde_json::json!({ "message": "Not Found" }))],
+        [on_main(), vec![Reply::empty(503)]].concat(),
+        [on_main(), vec![Reply::text(200, "<html>a proxy</html>")]].concat(),
+        [on_main(), vec![runs(&[serde_json::json!({ "id": "x", "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success", "head_sha": PUSHED, "event": "push", "head_branch": "main" })])]].concat(),
+        [on_main(), vec![green(10), runs(&[]), Reply::empty(500)]].concat(),
+    ] {
+        let api = api(answers.clone());
+        let (status, said, _) = release_gate(&api.server.url(), PUSHED, &limits);
+        assert_ne!(status, Some(0), "{answers:?}");
+        assert!(!said.starts_with("publish"), "{said}");
+    }
+}
+
+#[test]
+fn the_gate_takes_only_a_whole_commit() {
+    let api = api(vec![main_at()]);
+    for commit in [
+        "",
+        "main",
+        &PUSHED[..12],
+        &PUSHED.to_uppercase(),
+        &format!("{PUSHED}0"),
+        "../../x",
+    ] {
+        let (status, said, _) = release_gate(&api.server.url(), commit, &[]);
+        assert!(status.is_some_and(|code| code != 0), "{commit:?}");
+        assert_eq!(said, "", "{commit:?}");
+    }
+    assert_eq!(api.requests().len(), 0);
 }

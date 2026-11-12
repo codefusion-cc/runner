@@ -2469,8 +2469,11 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
     fn commands(&self) -> Vec<String> {
         let shared = &self.shared;
         let mut kinds = vec!["pause", "resume", "restart", "stop-runner"];
-        if shared.updates.is_some() {
-            kinds.extend(["update", "update-to"]);
+        if let Some(updates) = &shared.updates {
+            if updates.takes_head() {
+                kinds.push("update");
+            }
+            kinds.push("update-to");
         }
         if shared.settings.is_some() {
             kinds.push("settings");
@@ -2691,6 +2694,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return Some((false, "this Runner has nowhere to update from".into()));
         };
         let commit = match commit {
+            Ok(None) if !updates.takes_head() => return Some((false, crate::update::NO_HEAD.into())),
             Ok(commit) => commit,
             Err(why) => return Some((false, why)),
         };

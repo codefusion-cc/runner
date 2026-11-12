@@ -18,6 +18,8 @@ mod linux;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod manager;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+mod release_update;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod service;
 #[cfg(target_os = "linux")]
 mod systemd;

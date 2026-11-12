@@ -20,7 +20,8 @@ use crate::commands::VERSION;
 use crate::config::{Class, Config};
 use crate::hidden::{self, NoLine};
 use crate::manager::ServiceManager;
-use crate::update::{self, CheckoutUpdate, Started};
+use crate::release_update::ReleaseUpdate;
+use crate::update::{self, CheckoutUpdate, Installer, Started};
 
 /// How long GitHub and the console have to answer one call of a command.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -440,20 +441,11 @@ fn run_daemon(config: &Path) -> Result<(), String> {
     }
     // Only the installed program replaces itself: one run from elsewhere would replace another.
     let updates = (program == config.program())
-        .then(|| {
-            CheckoutUpdate::of_this_program(
-                &config.state_dir,
-                &config.program(),
-                &config.records(),
-                config.build_folder.as_deref(),
-                This::fit,
-            )
-        })
-        .flatten()
-        .map(Arc::new);
+        .then(|| self_update(&config))
+        .flatten();
     let runtime = runtime(2)?;
     let ran = runtime.block_on(async {
-        let updates = updates.clone().map(|updates| updates as Arc<dyn SelfUpdate>);
+        let updates = updates.clone();
         let (app, key) = app_and_key(&config)?;
         let held = key.map(|tokens| held(&config, &path_of_settings, tokens));
         // A key that serves says why it is kept, in its own words.
@@ -521,7 +513,7 @@ fn run_daemon(config: &Path) -> Result<(), String> {
     // An update's build is ended with the Runner (the console sends its command again to the one that starts
     // next), and a git call of one is not waited for.
     if let Some(updates) = &updates {
-        updates.end_build();
+        updates.end();
     }
     runtime.shutdown_timeout(Duration::from_secs(5));
     if ran.is_ok()
@@ -531,6 +523,34 @@ fn run_daemon(config: &Path) -> Result<(), String> {
         tracing::warn!(%error, "the update under way still counts this start");
     }
     ran
+}
+
+/// How the installed program updates itself: from the checkout it was built in when the configuration names that
+/// as its build folder; else, on a host the Runner's releases are made for, from the release of the commit the
+/// console names; else from a checkout, whose build says why it builds nothing.
+fn self_update(config: &Config) -> Option<Arc<dyn SelfUpdate>> {
+    let installer = || Installer {
+        installed: config.program(),
+        records: config.records(),
+        state_dir: config.state_dir.clone(),
+        fit: This::fit,
+    };
+    let checkout = || {
+        CheckoutUpdate::of_this_program(
+            &config.state_dir,
+            &config.program(),
+            &config.records(),
+            config.build_folder.as_deref(),
+            This::fit,
+        )
+        .map(|update| Arc::new(update) as Arc<dyn SelfUpdate>)
+    };
+    if config.build_folder.is_some() {
+        return checkout();
+    }
+    ReleaseUpdate::of_this_program(installer(), &config.github_api)
+        .map(|update| Arc::new(update) as Arc<dyn SelfUpdate>)
+        .or_else(checkout)
 }
 
 /// What a Runner starts on: its settings, as [`startable`] took them, what became of the App's key folder they named,

@@ -174,6 +174,19 @@ install and start again. A new program that does not stay up for a minute three 
 and the console hears why; a start that ends as asked (a signal, `restart`) does not count. `restart` ends the Runner
 at once and launchd (systemd on Linux) starts it again; machines that run go on and are adopted.
 
+A Linux Runner installed from a release (`host-setup.sh --version`, no `build_folder`) builds nothing: it lists only
+`update-to`, and the console names the commit. It takes that commit's release of this repository, `runner-<version>`
+(`0.1.0-<12 hex>`), from GitHub's API with no token: the release must be published by `github-actions[bot]`, made at
+the whole commit, on `main` and newer than the commit that runs (GitHub's compare). It fetches `SHA256SUMS` and
+`codefusion-runner-linux-amd64` or `-arm64` for its own architecture, checks the program against its line, asks it its
+`version`, which must run on this host and name the commit, and then drains, installs and checks the start as a build
+does. A commit whose release is not out yet is waited for up to 16 minutes, asked every 2; a commit with no release,
+an older one, a checksum that does not match, a missing file, a program of another architecture or a disk with no
+room leaves the running program as it was and says why. Releases are not signed: the checksum guards against a
+broken download, and HTTPS to GitHub and the publisher's name against anyone else. "Runner release" puts out a commit
+only once its push's CI, Image when it made one, and "Runner build" are green on main (`scripts/release-gate.sh`), the
+rule the console rolls out by, so every commit the console names has a release.
+
 A configuration written before the console held the App's key names `app_dir`, a folder with the key (`app.pem`)
 beside `app.json`. While the key file is there the Runner signs with it and makes its scale set calls itself, as before,
 and at each look at GitHub asks the console's scale set calls for its scale sets of a repository it serves. Once one
@@ -226,8 +239,10 @@ console, so no App key goes on it; run again (a reboot's startup script), it onl
 sudo scripts/host-setup.sh --machine <name> --console <url> --code-file <file>
 ```
 
-The script's head lists its options (`--home`, `--image`, `--ref`, `--check`). It reads GitHub's API for the image
-with `GITHUB_TOKEN` when that is set, and waits out GitHub's rate limit as the answer says. By hand, once, as root (Ubuntu 24.04
+The script's head lists its options (`--home`, `--image`, `--ref`, `--version`, `--check`). It reads GitHub's API for
+the image with `GITHUB_TOKEN` when that is set, and waits out GitHub's rate limit as the answer says. A `--version` is
+a minimum: an enrolled host whose Runner updated itself to a newer commit of main keeps it, and so does one when
+GitHub cannot say which is newer; the run says so, and a later run asks again. By hand, once, as root (Ubuntu 24.04
 also needs the line about user namespaces):
 
 ```sh

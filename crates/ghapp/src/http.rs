@@ -250,7 +250,7 @@ pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// An exponential wait with jitter: between half and the whole of `base * 2^attempt`, at most `cap`.
-fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
+pub(crate) fn backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
     let full = base
         .saturating_mul(1u32.checked_shl(attempt.min(20)).unwrap_or(u32::MAX))
         .min(cap);

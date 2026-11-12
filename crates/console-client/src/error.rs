@@ -194,7 +194,7 @@ impl From<HttpError> for Error {
                 other => Error::Protocol(format!("{} answered {other}", s.path)),
             },
             HttpError::Transport(why) => Error::Unavailable(why),
-            HttpError::Refused(why) => Error::Protocol(why),
+            HttpError::Refused(why) | HttpError::Local(why) => Error::Protocol(why),
             HttpError::Decode { what, why } => Error::Protocol(format!("{what}: {why}")),
             HttpError::Key(_) => Error::Protocol("a key was asked for".into()),
         }
