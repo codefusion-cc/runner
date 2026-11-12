@@ -1347,6 +1347,16 @@ fn in_a_container_the_job_starts_at_once_with_its_whole_size_and_no_disk() {
 
 /// Runs a container job while `daemon` plays the other side: it gets the monitor once the job runs.
 fn container_job(vmm: &Arc<FakeVmm>, layout: &Layout, daemon: impl FnOnce(&FakeVmm) + Send) -> JobState {
+    container_job_of(vmm, layout, request("a"), daemon)
+}
+
+/// [`container_job`] of this request, whose job is `a`.
+fn container_job_of(
+    vmm: &Arc<FakeVmm>,
+    layout: &Layout,
+    request: JobRequest,
+    daemon: impl FnOnce(&FakeVmm) + Send,
+) -> JobState {
     let mut limits = quick();
     limits.heartbeat = Duration::from_secs(30);
     std::thread::scope(|scope| {
@@ -1359,7 +1369,7 @@ fn container_job(vmm: &Arc<FakeVmm>, layout: &Layout, daemon: impl FnOnce(&FakeV
             }
             daemon(vmm);
         });
-        go_within(vmm, layout, request("a"), limits, false).unwrap()
+        go_within(vmm, layout, request, limits, false).unwrap()
     })
 }
 
@@ -1384,6 +1394,45 @@ fn a_container_that_writes_past_its_disk_size_is_stopped() {
         "it says the size it was held to"
     );
     assert!(vmm.stops() >= 1);
+}
+
+/// A job's disk of another size, as a host's settings give it (`job_disk_gb`): the engine is asked to bound the
+/// layer to it, and the layer is held to it, to the byte.
+#[test]
+fn a_containers_layer_is_bounded_and_held_to_the_disk_its_request_names() {
+    for (written, ends) in [(6 << 30, End::Ok), ((6 << 30) + 1, End::Failed)] {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let (go_on, wait) = mpsc::channel::<()>();
+        let vmm = Arc::new(
+            FakeVmm::new([job(move |mut stream, power, _| {
+                say(&mut stream, GuestMessage::Heartbeat(usage()));
+                if ends == End::Ok {
+                    let _ = wait.recv();
+                    finish(stream, summary(GuestEnd::Exited, Some(0)));
+                } else {
+                    // Only the vm-host's stop ends it.
+                    power.wait_for_the_end();
+                }
+            })])
+            .of_containers(),
+        );
+        let six = JobRequest {
+            scratch_bytes: 6 << 30,
+            ..request("a")
+        };
+        let state = container_job_of(&vmm, &layout, six, move |vmm| {
+            vmm.layer(Some(written));
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = go_on.send(());
+        });
+        assert_eq!(vmm.started()[0].layer_bytes, Some(6 << 30));
+        let ended = state.end.unwrap();
+        assert_eq!(ended.end, ends, "{written}");
+        if ends == End::Failed {
+            assert!(ended.message.unwrap().contains("6144 MiB"));
+        }
+    }
 }
 
 /// A layer of exactly the scratch size is fine, and the most it held is the job's disk peak, whatever the guest,
