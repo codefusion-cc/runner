@@ -31,12 +31,12 @@ if [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 
-main=$(github_get "$api/git/ref/heads/main" | jq -r '.object.sha // empty')
-if [[ ! $main =~ ^[0-9a-f]{40}$ ]]; then
-  echo "release-gate: main's ref names no commit" >&2
+main=$(main_head "$api")
+if [[ -z $main ]]; then
+  echo "release-gate: GitHub could not say which commit main is at" >&2
   exit 1
 fi
-status=$(github_get "$api/compare/$commit...$main?per_page=1" | jq -r '.status // empty')
+status=$(compare_status "$api" "$commit" "$main")
 case $status in
   ahead | identical) ;;
   behind | diverged)
@@ -49,13 +49,15 @@ case $status in
     ;;
 esac
 
-# The newest run of a workflow for the push of the commit to main: `<id> <status> <conclusion>`, or nothing for none.
+# Every run of the push of the commit to main, of every workflow, in one read.
+runs=$(github_get "$api/actions/runs?head_sha=$commit&event=push&branch=main&per_page=100")
+
+# The newest run of the workflow file $1 among them: `<id> <status> <conclusion>`, or nothing for none.
 newest_run() {
-  github_get "$api/actions/workflows/$1/runs?head_sha=$commit&event=push&branch=main&per_page=100" |
-    jq -r --arg commit "$commit" '
-      [.workflow_runs[] | select(.head_sha == $commit and .event == "push" and .head_branch == "main")]
-      | if length == 0 then empty else max_by(.run_number, .run_attempt)
-        | "\(.id) \(.status) \(.conclusion // "none")" end'
+  jq -r --arg commit "$commit" --arg path ".github/workflows/$1" '
+    [.workflow_runs[] | select(.path == $path and .head_sha == $commit and .event == "push" and .head_branch == "main")]
+    | if length == 0 then empty else max_by(.run_number, .run_attempt)
+      | "\(.id) \(.status) \(.conclusion // "none")" end' <<<"$runs"
 }
 
 # `wait` or `skip` for a run that is not green; nothing for a green one. $1 names the workflow, $2 its run, $3 whether

@@ -30,6 +30,6 @@ pub use http::{
 };
 pub use key::KeyTokens;
 pub use release::{
-    Asset, Author, Compared, Downloaded, RELEASES_PAGE, Release, Releases, Sink, is_whole_commit,
+    Asset, Author, Compared, Downloaded, Release, Releases, Sink, is_whole_commit, sleep_unless,
 };
 pub use source::{Monotonic, Pending, SystemMonotonic, TokenSource};

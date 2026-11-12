@@ -39,19 +39,37 @@ pub trait SelfUpdate: Send + Sync {
     /// `pending` written down first. Refused while a machine has a record.
     fn install(&self, pending: &Pending) -> Result<(), String>;
 
-    /// Whether [`SelfUpdate::build`] takes the head of the branch (`update`), as a host that builds does. A host
-    /// that takes the Runner's releases updates only to a commit named (`update-to`), whose release it checks.
-    fn takes_head(&self) -> bool {
-        true
+    /// Where the updates come from: a checkout by default.
+    fn updates_from(&self) -> UpdateFrom {
+        UpdateFrom::Checkout
     }
 
     /// Ends what a build or a download under way started, as the Runner ends: the console sends its command again
     /// to the Runner that starts next. Nothing by default.
     fn end(&self) {}
+}
+
+/// Where a Runner's updates come from, which decides the commands it takes and what the console sees meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateFrom {
+    /// A checkout it builds: the head of main (`update`) or a commit of it (`update-to`).
+    Checkout,
+    /// The Runner's releases: only a commit the console names (`update-to`), whose release it checks.
+    Releases,
+}
+
+impl UpdateFrom {
+    /// Whether [`SelfUpdate::build`] takes the head of the branch (`update`).
+    pub fn takes_head(self) -> bool {
+        self == UpdateFrom::Checkout
+    }
 
     /// What the console shows while [`SelfUpdate::build`] runs.
-    fn first_step(&self) -> &'static str {
-        "building"
+    pub fn first_step(self) -> &'static str {
+        match self {
+            UpdateFrom::Checkout => "building",
+            UpdateFrom::Releases => "fetching its release",
+        }
     }
 }
 

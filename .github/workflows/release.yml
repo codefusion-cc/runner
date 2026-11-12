@@ -97,18 +97,17 @@ jobs:
       - name: The build's programs
         run: |
           set -euo pipefail
-          for platform in amd64 arm64; do
-            for try in 1 2 3 4 5; do
-              rm -rf "in/$platform"
-              if gh run download "$BUILD" --repo "$GITHUB_REPOSITORY" --name "runner-$platform" --dir "in/$platform"; then
-                break
-              fi
-              ((try < 5)) || { echo "::error::run $BUILD's runner-$platform could not be fetched"; exit 1; }
-              sleep $((try * 15))
-            done
+          # Both artifacts in one call, each in a folder of its name.
+          for try in 1 2 3 4 5; do
+            rm -rf in
+            if gh run download "$BUILD" --repo "$GITHUB_REPOSITORY" --pattern 'runner-*' --dir in; then
+              break
+            fi
+            ((try < 5)) || { echo "::error::the programs of run $BUILD could not be fetched"; exit 1; }
+            sleep $((try * 15))
           done
           mkdir out
-          cp in/amd64/* in/arm64/* out/
+          cp in/runner-amd64/* in/runner-arm64/* out/
       - name: Publish
         run: |
           set -euo pipefail

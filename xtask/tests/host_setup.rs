@@ -806,26 +806,29 @@ fn release_gate(api: &str, commit: &str, env: &[(&str, &str)]) -> (Option<i32>, 
 }
 
 const PUSHED: &str = "dddddddddddd0000000000000000000000000000";
+const CI: &str = "ci.yml";
+const IMAGE: &str = "image.yml";
+const BUILD: &str = "runner-build.yml";
 
-/// A run of a workflow as GitHub lists it, of the push of `PUSHED` to main unless changed.
-fn run(id: u64, number: u64, status: &str, conclusion: Option<&str>) -> serde_json::Value {
+/// A run of the workflow file `workflow` as GitHub lists it, of the push of `PUSHED` to main unless changed.
+fn run(workflow: &str, id: u64, number: u64, status: &str, conclusion: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "id": id, "run_number": number, "run_attempt": 1, "status": status, "conclusion": conclusion,
-        "head_sha": PUSHED, "event": "push", "head_branch": "main",
+        "head_sha": PUSHED, "event": "push", "head_branch": "main", "path": format!(".github/workflows/{workflow}"),
     })
+}
+
+fn green(workflow: &str, id: u64) -> serde_json::Value {
+    run(workflow, id, 1, "completed", Some("success"))
 }
 
 fn runs(list: &[serde_json::Value]) -> Reply {
     Reply::json(&serde_json::json!({ "total_count": list.len(), "workflow_runs": list }))
 }
 
-fn green(id: u64) -> Reply {
-    runs(&[run(id, 1, "completed", Some("success"))])
-}
-
-/// The reads before the runs: main's ref, and main has the commit.
-fn on_main() -> Vec<Reply> {
-    vec![main_at(), compared("ahead")]
+/// Main's ref, main has the commit, and the push's runs.
+fn on_main(list: &[serde_json::Value]) -> Vec<Reply> {
+    vec![main_at(), compared("ahead"), runs(list)]
 }
 
 fn gate_says(answers: Vec<Reply>) -> (String, usize) {
@@ -838,7 +841,7 @@ fn gate_says(answers: Vec<Reply>) -> (String, usize) {
 /// A push whose CI, Image when it made one, and Runner build are green gets its release, with that build's programs.
 #[test]
 fn a_green_push_of_main_is_released_with_its_build() {
-    let api = api([on_main(), vec![green(10), runs(&[]), green(30)]].concat());
+    let api = api(on_main(&[green(CI, 10), green(BUILD, 30)]));
     let (status, said, stderr) = release_gate(&api.server.url(), PUSHED, &[]);
     assert_eq!((status, said.as_str()), (Some(0), "publish 30"), "{stderr}");
     let requests = api.requests();
@@ -848,57 +851,50 @@ fn a_green_push_of_main_is_released_with_its_build() {
         [
             "/git/ref/heads/main",
             &format!("/compare/{PUSHED}...{MAIN}"),
-            "/actions/workflows/ci.yml/runs",
-            "/actions/workflows/image.yml/runs",
-            "/actions/workflows/runner-build.yml/runs",
+            "/actions/runs"
         ]
     );
-    for request in &requests[2..] {
-        for pair in [("head_sha", PUSHED), ("event", "push"), ("branch", "main")] {
-            assert!(
-                request.query.contains(&(pair.0.to_string(), pair.1.to_string())),
-                "{:?}",
-                request.query
-            );
-        }
+    for pair in [("head_sha", PUSHED), ("event", "push"), ("branch", "main")] {
+        assert!(
+            requests[2]
+                .query
+                .contains(&(pair.0.to_string(), pair.1.to_string())),
+            "{:?}",
+            requests[2].query
+        );
     }
     // Main at the commit itself, and an Image run that is green.
-    let (said, _) = gate_says(vec![
+    let (said, asked) = gate_says(vec![
         main_at(),
         compared("identical"),
-        green(10),
-        green(20),
-        green(30),
+        runs(&[green(BUILD, 30), green(IMAGE, 20), green(CI, 10)]),
     ]);
-    assert_eq!(said, "publish 30");
+    assert_eq!((said.as_str(), asked), ("publish 30", 3));
 }
 
 /// The red commit that went out before: a run that ended other than green keeps its commit's release back, as does
 /// a commit main does not have.
 #[test]
 fn a_push_with_a_red_run_or_off_main_gets_no_release() {
-    let red = |conclusion| runs(&[run(9, 1, "completed", Some(conclusion))]);
+    let red = |workflow, conclusion| run(workflow, 9, 1, "completed", Some(conclusion));
     for (answers, starts) in [
         (vec![main_at(), compared("behind")], "skip "),
         (vec![main_at(), compared("diverged")], "skip "),
         (
-            [on_main(), vec![red("failure")]].concat(),
+            on_main(&[red(CI, "failure"), green(BUILD, 30)]),
             "skip CI run 9 ended failure",
         ),
         (
-            [on_main(), vec![red("cancelled")]].concat(),
+            on_main(&[red(CI, "cancelled"), green(BUILD, 30)]),
             "skip CI run 9 ended cancelled",
         ),
+        (on_main(&[red(CI, "timed_out")]), "skip CI run 9 ended timed_out"),
         (
-            [on_main(), vec![red("timed_out")]].concat(),
-            "skip CI run 9 ended timed_out",
-        ),
-        (
-            [on_main(), vec![green(10), red("failure")]].concat(),
+            on_main(&[green(CI, 10), red(IMAGE, "failure"), green(BUILD, 30)]),
             "skip Image run 9",
         ),
         (
-            [on_main(), vec![green(10), runs(&[]), red("failure")]].concat(),
+            on_main(&[green(CI, 10), red(BUILD, "failure")]),
             "skip Runner build run 9",
         ),
     ] {
@@ -910,64 +906,67 @@ fn a_push_with_a_red_run_or_off_main_gets_no_release() {
 /// A run not ended, or not started, makes it wait: the workflow_run of the run that ends starts the check again.
 #[test]
 fn a_push_whose_runs_have_not_ended_waits() {
-    let going = |status| runs(&[run(9, 1, status, None)]);
-    for (answers, says) in [
+    let going = |workflow, status| run(workflow, 9, 1, status, None);
+    for (list, says) in [
         (
-            [on_main(), vec![going("in_progress")]].concat(),
+            vec![going(CI, "in_progress"), green(BUILD, 30)],
             "wait CI run 9 is in_progress",
         ),
+        (vec![going(CI, "queued")], "wait CI run 9 is queued"),
+        (vec![green(BUILD, 30)], "wait CI has not run for this push"),
         (
-            [on_main(), vec![going("queued")]].concat(),
-            "wait CI run 9 is queued",
-        ),
-        (
-            [on_main(), vec![runs(&[])]].concat(),
-            "wait CI has not run for this push",
-        ),
-        (
-            [on_main(), vec![green(10), going("in_progress")]].concat(),
+            vec![green(CI, 10), going(IMAGE, "in_progress"), green(BUILD, 30)],
             "wait Image run 9 is in_progress",
         ),
         (
-            [on_main(), vec![green(10), runs(&[]), runs(&[])]].concat(),
-            "wait Runner build has not run for this push",
+            vec![green(CI, 10), going(BUILD, "in_progress")],
+            "wait Runner build run 9 is in_progress",
         ),
+        (vec![green(CI, 10)], "wait Runner build has not run for this push"),
     ] {
-        let (said, _) = gate_says(answers);
+        let (said, _) = gate_says(on_main(&list));
         assert_eq!(said, says);
     }
 }
 
 /// The newest run of a workflow counts, as on the console: a re-run that went green releases, a newer red one does
-/// not; runs of other commits, events or branches in the answer are none of this push's.
+/// not; runs of other workflows, commits, events or branches in the answer are none of this one's.
 #[test]
 fn the_newest_run_of_the_push_counts() {
-    let old_red = run(9, 4, "completed", Some("failure"));
-    let new_green = run(10, 5, "completed", Some("success"));
-    let mut rerun_green = run(9, 4, "completed", Some("success"));
+    let old_red = run(CI, 9, 4, "completed", Some("failure"));
+    let new_green = run(CI, 10, 5, "completed", Some("success"));
+    let mut rerun_green = run(CI, 9, 4, "completed", Some("success"));
     rerun_green["run_attempt"] = 2.into();
-    let mut first_attempt_red = run(9, 4, "completed", Some("failure"));
-    first_attempt_red["run_attempt"] = 1.into();
+    let first_attempt_red = run(CI, 9, 4, "completed", Some("failure"));
     for (list, says) in [
         (vec![old_red.clone(), new_green.clone()], "publish 30"),
         (vec![new_green.clone(), old_red.clone()], "publish 30"),
         (vec![first_attempt_red, rerun_green], "publish 30"),
         (
-            vec![run(11, 6, "completed", Some("failure")), new_green.clone()],
+            vec![run(CI, 11, 6, "completed", Some("failure")), new_green.clone()],
             "skip CI run 11 ended failure",
         ),
+        // A red run of another workflow file, Pins, is none of these.
+        (
+            vec![
+                new_green.clone(),
+                run("pins.yml", 12, 9, "completed", Some("failure")),
+            ],
+            "publish 30",
+        ),
     ] {
-        let (said, _) = gate_says([on_main(), vec![runs(&list), runs(&[]), green(30)]].concat());
+        let (said, _) = gate_says(on_main(&[list.clone(), vec![green(BUILD, 30)]].concat()));
         assert_eq!(said, says, "{list:?}");
     }
     for (field, value) in [
         ("head_sha", "eeeeeeeeeeee0000000000000000000000000000"),
         ("event", "pull_request"),
         ("head_branch", "main-copy"),
+        ("path", ".github/workflows/ci-copy.yml"),
     ] {
-        let mut other = run(12, 7, "completed", Some("success"));
+        let mut other = green(CI, 12);
         other[field] = value.into();
-        let (said, _) = gate_says([on_main(), vec![runs(&[other])]].concat());
+        let (said, _) = gate_says(on_main(&[other, green(BUILD, 30)]));
         assert_eq!(said, "wait CI has not run for this push", "{field}");
     }
 }
@@ -980,23 +979,29 @@ fn the_gate_waits_out_429_and_5xx_and_fails_when_github_cannot_say() {
         main_at(),
         Reply::empty(502),
         compared("ahead"),
-        green(10),
         Reply::empty(503),
-        runs(&[]),
-        green(30),
+        runs(&[green(CI, 10), green(BUILD, 30)]),
     ]);
-    assert_eq!((said.as_str(), asked), ("publish 30", 8));
+    assert_eq!((said.as_str(), asked), ("publish 30", 6));
 
     let limits = [("GITHUB_TRIES", "2"), ("GITHUB_WAIT_MAX", "1")];
+    let mut odd = green(CI, 10);
+    odd["id"] = "x".into();
     for answers in [
         vec![Reply::empty(503)],
         vec![Reply::json(&serde_json::json!({ "object": { "sha": "main" } }))],
         vec![main_at(), compared("sideways")],
-        vec![main_at(), Reply::status_json(404, &serde_json::json!({ "message": "Not Found" }))],
-        [on_main(), vec![Reply::empty(503)]].concat(),
-        [on_main(), vec![Reply::text(200, "<html>a proxy</html>")]].concat(),
-        [on_main(), vec![runs(&[serde_json::json!({ "id": "x", "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success", "head_sha": PUSHED, "event": "push", "head_branch": "main" })])]].concat(),
-        [on_main(), vec![green(10), runs(&[]), Reply::empty(500)]].concat(),
+        vec![
+            main_at(),
+            Reply::status_json(404, &serde_json::json!({ "message": "Not Found" })),
+        ],
+        vec![main_at(), compared("ahead"), Reply::empty(503)],
+        vec![
+            main_at(),
+            compared("ahead"),
+            Reply::text(200, "<html>a proxy</html>"),
+        ],
+        on_main(&[odd, green(BUILD, 30)]),
     ] {
         let api = api(answers.clone());
         let (status, said, _) = release_gate(&api.server.url(), PUSHED, &limits);

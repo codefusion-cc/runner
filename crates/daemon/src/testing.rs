@@ -951,15 +951,11 @@ impl crate::update::SelfUpdate for FakeUpdate {
         }
         answer
     }
-    fn takes_head(&self) -> bool {
-        !self.0.lock().expect("update").commits_only
-    }
-
-    fn first_step(&self) -> &'static str {
+    fn updates_from(&self) -> crate::update::UpdateFrom {
         if self.0.lock().expect("update").commits_only {
-            "fetching its release"
+            crate::update::UpdateFrom::Releases
         } else {
-            "building"
+            crate::update::UpdateFrom::Checkout
         }
     }
 }

@@ -6,16 +6,12 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use reqwest::redirect::Policy;
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, StatusError};
-use crate::http::{Http, RetryPolicy, is_safe_address, retry_after, server_time};
-
-/// How many redirects a download follows: GitHub sends a release's file on once, to its storage.
-const MAX_REDIRECTS: usize = 5;
+use crate::http::{Http, RetryPolicy, file_client, is_safe_address, retry_after, server_time};
 
 /// How long a download may go without a byte before it counts as dropped.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -24,7 +20,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_LOOK: Duration = Duration::from_millis(200);
 
 /// How many releases one page lists: a new release is among the first, and an image release lists many files.
-pub const RELEASES_PAGE: u32 = 30;
+const RELEASES_PAGE: u32 = 30;
 
 /// A release as GitHub's API lists it, with the fields an update reads.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -83,12 +79,12 @@ pub enum Compared {
 }
 
 /// What a download wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Downloaded {
     /// How many bytes.
     pub bytes: u64,
-    /// Their SHA-256.
-    pub sha256: [u8; 32],
+    /// Their SHA-256, in lowercase hex.
+    pub sha256: String,
 }
 
 /// Where a download writes: a sink that can be emptied to begin again when a try breaks off.
@@ -131,12 +127,6 @@ impl Releases {
         if !is_safe_address(&api) {
             return Err(Error::Refused(format!("{api} is not an HTTPS address")));
         }
-        let plain = |part: &str| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        };
         if !repo
             .split_once('/')
             .is_some_and(|(owner, name)| plain(owner) && plain(name))
@@ -145,7 +135,7 @@ impl Releases {
         }
         Ok(Releases {
             http: Http::new(Duration::from_secs(30), retry),
-            files: file_client(),
+            files: file_client(READ_TIMEOUT),
             retry,
             api,
             repo: repo.to_string(),
@@ -176,11 +166,7 @@ impl Releases {
 
     /// The release of `tag`, or `None` when there is none (GitHub answers 404).
     pub async fn by_tag(&self, tag: &str) -> Result<Option<Release>, Error> {
-        if tag.is_empty()
-            || !tag
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
-        {
+        if !plain(tag) {
             return Err(Error::Refused(format!("{tag} is no plain tag")));
         }
         match self.get("the release", &format!("releases/tags/{tag}")).await {
@@ -271,22 +257,16 @@ impl Releases {
                 Ok(downloaded) => return Ok(downloaded),
                 Err(error) => error,
             };
-            if attempt >= self.retry.retries || !error.is_transient() || stop.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) {
                 return Err(error);
             }
-            let wait = match error.retry_after() {
-                Some(asked) if asked > self.retry.max_retry_after => return Err(error),
-                Some(asked) => asked,
-                None => crate::http::backoff(self.retry.base, self.retry.cap, attempt),
+            let Some(wait) = self.retry.wait_after(&error, attempt) else {
+                return Err(error);
             };
             tracing::debug!(attempt, ?wait, "fetching a release's file again");
-            // A wait that `stop` ends early: a Retry-After may ask for minutes.
-            let until = tokio::time::Instant::now() + wait;
-            while tokio::time::Instant::now() < until {
-                if stop.load(Ordering::SeqCst) {
-                    return Err(stopped());
-                }
-                tokio::time::sleep_until(until.min(tokio::time::Instant::now() + STOP_LOOK)).await;
+            // A Retry-After may ask for minutes.
+            if !sleep_unless(stop, wait).await {
+                return Err(stopped());
             }
             attempt += 1;
         }
@@ -347,8 +327,23 @@ impl Releases {
         sink.flush().map_err(|error| local(&error))?;
         Ok(Downloaded {
             bytes,
-            sha256: hash.finalize().into(),
+            sha256: format!("{:x}", hash.finalize()),
         })
+    }
+}
+
+/// Sleeps for `time`, looking at `stop` meanwhile: `false` when it was set before the time was up.
+pub async fn sleep_unless(stop: &AtomicBool, time: Duration) -> bool {
+    let until = tokio::time::Instant::now() + time;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= until {
+            return true;
+        }
+        tokio::time::sleep_until(until.min(now + STOP_LOOK)).await;
     }
 }
 
@@ -365,27 +360,15 @@ fn local(error: &std::io::Error) -> Error {
     }
 }
 
+/// Whether `name` is a plain name in a GitHub address: letters, digits, `-`, `_` and `.`, and not empty.
+fn plain(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// Whether `name` is a whole commit's name: 40 lowercase hex characters.
 pub fn is_whole_commit(name: &str) -> bool {
     name.len() == 40 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// The client of a release's files: GitHub sends the address on to its storage, on another host, so redirects are
-/// followed to any HTTPS address. No token is ever sent; a file read too slowly is dropped, however long it takes
-/// whole.
-fn file_client() -> reqwest::Client {
-    let redirects = Policy::custom(|attempt| {
-        if attempt.previous().len() <= MAX_REDIRECTS && is_safe_address(attempt.url()) {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    });
-    reqwest::Client::builder()
-        .user_agent(concat!("codefusion-runner/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(READ_TIMEOUT)
-        .redirect(redirects)
-        .build()
-        .expect("a client with these settings builds")
 }

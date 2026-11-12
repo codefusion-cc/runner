@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use cf_daemon::update::{NO_HEAD, Pending, SelfUpdate, is_commit};
+use cf_daemon::update::{NO_HEAD, Pending, SelfUpdate, UpdateFrom, is_commit};
 use cf_ghapp::{Compared, Release, Releases, RetryPolicy, is_whole_commit};
 
 use crate::commands::VERSION;
@@ -51,6 +51,14 @@ pub fn asset_for_this_host() -> Option<&'static str> {
         "aarch64" => Some("codefusion-runner-linux-arm64"),
         _ => None,
     }
+}
+
+/// Whether `version` is a package version, three numbers: `0.1.0`.
+fn is_package_version(version: &str) -> bool {
+    version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The tag of a release of version `version` (`0.1.0`) at the commit `short` (12 characters).
@@ -131,9 +139,13 @@ impl ReleaseUpdate {
     async fn release_of(&self, short: &str) -> Result<Release, String> {
         let (wait, every) = self.wait;
         let began = Instant::now();
-        for look in 0u32.. {
+        let mut look = 0u32;
+        loop {
             let last = began.elapsed() + every > wait || self.stop.load(Ordering::SeqCst);
-            if let Some(release) = self.look_for(short, last || look % PAGE_EVERY == 0).await? {
+            if let Some(release) = self
+                .look_for(short, last || look.is_multiple_of(PAGE_EVERY))
+                .await?
+            {
                 return Ok(release);
             }
             if last {
@@ -143,9 +155,9 @@ impl ReleaseUpdate {
                 ));
             }
             tracing::info!(commit = short, "its release is not out yet; asking again");
-            self.sleep(every).await;
+            cf_ghapp::sleep_unless(&self.stop, every).await;
+            look += 1;
         }
-        unreachable!("the looks end by the wait")
     }
 
     async fn look_for(&self, short: &str, with_page: bool) -> Result<Option<Release>, String> {
@@ -170,27 +182,13 @@ impl ReleaseUpdate {
                 .tag_name
                 .strip_prefix("runner-")
                 .and_then(|rest| rest.strip_suffix(&ends))
-                .is_some_and(|version| {
-                    let parts: Vec<&str> = version.split('.').collect();
-                    parts.len() == 3
-                        && parts
-                            .iter()
-                            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-                })
+                .is_some_and(is_package_version)
         }))
     }
 
-    /// Sleeps for `time`, or less once the Runner ends.
-    async fn sleep(&self, time: Duration) {
-        let until = Instant::now() + time;
-        while Instant::now() < until && !self.stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(200).min(until - Instant::now())).await;
-        }
-    }
-
     /// Finds the release of `name`, checks it is newer on main than `running`, and fetches and checks its program
-    /// into [`ReleaseUpdate::download`]. Answers `None` when `running` is that commit already.
-    async fn fetch(&self, name: &str, short: &str, running: &str) -> Result<Option<()>, String> {
+    /// into [`ReleaseUpdate::download`]. Answers whether it fetched one: not when `running` is that commit already.
+    async fn fetch(&self, name: &str, short: &str, running: &str) -> Result<bool, String> {
         let release = self.release_of(short).await?;
         let tag = &release.tag_name;
         let not = "nothing was downloaded";
@@ -226,7 +224,7 @@ impl ReleaseUpdate {
         }
         match self.releases.compare(running, full).await.map_err(github)? {
             Compared::Ahead => {}
-            Compared::Identical => return Ok(None),
+            Compared::Identical => return Ok(false),
             Compared::Behind => {
                 return Err(format!(
                     "{short} is not newer than {running}, which runs: a Runner is not taken back; {not}"
@@ -268,14 +266,14 @@ impl ReleaseUpdate {
             .await
             .map_err(|error| fetched(&self.asset, error))?;
         drop(file);
-        let got = hex(&got.sha256);
+        let got = got.sha256;
         if got != want {
             return Err(format!(
                 "{} of {tag} has the SHA-256 {got}, not the {want} its {SUMS} names; {not}",
                 self.asset
             ));
         }
-        Ok(Some(()))
+        Ok(true)
     }
 }
 
@@ -304,13 +302,14 @@ impl SelfUpdate for ReleaseUpdate {
         }
         let path = self.download();
         let fetched = block_on(self.fetch(name, short, running));
-        let offered = match fetched {
-            Ok(None) => Ok(self.running.clone()),
-            Ok(Some(())) => make_runnable(&path)
+        let offered = fetched.and_then(|downloaded| {
+            if !downloaded {
+                return Ok(self.running.clone());
+            }
+            make_runnable(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))
-                .and_then(|()| self.installer.offer(&path, short, &self.asset)),
-            Err(why) => Err(why),
-        };
+                .and_then(|()| self.installer.offer(&path, short, &self.asset))
+        });
         let _ = std::fs::remove_file(&path);
         offered
     }
@@ -319,16 +318,12 @@ impl SelfUpdate for ReleaseUpdate {
         self.installer.install(pending)
     }
 
-    fn takes_head(&self) -> bool {
-        false
+    fn updates_from(&self) -> UpdateFrom {
+        UpdateFrom::Releases
     }
 
     fn end(&self) {
         self.stop.store(true, Ordering::SeqCst);
-    }
-
-    fn first_step(&self) -> &'static str {
-        "fetching its release"
     }
 }
 
@@ -361,10 +356,6 @@ fn make_runnable(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
@@ -394,7 +385,7 @@ mod tests {
     }
 
     fn sum(bytes: &[u8]) -> String {
-        hex(&Sha256::digest(bytes))
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     /// What the fake GitHub holds and answers.
@@ -855,7 +846,7 @@ mod tests {
         let mut bench = bench();
         bench
             .update
-            .wait_for(Duration::from_millis(1500), Duration::from_millis(100));
+            .wait_for(Duration::from_millis(600), Duration::from_millis(40));
         let none = "dddddddddddd3333333333333333333333333333";
         bench.update.build(Some(none)).expect_err("no release");
         let seen = bench.seen();
@@ -1088,7 +1079,7 @@ mod tests {
     fn main_s_head_is_not_taken_and_names_that_cannot_name_a_release_ask_nothing() {
         let bench = bench();
         assert_eq!(bench.update.build(None), Err(NO_HEAD.into()));
-        assert!(!bench.update.takes_head());
+        assert_eq!(bench.update.updates_from(), UpdateFrom::Releases);
         assert_eq!(
             bench.update.build(Some("bbbbbbb")),
             Err("bbbbbbb is too short to name a release: send 12 characters of it or more; nothing was downloaded".into())

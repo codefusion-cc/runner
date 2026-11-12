@@ -2470,7 +2470,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         let shared = &self.shared;
         let mut kinds = vec!["pause", "resume", "restart", "stop-runner"];
         if let Some(updates) = &shared.updates {
-            if updates.takes_head() {
+            if updates.updates_from().takes_head() {
                 kinds.push("update");
             }
             kinds.push("update-to");
@@ -2694,7 +2694,9 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             return Some((false, "this Runner has nowhere to update from".into()));
         };
         let commit = match commit {
-            Ok(None) if !updates.takes_head() => return Some((false, crate::update::NO_HEAD.into())),
+            Ok(None) if !updates.updates_from().takes_head() => {
+                return Some((false, crate::update::NO_HEAD.into()));
+            }
             Ok(commit) => commit,
             Err(why) => return Some((false, why)),
         };
@@ -2711,7 +2713,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 return Some((false, "an update is under way already".into()));
             }
             update.command = Some(id.to_string());
-            let step = updates.first_step();
+            let step = updates.updates_from().first_step();
             update.doing = Some(match &commit {
                 Some(commit) => format!("updating to {commit}: {step}"),
                 None => format!("updating: {step}"),

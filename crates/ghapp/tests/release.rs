@@ -73,8 +73,8 @@ fn program() -> Vec<u8> {
     (0..1_048_576u32).map(|n| (n % 251) as u8).collect()
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// A file in a folder of the test's own.

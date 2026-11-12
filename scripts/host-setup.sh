@@ -145,6 +145,26 @@ github_get() {
     sleep "$wait"
   done
 }
+# GitHub's compare of $2 with $3 in the repository whose API is $1, on standard output: ahead, behind, identical or
+# diverged as GitHub says it, or nothing when GitHub could not say.
+compare_status() {
+  (
+    trap - ERR
+    github_get "$1/compare/$2...$3?per_page=1" | jq -r '.status // empty'
+  ) || true
+}
+
+# The whole commit main's branch is at in the repository whose API is $1, read from its ref, which no tag named main
+# stands for; nothing when GitHub could not say.
+main_head() {
+  local sha
+  sha=$(
+    trap - ERR
+    github_get "$1/git/ref/heads/main" | jq -r '.object.sha // empty'
+  ) || sha=''
+  if [[ $sha =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; fi
+}
+
 # The configuration a run writes, on standard output: the one there now ($1, `{}` for none) without the keys the last
 # run's settings set ($2) and every key this script owns, then the owned keys this run gives ($3, nulls left out) and
 # its settings ($4), sorted on one line. The keys the Runner or the console set themselves stay. Fails for settings that
@@ -186,16 +206,12 @@ modules_wanted() {
 # when it runs a commit of main newer than $3, `install` when it runs $3, an older commit, one main does not have or
 # no commit at all, `unknown` when GitHub could not say.
 runs_newer() {
-  local api=$1 running=$2 wanted=$3 status head
+  local api=$1 running=$2 wanted=$3 head
   if [[ ! $running =~ ^[0-9a-f]{12}$ || $running == "$wanted" ]]; then
     echo install
     return 0
   fi
-  status=$(
-    trap - ERR
-    github_get "$api/compare/$wanted...$running?per_page=1" | jq -r '.status // empty'
-  ) || status=''
-  case $status in
+  case $(compare_status "$api" "$wanted" "$running") in
     ahead) ;;
     behind | diverged)
       echo install
@@ -206,20 +222,13 @@ runs_newer() {
       return 0
       ;;
   esac
-  # Newer than the one asked for, and main's: main's branch by its ref, which no tag named main stands for.
-  head=$(
-    trap - ERR
-    github_get "$api/git/ref/heads/main" | jq -r '.object.sha // empty'
-  ) || head=''
-  if [[ ! $head =~ ^[0-9a-f]{40}$ ]]; then
+  # Newer than the one asked for, and main's.
+  head=$(main_head "$api")
+  if [[ -z $head ]]; then
     echo unknown
     return 0
   fi
-  status=$(
-    trap - ERR
-    github_get "$api/compare/$running...$head?per_page=1" | jq -r '.status // empty'
-  ) || status=''
-  case $status in
+  case $(compare_status "$api" "$running" "$head") in
     ahead | identical) echo keep ;;
     behind | diverged) echo install ;;
     *) echo unknown ;;
