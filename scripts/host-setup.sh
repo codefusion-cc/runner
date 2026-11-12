@@ -22,7 +22,9 @@
 # A build from a checkout updates itself from the console once the host is enrolled, so `install` leaves it be then.
 # A host given a --binary or --version gets that one: on an enrolled host `install` holds new jobs back, waits for the
 # running ones (at most an hour) and installs it; when they outlast the wait it exits 75, the hold lifted, and the
-# Runner of before goes on.
+# Runner of before goes on. A Runner from a release updates itself to newer releases from the console (`update-to`), so
+# a --version is a minimum: an enrolled host whose Runner runs a newer commit of main, by GitHub's compare of main's
+# history, keeps it; when GitHub cannot say, the run fails and changes nothing.
 #
 # --class      shared (the default) or trusted: a host that runs only main's deploy, release and signing jobs of
 #              codefusion-cc/codefusion, by the Runner's default rules (crates/trusted), one job at a time
@@ -39,7 +41,8 @@
 # --github-api GitHub's API the Runner talks to, for a test against the fakes (`cargo xtask fakes serve`)
 # --check      both steps' form only: does every step but the enrolment and the service, and needs no code
 #
-# GITHUB_TOKEN, when set, goes with its reads of GitHub's API (the image's release), whose rate limit it waits out.
+# GITHUB_TOKEN, when set, goes with its reads of GitHub's API (the image's release, the compare of a --version with the
+# Runner that runs), whose rate limit it waits out.
 #
 # Each step is skipped when it is done already. Run again on an enrolled host with neither --binary nor --version (a
 # reboot's startup script), both steps only make sure the service runs. It says each step on standard output; a
@@ -50,7 +53,8 @@ set -Eeuo pipefail
 
 USER_NAME=codefusion-runner
 GITHUB_REPO=https://github.com/codefusion-cc/runner
-RELEASES_API=https://api.github.com/repos/codefusion-cc/runner/releases
+REPO_API=https://api.github.com/repos/codefusion-cc/runner
+RELEASES_API=$REPO_API/releases
 # A build needs the compiler and OpenSSL's headers; the Runner itself, passt (its machines' network) and curl's libssl.
 PACKAGES=(passt curl jq ca-certificates)
 # Container mode's engine: Podman, rootless, with the subordinate ids and the user's D-Bus it runs on.
@@ -141,6 +145,26 @@ github_get() {
     sleep "$wait"
   done
 }
+# GitHub's compare of $2 with $3 in the repository whose API is $1, on standard output: ahead, behind, identical or
+# diverged as GitHub says it, or nothing when GitHub could not say.
+compare_status() {
+  (
+    trap - ERR
+    github_get "$1/compare/$2...$3?per_page=1" | jq -r '.status // empty'
+  ) || true
+}
+
+# The whole commit main's branch is at in the repository whose API is $1, read from its ref, which no tag named main
+# stands for; nothing when GitHub could not say.
+main_head() {
+  local sha
+  sha=$(
+    trap - ERR
+    github_get "$1/git/ref/heads/main" | jq -r '.object.sha // empty'
+  ) || sha=''
+  if [[ $sha =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; fi
+}
+
 # The configuration a run writes, on standard output: the one there now ($1, `{}` for none) without the keys the last
 # run's settings set ($2) and every key this script owns, then the owned keys this run gives ($3, nulls left out) and
 # its settings ($4), sorted on one line. The keys the Runner or the console set themselves stay. Fails for settings that
@@ -175,6 +199,59 @@ modules_wanted() {
     grep -qx -- "$module" "$list" 2>/dev/null || printf 'boot %s\n' "$module"
     [[ -d $loaded/$module ]] || printf 'now %s\n' "$module"
   done
+}
+
+# Whether the Runner that runs, of the commit $2 (the 12 characters its version names), should stay in place of the
+# release of the commit $3 that a run asks for, by main's history as the repository's API at $1 compares them: `keep`
+# when it runs a commit of main newer than $3, `install` when it runs $3, an older commit, one main does not have or
+# no commit at all, `unknown` when GitHub could not say.
+runs_newer() {
+  local api=$1 running=$2 wanted=$3 head
+  if [[ ! $running =~ ^[0-9a-f]{12}$ || $running == "$wanted" ]]; then
+    echo install
+    return 0
+  fi
+  case $(compare_status "$api" "$wanted" "$running") in
+    ahead) ;;
+    behind | diverged)
+      echo install
+      return 0
+      ;;
+    *)
+      echo unknown
+      return 0
+      ;;
+  esac
+  # Newer than the one asked for, and main's.
+  head=$(main_head "$api")
+  if [[ -z $head ]]; then
+    echo unknown
+    return 0
+  fi
+  case $(compare_status "$api" "$running" "$head") in
+    ahead | identical) echo keep ;;
+    behind | diverged) echo install ;;
+    *) echo unknown ;;
+  esac
+}
+
+# Whether a run that asks for the release of the commit $3 (named $4) leaves the Runner that runs in place, which says
+# it is $2 (its version, `0.1.0+<12 characters>`), by `runs_newer` against the repository's API at $1: status 0, and
+# says so, when it runs a newer commit of main; 1 when the release goes in. When GitHub cannot say, the run fails and
+# changes nothing: the Runner that runs may be older than the release, and a run that ended `unchanged` would say
+# the release is in.
+release_stays() {
+  local api=$1 runs=$2 wanted=$3 named=$4
+  case $(runs_newer "$api" "${runs##*+}" "$wanted") in
+    keep)
+      say "it runs $runs, newer on main than $named: it stays, and $named waits for none"
+      return 0
+      ;;
+    unknown)
+      fail "it runs $runs, and GitHub could not say whether that is newer on main than $named; nothing changed: run it again once GitHub answers, or give the Runner with --binary"
+      ;;
+  esac
+  return 1
 }
 
 # Sourced (the tests), it only defines the above.
@@ -552,6 +629,16 @@ place_binary() {
   fi
   local named=${version:+release runner-$version}
   named=${named:-$binary}
+  # A release asked for is a minimum: a Runner that updated itself past it, to a newer commit of main, stays.
+  if ((enrolled)) && [[ -n $version && -x $installed && $(user_sha256 "$installed") != "$sha256" ]]; then
+    local runs
+    runs=$(
+      trap - ERR
+      as_user "'$installed' version" 2>/dev/null
+    ) || runs=''
+    runs=${runs#codefusion-runner }
+    if release_stays "$REPO_API" "$runs" "${version##*-}" "$named"; then return; fi
+  fi
   if [[ $(user_sha256 "$staged") != "$sha256" ]]; then
     change "place the Runner of $named"
     if ((!dry)); then

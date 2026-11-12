@@ -38,7 +38,44 @@ pub trait SelfUpdate: Send + Sync {
     /// Puts the program built last in place of the running one, keeping the running one to go back to, with
     /// `pending` written down first. Refused while a machine has a record.
     fn install(&self, pending: &Pending) -> Result<(), String>;
+
+    /// Where the updates come from: a checkout by default.
+    fn updates_from(&self) -> UpdateFrom {
+        UpdateFrom::Checkout
+    }
+
+    /// Ends what a build or a download under way started, as the Runner ends: the console sends its command again
+    /// to the Runner that starts next. Nothing by default.
+    fn end(&self) {}
 }
+
+/// Where a Runner's updates come from, which decides the commands it takes and what the console sees meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateFrom {
+    /// A checkout it builds: the head of main (`update`) or a commit of it (`update-to`).
+    Checkout,
+    /// The Runner's releases: only a commit the console names (`update-to`), whose release it checks.
+    Releases,
+}
+
+impl UpdateFrom {
+    /// Whether [`SelfUpdate::build`] takes the head of the branch (`update`).
+    pub fn takes_head(self) -> bool {
+        self == UpdateFrom::Checkout
+    }
+
+    /// What the console shows while [`SelfUpdate::build`] runs.
+    pub fn first_step(self) -> &'static str {
+        match self {
+            UpdateFrom::Checkout => "building",
+            UpdateFrom::Releases => "fetching its release",
+        }
+    }
+}
+
+/// What the console hears of a plain `update` on a host whose updates come as releases.
+pub const NO_HEAD: &str = "this Runner was installed from a release: it updates to a commit the console names (update-to), never to the \
+     head of main";
 
 /// How many characters a commit's name has: at least what git shortens one to, at most all of it.
 pub const COMMIT_CHARS: std::ops::RangeInclusive<usize> = 7..=40;

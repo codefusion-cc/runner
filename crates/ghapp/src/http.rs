@@ -41,8 +41,15 @@ pub fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
-/// The client every call goes through: a user agent, a connect timeout, a whole-request timeout, and redirects
-/// followed only to the same scheme, host and port, so no answer can send a request and its token elsewhere.
+/// What every client of GitHub has: a user agent and a connect timeout.
+fn builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(concat!("codefusion-runner/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(10))
+}
+
+/// The client every call goes through: a whole-request timeout, and redirects followed only to the same scheme, host
+/// and port, so no answer can send a request and its token elsewhere.
 fn client(timeout: Duration) -> reqwest::Client {
     let redirects = Policy::custom(|attempt| {
         let stays = attempt
@@ -55,10 +62,26 @@ fn client(timeout: Duration) -> reqwest::Client {
             attempt.stop()
         }
     });
-    reqwest::Client::builder()
-        .user_agent(concat!("codefusion-runner/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
+    builder()
         .timeout(timeout)
+        .redirect(redirects)
+        .build()
+        .expect("a client with these settings builds")
+}
+
+/// The client of a public release's files, which never carries a token: GitHub sends the address on to its storage,
+/// on another host, so redirects are followed to any HTTPS address. A file read too slowly (`read_timeout` without
+/// a byte) is dropped, however long it takes whole.
+pub(crate) fn file_client(read_timeout: Duration) -> reqwest::Client {
+    let redirects = Policy::custom(|attempt| {
+        if attempt.previous().len() <= MAX_REDIRECTS && is_safe_address(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
+    builder()
+        .read_timeout(read_timeout)
         .redirect(redirects)
         .build()
         .expect("a client with these settings builds")
@@ -159,13 +182,8 @@ impl Http {
                 Ok(response) => return Ok(response),
                 Err(error) => error,
             };
-            if attempt >= self.retry.retries || !error.is_transient() {
+            let Some(wait) = self.retry.wait_after(&error, attempt) else {
                 return Err(error);
-            }
-            let wait = match error.retry_after() {
-                Some(asked) if asked > self.retry.max_retry_after => return Err(error),
-                Some(asked) => asked,
-                None => backoff(self.retry.base, self.retry.cap, attempt),
             };
             tracing::debug!(attempt, ?wait, "trying a GitHub call again");
             tokio::time::sleep(wait).await;
@@ -237,16 +255,41 @@ impl Http {
     }
 }
 
-/// The wait `Retry-After` asks for, in whole seconds. (GitHub sends seconds; a date is not read.)
+/// The wait an answer asks for: `Retry-After` in whole seconds (GitHub sends seconds; a date is not read), else, for
+/// a rate limit used up (`x-ratelimit-remaining: 0`), until `x-ratelimit-reset` by the answer's own clock (`Date`),
+/// at least a second.
 pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
+    if let Some(seconds) = number(RETRY_AFTER.as_str()) {
+        return Some(Duration::from_secs(seconds));
+    }
+    if number("x-ratelimit-remaining")? != 0 {
+        return None;
+    }
+    let reset = i64::try_from(number("x-ratelimit-reset")?).ok()?;
+    let now = server_time(headers).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+    });
+    Some(Duration::from_secs(
+        u64::try_from(reset.saturating_sub(now)).unwrap_or(0).max(1),
+    ))
+}
+
+impl RetryPolicy {
+    /// The wait before trying again after try `attempt` (from 0) failed with `error`, or `None` when the call ends
+    /// with it: no tries left, an error that another try does not mend, or a `Retry-After` over the longest wait.
+    pub(crate) fn wait_after(&self, error: &Error, attempt: u32) -> Option<Duration> {
+        if attempt >= self.retries || !error.is_transient() {
+            return None;
+        }
+        match error.retry_after() {
+            Some(asked) if asked > self.max_retry_after => None,
+            Some(asked) => Some(asked),
+            None => Some(backoff(self.base, self.cap, attempt)),
+        }
+    }
 }
 
 /// An exponential wait with jitter: between half and the whole of `base * 2^attempt`, at most `cap`.

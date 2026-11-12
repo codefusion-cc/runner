@@ -1,0 +1,81 @@
+name: Runner build
+
+# The Runner's Linux program for each architecture a host runs, built for every push to main: one file that holds all
+# of it (the guest bundle and cloud-hypervisor are built in), with the `host-setup.sh` of the same commit, kept as the
+# artifacts runner-amd64 and runner-arm64. Built in Debian 12, the oldest system a host runs, so the program runs on its
+# glibc and on Ubuntu 24.04's. Every push, whatever it changes: the console rolls out each green commit of main, and a
+# Runner installed from a release updates only to a commit that has one.
+#
+# It publishes nothing. "Runner release" (release.yml) puts these programs out once the push's CI, and Image when the
+# push made one, are green as well, the rule the console rolls Runners out by. It holds no secret, so a pull request
+# that changes it runs it too. Each run builds from nothing, without a cache another run could have written.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/runner-build.yml
+
+permissions: {}
+
+concurrency:
+  group: runner-build-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build the ${{ matrix.platform }} Runner on Debian 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+          - platform: amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    container: debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends build-essential pkg-config libssl-dev curl git ca-certificates
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 https://sh.rustup.rs |
+            sh -s -- -y -q --profile minimal --default-toolchain none --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The checkout belongs to another user than the container's root; the build reads its commit.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rustup toolchain install
+          cargo xtask build
+          program=target/release/codefusion-runner
+          said=$("$program" version)
+          echo "$said"
+          version=${said#codefusion-runner }
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9a-f]{12}$ ]] || { echo "::error::version $said"; exit 1; }
+          [[ ${version#*+} == "${GITHUB_SHA:0:12}" ]] || { echo "::error::$said is not of $GITHUB_SHA"; exit 1; }
+          mkdir out
+          cp "$program" "out/codefusion-runner-linux-${{ matrix.platform }}"
+          # One copy of the script, from one of the two builds, so the merged artifacts hold it once.
+          if [[ ${{ matrix.platform }} == amd64 ]]; then cp scripts/host-setup.sh out/; fi
+          echo "$version" > "out/version-${{ matrix.platform }}"
+      - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runner-${{ matrix.platform }}
+          path: out
+          # A week, so a run of CI re-run green days later still finds its programs.
+          retention-days: 7
+          if-no-files-found: error

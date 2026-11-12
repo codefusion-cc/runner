@@ -15,6 +15,7 @@ reqwest = { version = "0.13", default-features = false, features = ["native-tls"
 ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 rand = "0.9"
 thiserror.workspace = true
 time = { version = "0.3", features = ["formatting", "parsing", "serde-well-known"] }

@@ -1,114 +1,122 @@
 name: Runner release
 
-# The Runner's Linux program for each architecture a host runs: one file that holds all of it (the guest bundle and
-# cloud-hypervisor are built in), released as `runner-<version>` (`0.1.0-446125c0a1b2` for the version
-# `0.1.0+446125c0a1b2` the program says), with `codefusion-runner-linux-amd64`, `-arm64`, the `host-setup.sh` of the
-# same commit and their SHA256SUMS. A host takes them with `host-setup.sh install --version <version> --sha256 <its
-# line>`, the script checked against its own line first, so it needs no Rust, no checkout and builds nothing. Built in Debian 12, the oldest system a host runs, so the program runs on its glibc and on Ubuntu 24.04's.
+# Puts out the Runner release of a commit of main once the commit is green by the rule the console rolls Runners out
+# by: its push's CI green, and Image green too when the push made one, the newest run of each counting. Its programs
+# are those the push's "Runner build" (runner-build.yml) made, released as `runner-<version>` (`0.1.0-446125c0a1b2`
+# for the version `0.1.0+446125c0a1b2` the program says), with `codefusion-runner-linux-amd64`, `-arm64`, the
+# `host-setup.sh` of the same commit and their SHA256SUMS. A host takes them with `host-setup.sh install --version
+# <version> --sha256 <its line>`, and a Runner installed so updates itself to the release of a commit the console names
+# (`update-to`), which it refuses when there is none: so no red commit is ever put out, and each green one whose build
+# succeeded is.
 #
-# `build` holds no secret, so a pull request that changes this workflow runs it too. `publish` runs only on main,
-# needs nothing but `gh`, and never replaces a release: a host's settings name its SHA-256, so the bytes of a version
-# never change. Each run builds from nothing, without a cache another run could have written.
+# Each of the three workflows ending starts the check (scripts/release-gate.sh); the one that ends last finds them all
+# green and publishes. A red run, a commit main does not have, or one whose runs have not ended gets no release, and a
+# notice says why. A re-run that ends green starts it again. By hand, `workflow_dispatch` with a commit does the same
+# check. A pull request that changes this workflow or the gate runs the check for its base commit, and publishes
+# nothing.
+#
+# `gate` checks out main's own workflow scripts, never the pushed commit's, and holds no write permission. `publish`
+# runs no code of the repository, needs nothing but `gh`, and never replaces a release: a host's settings name its
+# SHA-256, so the bytes of a version never change.
 on:
-  workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: [CI, Image, Runner build]
+    types: [completed]
     branches: [main]
-    paths:
-      - crates/**
-      - xtask/**
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - scripts/host-setup.sh
-      - .github/workflows/release.yml
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The whole commit of main to release, when its runs are green
+        required: true
+        type: string
   pull_request:
     paths:
       - .github/workflows/release.yml
+      - scripts/release-gate.sh
+      - scripts/host-setup.sh
 
 permissions: {}
 
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-${{ github.event.workflow_run.head_sha || inputs.commit || github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build the ${{ matrix.platform }} Runner on Debian 12
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-          - platform: amd64
-            runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
-    container: debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8
-    timeout-minutes: 60
+  gate:
+    name: Is the commit green on main
+    # Only a push of this repository's main: a fork's pull request from a branch it named main starts no release.
+    if: >-
+      github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
+    outputs:
+      commit: ${{ steps.gate.outputs.commit }}
+      build: ${{ steps.gate.outputs.build }}
     steps:
-      - name: Tools
-        run: |
-          apt-get update -q
-          apt-get install -y -q --no-install-recommends build-essential pkg-config libssl-dev curl git ca-certificates
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSL --retry 5 https://sh.rustup.rs |
-            sh -s -- -y -q --profile minimal --default-toolchain none --no-modify-path
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Build
-        shell: bash
+          sparse-checkout: scripts
+      - id: gate
+        name: Check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMIT: ${{ github.event.workflow_run.head_sha || inputs.commit || github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          # The checkout belongs to another user than the container's root; the build reads its commit.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          rustup toolchain install
-          cargo xtask build
-          program=target/release/codefusion-runner
-          said=$("$program" version)
+          said=$(scripts/release-gate.sh "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY" "$COMMIT")
           echo "$said"
-          version=${said#codefusion-runner }
-          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9a-f]{12}$ ]] || { echo "::error::version $said"; exit 1; }
-          [[ ${version#*+} == "${GITHUB_SHA:0:12}" ]] || { echo "::error::$said is not of $GITHUB_SHA"; exit 1; }
-          mkdir out
-          cp "$program" "out/codefusion-runner-linux-${{ matrix.platform }}"
-          # One copy of the script, from one of the two builds, so the merged artifacts hold it once.
-          if [[ ${{ matrix.platform }} == amd64 ]]; then cp scripts/host-setup.sh out/; fi
-          echo "$version" > "out/version-${{ matrix.platform }}"
-      - if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: runner-${{ matrix.platform }}
-          path: out
-          retention-days: 1
-          if-no-files-found: error
+          case $said in
+            publish\ *)
+              build=${said#publish }
+              [[ $build =~ ^[0-9]+$ ]] || { echo "::error::the gate named no run: $said"; exit 1; }
+              echo "::notice::$COMMIT is green on main: its release goes out with the programs of run $build"
+              { echo "commit=$COMMIT"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
+              ;;
+            wait\ * | skip\ *) echo "::notice::$COMMIT gets no release now: ${said#* }" ;;
+            *) echo "::error::the gate said '$said'"; exit 1 ;;
+          esac
 
   publish:
     name: Publish the Runner release
-    needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: gate
+    if: needs.gate.outputs.build != '' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COMMIT: ${{ needs.gate.outputs.commit }}
+      BUILD: ${{ needs.gate.outputs.build }}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: runner-*
-          merge-multiple: true
-          path: out
+      - name: The build's programs
+        run: |
+          set -euo pipefail
+          # Both artifacts in one call, each in a folder of its name.
+          for try in 1 2 3 4 5; do
+            rm -rf in
+            if gh run download "$BUILD" --repo "$GITHUB_REPOSITORY" --pattern 'runner-*' --dir in; then
+              break
+            fi
+            ((try < 5)) || { echo "::error::the programs of run $BUILD could not be fetched"; exit 1; }
+            sleep $((try * 15))
+          done
+          mkdir out
+          cp in/runner-amd64/* in/runner-arm64/* out/
       - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd out
           [ "$(cat version-amd64)" = "$(cat version-arm64)" ] || { echo "::error::the two builds differ in version"; exit 1; }
           version=$(cat version-amd64)
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+\+[0-9a-f]{12}$ && ${version#*+} == "${COMMIT:0:12}" ]] ||
+            { echo "::error::the build says $version, not of $COMMIT"; exit 1; }
           tag="runner-${version/+/-}"
           rm version-*
           [ -f host-setup.sh ] || { echo "::error::no host-setup.sh among the builds"; exit 1; }
@@ -119,5 +127,5 @@ jobs:
             exit 0
           fi
           gh release create "$tag" codefusion-runner-linux-* host-setup.sh SHA256SUMS --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --latest=false --title "$tag" \
+            --target "$COMMIT" --latest=false --title "$tag" \
             --notes "The Runner $version for Linux. A host checks host-setup.sh against its line in SHA256SUMS, then takes the Runner with \`host-setup.sh install --version ${version/+/-} --sha256 <its line in SHA256SUMS>\`."

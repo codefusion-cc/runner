@@ -14,6 +14,7 @@ mod error;
 mod http;
 mod jwt;
 mod key;
+mod release;
 mod rest;
 mod source;
 
@@ -28,4 +29,7 @@ pub use http::{
     Http, MAX_BODY_BYTES, Response, RetryPolicy, is_safe_address, is_safe_address_text, same_origin,
 };
 pub use key::KeyTokens;
+pub use release::{
+    Asset, Author, Compared, Downloaded, Release, Releases, Sink, is_whole_commit, sleep_unless,
+};
 pub use source::{Monotonic, Pending, SystemMonotonic, TokenSource};

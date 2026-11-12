@@ -57,6 +57,9 @@ pub enum Error {
     /// business naming), or an answer too long to read.
     #[error("refused: {0}")]
     Refused(String),
+    /// This host could not keep what it read: a file that could not be written, a disk with no room.
+    #[error("{0}")]
+    Local(String),
 }
 
 impl Error {
@@ -104,7 +107,7 @@ impl Error {
             Error::Status(s) => {
                 s.status == 429 || s.status >= 500 || (s.status == 403 && s.retry_after.is_some())
             }
-            Error::Decode { .. } | Error::Key(_) | Error::Refused(_) => false,
+            Error::Decode { .. } | Error::Key(_) | Error::Refused(_) | Error::Local(_) => false,
         }
     }
 }

@@ -30,8 +30,15 @@ const PREVIOUS: &str = "prev";
 const NEXT: &str = "next";
 
 /// The commit part of a version: `0.1.0+446125c0a1b2` → `446125c0a1b2`.
-fn commit_of(version: &str) -> Option<&str> {
+pub(crate) fn commit_of(version: &str) -> Option<&str> {
     version.split_once('+').map(|(_, commit)| commit)
+}
+
+/// The twelve characters of the commit `running` (a version) names, or why an update cannot go from it.
+pub(crate) fn running_commit(running: &str) -> Result<&str, String> {
+    commit_of(running)
+        .filter(|running| running.len() == 12 && running.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("{running} names no commit it was built at; update it by hand"))
 }
 
 /// The update of a Runner built from a checkout on this host.
@@ -44,18 +51,12 @@ pub struct CheckoutUpdate {
     pub env: Vec<(String, OsString)>,
     /// Where the build writes what it says.
     pub log: PathBuf,
-    /// The installed program, which the service manager runs.
-    pub installed: PathBuf,
-    /// The folder of the machines' records: an install is refused while one is there.
-    pub records: PathBuf,
-    /// The state folder, where [`UpdateFile`] is.
-    pub state_dir: PathBuf,
+    /// Where the program built waits, and how it is put in place.
+    pub installer: Installer,
     /// The running version.
     pub running: String,
     /// How long a build may take.
     pub build_limit: Duration,
-    /// Whether a program can start machines on this host.
-    pub fit: fn(&Path) -> Result<(), String>,
     /// `<origin> main`, for the console.
     source: String,
     /// The process group of the build that runs, which [`CheckoutUpdate::end_build`] ends.
@@ -108,12 +109,14 @@ impl CheckoutUpdate {
             cargo: cargo_home.join("bin").join("cargo"),
             env,
             log: state_dir.join("logs").join("update.log"),
-            installed: installed.to_path_buf(),
-            records: records.to_path_buf(),
-            state_dir: state_dir.to_path_buf(),
+            installer: Installer {
+                installed: installed.to_path_buf(),
+                records: records.to_path_buf(),
+                state_dir: state_dir.to_path_buf(),
+                fit,
+            },
             running: VERSION.into(),
             build_limit: BUILD_LIMIT,
-            fit,
             source: String::new(),
             building: Mutex::new(None),
             build_folder: build_folder.map(Path::to_path_buf),
@@ -141,17 +144,6 @@ impl CheckoutUpdate {
     /// The program a build makes.
     fn built(&self) -> PathBuf {
         self.checkout.join("target/release/codefusion-runner")
-    }
-
-    /// The program kept beside the installed one.
-    fn previous(&self) -> PathBuf {
-        self.installed.with_extension(PREVIOUS)
-    }
-
-    /// The program built and checked, put beside the installed one: the checkout is the person's too, and a build
-    /// of theirs while the machines end does not go in.
-    fn next(&self) -> PathBuf {
-        self.installed.with_extension(NEXT)
     }
 
     fn git(&self, args: &[&str]) -> Result<String, String> {
@@ -307,14 +299,7 @@ impl SelfUpdate for CheckoutUpdate {
     }
 
     fn build(&self, commit: Option<&str>) -> Result<String, String> {
-        let running = commit_of(&self.running)
-            .filter(|running| running.len() == 12 && running.bytes().all(|b| b.is_ascii_hexdigit()))
-            .ok_or_else(|| {
-                format!(
-                    "{} names no commit it was built at; update it by hand",
-                    self.running
-                )
-            })?;
+        let running = running_commit(&self.running)?;
         if let Some(name) = commit.filter(|name| !is_commit(name)) {
             return Err(format!(
                 "`{}` is no commit's name; nothing was fetched or built",
@@ -356,9 +341,48 @@ impl SelfUpdate for CheckoutUpdate {
         // Peeled, the name is the commit's alone: `git checkout` takes a branch named as a whole commit before it.
         self.git(&["checkout", "-q", "--detach", &format!("{target}^{{commit}}")])?;
         self.cargo_build()?;
-        let built = self.built();
-        let printed = run_at_most(Command::new(&built).arg("version"), GIT_LIMIT)
-            .map_err(|error| format!("{} version: {error}", built.display()))?;
+        self.installer.offer(&self.built(), short, "the program built")
+    }
+
+    fn install(&self, pending: &Pending) -> Result<(), String> {
+        self.installer.install(pending)
+    }
+
+    fn end(&self) {
+        self.end_build();
+    }
+}
+
+/// Where a new program waits until it is put in place, and how it is: the same for a program built here and one
+/// taken from a release.
+pub struct Installer {
+    /// The installed program, which the service manager runs.
+    pub installed: PathBuf,
+    /// The folder of the machines' records: an install is refused while one is there.
+    pub records: PathBuf,
+    /// The state folder, where [`UpdateFile`] is.
+    pub state_dir: PathBuf,
+    /// Whether a program can start machines on this host.
+    pub fit: fn(&Path) -> Result<(), String>,
+}
+
+impl Installer {
+    /// The program kept beside the installed one.
+    pub fn previous(&self) -> PathBuf {
+        self.installed.with_extension(PREVIOUS)
+    }
+
+    /// The program checked, put beside the installed one until it is installed: what it came from (a checkout that
+    /// is the person's too, a download) may change while the machines end, and that does not go in.
+    pub fn next(&self) -> PathBuf {
+        self.installed.with_extension(NEXT)
+    }
+
+    /// Offers `program` (`what` names it) for the install once it says it is of the commit `short` and `fit` passes
+    /// a copy of it: the copy is the one installed. Answers the version it says.
+    pub fn offer(&self, program: &Path, short: &str, what: &str) -> Result<String, String> {
+        let printed = run_at_most(Command::new(program).arg("version"), GIT_LIMIT)
+            .map_err(|error| format!("{what} does not run on this host: {error}"))?;
         let version = printed
             .trim()
             .strip_prefix("codefusion-runner ")
@@ -366,16 +390,18 @@ impl SelfUpdate for CheckoutUpdate {
             .to_string();
         if commit_of(&version) != Some(short) {
             return Err(format!(
-                "the program built says it is `{}`, not of {short}",
+                "{what} says it is `{}`, not of {short}",
                 cut(printed.trim(), 100)
             ));
         }
-        copy_whole(&built, &self.next())?;
+        copy_whole(program, &self.next())?;
         (self.fit)(&self.next())?;
         Ok(version)
     }
 
-    fn install(&self, pending: &Pending) -> Result<(), String> {
+    /// Puts the program offered last in place of the running one, keeping the running one to go back to, with
+    /// `pending` written down first. Refused while a machine has a record.
+    pub fn install(&self, pending: &Pending) -> Result<(), String> {
         let records = standing(&self.records);
         if records > 0 {
             return Err(format!(
@@ -501,7 +527,7 @@ fn redact_url(url: &str) -> String {
 }
 
 /// At most `chars` characters of `text`.
-fn cut(text: &str, chars: usize) -> String {
+pub(crate) fn cut(text: &str, chars: usize) -> String {
     text.chars().take(chars).collect()
 }
 
@@ -621,7 +647,11 @@ fn copy_checked(from: &Path, to: &Path, check: fn(&Path) -> Result<(), String>) 
     let mut name = to.file_name().ok_or("a copy needs a file name")?.to_os_string();
     name.push(".new");
     let fresh = to.with_file_name(name);
-    std::fs::copy(from, &fresh).map_err(|error| format!("{}: {error}", fresh.display()))?;
+    if let Err(error) = std::fs::copy(from, &fresh) {
+        // Half a copy (a disk with no room) is not left behind.
+        let _ = std::fs::remove_file(&fresh);
+        return Err(format!("{}: {error}", fresh.display()));
+    }
     if let Err(error) = check(&fresh) {
         let _ = std::fs::remove_file(&fresh);
         return Err(error);
@@ -716,12 +746,14 @@ chmod +x target/release/codefusion-runner"#;
                 ("MARKS".into(), root.join("marks").into_os_string()),
             ],
             log: state.join("logs/update.log"),
-            installed,
-            records: state.join("run"),
-            state_dir: state,
+            installer: Installer {
+                installed,
+                records: state.join("run"),
+                state_dir: state,
+                fit: signed,
+            },
             running: format!("0.1.0+{}", &first[..12]),
             build_limit: Duration::from_secs(60),
-            fit: signed,
             source: String::new(),
             building: Mutex::new(None),
             build_folder: Some(checkout.clone()),
@@ -996,7 +1028,8 @@ chmod +x target/release/codefusion-runner"#;
         assert_eq!(bench.head(), bench.second);
         assert_eq!(bench.builds(), 1);
         bench.update.install(&bench.pending()).expect("installed");
-        let says = run_at_most(&mut Command::new(&bench.update.installed), GIT_LIMIT).expect("it runs");
+        let says =
+            run_at_most(&mut Command::new(&bench.update.installer.installed), GIT_LIMIT).expect("it runs");
         assert_eq!(
             says,
             format!("codefusion-runner {}", Bench::version_of(&bench.second))
@@ -1317,7 +1350,7 @@ chmod +x target/release/codefusion-runner"#;
         assert!(said.contains("0.1.0+aaaaaaaaaaaa-dirty"), "{said}");
 
         let mut bench = self::bench(BUILDS);
-        bench.update.fit = unsigned;
+        bench.update.installer.fit = unsigned;
         let said = bench.update.build(None).expect_err("refused");
         assert!(said.ends_with("is not signed"), "{said}");
     }
@@ -1328,13 +1361,16 @@ chmod +x target/release/codefusion-runner"#;
         bench.update.build(None).expect("built");
         bench.update.install(&bench.pending()).expect("installed");
         let read = |path: &Path| std::fs::read_to_string(path).expect("a file");
-        assert_eq!(read(&bench.update.previous()), "the one that runs");
-        assert_eq!(read(&bench.update.installed), read(&bench.update.built()));
+        assert_eq!(read(&bench.update.installer.previous()), "the one that runs");
         assert_eq!(
-            UpdateFile::in_state(&bench.update.state_dir).read(),
+            read(&bench.update.installer.installed),
+            read(&bench.update.built())
+        );
+        assert_eq!(
+            UpdateFile::in_state(&bench.update.installer.state_dir).read(),
             Ok(Some(bench.pending()))
         );
-        let left: Vec<_> = std::fs::read_dir(bench.update.installed.parent().expect("bin"))
+        let left: Vec<_> = std::fs::read_dir(bench.update.installer.installed.parent().expect("bin"))
             .expect("bin")
             .flatten()
             .map(|entry| entry.file_name().into_string().expect("a name"))
@@ -1353,7 +1389,7 @@ chmod +x target/release/codefusion-runner"#;
         std::fs::write(bench.update.built(), "a build of another branch").expect("program");
         bench.update.install(&bench.pending()).expect("installed");
         assert_eq!(
-            std::fs::read_to_string(&bench.update.installed).expect("program"),
+            std::fs::read_to_string(&bench.update.installer.installed).expect("program"),
             checked
         );
     }
@@ -1362,31 +1398,37 @@ chmod +x target/release/codefusion-runner"#;
     fn an_install_is_refused_while_a_machine_has_a_record_and_changes_nothing() {
         let bench = bench(BUILDS);
         bench.update.build(None).expect("built");
-        std::fs::create_dir_all(&bench.update.records).expect("folder");
-        std::fs::write(bench.update.records.join("job.json"), "{}").expect("record");
+        std::fs::create_dir_all(&bench.update.installer.records).expect("folder");
+        std::fs::write(bench.update.installer.records.join("job.json"), "{}").expect("record");
         assert_eq!(
             bench.update.install(&bench.pending()),
             Err("1 machine has a record; nothing was installed".into())
         );
         assert_eq!(
-            std::fs::read_to_string(&bench.update.installed).expect("program"),
+            std::fs::read_to_string(&bench.update.installer.installed).expect("program"),
             "the one that runs"
         );
-        assert!(!bench.update.previous().exists());
-        assert_eq!(UpdateFile::in_state(&bench.update.state_dir).read(), Ok(None));
+        assert!(!bench.update.installer.previous().exists());
+        assert_eq!(
+            UpdateFile::in_state(&bench.update.installer.state_dir).read(),
+            Ok(None)
+        );
     }
 
     #[test]
     fn an_install_whose_program_cannot_be_placed_leaves_no_update_written_down() {
         let mut bench = bench(BUILDS);
         bench.update.build(None).expect("built");
-        bench.update.fit = unsigned;
+        bench.update.installer.fit = unsigned;
         assert!(bench.update.install(&bench.pending()).is_err());
         assert_eq!(
-            std::fs::read_to_string(&bench.update.installed).expect("program"),
+            std::fs::read_to_string(&bench.update.installer.installed).expect("program"),
             "the one that runs"
         );
-        assert_eq!(UpdateFile::in_state(&bench.update.state_dir).read(), Ok(None));
+        assert_eq!(
+            UpdateFile::in_state(&bench.update.installer.state_dir).read(),
+            Ok(None)
+        );
     }
 
     /// The starts of an installed program, as the service manager makes them: the new one counts its starts, goes back after

@@ -869,6 +869,8 @@ struct UpdateScript {
     /// What each build was asked for: `None` for the head of the branch.
     asked: Vec<Option<String>>,
     installed: Vec<crate::update::Pending>,
+    /// Updates only to a commit named, as a host that takes releases.
+    commits_only: bool,
 }
 
 impl FakeUpdate {
@@ -882,6 +884,11 @@ impl FakeUpdate {
     pub fn install_gives(&self, answer: Result<(), &str>) {
         let answer = answer.map_err(str::to_string);
         self.0.lock().expect("update").installs.push_back(answer);
+    }
+
+    /// Takes no update to the head of the branch from now on, as a host that takes releases.
+    pub fn commits_only(&self) {
+        self.0.lock().expect("update").commits_only = true;
     }
 
     /// Every build takes this long.
@@ -943,5 +950,12 @@ impl crate::update::SelfUpdate for FakeUpdate {
             script.installed.push(pending.clone());
         }
         answer
+    }
+    fn updates_from(&self) -> crate::update::UpdateFrom {
+        if self.0.lock().expect("update").commits_only {
+            crate::update::UpdateFrom::Releases
+        } else {
+            crate::update::UpdateFrom::Checkout
+        }
     }
 }
