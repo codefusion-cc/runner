@@ -259,7 +259,8 @@ pub fn read_body(reader: &mut impl BufRead, headers: &[(String, String)]) -> io:
                     }
                 }
             }
-            if body.len() + size > BODY_MAX {
+            // A size near the largest number would wrap the sum past the check.
+            if body.len().checked_add(size).is_none_or(|total| total > BODY_MAX) {
                 return Err(bad("the engine's answer is too large"));
             }
             let start = body.len();
@@ -380,6 +381,15 @@ mod tests {
         );
         assert_eq!(escape("plain-1.2_3~"), "plain-1.2_3~");
         assert_eq!(escape("ż"), "%C5%BC");
+    }
+
+    /// A chunk size near usize::MAX after a first chunk wraps `body.len() + size`
+    /// past the BODY_MAX check (a panic in a debug build, a slice out of range in release), where an error is due.
+    #[test]
+    fn a_chunk_size_that_overflows_is_an_error_not_a_panic() {
+        let text = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n";
+        let result = std::panic::catch_unwind(|| answer(text).is_err());
+        assert_eq!(result.ok(), Some(true), "the vm-host panicked on the engine's answer");
     }
 
     /// A request's head and body, as the engine read them.
