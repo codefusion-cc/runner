@@ -182,10 +182,14 @@ the whole commit, on `main` and newer than the commit that runs (GitHub's compar
 `version`, which must run on this host and name the commit, and then drains, installs and checks the start as a build
 does. A commit whose release is not out yet is waited for up to 45 minutes, asked every 3; a commit with no release,
 an older one, a checksum that does not match, a missing file, a program of another architecture or a disk with no
-room leaves the running program as it was and says why. Releases are not signed: the checksum guards against a
-broken download, and HTTPS to GitHub and the publisher's name against anyone else. "Runner release" puts out a commit
-only once its push's CI, Image when it made one, and "Runner build" are green on main (`scripts/release-gate.sh`), the
-rule the console rolls out by, so every commit the console names has a release.
+room leaves the running program as it was and says why. GitHub answers 60 reads an hour to an address without a
+token; a used-up limit is waited out, at most 15 minutes a read. Releases are not signed: the checksum guards against a
+broken download, HTTPS against anyone between the host and GitHub, and the publisher's name against a release someone
+made by hand; anyone who can change this repository's workflows on main can still publish. "Runner release" puts out
+a commit only once its push's CI, Image when it made one, and "Runner build" are green on main
+(`scripts/release-gate.sh`), the rule the console rolls out by, plus the build; a commit whose build failed has no
+release, and its `update-to` is refused. A Runner installed from a release before this could not update itself: one
+`host-setup.sh install --version` of a newer release puts in one that can.
 
 A configuration written before the console held the App's key names `app_dir`, a folder with the key (`app.pem`)
 beside `app.json`. While the key file is there the Runner signs with it and makes its scale set calls itself, as before,

@@ -6,7 +6,8 @@ name: Runner release
 # for the version `0.1.0+446125c0a1b2` the program says), with `codefusion-runner-linux-amd64`, `-arm64`, the
 # `host-setup.sh` of the same commit and their SHA256SUMS. A host takes them with `host-setup.sh install --version
 # <version> --sha256 <its line>`, and a Runner installed so updates itself to the release of a commit the console names
-# (`update-to`), which it refuses when there is none: so no red commit is ever put out, and each green one is.
+# (`update-to`), which it refuses when there is none: so no red commit is ever put out, and each green one whose build
+# succeeded is.
 #
 # Each of the three workflows ending starts the check (scripts/release-gate.sh); the one that ends last finds them all
 # green and publishes. A red run, a commit main does not have, or one whose runs have not ended gets no release, and a
