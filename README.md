@@ -99,6 +99,10 @@ A configuration file says what the Mac is:
   on a Mac, `["cf-linux"]` on Linux) and `only_labels` (labels of `labels` the host is kept for: it then serves only
   the jobs that ask for one of them, so a host with `"labels": ["cf-linux", "cf-ops"], "only_labels": ["cf-ops"]`
   is always free for `runs-on: [cf-2g, cf-ops]`, and the tests go elsewhere).
+- Optional, for a host with a small disk, in GB of 2^30 bytes at the file system of `state_dir`: `disk_hold_gb` (no
+  job starts with less free; 25), `disk_stop_gb` (with less free the job that wrote the most is stopped; 5, and never
+  above `disk_hold_gb`, which lowers it when set alone) and `job_disk_gb` (each job's disk, 4 to 512; 40). A hold the
+  file system can never meet, or a job's disk larger than it, is refused. `check` prints the disk line.
 - The file names where the console's token goes, so one that others can write is refused
   (`chmod go-w` it). Keep it in a folder that stays and is not `state_dir` (which `--purge` deletes): the agent
   reads it at every start.
