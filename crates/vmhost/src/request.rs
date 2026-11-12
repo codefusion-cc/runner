@@ -110,11 +110,6 @@ impl JobRequest {
         Ok(())
     }
 
-    /// The limits the guest holds the job to in a virtual machine.
-    pub fn limits(&self) -> cf_guest_proto::Limits {
-        self.limits_in(false)
-    }
-
     /// The limits the guest holds the job to: in a machine its size less the guest's kernel and supervisor
     /// ([`VM_OVERHEAD`]), in a container (`containers`) its whole size, which the engine holds it to.
     pub fn limits_in(&self, containers: bool) -> cf_guest_proto::Limits {

@@ -65,11 +65,6 @@ impl Engine {
         }
     }
 
-    /// Where it listens.
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
     fn connect(&self, timeout: Option<Duration>) -> io::Result<UnixStream> {
         let stream = UnixStream::connect(&self.socket)?;
         stream.set_read_timeout(timeout)?;
@@ -106,13 +101,16 @@ impl Engine {
     ) -> io::Result<Response> {
         let mut stream = self.connect(timeout)?;
         send_head(&mut stream, "POST", path, Some(kind), length, &[])?;
-        let sent = io::copy(&mut io::Read::take(body, length), &mut stream)?;
+        // Sent a MiB at a time: the copy reads into the writer's buffer, at its size.
+        let mut sending = io::BufWriter::with_capacity(1 << 20, stream);
+        let sent = io::copy(&mut io::Read::take(body, length), &mut sending)?;
         if sent != length {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!("the body ended after {sent} of {length} bytes"),
             ));
         }
+        let mut stream = sending.into_inner().map_err(io::IntoInnerError::into_error)?;
         stream.flush()?;
         let mut reader = BufReader::new(stream);
         let (status, headers) = read_head(&mut reader)?;

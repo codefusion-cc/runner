@@ -13,13 +13,12 @@
 use super::init::{Event, Failure, Host, LAST_WORDS, describe};
 use super::job::{Sandbox, Watch, empty_summary, forward_output, share_in, usage_of};
 use super::sys::{self, context, say};
-use cf_guest_proto::{GuestEnd, OomEvent};
+use cf_guest_proto::GuestEnd;
 use cf_guest_proto::{
     GuestMessage, HostMessage, Job, PROTOCOL, Start, Summary, Task, Workload, read_message,
 };
 use cf_supervisor::environment::{find_user, workload_environment};
-use cf_supervisor::oom;
-use cf_supervisor::processes::{Table, Tree};
+use cf_supervisor::processes::Tree;
 use cf_supervisor::tell::JobFacts;
 use std::fs::{self, File};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -258,12 +257,10 @@ fn run_job(
         since_start_ms()
     ));
 
-    // SAFETY: sysconf takes no pointers.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
-    let mut watch = Watch {
-        job: &job,
+    let mut watch = Watch::new(
+        &job,
         host,
-        sandbox: Sandbox {
+        Sandbox {
             tree: Tree::supervisor(std::process::id()),
             cgroup: CGROUP,
             shared: SHARED,
@@ -271,20 +268,9 @@ fn run_job(
             kill: kill_all,
             gone: end_container,
         },
-        started: Instant::now(),
         // The kernel's log is the host's; the control group's counter says what the kernel stopped.
-        kernel_log: None,
-        log: oom::Log::new(page),
-        previous: Table::new([]),
-        oom: None::<OomEvent>,
-        count: oom::Count::default(),
-        own_limit: oom::OwnLimit::default(),
-        step: None,
-        stop: None,
-        killed: false,
-        disk_peak: 0,
-        heartbeat: Instant::now(),
-    };
+        None,
+    );
     let ended = watch.until_the_end(events);
     watch.last_look();
     let usage = usage_of(CGROUP, None);

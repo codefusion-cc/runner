@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 cf-guest-proto = { path = "../guest-proto" }
+libc.workspace = true
 thiserror.workspace = true
 
 [lints]

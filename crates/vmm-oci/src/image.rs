@@ -3,16 +3,14 @@
 //! imports it as an image with no name, names it `codefusion-runner-guest:<version>` ([`crate::image_tag`]) once its
 //! hash is the signed one, and removes it when it is not.
 
-use crate::IMAGE_REPOSITORY;
 use crate::http::{Body, Engine, escape};
+use crate::{CALL, IMAGE_REPOSITORY};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 /// How long the engine may take to unpack what it was sent before its answer.
 const IMPORT: Duration = Duration::from_secs(30 * 60);
-/// How long another call may take.
-const CALL: Duration = Duration::from_secs(60);
 
 /// The images of the engine at a socket.
 pub struct Images {

@@ -84,14 +84,14 @@ impl ChVmm {
             *path = fs::canonicalize(&path)
                 .map_err(|e| VmmError::Unsupported(format!("{}: {e}", path.display())))?;
         }
-        delegation.sweep(alive);
+        delegation.sweep(cf_vmm::alive);
         if let Ok(entries) = fs::read_dir(&config.dir) {
             for entry in entries.flatten() {
                 if entry
                     .file_name()
                     .to_str()
                     .and_then(owner)
-                    .is_some_and(|host| !alive(host))
+                    .is_some_and(|host| !cf_vmm::alive(host))
                 {
                     let _ = fs::remove_dir_all(entry.path());
                 }
@@ -124,17 +124,6 @@ fn resolved(spec: &VmSpec) -> Result<VmSpec, VmmError> {
         disk.path = resolve(&disk.path)?;
     }
     Ok(resolved)
-}
-
-/// Whether a process of this id is running.
-fn alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: kill with signal 0 takes no pointers and sends nothing.
-    pid > 0
-        && (unsafe { libc::kill(pid, 0) } == 0
-            || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 impl Vmm for ChVmm {

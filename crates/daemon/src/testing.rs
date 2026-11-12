@@ -364,7 +364,7 @@ impl Vms for FakeVms {
                 started_at: 0,
                 stage: if ready { Stage::Running } else { Stage::Booting },
                 vm_bytes: request.memory_bytes,
-                limit_bytes: request.limits().memory_bytes,
+                limit_bytes: request.limits_in(false).memory_bytes,
                 cpus: request.cpus,
                 image: request.image.clone(),
                 boots: 1,

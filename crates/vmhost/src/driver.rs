@@ -160,6 +160,7 @@ fn run_in(
     cancel: &AtomicBool,
 ) -> Result<JobState, RunError> {
     let job = request.job.clone();
+    let containers = vmm.containers();
     let (state_path, socket_path, job_dir, console) = (
         layout.state(&job),
         layout.socket(&job),
@@ -187,6 +188,8 @@ fn run_in(
 
     // The registration leaves this process with the guest's task; nothing here keeps a second copy for longer
     // than a second boot may need it.
+    let guest_limits = request.limits_in(containers);
+    let limit_bytes = guest_limits.memory_bytes;
     let mut task = Some(Job {
         name: job.clone(),
         host: request.host.clone(),
@@ -194,7 +197,7 @@ fn run_in(
             &mut request.workload,
             cf_guest_proto::Workload::Command { argv: Vec::new() },
         ),
-        limits: request.limits_in(vmm.containers()),
+        limits: guest_limits,
         env: std::mem::take(&mut request.env),
         oom_grace_ms: 15_000,
         blocked: crate::host_net::host_networks(),
@@ -208,7 +211,7 @@ fn run_in(
         started_at: now_s() - started.elapsed().as_secs(),
         stage,
         vm_bytes: request.memory_bytes,
-        limit_bytes: request.limits_in(vmm.containers()).memory_bytes,
+        limit_bytes,
         cpus: request.cpus,
         image: request.image.clone(),
         boots: machine.map_or(0, Machine::boots),
@@ -275,7 +278,7 @@ fn run_in(
     };
     let scratch_disk = job_dir.join("scratch.img");
     // A container writes into its own layer, which goes with it: there is no disk to make.
-    let prepared = if vmm.containers() {
+    let prepared = if containers {
         Ok(())
     } else {
         scratch::template(
@@ -306,7 +309,7 @@ fn run_in(
         let _ = fs::remove_file(&state_path);
         return Err(RunError::Scratch(error));
     }
-    let spec = if vmm.containers() {
+    let spec = if containers {
         files.container(
             request.memory_bytes,
             request.cpus as usize,

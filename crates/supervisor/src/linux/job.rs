@@ -470,12 +470,10 @@ pub fn run(
         network.took.as_millis()
     ));
 
-    // SAFETY: sysconf takes no pointers.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
-    let mut watch = Watch {
-        job: &job,
+    let mut watch = Watch::new(
+        &job,
         host,
-        sandbox: Sandbox {
+        Sandbox {
             tree: Tree::launcher(launcher),
             cgroup: CGROUP,
             shared: SHARED,
@@ -483,19 +481,8 @@ pub fn run(
             kill: kill_job,
             gone: sys::power_off,
         },
-        started: Instant::now(),
         kernel_log,
-        log: oom::Log::new(page),
-        previous: Table::new([]),
-        oom: None,
-        count: oom::Count::default(),
-        own_limit: oom::OwnLimit::default(),
-        step: None,
-        stop: None,
-        killed: false,
-        disk_peak: 0,
-        heartbeat: Instant::now(),
-    };
+    );
     let ended = watch.until_the_end(events);
     // A process the kernel stopped in the job's last half second, which a workload that died of it ends with, was
     // not looked for yet.
@@ -600,28 +587,51 @@ pub(super) struct Sandbox {
 }
 
 pub(super) struct Watch<'a> {
-    pub job: &'a Job,
-    pub host: &'a Host,
-    pub sandbox: Sandbox,
+    job: &'a Job,
+    host: &'a Host,
+    sandbox: Sandbox,
     pub started: Instant,
-    pub kernel_log: Option<File>,
-    pub log: oom::Log,
+    kernel_log: Option<File>,
+    log: oom::Log,
     /// The processes at the last look, where one the kernel has since stopped is still found.
-    pub previous: Table,
+    previous: Table,
     pub oom: Option<OomEvent>,
     /// The stops the kernel counted for the job against those its log named.
-    pub count: oom::Count,
+    count: oom::Count,
     /// A Docker job's stops that are its containers' own, apart from the job's.
-    pub own_limit: oom::OwnLimit,
+    own_limit: oom::OwnLimit,
     /// The step whose processes go when its time to fail by itself is over.
-    pub step: Option<(Instant, Process)>,
+    step: Option<(Instant, Process)>,
     pub stop: Option<(StopReason, Instant)>,
-    pub killed: bool,
+    killed: bool,
     pub disk_peak: u64,
-    pub heartbeat: Instant,
+    heartbeat: Instant,
 }
 
-impl Watch<'_> {
+impl<'a> Watch<'a> {
+    /// The watch of a job that has just started in `sandbox`.
+    pub fn new(job: &'a Job, host: &'a Host, sandbox: Sandbox, kernel_log: Option<File>) -> Self {
+        // SAFETY: sysconf takes no pointers.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        Self {
+            job,
+            host,
+            sandbox,
+            started: Instant::now(),
+            kernel_log,
+            log: oom::Log::new(page),
+            previous: Table::new([]),
+            oom: None,
+            count: oom::Count::default(),
+            own_limit: oom::OwnLimit::default(),
+            step: None,
+            stop: None,
+            killed: false,
+            disk_peak: 0,
+            heartbeat: Instant::now(),
+        }
+    }
+
     pub fn until_the_end(&mut self, events: &Receiver<Event>) -> std::process::ExitStatus {
         let mut looked = Instant::now();
         loop {

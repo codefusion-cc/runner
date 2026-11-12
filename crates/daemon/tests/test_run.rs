@@ -626,7 +626,7 @@ async fn the_token_shows_in_no_debug_print_of_the_machines_request() {
         name: request.job.clone(),
         host: request.host.clone(),
         workload: request.workload.clone(),
-        limits: request.limits(),
+        limits: request.limits_in(false),
         env: request.env.clone(),
         oom_grace_ms: 0,
         blocked: Vec::new(),

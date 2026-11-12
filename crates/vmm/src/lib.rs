@@ -19,6 +19,18 @@ pub use cf_guest_proto::Psi;
 pub use exit::ExitCell;
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
 
+/// Whether a process of this id is running, as a monitor asks of the vm-host that left a machine behind. One of
+/// another user's counts as running.
+pub fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill with signal 0 takes no pointers and sends nothing.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
 /// The guest kernel's command line, the same under every monitor of an architecture. `console=hvc0` is the virtio
 /// console the monitor writes to the console file. `quiet` keeps the kernel's own lines off the console; `panic=-1`
 /// restarts a guest whose kernel panics, which closes the channel, and the host takes a closed channel for a lost

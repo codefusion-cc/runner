@@ -460,11 +460,7 @@ place_engine() {
         # After every range given, and never below 100000, where useradd starts.
         start=$(cat /etc/subuid /etc/subgid 2>/dev/null | awk -F: '$3 ~ /^[0-9]+$/ { end = $2 + $3; if (end > top) top = end }
           END { print (top > 100000 ? top : 100000) }')
-        if [[ $file == /etc/subuid ]]; then
-          usermod --add-subuids "$start-$((start + 65535))" "$USER_NAME"
-        else
-          usermod --add-subgids "$start-$((start + 65535))" "$USER_NAME"
-        fi
+        usermod "--add-${file#/etc/}s" "$start-$((start + 65535))" "$USER_NAME"
       fi
     fi
   done

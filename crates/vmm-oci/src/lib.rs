@@ -44,7 +44,7 @@ pub const SUPERVISOR: &str = "/run/codefusion/supervisor";
 /// The most processes a container holds.
 const PIDS: u64 = 4096;
 /// How long a call to the engine may take before it counts as a failure, but for a container's end.
-const CALL: Duration = Duration::from_secs(60);
+pub(crate) const CALL: Duration = Duration::from_secs(60);
 /// How long a network still in use is asked for again: Podman takes a container's network down in a process of its
 /// own once the container has gone, so the network may still be busy just after.
 const NETWORK_IN_USE: Duration = Duration::from_secs(10);
@@ -154,7 +154,7 @@ impl OciVmm {
             machine: config.machine,
             next: AtomicU64::new(0),
         };
-        vmm.sweep(alive);
+        vmm.sweep(cf_vmm::alive);
         Ok(vmm)
     }
 
@@ -175,16 +175,16 @@ impl OciVmm {
 
     /// The containers of this machine, each with the vm-host that made it, when its label names one.
     pub fn containers(&self) -> Vec<(String, Option<u32>)> {
-        self.labelled("/containers/json?all=1&filters=", "Id")
+        self.labelled("/containers/json?all=1&filters=")
     }
 
     /// The networks of this machine, each with the vm-host that made it, when its label names one.
     pub fn networks(&self) -> Vec<(String, Option<u32>)> {
-        self.labelled("/networks?filters=", "Id")
+        self.labelled("/networks?filters=")
     }
 
     /// What a list call of the engine names of this machine's, with each one's vm-host.
-    fn labelled(&self, list: &str, key: &str) -> Vec<(String, Option<u32>)> {
+    fn labelled(&self, list: &str) -> Vec<(String, Option<u32>)> {
         let filters = json!({ "label": [format!("{LABEL_MACHINE}={}", self.machine)] }).to_string();
         let path = format!("{list}{}", escape(&filters));
         let Ok(answer) = self.engine.request("GET", &path, Body::Empty, Some(CALL)) else {
@@ -195,7 +195,7 @@ impl OciVmm {
         };
         list.iter()
             .filter_map(|item| {
-                let id = item.get(key)?.as_str()?.to_string();
+                let id = item.get("Id")?.as_str()?.to_string();
                 let owner = item
                     .get("Labels")
                     .and_then(|labels| labels.get(LABEL_OWNER))
@@ -343,17 +343,6 @@ fn remove(engine: &Engine, id: &str) {
         Body::Empty,
         Some(CALL),
     );
-}
-
-/// Whether a process of this id is running.
-fn alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: kill with signal 0 takes no pointers and sends nothing.
-    pid > 0
-        && (unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 /// Removes a network; what is not there is not an error.
@@ -651,17 +640,19 @@ fn watch_end(engine: Engine, id: String, exit: Arc<ExitCell>) {
                 return;
             }
         };
-        let oom = engine
-            .request(
-                "GET",
-                &format!("/containers/{}/json", escape(&id)),
-                Body::Empty,
-                Some(CALL),
-            )
-            .ok()
-            .and_then(|answer| answer.json().ok())
-            .and_then(|value| value.get("State")?.get("OOMKilled")?.as_bool())
-            .unwrap_or(false);
+        // A clean end needs no look at the container: only a failure may be the kernel's doing.
+        let oom = code != Some(0)
+            && engine
+                .request(
+                    "GET",
+                    &format!("/containers/{}/json", escape(&id)),
+                    Body::Empty,
+                    Some(CALL),
+                )
+                .ok()
+                .and_then(|answer| answer.json().ok())
+                .and_then(|value| value.get("State")?.get("OOMKilled")?.as_bool())
+                .unwrap_or(false);
         match code {
             // The supervisor ends with 0 after it told the host how the job ended; a kill ends it with 137.
             Some(0) => exit.found_stopped(),
@@ -684,13 +675,6 @@ pub struct OciVm {
     channel: Mutex<Option<stream::AttachChannel>>,
     /// Removed after the container, when this is dropped.
     _network: Option<OwnNetwork>,
-}
-
-impl OciVm {
-    /// The engine's id of the container.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
 }
 
 impl Vm for OciVm {

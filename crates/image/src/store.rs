@@ -76,6 +76,9 @@ pub trait Engine {
     fn remove(&mut self, id: &str);
 }
 
+/// How much of a root file system one read takes.
+const COPY_BUFFER: usize = 1 << 20;
+
 /// The parts of a root file system read as one, hashed as they are read. Each part is deleted once it is read
 /// whole, so the install never holds the whole twice on the disk; a failure removes the partial folder anyway.
 struct Joined<'a> {
@@ -97,7 +100,7 @@ impl Read for Joined<'_> {
                 self.file = Some((File::open(&path)?, path));
             }
             let Some((file, path)) = self.file.as_mut() else {
-                return Ok(0);
+                unreachable!("a part was opened above");
             };
             let read = file.read(buffer)?;
             if read == 0 {
@@ -269,13 +272,16 @@ impl Store {
             Target::File => {
                 // New and its owner's alone, whatever this process's mask for new files is.
                 let path = partial.join(ROOTFS_NAME);
-                let mut out = fs::OpenOptions::new()
+                let out = fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
                     .open(&path)
                     .map_err(io(&path))?;
+                // Copied a MiB at a time: the copy reads into the writer's buffer, at its size.
+                let mut out = io::BufWriter::with_capacity(COPY_BUFFER, out);
                 io::copy(&mut joined, &mut out).map_err(io(&path))?;
+                let out = out.into_inner().map_err(|error| io(&path)(error.into_error()))?;
                 out.sync_all().map_err(io(&path))?;
                 None
             }

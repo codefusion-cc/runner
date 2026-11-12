@@ -398,6 +398,7 @@ name = "cf-vmm"
 version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
+ "libc",
  "thiserror",
 ]
 
