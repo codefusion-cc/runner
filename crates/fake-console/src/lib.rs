@@ -4,7 +4,7 @@
 //! order, with the same statuses and bounds.
 //!
 //! Tests drive it ([`FakeConsole::add_code`], [`FakeConsole::pause`], [`FakeConsole::queue_command`]), make it
-//! misbehave ([`FakeConsole::down`], [`FakeConsole::fail_next`], [`FakeConsole::accept_then_drop_next`],
+//! misbehave ([`FakeConsole::down`], [`FakeConsole::slow_next`], [`FakeConsole::fail_next`], [`FakeConsole::accept_then_drop_next`],
 //! [`FakeConsole::answer_next`]) and read what it saw ([`FakeConsole::reports`], [`FakeConsole::job_events`],
 //! [`FakeConsole::github_calls`]). It is written from the console's code and not
 //! from the client's types, so the client's wire format is checked against the contract and not against itself.
@@ -24,6 +24,7 @@ pub use scaleset::{
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use cf_fake_github::FakeGithub;
 use cf_fake_github::httpd::{Handler, Reply, Request, Server};
@@ -75,6 +76,8 @@ struct Faults {
     drop_after_reports: u32,
     /// What every scale set call is answered instead, while set.
     scaleset: Option<Reply>,
+    /// The next scale set call to this route, and how long the console takes before it asks GitHub.
+    slow: Option<(String, Duration)>,
 }
 
 #[derive(Default)]
@@ -91,6 +94,10 @@ struct State {
     /// Commands the console stopped sending (a test run that ended or was cancelled), by id.
     withdrawn: HashSet<String>,
     calls: usize,
+    /// Calls taken and not yet answered.
+    in_flight: usize,
+    /// Scale set calls [`Faults::slow`] held.
+    slowed: usize,
     paused: bool,
     /// The size the answers name the Mac to make room for.
     make_room_for: Option<String>,
@@ -124,6 +131,22 @@ fn error(status: u16, message: &str) -> Reply {
 /// A refusal with the code a Runner tells it apart by (agent.ts `refusal`), such as `broker_off`.
 fn coded(status: u16, message: &str, code: &str) -> Reply {
     Reply::status_json(status, &json!({ "error": message, "code": code }))
+}
+
+/// A call the console took, counted until it is answered or its caller went away.
+struct InFlight(Arc<Mutex<State>>);
+
+impl InFlight {
+    fn new(state: &Arc<Mutex<State>>) -> InFlight {
+        state.lock().unwrap_or_else(|e| e.into_inner()).in_flight += 1;
+        InFlight(state.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).in_flight -= 1;
+    }
 }
 
 fn take(counter: &mut u32) -> bool {
@@ -362,7 +385,9 @@ impl FakeConsole {
     }
 
     async fn handle(state: &Arc<Mutex<State>>, request: Request) -> Reply {
+        let _flying = InFlight::new(state);
         let github_route = request.path.starts_with(&format!("{PREFIX}github/"));
+        let mut slow = None;
         let step = {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             state.calls += 1;
@@ -386,14 +411,30 @@ impl FakeConsole {
                 return reply.clone();
             }
             match request.path.strip_prefix(scaleset::PREFIX) {
-                Some(route) if request.method == "POST" => state.scaleset_begin(route, &request),
+                Some(route) if request.method == "POST" => {
+                    if state
+                        .faults
+                        .slow
+                        .as_ref()
+                        .is_some_and(|(slowed, _)| slowed == route)
+                    {
+                        slow = state.faults.slow.take().map(|(_, wait)| wait);
+                        state.slowed += 1;
+                    }
+                    state.scaleset_begin(route, &request)
+                }
                 _ => scaleset::Step::Done(state.route(&request)),
             }
         };
         // GitHub is asked with no lock held.
         let reply = match step {
             scaleset::Step::Done(reply) => reply,
-            scaleset::Step::Call(call) => scaleset::run(state, *call).await,
+            scaleset::Step::Call(call) => {
+                if let Some(wait) = slow {
+                    tokio::time::sleep(wait).await;
+                }
+                scaleset::run(state, *call).await
+            }
         };
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let taken = matches!(&reply, Reply::Response { status: 200, .. });
@@ -439,6 +480,11 @@ impl FakeConsole {
         self.lock().faults.down = down;
     }
 
+    /// Whether [`FakeConsole::down`] has the console down.
+    pub fn is_down(&self) -> bool {
+        self.lock().faults.down
+    }
+
     /// While down, every call but a `github/…` one is answered 503: reports and job events wait while the console
     /// still gives the host its GitHub tokens and makes its scale set calls.
     pub fn reports_down(&self, down: bool) {
@@ -450,6 +496,31 @@ impl FakeConsole {
     /// [`Reply::Hang`] for one that never answers. `None` serves them again.
     pub fn scaleset_answer(&self, answer: Option<Reply>) {
         self.lock().faults.scaleset = answer;
+    }
+
+    /// The next scale set call to `route` (such as `session/open`) waits `wait` before the console asks GitHub: a
+    /// console that is slow while the Runner that asked dies and the next one starts.
+    pub fn slow_next(&self, route: &str, wait: Duration) {
+        self.lock().faults.slow = Some((route.to_string(), wait));
+    }
+
+    /// How many scale set calls [`FakeConsole::slow_next`] held so far.
+    pub fn slowed(&self) -> usize {
+        self.lock().slowed
+    }
+
+    /// Waits until the console answered every call it took: what it still asks GitHub for a caller ends first.
+    /// Panics after a minute, as a console that never ends a call would hang the test.
+    pub async fn quiet(&self) {
+        let began = std::time::Instant::now();
+        while self.lock().in_flight > 0 {
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "the console still answers {} calls after a minute",
+                self.lock().in_flight
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// What a console from before the scale set calls answers them: the 404 of a route it does not know, with no

@@ -9,11 +9,12 @@
 //! that commit. Plain `update` (main's head) is a build's: it is not offered here.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cf_daemon::update::{NO_HEAD, Pending, SelfUpdate, UpdateFrom, is_commit};
-use cf_ghapp::{Compared, Release, Releases, RetryPolicy, is_whole_commit};
+use cf_ghapp::{Compared, Monotonic, Release, Releases, RetryPolicy, SystemMonotonic, is_whole_commit};
 
 use crate::commands::VERSION;
 use crate::update::{Installer, cut, running_commit};
@@ -80,6 +81,8 @@ pub struct ReleaseUpdate {
     package: String,
     /// How long a release that is not out is waited for, asked for every so often.
     wait: (Duration, Duration),
+    /// The clock the wait is measured by.
+    clock: Arc<dyn Monotonic>,
     /// Set as the Runner ends: a download or a wait under way ends with it. The service runs one update at a time.
     stop: AtomicBool,
 }
@@ -118,6 +121,7 @@ impl ReleaseUpdate {
             asset: asset.to_string(),
             package: env!("CARGO_PKG_VERSION").into(),
             wait: (RELEASE_WAIT, ASK_EVERY),
+            clock: Arc::new(SystemMonotonic),
             stop: AtomicBool::new(false),
         })
     }
@@ -138,10 +142,13 @@ impl ReleaseUpdate {
     /// [`PAGE_EVERY`]th). Waits for one that is not out yet.
     async fn release_of(&self, short: &str) -> Result<Release, String> {
         let (wait, every) = self.wait;
-        let began = Instant::now();
+        let began = self.clock.now();
+        let elapsed = || self.clock.now().saturating_duration_since(began);
         let mut look = 0u32;
         loop {
-            let last = began.elapsed() + every > wait || self.stop.load(Ordering::SeqCst);
+            // The last look is the one after which the next would come at the end of the wait or past it: with no
+            // wait, the first, however little the clock moved since it began.
+            let last = elapsed() + every >= wait || self.stop.load(Ordering::SeqCst);
             if let Some(release) = self
                 .look_for(short, last || look.is_multiple_of(PAGE_EVERY))
                 .await?
@@ -151,7 +158,7 @@ impl ReleaseUpdate {
             if last {
                 return Err(format!(
                     "{short} has no release of {REPO} (asked for {}); nothing was downloaded",
-                    cf_daemon::update::spoken(began.elapsed())
+                    cf_daemon::update::spoken(elapsed())
                 ));
             }
             tracing::info!(commit = short, "its release is not out yet; asking again");
@@ -359,7 +366,8 @@ fn make_runnable(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
+    use std::time::Instant;
 
     use cf_daemon::update::{MAX_STARTS, UpdateFile};
     use cf_fake_github::httpd::{Handler, Reply, Request, Server};
@@ -405,6 +413,41 @@ mod tests {
         _server: Server,
         runtime: tokio::runtime::Runtime,
         update: ReleaseUpdate,
+        clock: Arc<TestClock>,
+    }
+
+    /// A clock that moves only by `step` at each read: frozen by default, as a clock read twice within its
+    /// resolution is. A wait that reads it without end is cut short, so a wait that never ends fails rather than
+    /// hangs.
+    struct TestClock {
+        at: Mutex<(Instant, Duration, u32)>,
+    }
+
+    impl TestClock {
+        const MAX_READS: u32 = 10_000;
+
+        fn frozen() -> TestClock {
+            TestClock {
+                at: Mutex::new((Instant::now(), Duration::ZERO, 0)),
+            }
+        }
+
+        fn step(&self, step: Duration) {
+            self.at.lock().expect("clock").1 = step;
+        }
+    }
+
+    impl Monotonic for TestClock {
+        fn now(&self) -> Instant {
+            let mut at = self.at.lock().expect("clock");
+            let (now, step, reads) = *at;
+            assert!(
+                reads < Self::MAX_READS,
+                "the wait read the clock {reads} times without ending"
+            );
+            *at = (now + step, step, reads + 1);
+            now
+        }
     }
 
     fn reply_for(hub: &mut Hub, request: &Request, base: &str) -> Reply {
@@ -522,6 +565,8 @@ mod tests {
         };
         let mut update = ReleaseUpdate::new(installer, &server.url(), ASSET, quick()).expect("an update");
         update.wait_for(Duration::ZERO, Duration::ZERO);
+        let clock = Arc::new(TestClock::frozen());
+        update.clock = clock.clone();
         update.running = format!("0.1.0+{RUNNING}");
         let bench = Bench {
             _folder: folder,
@@ -529,6 +574,7 @@ mod tests {
             _server: server,
             runtime,
             update,
+            clock,
         };
         bench.publish(NEW, &program(&NEW[..12]), &program(&NEW[..12]));
         {
@@ -847,6 +893,9 @@ mod tests {
         bench
             .update
             .wait_for(Duration::from_millis(600), Duration::from_millis(40));
+        // Each look comes 40 ms after the one before by this clock: at 40, 80 to 560 ms, the last, as the next would
+        // come at the end of the wait.
+        bench.clock.step(Duration::from_millis(40));
         let none = "dddddddddddd3333333333333333333333333333";
         bench.update.build(Some(none)).expect_err("no release");
         let seen = bench.seen();
@@ -863,7 +912,7 @@ mod tests {
                 page_after.push(look);
             }
         }
-        assert!(tags >= 10, "{seen:?}");
+        assert_eq!(tags, 14, "{seen:?}");
         let mut wanted: Vec<usize> = (1..=tags)
             .filter(|look| (look - 1) % PAGE_EVERY as usize == 0)
             .collect();
@@ -1148,6 +1197,7 @@ mod tests {
             _server,
             runtime,
             update,
+            ..
         } = bench();
         let update = Arc::new(update);
         let fetching = update.clone();
