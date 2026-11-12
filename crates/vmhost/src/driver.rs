@@ -348,6 +348,7 @@ fn run_in(
                         disk.look(old.as_ref());
                         disk.next_machine();
                         put_down(old.as_ref(), Duration::from_secs(3));
+                        let_go(old);
                     }
                     match vmm.start(&spec) {
                         Ok(machine) => {
@@ -430,6 +431,7 @@ fn run_in(
                     if let Some(vm) = vm.take() {
                         disk.look(vm.as_ref());
                         put_down(vm.as_ref(), Duration::from_secs(2));
+                        let_go(vm);
                     }
                     let io = disk.total();
                     let state = JobState {
@@ -532,6 +534,16 @@ fn add(a: Option<DiskIo>, b: Option<DiskIo>) -> Option<DiskIo> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.plus(b)),
         (a, b) => a.or(b),
+    }
+}
+
+/// Lets go of a machine that was put down once its watcher has, which sees the new generation within a nap: the
+/// last hold removes what the machine still had (a container and its network), and that is gone before the job's
+/// end is told. A watcher held up by a full queue is waited for no longer than a second.
+fn let_go(vm: Arc<dyn Vm>) {
+    let since = Instant::now();
+    while Arc::strong_count(&vm) > 1 && since.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 

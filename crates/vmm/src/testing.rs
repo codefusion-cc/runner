@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,6 +80,8 @@ pub struct FakeVmm {
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
     containers: bool,
+    linger: Duration,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl FakeVmm {
@@ -89,6 +92,18 @@ impl FakeVmm {
             containers: true,
             ..self
         }
+    }
+
+    /// The same monitor, whose machines take `linger` to be let go of, as a container and its network take to be
+    /// removed.
+    #[must_use]
+    pub fn lingering(self, linger: Duration) -> Self {
+        Self { linger, ..self }
+    }
+
+    /// How many of this monitor's machines were let go of (dropped) so far.
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
     }
 
     /// A monitor that will start these machines, in this order.
@@ -157,6 +172,8 @@ impl Vmm for FakeVmm {
                 resident: self.resident.clone(),
                 stalls: self.stalls.clone(),
                 disks: self.disks.clone(),
+                linger: self.linger,
+                dropped: self.dropped.clone(),
             })),
         }
     }
@@ -171,6 +188,8 @@ struct FakeVm {
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
+    linger: Duration,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl Vm for FakeVm {
@@ -246,6 +265,8 @@ impl Vm for FakeVm {
 impl Drop for FakeVm {
     fn drop(&mut self) {
         self.power.end(VmExit::Stopped);
+        std::thread::sleep(self.linger);
+        self.dropped.fetch_add(1, Ordering::SeqCst);
     }
 }
 

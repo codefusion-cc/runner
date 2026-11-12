@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -1351,4 +1351,42 @@ fn in_a_container_docker_and_trusted_jobs_are_refused_before_anything_starts() {
         assert!(!layout.state(&job).exists());
     }
     assert!(vmm.started().is_empty());
+}
+
+#[test]
+fn every_machine_of_a_job_is_let_go_of_before_its_end_is_told() {
+    // A container and its network go when its machine is let go of, which takes a while: a job that has ended has
+    // nothing of it left, whether the end came by itself, the machine took a stop or was killed.
+    // A cancelled job's guest asks for the stop itself once it is ready, so that its machine is up when it comes.
+    let machine = |stop: Option<Stop>, cancel: Arc<AtomicBool>| match stop {
+        None => job(|stream, _, _| finish(stream, summary(GuestEnd::Exited, Some(0)))),
+        Some(stop) => Script::Boot {
+            refuse_channel: 0,
+            guest: Box::new(move |mut stream, power| {
+                greet(&mut stream);
+                say(&mut stream, GuestMessage::Ready { boot_ms: 1 });
+                cancel.store(true, Ordering::SeqCst);
+                power.wait_for_the_end();
+            }),
+            stop,
+        },
+    };
+    let machines = [
+        (None, End::Ok),
+        (Some(Stop::Obeys), End::Cancelled),
+        (Some(Stop::Hangs), End::Cancelled),
+        (Some(Stop::Refuses), End::Cancelled),
+    ];
+    for _ in 0..3 {
+        for (stop, the_end) in machines {
+            let (_dir, layout) = state_dir();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let vmm = FakeVmm::new([formatter(), machine(stop, cancel.clone())])
+                .lingering(Duration::from_millis(100));
+            let state = run(&vmm, &layout, GUEST, request("a"), quick(), &cancel).unwrap();
+
+            assert_eq!(state.end.as_ref().map(|ended| ended.end), Some(the_end));
+            assert_eq!((vmm.started().len(), vmm.dropped()), (2, 2), "{stop:?}");
+        }
+    }
 }
