@@ -2016,6 +2016,24 @@ async fn a_report_says_the_memory_that_is_available_what_the_runner_keeps_free_a
 async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_with_room_gets_it() {
     const OTHER: &str = "org/other";
     let rig = Rig::new(1).await;
+    // The first repository's job takes the slot while its scale set is the only one. Two scale sets take turns at
+    // the slot, and a turn is lost whenever a poll the Runner gave up reaches GitHub after the one that replaced it:
+    // when the first job's room comes is chance.
+    rig.service.discover().await;
+    until("the first repository's session", || {
+        rig.github.scale_sets().iter().any(|s| s.has_session)
+    })
+    .await;
+    rig.queue().await;
+    until("a machine for the first repository's job", || {
+        rig.standing().len() == 1
+    })
+    .await;
+    let runner = rig.standing().remove(0);
+    rig.github.start_job(&runner);
+
+    // Polls that stand longer than the checks below, as GitHub's do: only the Runner ends one early.
+    rig.github.set_poll_timeout(Duration::from_secs(1));
     rig.github.add_repo(OTHER, true);
     rig.github.set_workflow(OTHER, "ci.yml", WORKFLOW);
     rig.service.discover().await;
@@ -2024,18 +2042,7 @@ async fn a_job_for_a_mac_whose_last_slot_just_went_stays_at_github_and_a_mac_wit
         sets.len() == 2 && sets.iter().all(|s| s.has_session)
     })
     .await;
-    // Polls that stand longer than the checks below, as GitHub's do: only the Runner ends one early. The two scale
-    // sets take turns at the one slot, two polls each, so a poll stands no longer than a turn fits the wait for room.
-    rig.github.set_poll_timeout(Duration::from_secs(1));
     tokio::time::sleep(Duration::from_millis(500)).await;
-
-    rig.queue().await;
-    until("a machine for the first repository's job", || {
-        rig.standing().len() == 1
-    })
-    .await;
-    let runner = rig.standing().remove(0);
-    rig.github.start_job(&runner);
     let others = rig
         .github
         .scale_sets()
