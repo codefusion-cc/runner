@@ -629,6 +629,7 @@ async fn the_token_shows_in_no_debug_print_of_the_machines_request() {
         limits: request.limits_in(false),
         env: request.env.clone(),
         oom_grace_ms: 0,
+        end_by_ms: None,
         blocked: Vec::new(),
         docker: false,
         trusted: None,

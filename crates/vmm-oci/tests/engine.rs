@@ -273,10 +273,11 @@ fn a_job_past_its_deadline_is_stopped_and_its_container_removed() {
     nothing_left(&vmm);
 }
 
-/// What a vm-host leaves when it dies mid-job, killed with no word, is gone when the next one starts.
+/// A vm-host killed mid-job with no word: the container's input ends with its attach, so the supervisor ends the
+/// job by itself, and the daemon's next look at the engine removes what is left, with no vm-host started.
 #[test]
 #[ignore = "needs a container engine: CF_ENGINE_SOCKET, CF_SUPERVISOR and CF_GUEST_IMAGE"]
-fn what_a_vm_host_killed_mid_job_leaves_is_removed_when_the_next_starts() {
+fn what_a_vm_host_killed_mid_job_leaves_ends_and_goes_at_the_daemons_next_look() {
     // The child is told the parent's name for the machine: its own process number differs.
     let name = std::env::var("CF_ENGINE_MACHINE").unwrap_or_else(|_| machine("crash"));
     if let Ok(folder) = std::env::var("CF_ENGINE_CHILD") {
@@ -296,7 +297,7 @@ fn what_a_vm_host_killed_mid_job_leaves_is_removed_when_the_next_starts() {
         .args([
             "--ignored",
             "--exact",
-            "what_a_vm_host_killed_mid_job_leaves_is_removed_when_the_next_starts",
+            "what_a_vm_host_killed_mid_job_leaves_ends_and_goes_at_the_daemons_next_look",
             "--nocapture",
         ])
         .env("CF_ENGINE_CHILD", parent.path())
@@ -316,13 +317,30 @@ fn what_a_vm_host_killed_mid_job_leaves_is_removed_when_the_next_starts() {
     // SAFETY: kill takes a number and a signal; the number is our own child's, whose exit nobody collected yet.
     unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
     let _ = child.wait();
+    let id = &made[0].0;
+    let running = || {
+        Engine::new(socket())
+            .request(
+                "GET",
+                &format!("/containers/{id}/json"),
+                Body::Empty,
+                Some(Duration::from_secs(30)),
+            )
+            .ok()
+            .and_then(|answer| answer.json().ok())
+            .and_then(|state| state["State"]["Running"].as_bool())
+    };
+    let killed = Instant::now();
+    while running() == Some(true) && killed.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
     assert_eq!(
-        watcher.containers(),
-        made,
-        "nothing removes it while no vm-host starts"
+        running(),
+        Some(false),
+        "the job ends with its vm-host, not at its deadline ten minutes on"
     );
-    let next = engine(&name);
-    nothing_left(&next);
+    cf_vmm_oci::sweep(&socket(), &name).expect("the daemon's look");
+    nothing_left(&watcher);
 }
 
 /// Two jobs at once on one host: neither sees the other's files or processes.

@@ -760,6 +760,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
     /// Reads the Mac, lets the budget and every machine's lifecycle see the time that passed, and does what they
     /// say. Call it every second.
     pub fn tick(&self) {
+        self.vms.tidy();
         let mut inner = self.lock();
         let reading: Option<HostReading> = match inner.host.read() {
             Ok(reading) => {

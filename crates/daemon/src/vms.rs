@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -64,7 +65,15 @@ pub trait Vms: Send + Sync {
     fn console_tail(&self, _job: &str, _bytes: usize) -> Option<String> {
         None
     }
+
+    /// Removes, now and then, what vm-hosts that are gone left outside the state folder: a container engine's
+    /// containers and networks. Asked at every tick; it never waits on what it asks.
+    fn tidy(&self) {}
 }
+
+/// How often the engine is swept for what dead vm-hosts left. Each sweep is a call to the engine, which a rootless
+/// Podman answers with a service it starts for the call and stops when idle: a look every tick would keep it up.
+const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
 /// How long a vm-host has to answer on its socket. It answers one client at a time within a second.
 const ANSWER: Duration = Duration::from_millis(1500);
@@ -109,6 +118,9 @@ pub struct VmHosts {
     systemd_run: Option<PathBuf>,
     /// The engine's socket and this host's name, when each job runs in a container ([`VmHosts::in_engine`]).
     engine: Option<(PathBuf, String)>,
+    /// When the engine was last swept, and whether a sweep runs now ([`Vms::tidy`]).
+    swept: Arc<Mutex<Option<Instant>>>,
+    sweeping: Arc<AtomicBool>,
 }
 
 impl VmHosts {
@@ -122,6 +134,8 @@ impl VmHosts {
             children: Arc::default(),
             systemd_run: None,
             engine: None,
+            swept: Arc::default(),
+            sweeping: Arc::default(),
         }
     }
 
@@ -462,6 +476,33 @@ impl Vms for VmHosts {
         self.exited.lock().expect("exited").remove(job);
     }
 
+    fn tidy(&self) {
+        let Some((socket, machine)) = self.engine.clone() else {
+            return;
+        };
+        {
+            let mut swept = self
+                .swept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if swept.is_some_and(|at| at.elapsed() < SWEEP_EVERY) {
+                return;
+            }
+            *swept = Some(Instant::now());
+        }
+        if self.sweeping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sweeping = self.sweeping.clone();
+        // The engine may be slow or gone: the tick does not wait for it.
+        std::thread::spawn(move || {
+            if let Err(error) = cf_vmm_oci::sweep(&socket, &machine) {
+                tracing::warn!(%error, "the engine could not be swept");
+            }
+            sweeping.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn console_tail(&self, job: &str, bytes: usize) -> Option<String> {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let mut file = std::fs::File::open(self.layout.console(job)).ok()?;
@@ -501,6 +542,87 @@ mod tests {
             docker: false,
             trusted: None,
         }
+    }
+
+    /// A vm-host killed mid-job (SIGKILL, the kernel's out-of-memory killer) leaves its container and network in the
+    /// engine. The daemon's own looks remove them while no vm-host starts, and leave a live vm-host's alone. A tick
+    /// comes every second, a look at the engine far less often: one at a time, and never on every tick.
+    #[test]
+    fn what_a_dead_vm_host_left_in_the_engine_goes_at_the_daemons_next_look() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let live = cf_vmm::Owner::this().unwrap().label();
+        let (asked, lines) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                    line.clear();
+                }
+                let path = first.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                let listed = |kind: &str| {
+                    serde_json::json!([
+                        { "Id": format!("{kind}-dead"), "Labels": { cf_vmm_oci::LABEL_OWNER: "1-1-00000000" } },
+                        { "Id": format!("{kind}-live"), "Labels": { cf_vmm_oci::LABEL_OWNER: live } },
+                    ])
+                    .to_string()
+                };
+                let (status, body) = if path.starts_with("GET /containers/json") {
+                    (200, listed("c"))
+                } else if path.starts_with("GET /networks") {
+                    (200, listed("n"))
+                } else {
+                    (204, String::new())
+                };
+                let _ = write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = asked.send(path);
+            }
+        });
+        let vms = VmHosts::new("/nonexistent", folder.path()).in_engine(&socket, "host-1");
+        for _ in 0..5 {
+            vms.tidy();
+        }
+        let mut seen = Vec::new();
+        let began = Instant::now();
+        while !seen
+            .iter()
+            .any(|line: &String| line.starts_with("DELETE /networks/n-dead"))
+            && began.elapsed() < Duration::from_secs(10)
+        {
+            if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
+                seen.push(line);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        seen.extend(lines.try_iter());
+        let removed: Vec<&str> = seen
+            .iter()
+            .filter(|line| line.starts_with("DELETE"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            removed,
+            ["DELETE /containers/c-dead?force=1&v=1", "DELETE /networks/n-dead"],
+            "{seen:?}"
+        );
+        let lists = seen
+            .iter()
+            .filter(|line| line.starts_with("GET /containers/json"))
+            .count();
+        assert_eq!(lists, 1, "five ticks, one look: {seen:?}");
+
+        // A host of virtual machines has no engine to look at.
+        VmHosts::new("/nonexistent", folder.path()).tidy();
     }
 
     /// A Runner that starts again looks at a vm-host for the first time long after the vm-host started: its start is
