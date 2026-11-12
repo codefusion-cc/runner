@@ -419,6 +419,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-vmm-oci"
+version = "0.1.0"
+dependencies = [
+ "cf-guest-proto",
+ "cf-vmm",
+ "flate2",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "cf-vmm-vz"
 version = "0.1.0"
 dependencies = [

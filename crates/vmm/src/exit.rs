@@ -40,6 +40,13 @@ impl ExitCell {
         self.end(if asked { VmExit::Stopped } else { VmExit::Guest });
     }
 
+    /// The machine was found ended in a way only a stop explains: the host's stop after [`ExitCell::stop_asked`],
+    /// a failure that `error` describes otherwise.
+    pub fn found_failed(&self, error: String) {
+        let asked = self.slot().1;
+        self.end(if asked { VmExit::Stopped } else { VmExit::Error(error) });
+    }
+
     /// Waits for the end for at most `timeout`. `None` when the machine still runs.
     pub fn wait(&self, timeout: Duration) -> Option<VmExit> {
         let deadline = Instant::now().checked_add(timeout);
