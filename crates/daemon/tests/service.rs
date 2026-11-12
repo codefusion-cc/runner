@@ -291,8 +291,11 @@ impl Rig {
 
     /// The new Runner of [`Rig::restart_after`], not yet doing its rounds.
     async fn start_again(&mut self, edit: impl FnOnce(&Rig)) {
-        // From this moment nothing the dying Runner asks reaches GitHub: an answer it got is the last it gets.
+        // From this moment nothing the dying Runner asks reaches GitHub, itself or through the console: an answer it
+        // got is the last it gets.
         self.github.set_down(true);
+        let console_down = self.console.is_down();
+        self.console.down(true);
         self.stop_pump().await;
         self.service.kill();
         if self.store.crashed() {
@@ -300,9 +303,13 @@ impl Rig {
             tokio::time::sleep(Duration::from_millis(50)).await;
             self.parts.vms.freeze(false);
         }
+        // A call the console took from the dying Runner, a session it opens at GitHub say, ends while GitHub is down:
+        // it does not land once the next Runner started.
+        self.console.quiet().await;
         self.store.revive();
         edit(self);
         self.dead.store(false, Ordering::Relaxed);
+        self.console.down(console_down);
         self.github.set_down(false);
         let host = self.machines.with_host(|host| host.clone());
         self.parts.roster = Arc::new(Roster::new());
@@ -2775,6 +2782,45 @@ fn running(rig: &Rig, jobs: &[i64]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// A session the Runner asked the console for just before it died, which the console opens at GitHub only once the
+/// next Runner started, would be the dead Runner's: GitHub refuses the next one's while it lasts. The rig's Runner that
+/// starts again waits for the console to end what the dying one asked, against a GitHub that is down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_the_dying_runner_asked_the_console_for_is_not_opened_once_the_next_one_started() {
+    let mut rig = Rig::new(2).await;
+    rig.service.discover().await;
+    until("the scale set's session", || {
+        rig.github.scale_sets().iter().any(|set| set.has_session)
+    })
+    .await;
+    let set = rig.github.scale_sets()[0].id;
+    rig.console.slow_next("session/open", Duration::from_millis(300));
+    rig.github.lose_session(set);
+    until("the listener's open waits at the console", || {
+        rig.console.slowed() == 1
+    })
+    .await;
+    let before = session_opens(&rig)[0];
+    rig.restart().await;
+    // The dying Runner's open is over, whatever the console made of it.
+    rig.console.quiet().await;
+    rig.service.discover().await;
+    until("the next Runner's session", || {
+        rig.github
+            .scale_sets()
+            .iter()
+            .any(|s| s.id == set && s.has_session)
+    })
+    .await;
+    // A session that was there first would have the open refused, and tried again every 20 to 100 ms.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        session_opens(&rig)[0] - before,
+        1,
+        "the next Runner opened its session once, and nothing else did"
+    );
 }
 
 proptest! {
