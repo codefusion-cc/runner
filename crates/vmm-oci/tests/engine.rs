@@ -503,7 +503,12 @@ fn a_job_reaches_no_listener_of_the_host_and_no_metadata() {
     let own = std::process::Command::new("hostname")
         .arg("-I")
         .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .unwrap_or_default();
     let script = format!(
         "gw=$(ip route 2>/dev/null | awk '/default/ {{print $3}}'); \
