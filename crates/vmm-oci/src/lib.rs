@@ -637,16 +637,17 @@ fn watch_end(engine: Engine, id: String, exit: Arc<ExitCell>) {
                 .json()
                 .ok()
                 .and_then(|value| value.get("StatusCode")?.as_i64()),
+            // A container the host stopped or removed may end the wait this way too: then it was the host's stop.
             Ok(answer) => {
-                exit.end(VmExit::Error(format!(
+                exit.found_failed(format!(
                     "the engine's wait answered {}: {}",
                     answer.status,
                     answer.message()
-                )));
+                ));
                 return;
             }
             Err(error) => {
-                exit.end(VmExit::Error(format!("the engine was lost: {error}")));
+                exit.found_failed(format!("the engine was lost: {error}"));
                 return;
             }
         };
@@ -811,7 +812,7 @@ mod tests {
     #[test]
     fn a_network_still_in_use_is_asked_for_again_until_it_goes_or_the_wait_ends() {
         let (_folder, engine, asked) = scripted_engine(vec![500, 409, 403, 204]);
-        remove_network_within(&engine, "codefusion-dal1-vm-7-0", Duration::from_secs(10));
+        remove_network_within(&engine, "codefusion-host-1-vm-7-0", Duration::from_secs(10));
         assert_eq!(asked.load(Ordering::SeqCst), 4, "asked until it was removed");
 
         let (_folder, engine, asked) = scripted_engine(vec![404]);
@@ -827,6 +828,36 @@ mod tests {
         remove_network_within(&engine, "busy", Duration::from_millis(300));
         assert!(began.elapsed() < Duration::from_secs(1), "the wait ends");
         assert!(asked.load(Ordering::SeqCst) >= 2, "asked again within it");
+    }
+
+    #[test]
+    fn a_wait_that_fails_after_the_host_asked_for_a_stop_is_the_hosts_stop() {
+        let ended = |engine: Engine, asked: bool| {
+            let exit = Arc::new(ExitCell::default());
+            if asked {
+                exit.stop_asked();
+            }
+            watch_end(engine, "c1".into(), exit.clone());
+            exit.wait(Duration::from_secs(10))
+        };
+        let (_folder, engine, _) = scripted_engine(vec![404]);
+        assert_eq!(
+            ended(engine, true),
+            Some(VmExit::Stopped),
+            "the removed container's 404"
+        );
+        assert_eq!(
+            ended(Engine::new("/nowhere.sock"), true),
+            Some(VmExit::Stopped),
+            "the engine lost"
+        );
+
+        let (_folder, engine, _) = scripted_engine(vec![404]);
+        assert!(matches!(ended(engine, false), Some(VmExit::Error(error)) if error.contains("404")));
+        assert!(matches!(
+            ended(Engine::new("/nowhere.sock"), false),
+            Some(VmExit::Error(error)) if error.contains("lost")
+        ));
     }
 
     #[test]
@@ -884,7 +915,7 @@ mod tests {
     fn vmm() -> OciVmm {
         OciVmm {
             engine: Engine::new("/nowhere.sock"),
-            machine: "dal1".into(),
+            machine: "host-1".into(),
             next: AtomicU64::new(0),
         }
     }
@@ -909,7 +940,7 @@ mod tests {
 
     #[test]
     fn a_container_is_held_in_as_a_machine_is() {
-        let body = vmm().create_body(&spec(), "image-20261112-7", Some("codefusion-dal1-vm-7-0"));
+        let body = vmm().create_body(&spec(), "image-20261112-7", Some("codefusion-host-1-vm-7-0"));
         let host = &body["HostConfig"];
         assert_eq!(body["Image"], "codefusion-runner-guest:image-20261112-7");
         assert_eq!(body["User"], "runner", "never root");
@@ -932,9 +963,9 @@ mod tests {
         assert_eq!(host["PidMode"], "", "a process namespace of its own");
         assert_eq!(host["IpcMode"], "private");
         assert_eq!(host["CgroupnsMode"], "private");
-        assert_eq!(host["NetworkMode"], "codefusion-dal1-vm-7-0");
+        assert_eq!(host["NetworkMode"], "codefusion-host-1-vm-7-0");
         assert_eq!(host["LogConfig"]["Type"], "none");
-        assert_eq!(body["Labels"][LABEL_MACHINE], "dal1");
+        assert_eq!(body["Labels"][LABEL_MACHINE], "host-1");
         assert_eq!(body["Labels"][LABEL_OWNER], std::process::id().to_string());
         assert_eq!(body["Entrypoint"], json!([SUPERVISOR]));
         assert_eq!(body["Cmd"], json!(["container-guest"]));
@@ -977,7 +1008,7 @@ mod tests {
 
     #[test]
     fn names_that_go_into_containers_and_labels_are_plain() {
-        assert!(plain("dal1"));
+        assert!(plain("host-1"));
         assert!(plain("mac-mini-2"));
         for name in ["", "Dal1", "a b", "a/b", "a=b", &"a".repeat(65)] {
             assert!(!plain(name), "{name:?}");
