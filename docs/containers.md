@@ -17,14 +17,46 @@ Everything above the hypervisor is the same in both modes: the vm-host, its stat
 daemon, the budget. `cf-vmm-oci` stands where cloud-hypervisor stands, and a "machine" is one container:
 
 - made from `codefusion-runner-guest:<version>`, which `image install --engine` put in the engine;
-- run as the image's user `runner`, every capability dropped, `no-new-privileges`, never privileged;
-- with nothing of the host's mounted: no folder, no device, never the engine's socket;
-- held to its size's memory with no swap, its CPUs and 4096 processes, so a job that runs out ends `oom`;
-- on a network of its own, which reaches no other job's container;
-- ended at the job's timeout like a machine, and removed with its volumes and its network when its vm-host lets go.
+- never privileged, `no-new-privileges`, with nothing of the host's mounted: no folder, no device, never the
+  engine's socket;
+- held to its size's memory with no swap, its CPUs and 4096 processes, so a job that runs out ends `oom`; an engine
+  that answers the create with any warning (a limit it could not set) gets its container removed and the job refused,
+  and the supervisor refuses to start a job whose control group reads `max` for `memory.max` or `pids.max`;
+- held to the size's scratch disk: the vm-host reads the container's writable layer (`SizeRw`) every 2 seconds, ends
+  the job when it holds more, and reports its peak as the job's disk peak; where the engine's storage can bound a
+  layer (overlay on xfs, an engine with root) the create also asks for `StorageOpt.size`;
+- on a network of its own, which reaches no other job's container.
 
-The next vm-host removes what one that died left: containers and networks whose owner is gone, on start and after
-each job.
+The container's first process is the supervisor, as the container's root with only `NET_ADMIN`, `SETGID`, `SETPCAP`
+and `SETUID`. Before the job starts it locks the job in, and any step that fails ends the container instead:
+
+1. the machine's firewall in the container's own network namespace: the internet, port 53 to the name servers the
+   engine wrote in `resolv.conf` and nothing else of `BLOCKED`, of 127/8 off its own loopback, of the networks next
+   to it (its interfaces, its gateway) or of the host's own; a rule set that does not load is a failed job, never an
+   open one;
+2. the memory and process limits read back from the control group, as above;
+3. every capability out of the bounding set;
+4. a seccomp filter on top of the engine's: no `unshare` or `clone` with `CLONE_NEWUSER`, no `clone3`, no x32 call
+   and nothing of an architecture it does not know, so a job makes no user namespace and reaches none of the host
+   kernel's code a namespace's capabilities open;
+5. the image's user `runner`, with no capability in any set and not dumpable;
+6. a read of `/proc/self/status` that proves it: that user, every capability set empty, `NoNewPrivs` and the filter
+   on.
+
+`no-new-privileges` is what lets the supervisor install the filter without `CAP_SYS_ADMIN`; it also means `sudo` in
+a job does not work in container mode, as it never has.
+
+A container ends at the job's timeout like a machine, and is removed with its volumes and its network when its
+vm-host lets go. One whose vm-host is gone ends anyway:
+
+- its input closes with the vm-host's attach (`StdinOnce`), and the supervisor takes that as its host gone;
+- the supervisor ends the job itself at its longest life plus 30 seconds, whatever the host does;
+- the daemon sweeps the engine at most every 30 seconds, from its tick, and removes the containers and networks whose
+  vm-host is gone. A vm-host is known by its process id, its start time and the boot it ran in (the same owner a
+  machine host's leftovers are judged by), so a reused process id keeps nothing alive.
+
+Installing a new image removes the engine's older job images, keeping the one before it and any a container still
+uses.
 
 A container shares the host's kernel, so a container host is held to less than a machine host:
 
@@ -55,9 +87,13 @@ The budget is the same as a machine host's, so a size's count is set by memory a
 ## Tests
 
 - `crates/vmm-oci/tests/engine.rs`, against a real engine (CI's Linux jobs, with Docker and with rootless Podman): a
-  job cannot read a host file or reach the engine's socket, is held to its memory, is ended at its timeout, two jobs
-  at once do not see each other's files, a vm-host that crashed leaves nothing the next one does not remove, and a container-image
+  job cannot read a host file or reach the engine's socket, reaches no listener of the host and no metadata address,
+  makes no user namespace, is held to its memory, is ended at its timeout, two jobs at once do not see each other's
+  files, a container whose vm-host was killed mid-job ends and goes at the daemon's next sweep, and a container-image
   release installed into the engine runs a job.
+- `crates/supervisor/tests/container.rs`: the firewall's inputs and what it lets out, the limits check, the seccomp
+  filter on each architecture (with a property test against its specification) and the look at the kernel's account.
+- `crates/vmhost/src/driver.rs`: a container that writes past its disk is stopped, and its disk peak is reported.
 - `crates/image/tests/store.rs`: the image goes whole into the engine, each host takes only its kind, and an import
   that stops early, cannot be named or is refused leaves nothing.
 - `xtask/tests/host_setup.rs`: `--sandbox` and the keys it writes.
