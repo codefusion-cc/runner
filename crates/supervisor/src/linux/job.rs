@@ -14,7 +14,7 @@ use cf_supervisor::environment::{find_user, groups_of, workload_environment};
 use cf_supervisor::gate::{self, GateConfig};
 use cf_supervisor::oom::{self, Kill};
 use cf_supervisor::outcome::{REPORT_BYTES, workload_end};
-use cf_supervisor::processes::{Process, Table, parse_stat};
+use cf_supervisor::processes::{Process, Table, Tree, parse_stat};
 use cf_supervisor::tell::{self, JobFacts};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -118,32 +118,37 @@ pub fn format_scratch() -> Result<Summary, String> {
 }
 
 fn usage() -> Usage {
-    let cpu = fs::read_to_string(format!("{CGROUP}/cpu.stat")).unwrap_or_default();
+    usage_of(CGROUP, Some(SCRATCH))
+}
+
+/// What the job in this control group uses, its disk the file system at `disk` where it has one of its own.
+pub(super) fn usage_of(cgroup: &str, disk: Option<&str>) -> Usage {
+    let cpu = fs::read_to_string(format!("{cgroup}/cpu.stat")).unwrap_or_default();
     Usage {
-        memory_bytes: sys::number(format!("{CGROUP}/memory.current")),
-        memory_peak_bytes: sys::number(format!("{CGROUP}/memory.peak")),
+        memory_bytes: sys::number(format!("{cgroup}/memory.current")),
+        memory_peak_bytes: sys::number(format!("{cgroup}/memory.peak")),
         cpu_usec: cpu
             .lines()
             .find_map(|line| line.strip_prefix("usage_usec "))
             .and_then(|text| text.trim().parse().ok())
             .unwrap_or(0),
-        disk_bytes: sys::disk_used(SCRATCH),
-        pids: sys::number(format!("{CGROUP}/pids.current")) as u32,
-        memory_file_bytes: fs::read_to_string(format!("{CGROUP}/memory.stat"))
+        disk_bytes: disk.map_or(0, sys::disk_used),
+        pids: sys::number(format!("{cgroup}/pids.current")) as u32,
+        memory_file_bytes: fs::read_to_string(format!("{cgroup}/memory.stat"))
             .ok()
             .and_then(|stat| {
                 stat.lines()
                     .find_map(|line| line.strip_prefix("file ")?.trim().parse().ok())
             })
             .unwrap_or(0),
-        pressure: pressure(),
+        pressure: pressure(cgroup),
     }
 }
 
 /// What the job's cgroup stalled on, from its pressure files; `None` when the kernel keeps no such account.
-fn pressure() -> Option<Pressure> {
+fn pressure(cgroup: &str) -> Option<Pressure> {
     let read =
-        |name: &str| cf_guest_proto::psi(&fs::read_to_string(format!("{CGROUP}/{name}.pressure")).ok()?);
+        |name: &str| cf_guest_proto::psi(&fs::read_to_string(format!("{cgroup}/{name}.pressure")).ok()?);
     Some(Pressure {
         memory: read("memory")?,
         cpu: read("cpu")?,
@@ -212,7 +217,12 @@ fn kill_job() {
 }
 
 fn share(name: &str, text: &str, mode: u32) -> Result<(), String> {
-    let path = format!("{SHARED}/{name}");
+    share_in(SHARED, name, text, mode)
+}
+
+/// Puts a file in the folder the workload sees at `/run/codefusion`, whole or not at all.
+pub(super) fn share_in(folder: &str, name: &str, text: &str, mode: u32) -> Result<(), String> {
+    let path = format!("{folder}/{name}");
     let temporary = format!("{path}.new");
     context(
         &path,
@@ -465,7 +475,14 @@ pub fn run(
     let mut watch = Watch {
         job: &job,
         host,
-        launcher,
+        sandbox: Sandbox {
+            tree: Tree::launcher(launcher),
+            cgroup: CGROUP,
+            shared: SHARED,
+            disk: Some(SCRATCH),
+            kill: kill_job,
+            gone: sys::power_off,
+        },
         started: Instant::now(),
         kernel_log,
         log: oom::Log::new(page),
@@ -521,8 +538,20 @@ fn launch(spec: &Spec, sender: Sender<Event>) -> Result<(u32, std::os::fd::Owned
     // While the end the launcher got is open here too, the pipe never ends.
     drop(status_write);
     let launcher = child.id();
+    forward_output(output_read);
     std::thread::spawn(move || {
-        let mut output = File::from(output_read);
+        if let Ok(status) = child.wait() {
+            let _ = sender.send(Event::Ended(status));
+        }
+    });
+    Ok((launcher, status_read))
+}
+
+/// Copies what the workload writes to the console, up to [`OUTPUT_CAP`]; the rest is read and dropped, so the
+/// workload never waits on a full pipe.
+pub(super) fn forward_output(output: std::os::fd::OwnedFd) {
+    std::thread::spawn(move || {
+        let mut output = File::from(output);
         let (mut buffer, mut written) = (vec![0u8; 65536], 0usize);
         while let Ok(read @ 1..) = output.read(&mut buffer) {
             if written < OUTPUT_CAP {
@@ -534,12 +563,6 @@ fn launch(spec: &Spec, sender: Sender<Event>) -> Result<(u32, std::os::fd::Owned
             }
         }
     });
-    std::thread::spawn(move || {
-        if let Ok(status) = child.wait() {
-            let _ = sender.send(Event::Ended(status));
-        }
-    });
-    Ok((launcher, status_read))
 }
 
 fn processes() -> Table {
@@ -560,30 +583,46 @@ fn processes() -> Table {
     )
 }
 
-struct Watch<'a> {
-    job: &'a Job,
-    host: &'a Host,
-    launcher: u32,
-    started: Instant,
-    kernel_log: Option<File>,
-    log: oom::Log,
+/// Where a job runs, as the watch over it needs to know: in a machine's container or in an engine's.
+pub(super) struct Sandbox {
+    /// The job's processes.
+    pub tree: Tree,
+    /// The control group the job's limits and accounts are in.
+    pub cgroup: &'static str,
+    /// The folder the workload sees at `/run/codefusion`.
+    pub shared: &'static str,
+    /// The job's own file system, when it has one.
+    pub disk: Option<&'static str>,
+    /// Stops every process of the job at once.
+    pub kill: fn(),
+    /// What is left to do when nobody is there to tell how the job ends: end everything.
+    pub gone: fn() -> !,
+}
+
+pub(super) struct Watch<'a> {
+    pub job: &'a Job,
+    pub host: &'a Host,
+    pub sandbox: Sandbox,
+    pub started: Instant,
+    pub kernel_log: Option<File>,
+    pub log: oom::Log,
     /// The processes at the last look, where one the kernel has since stopped is still found.
-    previous: Table,
-    oom: Option<OomEvent>,
+    pub previous: Table,
+    pub oom: Option<OomEvent>,
     /// The stops the kernel counted for the job against those its log named.
-    count: oom::Count,
+    pub count: oom::Count,
     /// A Docker job's stops that are its containers' own, apart from the job's.
-    own_limit: oom::OwnLimit,
+    pub own_limit: oom::OwnLimit,
     /// The step whose processes go when its time to fail by itself is over.
-    step: Option<(Instant, Process)>,
-    stop: Option<(StopReason, Instant)>,
-    killed: bool,
-    disk_peak: u64,
-    heartbeat: Instant,
+    pub step: Option<(Instant, Process)>,
+    pub stop: Option<(StopReason, Instant)>,
+    pub killed: bool,
+    pub disk_peak: u64,
+    pub heartbeat: Instant,
 }
 
 impl Watch<'_> {
-    fn until_the_end(&mut self, events: &Receiver<Event>) -> std::process::ExitStatus {
+    pub fn until_the_end(&mut self, events: &Receiver<Event>) -> std::process::ExitStatus {
         let mut looked = Instant::now();
         loop {
             match events.recv_timeout(TICK.saturating_sub(looked.elapsed())) {
@@ -595,8 +634,8 @@ impl Watch<'_> {
                 Ok(Event::HostGone) | Err(RecvTimeoutError::Disconnected) => {
                     // Nobody is left to tell how the job ends, and nothing of it may outlive its host.
                     say("the host is gone");
-                    kill_job();
-                    sys::power_off();
+                    (self.sandbox.kill)();
+                    (self.sandbox.gone)();
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -614,20 +653,21 @@ impl Watch<'_> {
             return;
         }
         self.stop = Some((reason, deadline));
-        let _ = share(
+        let _ = share_in(
+            self.sandbox.shared,
             "stop.json",
             &serde_json::to_string(&reason).unwrap_or_default(),
             0o644,
         );
         say(&tell::stopped(reason, &self.job.host));
-        if let Some(workload) = processes().workload(self.launcher) {
+        if let Some(workload) = processes().workload(self.sandbox.tree) {
             sys::kill(workload.pid, libc::SIGTERM);
         }
     }
 
     /// The look the job's end cuts short: what the kernel stopped since the last one, believing its counter at
     /// once, since there is no later look to confirm it.
-    fn last_look(&mut self) {
+    pub fn last_look(&mut self) {
         let table = processes();
         for kill in self.kernel_kills(true) {
             self.out_of_memory(kill, &table);
@@ -653,11 +693,11 @@ impl Watch<'_> {
         }
         if !self.killed && self.stop.is_some_and(|(_, deadline)| Instant::now() >= deadline) {
             self.killed = true;
-            kill_job();
+            (self.sandbox.kill)();
         }
         if self.heartbeat.elapsed() >= HEARTBEAT {
             self.heartbeat = Instant::now();
-            let usage = usage();
+            let usage = usage_of(self.sandbox.cgroup, self.sandbox.disk);
             self.disk_peak = self.disk_peak.max(usage.disk_bytes);
             self.host.send(&GuestMessage::Heartbeat(usage));
         }
@@ -672,12 +712,13 @@ impl Watch<'_> {
             let reader = &mut self.log;
             oom::read_records(log, |message| kills.extend(reader.line(message)));
         }
+        let cgroup = self.sandbox.cgroup;
         let mut counted =
-            oom::kills_in_events(&fs::read_to_string(format!("{CGROUP}/memory.events")).unwrap_or_default());
+            oom::kills_in_events(&fs::read_to_string(format!("{cgroup}/memory.events")).unwrap_or_default());
         if self.job.docker {
             // The job's limits are set on the job's group and on its container's; a container of the daemon's
             // that reached a limit of its own reached neither.
-            let reached: u64 = [CGROUP.to_string(), format!("{CGROUP}/run")]
+            let reached: u64 = [cgroup.to_string(), format!("{cgroup}/run")]
                 .iter()
                 .map(|group| {
                     oom::limit_reached(
@@ -712,10 +753,10 @@ impl Watch<'_> {
         if self.step.is_none() {
             let step = self
                 .previous
-                .step_of(kill.process.pid, self.launcher)
-                .or_else(|| table.step_of(kill.process.pid, self.launcher))
+                .step_of(kill.process.pid, self.sandbox.tree)
+                .or_else(|| table.step_of(kill.process.pid, self.sandbox.tree))
                 // A process that lived and died between two looks is in neither table.
-                .or_else(|| table.only_step(self.launcher));
+                .or_else(|| table.only_step(self.sandbox.tree));
             if step.is_none() {
                 say("no step to stop for it: its process is gone and no single step runs");
             }
@@ -732,7 +773,8 @@ impl Watch<'_> {
                 limit_bytes: self.job.limits.memory_bytes,
                 largest: kill.largest,
             };
-            let _ = share(
+            let _ = share_in(
+                self.sandbox.shared,
                 "oom.json",
                 &serde_json::to_string(&event).unwrap_or_default(),
                 0o644,

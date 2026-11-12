@@ -6,7 +6,7 @@ use cf_supervisor::dhcp::{self, Lease, Reply};
 use cf_supervisor::environment::{find_group, find_user, workload_environment};
 use cf_supervisor::firewall::{self, own_network, policy};
 use cf_supervisor::oom::{Count, Kill, Log, kills_in_events, message_of};
-use cf_supervisor::processes::{Process, Table, parse_stat};
+use cf_supervisor::processes::{Process, Table, Tree, parse_stat};
 use cf_supervisor::tell::{
     JobFacts, docker_missing, out_of_memory_line, out_of_memory_summary, size, started, stopped,
 };
@@ -699,19 +699,22 @@ fn the_step_of_a_process_is_its_top_ancestor_below_the_actions_runner() {
     let table = actions_runner_job();
     for victim in [20, 21, 22, 23, 24] {
         assert_eq!(
-            table.step_of(victim, 10).map(|step| step.pid),
+            table.step_of(victim, Tree::launcher(10)).map(|step| step.pid),
             Some(20),
             "{victim}"
         );
     }
-    assert_eq!(table.step_of(31, 10).map(|step| step.pid), Some(30));
+    assert_eq!(
+        table.step_of(31, Tree::launcher(10)).map(|step| step.pid),
+        Some(30)
+    );
     // The Actions runner's own processes and the container's are nobody's step.
     for own in [10, 11, 12, 13, 14, 15] {
-        assert_eq!(table.step_of(own, 10), None, "{own}");
+        assert_eq!(table.step_of(own, Tree::launcher(10)), None, "{own}");
     }
     // A process outside the container, and one that is not in the table.
-    assert_eq!(table.step_of(40, 10), None);
-    assert_eq!(table.step_of(999, 10), None);
+    assert_eq!(table.step_of(40, Tree::launcher(10)), None);
+    assert_eq!(table.step_of(999, Tree::launcher(10)), None);
 }
 
 #[test]
@@ -724,10 +727,63 @@ fn a_plain_command_has_its_children_as_steps() {
         process(13, 12, "tail"),
         process(14, 12, "head"),
     ]);
-    assert_eq!(table.step_of(13, 10).map(|step| step.pid), Some(13));
-    assert_eq!(table.step_of(12, 10), None, "the workload itself is not a step");
-    assert_eq!(table.workload(10).map(|workload| workload.pid), Some(12));
-    assert_eq!(table.workload(13), None);
+    assert_eq!(
+        table.step_of(13, Tree::launcher(10)).map(|step| step.pid),
+        Some(13)
+    );
+    assert_eq!(
+        table.step_of(12, Tree::launcher(10)),
+        None,
+        "the workload itself is not a step"
+    );
+    assert_eq!(
+        table.workload(Tree::launcher(10)).map(|workload| workload.pid),
+        Some(12)
+    );
+    assert_eq!(table.workload(Tree::launcher(13)), None);
+}
+
+#[test]
+fn in_an_engines_container_the_workload_hangs_right_below_the_supervisor() {
+    // The supervisor is the container's first process; run.sh is its child, and the Actions runner's chain and the
+    // steps below that, as in a machine.
+    let table = Table::new([
+        process(1, 0, "supervisor"),
+        process(7, 1, "run.sh"),
+        process(8, 7, "run-helper.sh"),
+        process(9, 8, "Runner.Listener"),
+        process(10, 9, "Runner.Worker"),
+        process(20, 10, "bash"),
+        process(21, 20, "cargo"),
+        process(30, 1, "zombie-parent"),
+    ]);
+    let tree = Tree::supervisor(1);
+    assert_eq!(table.workload(tree).map(|workload| workload.pid), Some(7));
+    assert_eq!(table.step_of(21, tree).map(|step| step.pid), Some(20));
+    for own in [1, 7, 8, 9, 10] {
+        assert_eq!(table.step_of(own, tree), None, "{own} is nobody's step");
+    }
+    // An orphan the supervisor took in sits where the workload does, as one in a machine's container sits under
+    // the container's first process: nobody's step, so the one step running is still the cargo build's.
+    assert_eq!(table.step_of(30, tree), None);
+    assert_eq!(table.only_step(tree).map(|step| step.pid), Some(20));
+    // A plain command's children are its steps, one level below the supervisor's child.
+    let command = Table::new([
+        process(1, 0, "supervisor"),
+        process(7, 1, "bash"),
+        process(8, 7, "tail"),
+    ]);
+    assert_eq!(command.step_of(8, tree).map(|step| step.pid), Some(8));
+    assert_eq!(
+        command.step_of(7, tree),
+        None,
+        "the workload itself is not a step"
+    );
+    // With depth 2 the same table would start the workload a level too low.
+    assert_eq!(
+        table.workload(Tree::launcher(1)).map(|workload| workload.pid),
+        Some(8)
+    );
 }
 
 #[test]
@@ -746,7 +802,7 @@ fn a_tree_lists_children_before_parents_and_survives_a_cycle() {
     // Ids reused between two reads can make a table with a cycle; it must end.
     let cycle = Table::new([process(5, 6, "a"), process(6, 5, "b")]);
     assert_eq!(cycle.tree(5).len(), 2);
-    assert_eq!(cycle.step_of(5, 10), None);
+    assert_eq!(cycle.step_of(5, Tree::launcher(10)), None);
 }
 
 #[test]
@@ -987,7 +1043,7 @@ fn a_process_nobody_saw_is_of_the_one_step_that_runs() {
         );
         Table::new(all)
     };
-    let only = |table: Table| table.only_step(10).map(|step| step.pid);
+    let only = |table: Table| table.only_step(Tree::launcher(10)).map(|step| step.pid);
     // One step with what it started: a process that came and went was its.
     assert_eq!(
         only(job(&[(20, 14, "bash"), (21, 20, "sleep"), (22, 21, "node")])),

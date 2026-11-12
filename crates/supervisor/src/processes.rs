@@ -40,6 +40,28 @@ pub fn parse_stat(text: &str) -> Option<Process> {
     })
 }
 
+/// Where a job's processes hang: the sandbox's own process at the top, and how many levels of the sandbox's own
+/// sit below it before the workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tree {
+    /// The topmost process of the job's sandbox.
+    pub root: u32,
+    /// The levels from `root` down to the workload.
+    pub depth: usize,
+}
+
+impl Tree {
+    /// In a machine: the launcher, the container's first process below it, and the workload below that.
+    pub const fn launcher(pid: u32) -> Self {
+        Self { root: pid, depth: 2 }
+    }
+
+    /// In a container of an engine: the supervisor, its first process, and the workload right below it.
+    pub const fn supervisor(pid: u32) -> Self {
+        Self { root: pid, depth: 1 }
+    }
+}
+
 /// Every process at one moment, by id.
 #[derive(Debug, Clone, Default)]
 pub struct Table(BTreeMap<u32, Process>);
@@ -84,42 +106,43 @@ impl Table {
         order
     }
 
-    /// The workload's first process: the container is a launcher, the container's first process below it, and the
-    /// workload below that.
-    pub fn workload(&self, launcher: u32) -> Option<&Process> {
-        let init = self.children(launcher).next()?;
-        self.children(init.pid).next()
+    /// The workload's first process, `tree.depth` levels below its root.
+    pub fn workload(&self, tree: Tree) -> Option<&Process> {
+        let mut process = self.get(tree.root)?;
+        for _ in 0..tree.depth {
+            process = self.children(process.pid).next()?;
+        }
+        Some(process)
     }
 
     /// The top process of the step that `process` belongs to: its highest ancestor (or itself) that is neither the
     /// container's own nor the Actions runner's. `None` when the process is not in the container, or is one of
     /// those: then no step lost a process and there is nothing to stop.
-    pub fn step_of(&self, process: u32, launcher: u32) -> Option<&Process> {
-        // From the process up to the launcher.
+    pub fn step_of(&self, process: u32, tree: Tree) -> Option<&Process> {
+        // From the process up to the sandbox's root.
         let mut path = vec![self.get(process)?];
-        while path.last()?.pid != launcher {
+        while path.last()?.pid != tree.root {
             let parent = self.get(path.last()?.parent)?;
             if path.len() > self.0.len() {
                 return None;
             }
             path.push(parent);
         }
-        // From the top down: the launcher, the container's first process, the workload, then the Actions
-        // runner's chain.
+        // From the top down: the sandbox's own, the workload, then the Actions runner's chain.
         path.reverse();
         path.into_iter()
-            .skip(3)
+            .skip(tree.depth + 1)
             .find(|process| !ACTIONS_RUNNER.contains(&process.name.as_str()))
     }
 
     /// The one step running now, when exactly one is. The Actions runner runs a job's steps one after another, so a
     /// process that came and went between two looks at the table was that step's. `None` when no step runs or
     /// several do: then nobody can say whose it was.
-    pub fn only_step(&self, launcher: u32) -> Option<&Process> {
+    pub fn only_step(&self, tree: Tree) -> Option<&Process> {
         let mut steps: Vec<u32> = self
             .0
             .keys()
-            .filter_map(|pid| self.step_of(*pid, launcher))
+            .filter_map(|pid| self.step_of(*pid, tree))
             .map(|step| step.pid)
             .collect();
         steps.sort_unstable();
