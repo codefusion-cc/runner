@@ -423,6 +423,7 @@ name = "cf-vmm-oci"
 version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
+ "cf-vmhost",
  "cf-vmm",
  "flate2",
  "libc",
@@ -481,6 +482,7 @@ dependencies = [
  "cf-vmhost",
  "cf-vmm",
  "cf-vmm-ch",
+ "cf-vmm-oci",
  "cf-vmm-vz",
  "cf-workflows",
  "ed25519-dalek",

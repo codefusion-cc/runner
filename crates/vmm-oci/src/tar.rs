@@ -40,7 +40,9 @@ pub fn write(entries: &[Entry<'_>]) -> Result<Vec<u8>, String> {
         }
         let size = entry.data.map_or(0, <[u8]>::len) as u64;
         if size > SIZE_MAX || entry.uid > ID_MAX || entry.gid > ID_MAX {
-            return Err(format!("{name:?} is too large or its owner's id too high for the archive"));
+            return Err(format!(
+                "{name:?} is too large or its owner's id too high for the archive"
+            ));
         }
         let mut header = [0u8; 512];
         header[..name.len()].copy_from_slice(name.as_bytes());
@@ -131,7 +133,10 @@ mod tests {
         let file = &archive[512..1024];
         assert_eq!(number(&file[100..108]), Some(0o755));
         assert_eq!(number(&file[108..116]), Some(0));
-        assert_eq!(read_file(&archive, "supervisor").as_deref(), Some(&b"\x7fELF and the rest"[..]));
+        assert_eq!(
+            read_file(&archive, "supervisor").as_deref(),
+            Some(&b"\x7fELF and the rest"[..])
+        );
         assert_eq!(read_file(&archive, "codefusion"), None, "a folder is no file");
         // Every header's sum is right, or the engine refuses the archive.
         for header in [&archive[..512], file] {

@@ -135,9 +135,14 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
 
 /// The budget's numbers on this host under the configuration: the defaults with what the file sets on top.
 fn budget_of(facts: HostFacts, config: &Config) -> Result<Settings, String> {
-    This::settings(facts, config.mode(), config.class == Class::Trusted)
-        .limited(&config.limits())
-        .map_err(|error| format!("the limits for jobs: {error}"))
+    This::settings(
+        facts,
+        config.mode(),
+        config.class == Class::Trusted,
+        config.sandbox,
+    )
+    .limited(&config.limits())
+    .map_err(|error| format!("the limits for jobs: {error}"))
 }
 
 /// The settings in `path`, when a Runner can start on them: the file is one it takes, its limits are ones the budget
@@ -287,6 +292,7 @@ fn service(
         image: config.image.clone(),
         deadline: config.deadline(),
         mode: config.mode(),
+        sandbox: (config.sandbox, config.engine.clone()),
         limits: config.limits(),
         policy: ServePolicy {
             repos: config.repos.clone(),
@@ -813,10 +819,10 @@ fn needs(config: &Config, home: &Path, hostname: &str, program: &Path) -> Vec<Re
     #[cfg(target_os = "linux")]
     let _ = (home, hostname);
     #[cfg(target_os = "linux")]
-    let mut lines = crate::linux::lines(&crate::linux::Facts::of_this_host(
-        Path::new("/"),
-        &config.state_dir,
-    ));
+    let mut lines = crate::linux::lines(
+        &crate::linux::Facts::of_this_host(Path::new("/"), &config.state_dir),
+        config.sandbox == cf_budget::Sandbox::Container,
+    );
     lines.extend(common_needs(config, program));
     lines
 }
@@ -841,6 +847,10 @@ fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> 
         This::fit(program).map(|()| format!("{} can start machines", program.display())),
         room(config),
     ];
+    // Right after the image: the engine must hold it too.
+    if let Some(socket) = &config.engine {
+        lines.insert(1, cf_vmm_oci::probe(socket, &config.image));
+    }
     if let Some(dir) = &config.app_dir {
         lines.insert(
             0,

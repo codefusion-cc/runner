@@ -25,6 +25,7 @@ cf-secret = { path = "../secret" }
 cf-trusted = { path = "../trusted" }
 cf-vmhost = { path = "../vmhost" }
 cf-vmm = { path = "../vmm" }
+cf-vmm-oci = { path = "../vmm-oci" }
 cf-workflows = { path = "../workflows" }
 libc.workspace = true
 serde.workspace = true

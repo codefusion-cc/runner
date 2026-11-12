@@ -106,12 +106,23 @@ pub fn run(
         let path = path.display().to_string();
         move |error| RunError::Io(path, error)
     };
-    let rootfs = layout.rootfs(&request.image);
-    if !rootfs.is_file() {
-        return Err(RunError::Image(request.image));
-    }
-    for trusted in layout.trusted_for(&request.image) {
-        private(&trusted).map_err(RunError::NotPrivate)?;
+    if vmm.containers() {
+        // The engine holds the image, and a container has none of a machine's walls: no Docker beside the job, which
+        // would need a privileged container, and no trusted job, whose gate stands on a kernel of its own.
+        if request.docker {
+            return Err(RequestError::Refused("a job in a container gets no Docker").into());
+        }
+        if request.trusted.is_some() {
+            return Err(RequestError::Refused("a trusted job runs in a virtual machine only").into());
+        }
+    } else {
+        let rootfs = layout.rootfs(&request.image);
+        if !rootfs.is_file() {
+            return Err(RunError::Image(request.image));
+        }
+        for trusted in layout.trusted_for(&request.image) {
+            private(&trusted).map_err(RunError::NotPrivate)?;
+        }
     }
     let (state_path, socket_path, job_dir) = (layout.state(&job), layout.socket(&job), layout.job_dir(&job));
     for folder in [layout.run(), layout.logs()] {
@@ -183,7 +194,7 @@ fn run_in(
             &mut request.workload,
             cf_guest_proto::Workload::Command { argv: Vec::new() },
         ),
-        limits: request.limits(),
+        limits: request.limits_in(vmm.containers()),
         env: std::mem::take(&mut request.env),
         oom_grace_ms: 15_000,
         blocked: crate::host_net::host_networks(),
@@ -197,7 +208,7 @@ fn run_in(
         started_at: now_s() - started.elapsed().as_secs(),
         stage,
         vm_bytes: request.memory_bytes,
-        limit_bytes: request.limits().memory_bytes,
+        limit_bytes: request.limits_in(vmm.containers()).memory_bytes,
         cpus: request.cpus,
         image: request.image.clone(),
         boots: machine.map_or(0, Machine::boots),
@@ -263,16 +274,21 @@ fn run_in(
         stopped.get().is_some()
     };
     let scratch_disk = job_dir.join("scratch.img");
-    let prepared = scratch::template(
-        vmm,
-        layout,
-        &files,
-        &request.image,
-        request.scratch_bytes,
-        &console,
-        &stop_asked,
-    )
-    .and_then(|template| scratch::copy(&template, &scratch_disk));
+    // A container writes into its own layer, which goes with it: there is no disk to make.
+    let prepared = if vmm.containers() {
+        Ok(())
+    } else {
+        scratch::template(
+            vmm,
+            layout,
+            &files,
+            &request.image,
+            request.scratch_bytes,
+            &console,
+            &stop_asked,
+        )
+        .and_then(|template| scratch::copy(&template, &scratch_disk))
+    };
     if stop_asked() {
         done.store(true, Ordering::Relaxed);
         let mut state = snapshot(None, Stage::Ended);
@@ -290,13 +306,22 @@ fn run_in(
         let _ = fs::remove_file(&state_path);
         return Err(RunError::Scratch(error));
     }
-    let spec = files.machine(
-        &scratch_disk,
-        request.memory_bytes,
-        request.cpus as usize,
-        Network::Nat,
-        &console,
-    );
+    let spec = if vmm.containers() {
+        files.container(
+            request.memory_bytes,
+            request.cpus as usize,
+            Network::Nat,
+            &console,
+        )
+    } else {
+        files.machine(
+            &scratch_disk,
+            request.memory_bytes,
+            request.cpus as usize,
+            Network::Nat,
+            &console,
+        )
+    };
     // The job's clock starts here: the wait for a guest's `ready` is for the boot, not for a disk made before it.
     let (mut machine, first) = Machine::new(limits, started.elapsed());
     // The worst wait of the machine's vCPUs for the host's CPUs: only the host sees it, so the guest's peaks have it not.

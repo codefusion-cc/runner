@@ -10,19 +10,19 @@
 //! - as the image's user `runner`, every capability dropped, `no-new-privileges`, never privileged;
 //! - held to the machine's size of memory with no swap ([`cf_vmm::VmSpec::memory_bytes`]), its CPUs, and 4096
 //!   processes;
-//! - on a network of the Runner's whose containers cannot reach each other ([`NETWORK`]), or none;
+//! - on a network of its own, made with it and named as it is, or none;
 //! - with the guest's own supervisor, taken from the verified initramfs, put in at `/run/codefusion/supervisor`
 //!   before the container starts, as its first process (`container-guest`);
 //! - talked to over its standard input and output, attached before it starts; its standard error is the console;
-//! - thrown away, with its anonymous volumes, when the vm-host lets go of it, and found and thrown away by the next
-//!   vm-host when the one that made it is gone ([`OciVmm::new`]).
+//! - thrown away, with its anonymous volumes and its network, when the vm-host lets go of it, and found and thrown
+//!   away by the next vm-host when the one that made it is gone ([`OciVmm::new`]).
 
 pub mod http;
 pub mod initramfs;
 mod stream;
 pub mod tar;
 
-use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, Vmm, VmmError, VmSpec};
+use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
 use http::{Body, Engine, escape};
 use serde_json::json;
 use std::fs;
@@ -40,8 +40,6 @@ pub const LABEL_OWNER: &str = "cc.codefusion.runner.vm-host";
 pub const IMAGE_REPOSITORY: &str = "codefusion-runner-guest";
 /// Where the supervisor is in the container.
 pub const SUPERVISOR: &str = "/run/codefusion/supervisor";
-/// The prefix of the network the containers of a machine share, which lets none reach another.
-pub const NETWORK: &str = "codefusion-runner-";
 /// The most processes a container holds.
 const PIDS: u64 = 4096;
 /// How long a call to the engine may take before it counts as a failure, but for a container's end.
@@ -59,6 +57,9 @@ pub struct Config {
     pub socket: PathBuf,
     /// The machine's name, which every container it makes carries ([`LABEL_MACHINE`]).
     pub machine: String,
+    /// Takes an engine whose containers' root is the host's ([`isolation`]): for the real-engine tests on a
+    /// throwaway host only. The Runner never sets it.
+    pub rootful_for_tests: bool,
 }
 
 /// Containers of one engine as machines.
@@ -72,18 +73,60 @@ fn engine_error(what: &str, error: impl std::fmt::Display) -> String {
     format!("{what}: {error}")
 }
 
+/// What `check` says of the engine at `socket` for jobs of the image `version`, changing nothing: that it answers,
+/// what keeps its containers' root from the host's ([`isolation`]), and that it holds the image.
+pub fn probe(socket: &std::path::Path, version: &str) -> Result<String, String> {
+    let engine = Engine::new(socket);
+    let call = |path: &str| {
+        engine
+            .request("GET", path, Body::Empty, Some(Duration::from_secs(10)))
+            .map_err(|error| format!("the engine at {} does not answer: {error}", socket.display()))
+    };
+    let info = call("/info")?;
+    if !info.ok() {
+        return Err(format!(
+            "the engine at {} answers {}: {}",
+            socket.display(),
+            info.status,
+            info.message()
+        ));
+    }
+    let info = info
+        .json()
+        .map_err(|error| format!("the engine's /info: {error}"))?;
+    let isolated = isolation(&info)?;
+    let tag = image_tag(version);
+    let image = call(&format!("/images/{}/json", escape(&tag)))?;
+    if !image.ok() {
+        return Err(format!(
+            "the engine at {} holds no {tag}; run `image install`",
+            socket.display()
+        ));
+    }
+    Ok(format!(
+        "the engine at {} ({isolated}) holds {tag}",
+        socket.display()
+    ))
+}
+
 impl OciVmm {
     /// The engine at `config.socket`, once it answers. Containers of this machine whose vm-host is gone are thrown
     /// away first, with what they hold.
     pub fn new(config: Config) -> Result<Self, VmmError> {
         if !plain(&config.machine) {
-            return Err(VmmError::Unsupported(format!("{:?} is no machine name", config.machine)));
+            return Err(VmmError::Unsupported(format!(
+                "{:?} is no machine name",
+                config.machine
+            )));
         }
         let engine = Engine::new(&config.socket);
         let ping = engine
             .request("GET", "/_ping", Body::Empty, Some(Duration::from_secs(10)))
             .map_err(|error| {
-                VmmError::Unsupported(format!("the engine at {} does not answer: {error}", config.socket.display()))
+                VmmError::Unsupported(format!(
+                    "the engine at {} does not answer: {error}",
+                    config.socket.display()
+                ))
             })?;
         if !ping.ok() {
             return Err(VmmError::Unsupported(format!(
@@ -92,6 +135,15 @@ impl OciVmm {
                 ping.status,
                 ping.message()
             )));
+        }
+        let info = engine
+            .request("GET", "/info", Body::Empty, Some(CALL))
+            .ok()
+            .filter(http::Response::ok)
+            .and_then(|answer| answer.json().ok())
+            .ok_or_else(|| VmmError::Unsupported("the engine does not say what it is (/info)".into()))?;
+        if !config.rootful_for_tests {
+            isolation(&info).map_err(VmmError::Unsupported)?;
         }
         let vmm = Self {
             engine,
@@ -102,19 +154,35 @@ impl OciVmm {
         Ok(vmm)
     }
 
-    /// Throws away every container of this machine whose vm-host is not `alive`, with its anonymous volumes.
+    /// Throws away every container and network of this machine whose vm-host is not `alive`, the containers first,
+    /// as a network a container is on cannot go.
     pub fn sweep(&self, alive: impl Fn(u32) -> bool) {
         for (id, owner) in self.containers() {
             if !owner.is_some_and(&alive) {
                 remove(&self.engine, &id);
             }
         }
+        for (id, owner) in self.networks() {
+            if !owner.is_some_and(&alive) {
+                remove_network(&self.engine, &id);
+            }
+        }
     }
 
     /// The containers of this machine, each with the vm-host that made it, when its label names one.
     pub fn containers(&self) -> Vec<(String, Option<u32>)> {
+        self.labelled("/containers/json?all=1&filters=", "Id")
+    }
+
+    /// The networks of this machine, each with the vm-host that made it, when its label names one.
+    pub fn networks(&self) -> Vec<(String, Option<u32>)> {
+        self.labelled("/networks?filters=", "Id")
+    }
+
+    /// What a list call of the engine names of this machine's, with each one's vm-host.
+    fn labelled(&self, list: &str, key: &str) -> Vec<(String, Option<u32>)> {
         let filters = json!({ "label": [format!("{LABEL_MACHINE}={}", self.machine)] }).to_string();
-        let path = format!("/containers/json?all=1&filters={}", escape(&filters));
+        let path = format!("{list}{}", escape(&filters));
         let Ok(answer) = self.engine.request("GET", &path, Body::Empty, Some(CALL)) else {
             return Vec::new();
         };
@@ -122,9 +190,9 @@ impl OciVmm {
             return Vec::new();
         };
         list.iter()
-            .filter_map(|container| {
-                let id = container.get("Id")?.as_str()?.to_string();
-                let owner = container
+            .filter_map(|item| {
+                let id = item.get(key)?.as_str()?.to_string();
+                let owner = item
                     .get("Labels")
                     .and_then(|labels| labels.get(LABEL_OWNER))
                     .and_then(|owner| owner.as_str())
@@ -134,14 +202,17 @@ impl OciVmm {
             .collect()
     }
 
-    /// The network this machine's containers share, made when it is not there. Docker's bridge option keeps the
-    /// containers on it from reaching one another; they reach the internet, as a machine's NAT does.
-    fn network(&self) -> Result<String, String> {
-        let name = format!("{NETWORK}{}", self.machine);
-        let path = format!("/networks/{}", escape(&name));
-        if self.engine.request("GET", &path, Body::Empty, Some(CALL)).is_ok_and(|answer| answer.ok()) {
-            return Ok(name);
-        }
+    /// The labels of what this vm-host makes.
+    fn labels(&self) -> serde_json::Value {
+        json!({
+            LABEL_MACHINE: self.machine,
+            LABEL_OWNER: std::process::id().to_string(),
+        })
+    }
+
+    /// A network for one container, named as it is: it reaches the internet, as a machine's NAT does, and no other
+    /// job's container, which is on a network of its own.
+    fn network(&self, name: &str) -> Result<OwnNetwork, String> {
         let body = json!({
             "Name": name,
             "Driver": "bridge",
@@ -153,19 +224,68 @@ impl OciVmm {
                 // Podman's netavark: the same, said its way.
                 "isolate": "true",
             },
-            "Labels": { LABEL_MACHINE: self.machine },
+            "Labels": self.labels(),
         });
         let answer = self
             .engine
             .request("POST", "/networks/create", Body::Json(&body), Some(CALL))
             .map_err(|error| engine_error("the network", error))?;
-        // Another vm-host made it in between.
-        if answer.ok() || answer.status == 409 {
-            Ok(name)
+        if answer.ok() {
+            Ok(OwnNetwork {
+                engine: self.engine.clone(),
+                name: name.to_string(),
+            })
         } else {
-            Err(format!("the network was refused ({}): {}", answer.status, answer.message()))
+            Err(format!(
+                "the network was refused ({}): {}",
+                answer.status,
+                answer.message()
+            ))
         }
     }
+}
+
+/// What keeps a container's root from the host's, as the engine's `/info` tells it, or why nothing does. A job
+/// runs as an unprivileged user with no capabilities, but a kernel flaw that makes it root in its container must
+/// not make it the host's root, so the engine must be one of:
+///
+/// - rootless (Docker's or Podman's `name=rootless`): the engine and every container are a user's;
+/// - with user namespaces (Docker's `userns-remap`, `name=userns`): a container's root is an unprivileged user of
+///   the host;
+/// - in a virtual machine of its own (OrbStack, Docker Desktop), whose root is not the host's.
+pub fn isolation(info: &serde_json::Value) -> Result<&'static str, String> {
+    let options: Vec<&str> = info
+        .get("SecurityOptions")
+        .and_then(serde_json::Value::as_array)
+        .map(|options| options.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    let has = |name: &str| {
+        options
+            .iter()
+            .any(|option| option.split(',').any(|part| part == format!("name={name}")))
+    };
+    if has("rootless") {
+        return Ok("rootless");
+    }
+    if has("userns") {
+        return Ok("user namespaces");
+    }
+    let system = info
+        .get("OperatingSystem")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if system == "OrbStack" || system == "Docker Desktop" {
+        return Ok("a virtual machine of its own");
+    }
+    Err(format!(
+        "the engine runs containers as the host's root ({}): run it rootless, or with user namespaces \
+         (`userns-remap`)",
+        if system.is_empty() {
+            "it names no system"
+        } else {
+            system
+        }
+    ))
 }
 
 /// Lowercase letters, digits and dashes: what goes into a container's name and a label.
@@ -232,15 +352,43 @@ fn alive(pid: u32) -> bool {
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
-/// The container, removed when this goes out of scope, however its making ends.
+/// Removes a network; what is not there is not an error.
+fn remove_network(engine: &Engine, id: &str) {
+    let _ = engine.request(
+        "DELETE",
+        &format!("/networks/{}", escape(id)),
+        Body::Empty,
+        Some(CALL),
+    );
+}
+
+/// A container's own network, removed when this goes out of scope: after the container, which is dropped first.
+struct OwnNetwork {
+    engine: Engine,
+    name: String,
+}
+
+impl Drop for OwnNetwork {
+    fn drop(&mut self) {
+        remove_network(&self.engine, &self.name);
+    }
+}
+
+/// The container and its network, removed when this goes out of scope, however its making ends; taken apart
+/// once the machine stands.
 struct Made {
     engine: Engine,
+    /// Empty once taken.
     id: String,
+    network: Option<OwnNetwork>,
 }
 
 impl Drop for Made {
     fn drop(&mut self) {
-        remove(&self.engine, &self.id);
+        if !self.id.is_empty() {
+            remove(&self.engine, &self.id);
+        }
+        // The network goes after, with the fields.
     }
 }
 
@@ -263,10 +411,7 @@ impl OciVmm {
             "StdinOnce": false,
             "Tty": false,
             "NetworkDisabled": network.is_none(),
-            "Labels": {
-                LABEL_MACHINE: self.machine,
-                LABEL_OWNER: std::process::id().to_string(),
-            },
+            "Labels": self.labels(),
             "HostConfig": {
                 "Memory": memory,
                 "MemorySwap": memory,
@@ -308,17 +453,21 @@ impl OciVmm {
             .mode(0o600)
             .open(&spec.console)
             .map_err(|error| engine_error(&spec.console.display().to_string(), error))?;
-        let network = match spec.network {
-            Network::Nat => Some(self.network()?),
-            Network::None => None,
-        };
         let name = format!(
             "codefusion-{}-vm-{}-{}",
             self.machine,
             std::process::id(),
             self.next.fetch_add(1, Ordering::Relaxed)
         );
-        let body = self.create_body(spec, &version, network.as_deref());
+        let network = match spec.network {
+            Network::Nat => Some(self.network(&name)?),
+            Network::None => None,
+        };
+        let body = self.create_body(
+            spec,
+            &version,
+            network.as_ref().map(|network| network.name.as_str()),
+        );
         let answer = self
             .engine
             .request(
@@ -328,6 +477,11 @@ impl OciVmm {
                 Some(CALL),
             )
             .map_err(|error| engine_error("the container", error))?;
+        let mut made = Made {
+            engine: self.engine.clone(),
+            id: String::new(),
+            network,
+        };
         if answer.status == 404 {
             return Err(format!(
                 "the engine has no image {}: install it first ({})",
@@ -336,17 +490,18 @@ impl OciVmm {
             ));
         }
         if !answer.ok() {
-            return Err(format!("the container was refused ({}): {}", answer.status, answer.message()));
+            return Err(format!(
+                "the container was refused ({}): {}",
+                answer.status,
+                answer.message()
+            ));
         }
         let id = answer
             .json()
             .ok()
             .and_then(|value| Some(value.get("Id")?.as_str()?.to_string()))
             .ok_or("the engine named no container")?;
-        let made = Made {
-            engine: self.engine.clone(),
-            id: id.clone(),
-        };
+        made.id.clone_from(&id);
         let passwd = self
             .engine
             .request(
@@ -380,13 +535,20 @@ impl OciVmm {
             .engine
             .request(
                 "PUT",
-                &format!("/containers/{}/archive?path=%2F&noOverwriteDirNonDir=true", escape(&id)),
+                &format!(
+                    "/containers/{}/archive?path=%2F&noOverwriteDirNonDir=true",
+                    escape(&id)
+                ),
                 Body::Tar(&archive),
                 Some(CALL),
             )
             .map_err(|error| engine_error("the supervisor", error))?;
         if !put.ok() {
-            return Err(format!("the supervisor was refused ({}): {}", put.status, put.message()));
+            return Err(format!(
+                "the supervisor was refused ({}): {}",
+                put.status,
+                put.message()
+            ));
         }
         let (attached, early) = self
             .engine
@@ -395,24 +557,35 @@ impl OciVmm {
                 escape(&id)
             ))
             .map_err(|error| engine_error("the container's streams", error))?;
-        let channel = stream::split(attached, early, console).map_err(|error| engine_error("the streams", error))?;
+        let channel =
+            stream::split(attached, early, console).map_err(|error| engine_error("the streams", error))?;
         let started = self
             .engine
-            .request("POST", &format!("/containers/{}/start", escape(&id)), Body::Empty, Some(CALL))
+            .request(
+                "POST",
+                &format!("/containers/{}/start", escape(&id)),
+                Body::Empty,
+                Some(CALL),
+            )
             .map_err(|error| engine_error("the start", error))?;
         if !started.ok() && started.status != 304 {
             channel.shutdown();
-            return Err(format!("the container did not start ({}): {}", started.status, started.message()));
+            return Err(format!(
+                "the container did not start ({}): {}",
+                started.status,
+                started.message()
+            ));
         }
         let exit = Arc::new(ExitCell::default());
         watch_end(self.engine.clone(), id.clone(), exit.clone());
-        // From here the machine's own value removes it.
-        std::mem::forget(made);
+        // From here the machine's own value removes them.
+        made.id.clear();
         Ok(OciVm {
             engine: self.engine.clone(),
             id,
             exit,
             channel: Mutex::new(Some(channel)),
+            _network: made.network.take(),
         })
     }
 }
@@ -420,7 +593,13 @@ impl OciVmm {
 impl Vmm for OciVmm {
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError> {
         spec.validate()?;
-        self.make(spec).map(|vm| Box::new(vm) as Box<dyn Vm>).map_err(VmmError::Start)
+        self.make(spec)
+            .map(|vm| Box::new(vm) as Box<dyn Vm>)
+            .map_err(VmmError::Start)
+    }
+
+    fn containers(&self) -> bool {
+        true
     }
 }
 
@@ -439,7 +618,11 @@ fn watch_end(engine: Engine, id: String, exit: Arc<ExitCell>) {
                 .ok()
                 .and_then(|value| value.get("StatusCode")?.as_i64()),
             Ok(answer) => {
-                exit.end(VmExit::Error(format!("the engine's wait answered {}: {}", answer.status, answer.message())));
+                exit.end(VmExit::Error(format!(
+                    "the engine's wait answered {}: {}",
+                    answer.status,
+                    answer.message()
+                )));
                 return;
             }
             Err(error) => {
@@ -448,7 +631,12 @@ fn watch_end(engine: Engine, id: String, exit: Arc<ExitCell>) {
             }
         };
         let oom = engine
-            .request("GET", &format!("/containers/{}/json", escape(&id)), Body::Empty, Some(CALL))
+            .request(
+                "GET",
+                &format!("/containers/{}/json", escape(&id)),
+                Body::Empty,
+                Some(CALL),
+            )
             .ok()
             .and_then(|answer| answer.json().ok())
             .and_then(|value| value.get("State")?.get("OOMKilled")?.as_bool())
@@ -460,7 +648,9 @@ fn watch_end(engine: Engine, id: String, exit: Arc<ExitCell>) {
                 "the kernel stopped the container's first process for memory".into(),
             )),
             Some(code) => exit.found_failed(format!("the container ended with {code}")),
-            None => exit.end(VmExit::Error("the engine did not say how the container ended".into())),
+            None => exit.end(VmExit::Error(
+                "the engine did not say how the container ended".into(),
+            )),
         }
     });
 }
@@ -471,6 +661,8 @@ pub struct OciVm {
     id: String,
     exit: Arc<ExitCell>,
     channel: Mutex<Option<stream::AttachChannel>>,
+    /// Removed after the container, when this is dropped.
+    _network: Option<OwnNetwork>,
 }
 
 impl OciVm {
@@ -483,10 +675,12 @@ impl OciVm {
 impl Vm for OciVm {
     fn channel(&self, _port: u32) -> Result<Box<dyn Channel>, VmmError> {
         let taken = self.channel.lock().ok().and_then(|mut slot| slot.take());
-        taken.map(|channel| Box::new(channel) as Box<dyn Channel>).ok_or(VmmError::Connect {
-            port: cf_guest_proto::PORT,
-            reason: "the container's streams are taken".into(),
-        })
+        taken
+            .map(|channel| Box::new(channel) as Box<dyn Channel>)
+            .ok_or(VmmError::Connect {
+                port: cf_guest_proto::PORT,
+                reason: "the container's streams are taken".into(),
+            })
     }
 
     fn wait(&self, timeout: Duration) -> Option<VmExit> {
@@ -522,7 +716,10 @@ impl Vm for OciVm {
             .engine
             .request(
                 "GET",
-                &format!("/containers/{}/stats?stream=false&one-shot=true", escape(&self.id)),
+                &format!(
+                    "/containers/{}/stats?stream=false&one-shot=true",
+                    escape(&self.id)
+                ),
                 Body::Empty,
                 Some(Duration::from_secs(10)),
             )
@@ -562,6 +759,41 @@ impl Drop for OciVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_engine_whose_root_is_not_the_hosts_is_taken() {
+        let info =
+            |options: &[&str], system: &str| json!({ "SecurityOptions": options, "OperatingSystem": system });
+        let seccomp = "name=seccomp,profile=builtin";
+        assert_eq!(
+            isolation(&info(
+                &[seccomp, "name=rootless", "name=cgroupns"],
+                "Ubuntu 26.04 LTS"
+            )),
+            Ok("rootless")
+        );
+        assert_eq!(
+            isolation(&info(&["name=userns", seccomp], "Debian GNU/Linux 13")),
+            Ok("user namespaces")
+        );
+        assert_eq!(
+            isolation(&info(&[seccomp], "OrbStack")),
+            Ok("a virtual machine of its own")
+        );
+        assert_eq!(
+            isolation(&info(&[], "Docker Desktop")),
+            Ok("a virtual machine of its own")
+        );
+        for refused in [
+            info(&[seccomp, "name=cgroupns"], "Ubuntu 26.04 LTS"),
+            info(&["name=rootlessish", "rootless"], ""),
+            json!({ "SecurityOptions": "name=rootless" }),
+            json!({}),
+        ] {
+            let said = isolation(&refused).unwrap_err();
+            assert!(said.contains("as the host's root"), "{said}");
+        }
+    }
     use cf_vmm::Disk;
 
     fn spec() -> VmSpec {
@@ -591,7 +823,12 @@ mod tests {
     #[test]
     fn the_image_is_the_installed_version_the_image_disk_names() {
         assert_eq!(image_version(&spec()).unwrap(), "image-20261112-7");
-        for path in ["/rootfs.img", "/state/images/../rootfs.img", "/state/images/a b/rootfs.img", "/s/.x/r"] {
+        for path in [
+            "/rootfs.img",
+            "/state/images/../rootfs.img",
+            "/state/images/a b/rootfs.img",
+            "/s/.x/r",
+        ] {
             let mut spec = spec();
             spec.disks[0].path = path.into();
             assert!(image_version(&spec).is_err(), "{path}");
@@ -603,7 +840,7 @@ mod tests {
 
     #[test]
     fn a_container_is_held_in_as_a_machine_is() {
-        let body = vmm().create_body(&spec(), "image-20261112-7", Some("codefusion-runner-dal1"));
+        let body = vmm().create_body(&spec(), "image-20261112-7", Some("codefusion-dal1-vm-7-0"));
         let host = &body["HostConfig"];
         assert_eq!(body["Image"], "codefusion-runner-guest:image-20261112-7");
         assert_eq!(body["User"], "runner", "never root");
@@ -622,13 +859,20 @@ mod tests {
         assert_eq!(host["PidMode"], "", "a process namespace of its own");
         assert_eq!(host["IpcMode"], "private");
         assert_eq!(host["CgroupnsMode"], "private");
-        assert_eq!(host["NetworkMode"], "codefusion-runner-dal1");
+        assert_eq!(host["NetworkMode"], "codefusion-dal1-vm-7-0");
         assert_eq!(host["LogConfig"]["Type"], "none");
         assert_eq!(body["Labels"][LABEL_MACHINE], "dal1");
         assert_eq!(body["Labels"][LABEL_OWNER], std::process::id().to_string());
         assert_eq!(body["Entrypoint"], json!([SUPERVISOR]));
         assert_eq!(body["Cmd"], json!(["container-guest"]));
-        let offline = vmm().create_body(&VmSpec { network: Network::None, ..spec() }, "v", None);
+        let offline = vmm().create_body(
+            &VmSpec {
+                network: Network::None,
+                ..spec()
+            },
+            "v",
+            None,
+        );
         assert_eq!(offline["HostConfig"]["NetworkMode"], "none");
         assert_eq!(offline["NetworkDisabled"], true);
     }
@@ -649,7 +893,11 @@ mod tests {
         let v1 = json!({"memory_stats": {"usage": 900, "stats": {"total_inactive_file": 100}}});
         assert_eq!(resident_of(&v1), Some(800));
         assert_eq!(resident_of(&json!({"memory_stats": {"usage": 5}})), Some(5));
-        assert_eq!(resident_of(&json!({"memory_stats": {}})), None, "an ended container has none");
+        assert_eq!(
+            resident_of(&json!({"memory_stats": {}})),
+            None,
+            "an ended container has none"
+        );
         let odd = json!({"memory_stats": {"usage": 5, "stats": {"inactive_file": 9}}});
         assert_eq!(resident_of(&odd), Some(0));
     }

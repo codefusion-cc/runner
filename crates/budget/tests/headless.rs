@@ -4,7 +4,7 @@
 mod common;
 
 use Size::{G2, G4, G6, G8};
-use cf_budget::{Budget, Charge, GIB, HostFacts, Limits, MIB, Mode, Refusal, Settings, Size, admit};
+use cf_budget::{Budget, Charge, GIB, HostFacts, Limits, MIB, Mode, Refusal, Sandbox, Settings, Size, admit};
 use common::*;
 use proptest::prelude::*;
 
@@ -271,8 +271,10 @@ proptest! {
         cores in 1..64u32,
         fast in 0..72u32,
         sizes in prop::collection::vec(prop::sample::select(Size::ALL.to_vec()), 0..40),
+        sandbox in prop::sample::select(vec![Sandbox::Vm, Sandbox::Container]),
     ) {
-        let settings = Settings::for_headless(host(total_mib * MIB, cores), fast);
+        let settings = Settings::for_headless_in(host(total_mib * MIB, cores), fast, sandbox);
+        let engine = if sandbox == Sandbox::Container { Settings::ENGINE_USE } else { 0 };
         prop_assert_eq!(settings.check(), Ok(()));
         let limits = settings.away;
         let mut charges: Vec<Charge> = Vec::new();
@@ -288,7 +290,7 @@ proptest! {
             let held: u64 = charges.iter().map(|charge| charge.host_bytes).sum();
             // A host too small for its own share and the floor lets nothing in.
             prop_assert!(
-                held == 0 || held + limits.floor_bytes + Settings::HEADLESS_HOST_USE <= settings.total_bytes,
+                held == 0 || held + limits.floor_bytes + Settings::HEADLESS_HOST_USE + engine <= settings.total_bytes,
                 "{} MiB held of {} MiB", held / MIB, total_mib
             );
             prop_assert!(charges.iter().map(|charge| charge.cpus).sum::<u32>() <= limits.cpus);
@@ -520,4 +522,61 @@ fn a_4_cpu_cloud_vm_with_16_gb_runs_two_cf_4g() {
     assert_eq!(settings.vcpus_of(G4), 2);
     assert_eq!(settings.side_by_side(&settings.away, G4), 2);
     assert_eq!(grants(settings, &[G4, G4, G4])[..2], [Ok(2), Ok(2)]);
+}
+
+/// In containers no guest kernel takes a share of the job's size and each job costs the host far less, so the same
+/// host runs more at once; the engine's own share comes off the room once.
+#[test]
+fn in_containers_a_host_counts_no_guest_kernel_and_a_smaller_overhead() {
+    let facts = host(BOARD_BYTES, 8);
+    let vms = Settings::for_headless(facts, 4);
+    let containers = Settings::for_headless_in(facts, 4, Sandbox::Container);
+    assert_eq!(containers.check(), Ok(()));
+    assert_eq!(Settings::for_headless_in(facts, 4, Sandbox::Vm), vms);
+    assert_eq!(containers.guest_overhead_bytes, 0);
+    assert_eq!(
+        containers.job_limit_bytes(G4),
+        G4.vm_bytes(),
+        "the job gets its whole size"
+    );
+    assert_eq!(
+        containers.host_bytes(G4),
+        G4.vm_bytes() + Settings::CONTAINER_HOST_OVERHEAD
+    );
+    let floor = GIB + BOARD_BYTES / 32;
+    assert_eq!(
+        containers.away.cap_bytes,
+        BOARD_BYTES - floor - GIB / 2 - Settings::ENGINE_USE - 2 * Settings::CONTAINER_HOST_OVERHEAD
+    );
+    assert_eq!(containers.away.floor_bytes, vms.away.floor_bytes);
+    assert_eq!(containers.away.cpus, vms.away.cpus);
+    // Two side by side save what the engine takes, so the cap is the machines' cap; what the jobs gain is their
+    // guest kernel's share.
+    assert_eq!(containers.away.cap_bytes, vms.away.cap_bytes);
+    assert_eq!(
+        containers.job_limit_bytes(G2) - vms.job_limit_bytes(G2),
+        Settings::GUEST_OVERHEAD_ESTIMATE
+    );
+}
+
+/// A Mac's or a workstation's settings in containers keep its floors and lose the engine's share off each cap that
+/// lets anything in; a cap of nothing stays nothing.
+#[test]
+fn a_workstation_in_containers_keeps_its_floors_and_a_closed_cap() {
+    let vms = Settings::for_host(host(16 * GIB, 10), Mode::Workstation);
+    let containers = vms.clone().in_containers();
+    assert_eq!(containers.check(), Ok(()));
+    assert_eq!(
+        containers.away.cap_bytes,
+        vms.away.cap_bytes - Settings::ENGINE_USE
+    );
+    assert_eq!(containers.in_use.cap_bytes, 0);
+    assert_eq!(
+        (containers.away.floor_bytes, containers.in_use.floor_bytes),
+        (vms.away.floor_bytes, vms.in_use.floor_bytes)
+    );
+    assert_eq!(
+        containers.vm_host_overhead_bytes,
+        Settings::CONTAINER_HOST_OVERHEAD
+    );
 }

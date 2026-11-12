@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cf_budget::{Host, HostError, HostFacts, Limits, Mode, Settings};
+use cf_budget::{Host, HostError, HostFacts, Limits, Mode, Sandbox, Settings};
 use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
@@ -66,8 +66,9 @@ pub trait Platform {
     fn host(state_dir: &Path) -> Result<Self::Host, HostError>;
 
     /// The budget's settings for a host with these facts. `mode` is whether a person works there, on a system where
-    /// one does. A trusted host runs one machine at a time ([`Settings::one_at_a_time`]).
-    fn settings(facts: HostFacts, mode: Mode, trusted: bool) -> Settings;
+    /// one does. A trusted host runs one machine at a time ([`Settings::one_at_a_time`]); in containers each job
+    /// costs the host less ([`Settings::in_containers`]).
+    fn settings(facts: HostFacts, mode: Mode, trusted: bool, sandbox: Sandbox) -> Settings;
 
     /// A name for this start of the host: another one after every start, the same until the next, whatever the
     /// clock does meanwhile. `None` when the system will not say.
@@ -137,6 +138,8 @@ pub struct HostSetup {
     pub deadline: Duration,
     /// Whether a person works on the host.
     pub mode: Mode,
+    /// What keeps each job from the host, and in containers the engine's socket.
+    pub sandbox: (Sandbox, Option<PathBuf>),
     /// What the owner set of the budget on top of the host's defaults.
     pub limits: Limits,
     /// Which repositories are served.
@@ -206,8 +209,14 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
     let rings = bell.clone();
     let machines = Machines::restore(MachineParts {
         host,
-        vms: P::vm_hosts(&setup.program, state),
-        settings: P::settings(facts, setup.mode, setup.policy.trusted.is_some())
+        vms: match &setup.sandbox {
+            (Sandbox::Container, Some(engine)) => {
+                P::vm_hosts(&setup.program, state).in_engine(engine, &setup.machine)
+            }
+            (Sandbox::Container, None) => return Err("a container host names its engine's socket".into()),
+            (Sandbox::Vm, _) => P::vm_hosts(&setup.program, state),
+        },
+        settings: P::settings(facts, setup.mode, setup.policy.trusted.is_some(), setup.sandbox.0)
             .limited(&setup.limits)
             .map_err(|error| format!("the limits for jobs: {error}"))?,
         config,

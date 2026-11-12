@@ -44,7 +44,11 @@ impl ExitCell {
     /// a failure that `error` describes otherwise.
     pub fn found_failed(&self, error: String) {
         let asked = self.slot().1;
-        self.end(if asked { VmExit::Stopped } else { VmExit::Error(error) });
+        self.end(if asked {
+            VmExit::Stopped
+        } else {
+            VmExit::Error(error)
+        });
     }
 
     /// Waits for the end for at most `timeout`. `None` when the machine still runs.

@@ -107,6 +107,8 @@ pub struct VmHosts {
     children: Arc<Mutex<BTreeMap<String, u32>>>,
     /// `systemd-run`, when each vm-host starts in a systemd scope of its own ([`VmHosts::in_scopes`]).
     systemd_run: Option<PathBuf>,
+    /// The engine's socket and this host's name, when each job runs in a container ([`VmHosts::in_engine`]).
+    engine: Option<(PathBuf, String)>,
 }
 
 impl VmHosts {
@@ -119,6 +121,16 @@ impl VmHosts {
             exited: Arc::default(),
             children: Arc::default(),
             systemd_run: None,
+            engine: None,
+        }
+    }
+
+    /// The same vm-hosts, each running its job in a container of the engine whose API answers on `socket`, made
+    /// by the host `machine` and named after it.
+    pub fn in_engine(self, socket: impl Into<PathBuf>, machine: impl Into<String>) -> VmHosts {
+        VmHosts {
+            engine: Some((socket.into(), machine.into())),
+            ..self
         }
     }
 
@@ -163,6 +175,9 @@ impl VmHosts {
             }
         };
         command.arg("vm").arg("--state-dir").arg(&self.state_dir);
+        if let Some((socket, machine)) = &self.engine {
+            command.arg("--engine").arg(socket).arg("--machine").arg(machine);
+        }
         Ok(command)
     }
 
@@ -637,6 +652,22 @@ mod tests {
         assert_eq!(
             direct.get_args().collect::<Vec<_>>(),
             ["vm", "--state-dir", "/state"]
+        );
+        let contained = VmHosts::new("/state/bin/codefusion-runner", "/state")
+            .in_engine("/run/user/1001/docker.sock", "pc-1")
+            .command("j1a2b3c4")
+            .expect("a command");
+        assert_eq!(
+            contained.get_args().collect::<Vec<_>>(),
+            [
+                "vm",
+                "--state-dir",
+                "/state",
+                "--engine",
+                "/run/user/1001/docker.sock",
+                "--machine",
+                "pc-1"
+            ]
         );
     }
 

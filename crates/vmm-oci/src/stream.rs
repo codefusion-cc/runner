@@ -40,11 +40,18 @@ pub fn demultiplex(source: &mut impl Read, mut output: UnixStream, mut console: 
     let result = loop {
         let mut header = [0u8; 8];
         if let Err(error) = source.read_exact(&mut header) {
-            break if error.kind() == io::ErrorKind::UnexpectedEof { Ok(()) } else { Err(error) };
+            break if error.kind() == io::ErrorKind::UnexpectedEof {
+                Ok(())
+            } else {
+                Err(error)
+            };
         }
         let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if header[1..4] != [0, 0, 0] || header[0] > 2 || length > PIECE_MAX {
-            break Err(io::Error::new(io::ErrorKind::InvalidData, "the engine's stream is not multiplexed"));
+            break Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the engine's stream is not multiplexed",
+            ));
         }
         piece.resize(length, 0);
         if let Err(error) = source.read_exact(&mut piece) {
@@ -142,7 +149,10 @@ mod tests {
         ] {
             let (result, output, _) = run(bytes.clone());
             assert!(result.is_err(), "{bytes:?}");
-            assert!(output.len() <= 2, "nothing past the bad piece reaches the guest's reader");
+            assert!(
+                output.len() <= 2,
+                "nothing past the bad piece reaches the guest's reader"
+            );
         }
         let (result, output, console) = run(Vec::new());
         assert!(result.is_ok(), "an empty stream is the container's end");

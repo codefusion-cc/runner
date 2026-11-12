@@ -43,7 +43,7 @@ pub use budget::{
 pub use fake::FakeHost;
 pub use host::{Battery, Host, HostError, HostFacts, HostReading, Millis, Now, Pressure, Thermal};
 pub use level::{Hold, Level, Trouble};
-pub use settings::{DEFER_LIMIT, Limits, Mode, Profile, Settings, SettingsError};
+pub use settings::{DEFER_LIMIT, Limits, Mode, Profile, Sandbox, Settings, SettingsError};
 pub use size::Size;
 
 /// One mebibyte. The plan's "MB" and "GB" are these: a 16 GB Mac reports 16 × 2^30 bytes.

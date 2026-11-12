@@ -951,6 +951,26 @@ fn an_out_of_memory_job_is_told_what_was_stopped_and_the_next_size_to_ask_for() 
     assert!(summary.contains("`node` (process 260) was stopped"));
     assert!(summary.contains("| `node` | 600 MB |\n| `Web Content` | 1.5 GB |"));
     assert!(summary.contains("cf-6g"));
+    // Only the control group's counter told of it: no name and no number to give.
+    let counted = OomEvent {
+        process: Used {
+            pid: 0,
+            name: "a process".into(),
+            memory_bytes: 0,
+        },
+        largest: Vec::new(),
+        ..oom(4026531840)
+    };
+    let summary = out_of_memory_summary(&counted);
+    assert!(
+        summary.contains("used all of it. A process was stopped.\n"),
+        "{summary}"
+    );
+    assert!(
+        !summary.contains("process 0") && !summary.contains("largest"),
+        "{summary}"
+    );
+    assert!(out_of_memory_line(&counted).contains(", so a process was stopped."));
 }
 
 #[test]

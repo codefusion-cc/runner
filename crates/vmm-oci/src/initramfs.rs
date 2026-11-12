@@ -16,7 +16,8 @@ pub fn file(initramfs: &[u8], name: &str) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("the initramfs does not unpack: {error}"))?;
     let mut at = 0usize;
     let field = |header: &[u8], index: usize| -> Result<usize, String> {
-        let text = std::str::from_utf8(&header[6 + index * 8..14 + index * 8]).map_err(|_| "a cpio header")?;
+        let text =
+            std::str::from_utf8(&header[6 + index * 8..14 + index * 8]).map_err(|_| "a cpio header")?;
         usize::from_str_radix(text, 16).map_err(|_| "a cpio header".to_string())
     };
     loop {
@@ -37,7 +38,9 @@ pub fn file(initramfs: &[u8], name: &str) -> Result<Vec<u8>, String> {
         if entry == b"TRAILER!!!" {
             return Err(format!("the initramfs has no {name}"));
         }
-        let data = cpio.get(data_at..data_at + size).ok_or("the initramfs is cut short")?;
+        let data = cpio
+            .get(data_at..data_at + size)
+            .ok_or("the initramfs is cut short")?;
         if entry == name.as_bytes() {
             return Ok(data.to_vec());
         }
@@ -77,7 +80,11 @@ mod tests {
 
     #[test]
     fn the_init_is_found_among_the_others() {
-        let archive = newc(&[("etc/modules", b"virtio\n"), ("init", b"\x7fELF supervisor"), ("lib", b"")]);
+        let archive = newc(&[
+            ("etc/modules", b"virtio\n"),
+            ("init", b"\x7fELF supervisor"),
+            ("lib", b""),
+        ]);
         assert_eq!(file(&archive, "init").unwrap(), b"\x7fELF supervisor");
         assert_eq!(file(&archive, "etc/modules").unwrap(), b"virtio\n");
         assert!(file(&archive, "missing").unwrap_err().contains("no missing"));

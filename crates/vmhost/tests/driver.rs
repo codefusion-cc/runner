@@ -1295,3 +1295,60 @@ fn a_trusted_jobs_folder_is_gone_after_every_end() {
     assert_eq!(state.end.unwrap().end, End::Cancelled);
     assert!(!layout.job_dir("cancelled").exists() && !layout.socket("cancelled").exists());
 }
+
+/// In containers there is no disk to format and no image file to check: the engine holds the image. The job's one
+/// start is a container of its whole size, given the image's disk only, so that the engine knows its version.
+#[test]
+fn in_a_container_the_job_starts_at_once_with_its_whole_size_and_no_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let (seen, tasks) = mpsc::channel();
+    let vmm = FakeVmm::new([job(move |stream, _, task| {
+        seen.send(task).unwrap();
+        finish(stream, summary(GuestEnd::Exited, Some(0)));
+    })])
+    .of_containers();
+    let state = go(&vmm, &layout, request("job-1"), quick()).unwrap();
+    assert_eq!(state.end.as_ref().map(|ended| ended.end), Some(End::Ok));
+    assert_eq!(
+        (state.vm_bytes, state.limit_bytes, state.boots),
+        (4 << 30, 4 << 30, 1)
+    );
+    let Task::Job(task) = tasks.recv().unwrap() else {
+        panic!("the guest was not given a job")
+    };
+    assert_eq!(task.limits.memory_bytes, 4 << 30);
+    let specs = vmm.started();
+    assert_eq!(specs.len(), 1, "no machine formats a disk");
+    let disks: Vec<_> = specs[0]
+        .disks
+        .iter()
+        .map(|disk| (disk.id.as_str(), disk.path.clone(), disk.read_only))
+        .collect();
+    assert_eq!(disks, [("cf-image", layout.rootfs("image-1"), true)]);
+    assert_eq!((specs[0].memory_bytes, specs[0].network), (4 << 30, Network::Nat));
+    assert!(!layout.job_dir("job-1").exists());
+}
+
+/// A container is no place for a Docker daemon or a trusted job's gate: both are refused before anything starts.
+#[test]
+fn in_a_container_docker_and_trusted_jobs_are_refused_before_anything_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = Layout::new(dir.path());
+    let vmm = FakeVmm::new([]).of_containers();
+    let docker = JobRequest {
+        docker: true,
+        ..request("job-1")
+    };
+    let trusted = JobRequest {
+        trusted: Some(cf_trusted::Policy::default()),
+        ..request("job-2")
+    };
+    for asked in [docker, trusted] {
+        let job = asked.job.clone();
+        let error = go(&vmm, &layout, asked, quick()).unwrap_err();
+        assert!(matches!(error, RunError::Request(_)), "{error}");
+        assert!(!layout.state(&job).exists());
+    }
+    assert!(vmm.started().is_empty());
+}

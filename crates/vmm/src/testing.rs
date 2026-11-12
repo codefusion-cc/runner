@@ -78,9 +78,19 @@ pub struct FakeVmm {
     resident: Arc<Mutex<Option<u64>>>,
     stalls: Arc<Mutex<Option<Psi>>>,
     disks: Arc<Mutex<Option<DiskIo>>>,
+    containers: bool,
 }
 
 impl FakeVmm {
+    /// The same monitor, as an engine whose machines are containers ([`Vmm::containers`]).
+    #[must_use]
+    pub fn of_containers(self) -> Self {
+        Self {
+            containers: true,
+            ..self
+        }
+    }
+
     /// A monitor that will start these machines, in this order.
     pub fn new(scripts: impl IntoIterator<Item = Script>) -> Self {
         Self {
@@ -119,6 +129,10 @@ impl FakeVmm {
 }
 
 impl Vmm for FakeVmm {
+    fn containers(&self) -> bool {
+        self.containers
+    }
+
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError> {
         spec.validate()?;
         self.started.lock().unwrap().push(spec.clone());

@@ -79,7 +79,13 @@ impl Engine {
 
     /// Sends one request and reads its whole answer; `timeout` bounds every read, `None` waits as long as the
     /// engine takes (a container's end).
-    pub fn request(&self, method: &str, path: &str, body: Body<'_>, timeout: Option<Duration>) -> io::Result<Response> {
+    pub fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Body<'_>,
+        timeout: Option<Duration>,
+    ) -> io::Result<Response> {
         let mut stream = self.connect(timeout)?;
         send(&mut stream, method, path, &body, &[])?;
         let mut reader = BufReader::new(stream);
@@ -105,7 +111,9 @@ impl Engine {
         if status != 101 && status != 200 {
             let body = read_body(&mut reader, &headers).unwrap_or_default();
             let said = Response { status, body }.message();
-            return Err(io::Error::other(format!("the attach was refused ({status}): {said}")));
+            return Err(io::Error::other(format!(
+                "the attach was refused ({status}): {said}"
+            )));
         }
         let early = reader.buffer().to_vec();
         let stream = reader.into_inner();
@@ -114,9 +122,18 @@ impl Engine {
     }
 }
 
-fn send(stream: &mut UnixStream, method: &str, path: &str, body: &Body<'_>, extra: &[(&str, &str)]) -> io::Result<()> {
+fn send(
+    stream: &mut UnixStream,
+    method: &str,
+    path: &str,
+    body: &Body<'_>,
+    extra: &[(&str, &str)],
+) -> io::Result<()> {
     if !path.starts_with('/') || path.bytes().any(|byte| byte.is_ascii_control() || byte == b' ') {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no path for a request"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no path for a request",
+        ));
     }
     let json;
     let (kind, bytes): (Option<&str>, &[u8]) = match body {
@@ -175,7 +192,9 @@ pub fn read_head(reader: &mut impl BufRead) -> io::Result<(u16, Vec<(String, Str
         if text.is_empty() {
             return Ok((status, headers));
         }
-        let (name, value) = text.split_once(':').ok_or_else(|| bad("a header without a colon"))?;
+        let (name, value) = text
+            .split_once(':')
+            .ok_or_else(|| bad("a header without a colon"))?;
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
 }
@@ -273,7 +292,10 @@ mod tests {
             answer(b"HTTP/1.0 404 Not Found\r\n\r\n{\"message\":\"no such container\"}").unwrap(),
             (404, b"{\"message\":\"no such container\"}".to_vec())
         );
-        assert_eq!(answer(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").unwrap(), (204, Vec::new()));
+        assert_eq!(
+            answer(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").unwrap(),
+            (204, Vec::new())
+        );
     }
 
     #[test]
@@ -294,7 +316,10 @@ mod tests {
             assert!(answer(text).is_err(), "{:?}", String::from_utf8_lossy(text));
         }
         let huge = format!("HTTP/1.1 200 OK\r\nX: {}\r\n\r\n", "a".repeat(HEAD_MAX));
-        assert!(answer(huge.as_bytes()).is_err(), "a head without end is not read for ever");
+        assert!(
+            answer(huge.as_bytes()).is_err(),
+            "a head without end is not read for ever"
+        );
     }
 
     #[test]
@@ -314,7 +339,10 @@ mod tests {
 
     #[test]
     fn a_query_value_is_escaped_whole() {
-        assert_eq!(escape("label=cc.codefusion/x y&z"), "label%3Dcc.codefusion%2Fx%20y%26z");
+        assert_eq!(
+            escape("label=cc.codefusion/x y&z"),
+            "label%3Dcc.codefusion%2Fx%20y%26z"
+        );
         assert_eq!(escape("plain-1.2_3~"), "plain-1.2_3~");
         assert_eq!(escape("ż"), "%C5%BC");
     }

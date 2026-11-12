@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 30
     env:
       # The crates that build and pass on Linux. Add a crate here once it does.
-      LINUX_CRATES: -p cf-budget -p cf-clock -p cf-console-client -p cf-daemon -p cf-fake-console -p cf-fake-github -p cf-ghapp -p cf-guest-proto -p cf-harness -p cf-host-linux -p cf-image -p cf-lifecycle -p cf-netlink -p cf-nft -p cf-scaleset -p cf-secret -p cf-supervisor -p cf-trusted -p cf-vmhost -p cf-vmm -p cf-vmm-ch -p cf-workflows -p codefusion-runner -p xtask
+      LINUX_CRATES: -p cf-budget -p cf-clock -p cf-console-client -p cf-daemon -p cf-fake-console -p cf-fake-github -p cf-ghapp -p cf-guest-proto -p cf-harness -p cf-host-linux -p cf-image -p cf-lifecycle -p cf-netlink -p cf-nft -p cf-scaleset -p cf-secret -p cf-supervisor -p cf-trusted -p cf-vmhost -p cf-vmm -p cf-vmm-ch -p cf-vmm-oci -p cf-workflows -p codefusion-runner -p xtask
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -122,6 +122,20 @@ jobs:
           CF_REQUIRE_NAMESPACES: '1'
       - name: The probe reads this host
         run: cargo run --locked -p cf-host-linux --example linux-probe
+      # Container mode against this runner's own Docker: a job cannot read a host file or reach the engine's socket, is
+      # stopped at its memory and its deadline, two at once do not see each other, and what a killed vm-host leaves is
+      # removed. The runner is thrown away after, so its rootful engine is taken (CF_ENGINE_ROOTFUL); a host never is.
+      - name: Container mode against a real engine
+        timeout-minutes: 10
+        env:
+          CF_ENGINE_SOCKET: /var/run/docker.sock
+          CF_GUEST_IMAGE: it-ci
+          CF_ENGINE_ROOTFUL: '1'
+        run: |
+          cargo build --locked -p cf-supervisor --bin supervisor --target ${{ matrix.guest }} -j4
+          export CF_SUPERVISOR="$PWD/target/${{ matrix.guest }}/debug/supervisor"
+          docker build -q -t "codefusion-runner-guest:$CF_GUEST_IMAGE" crates/vmm-oci/tests/image
+          cargo test --locked -p cf-vmm-oci --test engine -j4 -- --ignored --test-threads=2
 
   fresh-host:
     # A fresh Ubuntu host set up the way a cloud VM is (scripts/host-setup.sh as root: a connect code, no App key),

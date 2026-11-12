@@ -101,6 +101,13 @@ pub enum VmExit {
 pub trait Vmm: Send + Sync {
     /// Starts a machine and returns once it runs. The machine holds its full memory size from here on.
     fn start(&self, spec: &VmSpec) -> Result<Box<dyn Vm>, VmmError>;
+
+    /// Whether each machine is a container of an engine rather than a virtual machine: it boots no kernel and has
+    /// no disk of its own, runs the image the engine holds by the version its image disk names, and its job has
+    /// its whole memory size.
+    fn containers(&self) -> bool {
+        false
+    }
 }
 
 /// One running (or ended) virtual machine. Dropping it ends the machine.

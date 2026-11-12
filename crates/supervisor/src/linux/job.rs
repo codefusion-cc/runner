@@ -746,10 +746,12 @@ impl Watch<'_> {
     }
 
     fn out_of_memory(&mut self, kill: Kill, table: &Table) {
-        say(&format!(
-            "out of memory: the kernel stopped {} (process {})",
-            kill.process.name, kill.process.pid
-        ));
+        // A kill only the control group's counter told of has no process number.
+        let which = match kill.process.pid {
+            0 => kill.process.name.clone(),
+            pid => format!("{} (process {pid})", kill.process.name),
+        };
+        say(&format!("out of memory: the kernel stopped {which}"));
         if self.step.is_none() {
             let step = self
                 .previous

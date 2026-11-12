@@ -119,6 +119,7 @@ fn start_runner(bench: &Bench, world: &World, token: &Secret<String>) -> Fallibl
             image: bench.image.clone(),
             deadline: Duration::from_secs(300),
             mode: Mode::Dedicated,
+            sandbox: (cf_budget::Sandbox::Vm, None),
             limits: Limits::default(),
             policy: ServePolicy::default(),
             console: Some((world.console.url(), Secret::new(token.expose().clone()))),

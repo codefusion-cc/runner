@@ -83,13 +83,21 @@ pub fn out_of_memory_line(oom: &OomEvent) -> String {
     )
 }
 
+/// The process the kernel stopped as a summary names it: `` `node` (process 260) ``, or, when only the control
+/// group's counter told of it (in a container, which reads no kernel log), just that it was one.
+fn stopped_process(oom: &OomEvent) -> String {
+    match oom.process.pid {
+        0 => "A process".into(),
+        pid => format!("`{}` (process {pid})", oom.process.name),
+    }
+}
+
 /// The same as a job summary (Markdown): the limit, the process stopped, who held the memory, what to do.
 pub fn out_of_memory_summary(oom: &OomEvent) -> String {
     let mut text = format!(
-        "### Out of memory\n\nThis job has {} memory and used all of it. `{}` (process {}) was stopped.\n",
+        "### Out of memory\n\nThis job has {} memory and used all of it. {} was stopped.\n",
         size(oom.limit_bytes),
-        oom.process.name,
-        oom.process.pid
+        stopped_process(oom)
     );
     if !oom.largest.is_empty() {
         text.push_str("\nThe largest processes at that moment:\n\n| Process | Memory |\n| --- | --- |\n");

@@ -27,11 +27,15 @@ const USAGE: &str = "usage: codefusion-runner
   status --config <file> [--json]       the holds, whether the host takes jobs, and the machines that run
   image verify <folder> --version <v>
   image install <folder> --version <v> --state-dir <folder>
-  vm --state-dir <folder> [--host-cpus <list>]
+  vm --state-dir <folder> [--host-cpus <list>] [--engine <socket> --machine <name>]
                                         the vm-host of one job; on Linux --host-cpus are the CPUs its
-                                        machine runs on (such as 4-7), by default the fastest
+                                        machine runs on (such as 4-7), by default the fastest; with
+                                        --engine the job runs in a container of that engine
   vmm                                   the virtual machine monitor this build carries (Linux)
-  boot-proof [--memory-mb N] [--timeout-s N, at most 3600] [--host-cpus <list>]";
+  boot-proof [--memory-mb N] [--timeout-s N, at most 3600] [--host-cpus <list>]
+             [--engine <socket> --image <version>]
+                                        with --engine, a container of the image <version> the engine
+                                        holds in place of a machine";
 
 /// The commands on the machine for its holds (`pause`, `resume`, `status`), which end with an exit code of their
 /// own ([`crate::holds::TIMED_OUT`]); none for any other command.
@@ -67,8 +71,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--state-dir",
             state,
         ] => install(folder, version, state),
-        ["vm", "--state-dir", state] => vm_host(state, None),
-        ["vm", "--state-dir", state, "--host-cpus", cpus] => vm_host(state, Some(cpus)),
+        ["vm", "--state-dir", state, options @ ..] => vm_host(state, options),
         [
             command @ ("daemon" | "enroll" | "check" | "install" | "uninstall"),
             "--config",
@@ -129,16 +132,53 @@ fn service(_command: &str, _config: &str, _options: &[&str]) -> Result<(), Strin
     Err("the service runs on macOS and Linux only".into())
 }
 
+/// The options of `vm` and `boot-proof` that say where machines run, each at most once: `--host-cpus`, and
+/// `--engine` with the one `with_engine` names beside it (`--machine` or `--image`). Any other is refused.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn vm_host(state: &str, cpus: Option<&str>) -> Result<(), String> {
-    let host = crate::vm::Host {
-        cpus: cpus.map(String::from),
+fn host_options<'a>(
+    options: &[&'a str],
+    with_engine: &str,
+    mut other: impl FnMut(&'a str, &'a str) -> Result<(), String>,
+) -> Result<crate::vm::Host, String> {
+    let (mut cpus, mut engine, mut beside) = (None, None, None);
+    let mut iter = options.iter();
+    while let Some(&option) = iter.next() {
+        let &value = iter.next().ok_or(USAGE)?;
+        let slot = match option {
+            "--host-cpus" => &mut cpus,
+            "--engine" => &mut engine,
+            _ if option == with_engine => &mut beside,
+            _ => {
+                other(option, value)?;
+                continue;
+            }
+        };
+        if slot.replace(value).is_some() {
+            return Err(format!("{option} is given twice"));
+        }
+    }
+    let engine = match (engine, beside) {
+        (None, None) => None,
+        (Some(socket), Some(name)) if Path::new(socket).is_absolute() => {
+            Some((std::path::PathBuf::from(socket), name.to_string()))
+        }
+        (Some(_), Some(_)) => return Err("--engine is the engine socket's absolute path".into()),
+        _ => return Err(format!("--engine and {with_engine} go together")),
     };
+    Ok(crate::vm::Host {
+        cpus: cpus.map(String::from),
+        engine,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn vm_host(state: &str, options: &[&str]) -> Result<(), String> {
+    let host = host_options(options, "--machine", |_, _| Err(USAGE.into()))?;
     crate::vm::host(state, &host)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn vm_host(_state: &str, _cpus: Option<&str>) -> Result<(), String> {
+fn vm_host(_state: &str, _options: &[&str]) -> Result<(), String> {
     Err("a vm-host runs on macOS and Linux only".into())
 }
 
@@ -146,18 +186,15 @@ fn vm_host(_state: &str, _cpus: Option<&str>) -> Result<(), String> {
 fn boot_proof(options: &[&str]) -> Result<(), String> {
     let mut memory_mb = 1024u64;
     let mut timeout = 60u64;
-    let mut cpus = None;
-    let mut iter = options.iter();
-    while let Some(option) = iter.next() {
-        let value = iter.next().ok_or(USAGE)?;
+    let host = host_options(options, "--image", |option, value| {
         let number = || value.parse::<u64>().map_err(|_| USAGE.to_string());
-        match *option {
+        match option {
             "--memory-mb" => memory_mb = number()?,
             "--timeout-s" => timeout = number()?,
-            "--host-cpus" => cpus = Some(*value),
             _ => return Err(USAGE.into()),
         }
-    }
+        Ok(())
+    })?;
     // A proof is over in seconds; an hour is already no proof, and a time no clock can add is none either.
     if memory_mb == 0 || timeout == 0 || timeout > 3600 {
         return Err(USAGE.into());
@@ -165,13 +202,7 @@ fn boot_proof(options: &[&str]) -> Result<(), String> {
     let memory_bytes = memory_mb
         .checked_mul(1024 * 1024)
         .ok_or("--memory-mb is too large")?;
-    crate::vm::boot_proof(
-        memory_bytes,
-        std::time::Duration::from_secs(timeout),
-        &crate::vm::Host {
-            cpus: cpus.map(String::from),
-        },
-    )
+    crate::vm::boot_proof(memory_bytes, std::time::Duration::from_secs(timeout), &host)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

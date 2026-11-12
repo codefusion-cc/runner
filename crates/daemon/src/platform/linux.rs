@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use cf_budget::{HostError, HostFacts, Mode, Settings};
+use cf_budget::{HostError, HostFacts, Mode, Sandbox, Settings};
 use cf_host_linux::{
     LinuxHost, battery, boot_session, boot_time, cpu_percent, fast_cpus, host_name, load, model,
 };
@@ -43,9 +43,9 @@ impl Platform for Linux {
 
     /// The settings of a host nobody works at ([`Settings::for_headless`]), with machines on its fast cores. `mode`
     /// is not used: nobody sits at it.
-    fn settings(facts: HostFacts, _mode: Mode, trusted: bool) -> Settings {
+    fn settings(facts: HostFacts, _mode: Mode, trusted: bool, sandbox: Sandbox) -> Settings {
         let fast = fast_cpus(Path::new(ROOT)).map_or(0, |cpus| u32::try_from(cpus.len()).unwrap_or(0));
-        let settings = Settings::for_headless(facts, fast);
+        let settings = Settings::for_headless_in(facts, fast, sandbox);
         if trusted {
             settings.one_at_a_time(fast)
         } else {
