@@ -136,6 +136,24 @@ jobs:
           export CF_SUPERVISOR="$PWD/target/${{ matrix.guest }}/debug/supervisor"
           docker build -q -t "codefusion-runner-guest:$CF_GUEST_IMAGE" crates/vmm-oci/tests/image
           cargo test --locked -p cf-vmm-oci --test engine -j4 -- --ignored --test-threads=2
+      # The same against the engine a container host runs (scripts/host-setup.sh --sandbox container): this user's
+      # rootless Podman, its socket opened by the user's systemd.
+      - name: Container mode against rootless Podman
+        timeout-minutes: 10
+        env:
+          CF_GUEST_IMAGE: it-ci
+        run: |
+          command -v podman >/dev/null ||
+            { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends podman uidmap slirp4netns; }
+          podman --version
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; sleep 1; done
+          systemctl --user start podman.socket
+          export CF_ENGINE_SOCKET="$XDG_RUNTIME_DIR/podman/podman.sock"
+          export CF_SUPERVISOR="$PWD/target/${{ matrix.guest }}/debug/supervisor"
+          podman build -q -t "codefusion-runner-guest:$CF_GUEST_IMAGE" crates/vmm-oci/tests/image
+          cargo test --locked -p cf-vmm-oci --test engine -j4 -- --ignored --test-threads=2
 
   fresh-host:
     # A fresh Ubuntu host set up the way a cloud VM is (scripts/host-setup.sh as root: a connect code, no App key),

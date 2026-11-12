@@ -247,7 +247,7 @@ fn merged(now: &str, last: &str, owned: &str, settings: &str) -> Result<serde_js
     }
 }
 
-const OWNED: &str = r#"{"machine": "lon1", "class": null, "state_dir": "/s", "build_folder": null, "image": "i1",
+const OWNED: &str = r#"{"machine": "lon1", "class": null, "sandbox": null, "engine": null, "state_dir": "/s", "build_folder": null, "image": "i1",
     "console": "https://c", "github_api": null, "use": "dedicated"}"#;
 
 #[test]
@@ -274,6 +274,29 @@ fn keys_the_runner_or_the_console_set_stay_and_settings_left_out_go() {
             "max_jobs": 2, "ci_memory_gb": 10.6
         })),
         "the console's max_jobs stays; ci_cpus and vcpus, set by the last run alone, go; an owned key now null goes"
+    );
+}
+
+#[test]
+fn a_host_moved_from_containers_to_machines_loses_its_engine() {
+    let container = OWNED.replace(
+        r#""sandbox": null, "engine": null"#,
+        r#""sandbox": "container", "engine": "/run/user/1001/podman/podman.sock""#,
+    );
+    let now = merged("{}", "{}", &container, "{}").expect("a container host");
+    assert_eq!(
+        (&now["sandbox"], &now["engine"]),
+        (
+            &serde_json::json!("container"),
+            &serde_json::json!("/run/user/1001/podman/podman.sock")
+        )
+    );
+    let vm = merged(&now.to_string(), "{}", OWNED, "{}").expect("a machine host");
+    assert!(vm.get("sandbox").is_none() && vm.get("engine").is_none(), "{vm}");
+    let refused = merged("{}", "{}", OWNED, r#"{"engine": "/x.sock"}"#).expect_err("refused");
+    assert!(
+        refused.contains("--settings: engine only this script sets"),
+        "{refused}"
     );
 }
 
@@ -429,6 +452,23 @@ fn each_step_takes_only_its_own_options() {
         ),
         (base.to_vec(), "--code-file is needed (or --check)"),
         (vec!["enroll", "--home", "relative"], "--home: an absolute path"),
+        (
+            vec!["enroll", "--sandbox", "container"],
+            "enroll takes --sandbox from the configuration",
+        ),
+        (
+            [&["install"][..], &base, &["--sandbox", "chroot"]].concat(),
+            "--sandbox: vm or container",
+        ),
+        (
+            [
+                &["install"][..],
+                &base,
+                &["--sandbox", "container", "--class", "trusted"],
+            ]
+            .concat(),
+            "--sandbox: a trusted host runs its jobs in machines",
+        ),
         (vec!["install", "--machine"], "--machine needs a value"),
     ];
     for (args, said) in cases {
@@ -461,6 +501,19 @@ fn right_options_get_as_far_as_asking_for_root() {
         [
             &base[..],
             &["--version", "0.1.0-446125c0a1b2", "--sha256", SHA, "--check"],
+        ]
+        .concat(),
+        [
+            &["install"][..],
+            &base,
+            &[
+                "--sandbox",
+                "container",
+                "--version",
+                "0.1.0-446125c0a1b2",
+                "--sha256",
+                SHA,
+            ],
         ]
         .concat(),
         vec!["enroll", "--code-file", "/nowhere/code", "--home", "/home/x"],

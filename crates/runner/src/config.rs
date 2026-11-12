@@ -136,7 +136,8 @@ pub struct Config {
     /// What keeps each job from the host: `vm`, a virtual machine of its own (left out, this), or `container`, a
     /// container of its own in a Docker-compatible engine ([`Config::engine`]), for a host that gives no
     /// virtualization. A container shares the host's kernel, so such a host serves private repositories only, gives
-    /// no job Docker, is never trusted, and has [`CONTAINER_LABEL`] in `labels` and `only_labels`.
+    /// no job Docker, is never trusted, and takes only the jobs that ask for [`CONTAINER_LABEL`], which it adds to
+    /// `labels` and `only_labels` itself.
     #[serde(default, deserialize_with = "sandbox")]
     pub sandbox: Sandbox,
     /// The API socket of the engine jobs run in with `sandbox: container`, such as
@@ -191,7 +192,15 @@ impl Config {
 
     /// Reads and checks the file's text.
     pub fn parse(text: &str) -> Result<Config, String> {
-        let config: Config = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let mut config: Config = serde_json::from_str(text).map_err(|error| error.to_string())?;
+        if config.sandbox == Sandbox::Container {
+            // Only the jobs that ask for a container run on a container host, whoever wrote its file.
+            for list in [&mut config.labels, &mut config.only_labels] {
+                if !list.iter().any(|label| label == CONTAINER_LABEL) {
+                    list.push(CONTAINER_LABEL.into());
+                }
+            }
+        }
         config.check()?;
         Ok(config)
     }
@@ -362,12 +371,6 @@ impl Config {
                 return Err(format!("engine: `{}` is not an absolute path", socket.display()));
             }
             Some(_) => {}
-        }
-        if !has_label || !self.only_labels.iter().any(|label| label == CONTAINER_LABEL) {
-            return Err(format!(
-                "labels and only_labels: a container host has `{CONTAINER_LABEL}` in both, so that only the jobs \
-                 that ask for a container run here"
-            ));
         }
         if self.class == Class::Trusted || self.trusted.is_some() {
             return Err(
@@ -947,12 +950,10 @@ mod tests {
         assert!(with(|v| v["docker_max_jobs"] = 8.into()).is_ok());
     }
 
-    /// A container host: its engine, and `cf-container` in both label lists.
+    /// A container host: its engine.
     fn container(v: &mut serde_json::Value) {
         v["sandbox"] = "container".into();
         v["engine"] = "/run/user/1001/docker.sock".into();
-        v["labels"] = serde_json::json!(["cf-linux", "cf-container"]);
-        v["only_labels"] = serde_json::json!(["cf-container"]);
     }
 
     #[test]
@@ -961,6 +962,27 @@ mod tests {
         assert_eq!((vm.sandbox, vm.engine), (Sandbox::Vm, None));
         let host = with(container).expect("a container host");
         assert_eq!(host.sandbox, Sandbox::Container);
+        assert_eq!(
+            (host.labels, host.only_labels),
+            (
+                [labels(), vec!["cf-container".into()]].concat(),
+                vec!["cf-container".into()]
+            ),
+            "it takes only the jobs that ask for a container"
+        );
+        let kept = with(|v| {
+            container(v);
+            v["labels"] = serde_json::json!(["cf-linux", "cf-container", "cf-ops"]);
+            v["only_labels"] = serde_json::json!(["cf-ops"]);
+        })
+        .expect("labels of its own");
+        assert_eq!(
+            (kept.labels, kept.only_labels),
+            (
+                vec!["cf-linux".into(), "cf-container".into(), "cf-ops".into()],
+                vec!["cf-ops".into(), "cf-container".into()]
+            )
+        );
         assert_eq!(
             host.engine.as_deref(),
             Some(Path::new("/run/user/1001/docker.sock"))
@@ -986,8 +1008,6 @@ mod tests {
                 "engine:",
             ),
             (|v| v["engine"] = "docker.sock".into(), "not an absolute path"),
-            (|v| v["only_labels"] = serde_json::json!([]), "in both"),
-            (|v| v["labels"] = serde_json::json!(["cf-linux"]), "only_labels"),
             (
                 |v| v["docker_repos"] = serde_json::json!(["org/app"]),
                 "docker_repos",
@@ -996,13 +1016,7 @@ mod tests {
                 |v| v["public_repos"] = serde_json::json!(["org/site"]),
                 "public_repos",
             ),
-            (
-                |v| {
-                    v["class"] = "trusted".into();
-                    v["only_labels"] = serde_json::json!([]);
-                },
-                "",
-            ),
+            (|v| v["class"] = "trusted".into(), "class:"),
         ] {
             let said = refused(change);
             assert!(said != "taken" && said.contains(word), "{word}: {said}");

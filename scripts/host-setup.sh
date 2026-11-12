@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sets up a Linux host (Ubuntu 24.04 or Debian 12, x86_64 or arm64, with KVM) as a Runner of the console, unattended,
+# Sets up a Linux host (Ubuntu 24.04 or Debian 12, x86_64 or arm64, with KVM, or without it in container mode) as a Runner of the console, unattended,
 # as root, in two steps that hosts kept as code run apart, or both at once as a cloud VM's startup script does:
 #
 #   scripts/host-setup.sh install --machine <name> --console <url> [options]   everything but the enrolment
@@ -26,6 +26,10 @@
 #
 # --class      shared (the default) or trusted: a host that runs only main's deploy, release and signing jobs of
 #              codefusion-cc/codefusion, by the Runner's default rules (crates/trusted), one job at a time
+# --sandbox    vm (the default): each job in a machine of its own, which needs KVM; or container: each job in a
+#              container of its own in the Runner user's rootless Podman, for a host without virtualization. Such a host
+#              takes only `cf-container` jobs of private repositories, gives no job Docker and is never trusted. Its image
+#              is a container-image release, which `image install --engine` puts in Podman.
 # --settings   a JSON object of more keys for the configuration (`ci_memory_gb`, `ci_cpus`, `vcpus`, `labels` …), never
 #              one this script writes; a key a run before set and this one leaves out is taken out again
 # --code-file  the console's one-time connect code, alone in a file only root reads; deleted once the host enrolled
@@ -49,18 +53,20 @@ GITHUB_REPO=https://github.com/codefusion-cc/runner
 RELEASES_API=https://api.github.com/repos/codefusion-cc/runner/releases
 # A build needs the compiler and OpenSSL's headers; the Runner itself, passt (its machines' network) and curl's libssl.
 PACKAGES=(passt curl jq ca-certificates)
+# Container mode's engine: Podman, rootless, with the subordinate ids and the user's D-Bus it runs on.
+CONTAINER_PACKAGES=(podman uidmap slirp4netns dbus-user-session)
 BUILD_PACKAGES=(git build-essential pkg-config libssl-dev)
 # The hold `install` sets while it puts a new Runner in place.
 SETUP_HOLD=host-setup
 # A wait for running jobs that ran out: the hold is lifted, nothing changed, and a later run tries again.
 TIMED_OUT=75
 # The keys of the configuration this script writes itself; --settings sets the others.
-OWNED_KEYS='["machine", "class", "state_dir", "build_folder", "image", "console", "github_api", "use"]'
+OWNED_KEYS='["machine", "class", "sandbox", "engine", "state_dir", "build_folder", "image", "console", "github_api", "use"]'
 # Keys --settings may not set although this script leaves them be: a trusted host's rules and the Mac app's folder.
 REFUSED_SETTINGS='["trusted", "app_dir"]'
 
-mode=both machine='' console='' code_file='' class=shared ref='' image='' home=/home/$USER_NAME repo=$GITHUB_REPO
-github_api='' check=0 dry=0 settings='' binary='' version='' sha256=''
+mode=both machine='' console='' code_file='' class=shared sandbox=vm ref='' image='' home=/home/$USER_NAME repo=$GITHUB_REPO
+github_api='' check=0 dry=0 settings='' engine='' binary='' version='' sha256=''
 # The clone this script is in; none when it came on standard input (curl … | bash -s), which then names --ref.
 here=''
 [[ -f ${BASH_SOURCE[0]:-} ]] && here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -161,7 +167,7 @@ while (($#)); do
   case $1 in
     --check) check=1; shift; continue ;;
     --dry-run) dry=1; shift; continue ;;
-    --machine | --console | --class | --settings | --binary | --version | --sha256 | --ref | --image | --repo | --github-api)
+    --machine | --console | --class | --sandbox | --settings | --binary | --version | --sha256 | --ref | --image | --repo | --github-api)
       [[ $mode != enroll ]] || fail "enroll takes $1 from the configuration install wrote"
       ;;
     --code-file) [[ $mode != install ]] || fail "install takes no code; enroll does" ;;
@@ -176,6 +182,7 @@ while (($#)); do
     --console) console=$2 ;;
     --code-file) code_file=$2 ;;
     --class) class=$2 ;;
+    --sandbox) sandbox=$2 ;;
     --settings) settings=$2 ;;
     --binary) binary=$2 ;;
     --version) version=$2 ;;
@@ -193,6 +200,8 @@ done
 [[ $home == /* && $home != *[[:space:]\"\\\$\`\']* ]] || fail "--home: an absolute path without spaces or quotes"
 if [[ $mode != enroll ]]; then
   [[ $class == shared || $class == trusted ]] || fail "--class: shared or trusted"
+  [[ $sandbox == vm || $sandbox == container ]] || fail "--sandbox: vm or container"
+  [[ $sandbox == vm || $class == shared ]] || fail "--sandbox: a trusted host runs its jobs in machines"
   [[ $machine =~ ^[a-z0-9]+(-[a-z0-9]+)*$ && ${#machine} -le 24 ]] ||
     fail "--machine: lowercase letters, digits and dashes, at most 24"
   # As the Runner has it: https, or http only to this host.
@@ -224,10 +233,12 @@ if [[ -n $code_file && ( -e $code_file || -L $code_file ) ]]; then
 fi
 ((EUID == 0)) || fail "run it as root"
 case $(uname -m) in
-  x86_64) image_prefix=amd64-image- platform=amd64 ;;
-  aarch64) image_prefix=image- platform=arm64 ;;
+  x86_64) image_prefix=amd64- platform=amd64 ;;
+  aarch64) image_prefix='' platform=arm64 ;;
   *) fail "this host is $(uname -m); the Runner runs on x86_64 and arm64" ;;
 esac
+# A machine's image is image-… (arm64) or amd64-image-…; a container's is container-image-… or amd64-container-image-….
+if [[ $sandbox == container ]]; then image_prefix+=container-image-; else image_prefix+=image-; fi
 
 # A command as the Runner's user, in its home, with its own systemd reachable and its Rust on the path.
 as_user() {
@@ -347,6 +358,7 @@ install_host() {
   step=packages
   local wanted=("${PACKAGES[@]}") missing=() package present
   ((!built_here)) || wanted+=("${BUILD_PACKAGES[@]}")
+  [[ $sandbox != container ]] || wanted+=("${CONTAINER_PACKAGES[@]}")
   # One question for all: a package dpkg does not know is left out of its answer, and so is missing.
   present=$(
     trap - ERR
@@ -370,7 +382,8 @@ install_host() {
       done
     fi
   fi
-  [[ -e /dev/kvm ]] || fail "no /dev/kvm: on a cloud VM, turn nested virtualization on"
+  [[ $sandbox == container || -e /dev/kvm ]] ||
+    fail "no /dev/kvm: on a cloud VM, turn nested virtualization on, or run its jobs in containers (--sandbox container)"
   if ((dry)) && ! command -v jq >/dev/null; then
     change "set up the rest of the host: the Runner's user, the Runner, its image and its configuration"
     return
@@ -386,7 +399,7 @@ install_host() {
     mkdir -p "$(dirname "$home")"
     useradd --create-home --home-dir "$home" --shell /bin/bash "$USER_NAME"
   fi
-  if ! id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx kvm; then
+  if [[ $sandbox == vm ]] && ! id -nG "$USER_NAME" | tr ' ' '\n' | grep -qx kvm; then
     change "add $USER_NAME to kvm"
     ((dry)) || usermod -aG kvm "$USER_NAME"
   fi
@@ -417,6 +430,7 @@ install_host() {
     fi
   fi
 
+  [[ $sandbox == vm ]] || place_engine
   if ((built_here)); then
     build_here
   else
@@ -424,6 +438,38 @@ install_host() {
   fi
   place_image
   write_config
+}
+
+# Container mode's engine: the Runner user's own Podman, whose API socket systemd opens and which starts on the first
+# call. Its containers' users map into subordinate ids of that user's, never onto the host's root.
+place_engine() {
+  step=engine
+  engine=/run/user/$(id -u "$USER_NAME" 2>/dev/null || echo 0)/podman/podman.sock
+  local file start
+  for file in /etc/subuid /etc/subgid; do
+    if ! grep -q "^$USER_NAME:" "$file" 2>/dev/null; then
+      change "give $USER_NAME 65536 subordinate ids in $file"
+      if ((!dry)); then
+        # After every range given, and never below 100000, where useradd starts.
+        start=$(cat /etc/subuid /etc/subgid 2>/dev/null | awk -F: '$3 ~ /^[0-9]+$/ { end = $2 + $3; if (end > top) top = end }
+          END { print (top > 100000 ? top : 100000) }')
+        if [[ $file == /etc/subuid ]]; then
+          usermod --add-subuids "$start-$((start + 65535))" "$USER_NAME"
+        else
+          usermod --add-subgids "$start-$((start + 65535))" "$USER_NAME"
+        fi
+      fi
+    fi
+  done
+  if ! as_user "systemctl --user is-enabled -q podman.socket 2>/dev/null && systemctl --user is-active -q podman.socket"; then
+    change "open Podman's socket for $USER_NAME at $engine"
+    ((dry)) && return
+    # Podman reads the subordinate ids when it first runs; one that ran before them knows none.
+    as_user "podman system migrate >/dev/null 2>&1 || true; systemctl --user enable --now podman.socket"
+  fi
+  ((dry)) && return
+  as_user "curl -fsS --max-time 30 --unix-socket '$engine' http://engine/_ping >/dev/null" ||
+    fail "Podman does not answer at $engine"
 }
 
 # The Runner built from its own checkout at --ref. Once enrolled, the console's updates move that checkout, so a run
@@ -530,6 +576,16 @@ place_image() {
     [[ -n $image ]] || fail "no ${image_prefix}… release at $RELEASES_API"
   fi
   [[ $image =~ ^[A-Za-z0-9.-]+$ ]] || fail "--image: not a release name"
+  local into=''
+  if [[ $sandbox == container ]]; then
+    into=" --engine '$engine'"
+    # Its folder keeps the release's record; the files the jobs start from are in Podman, which may have lost them.
+    if [[ -d $state/images/$image ]] && ! as_user "podman image exists 'codefusion-runner-guest:$image'"; then
+      change "install image $image again: Podman no longer holds it"
+      ((dry)) && return
+      as_user "rm -rf '$state/images/$image'"
+    fi
+  fi
   if [[ ! -d $state/images/$image ]]; then
     change "install image $image"
     ((dry)) && return
@@ -538,7 +594,7 @@ place_image() {
     [[ $files =~ ^([A-Za-z0-9._-]+\ )+$ ]] || fail "release $image has no files, or one whose name is not plain"
     as_user "rm -rf 'downloads/$image' && mkdir -p 'downloads/$image' && cd 'downloads/$image' &&
       for f in $files; do curl -fsSL --retry 5 -o \"\$f\" '$GITHUB_REPO/releases/download/$image/'\"\$f\"; done &&
-      '$program' image install \"\$PWD\" --version '$image' --state-dir '$state' && cd && rm -rf 'downloads/$image'"
+      '$program' image install \"\$PWD\" --version '$image' --state-dir '$state'$into && cd && rm -rf 'downloads/$image'"
   fi
 }
 
@@ -551,10 +607,13 @@ write_config() {
   [[ ! -f $config ]] || now=$(trap - ERR; user_file "$config" | jq -S -c .) || fail "$config is no JSON"
   [[ ! -f $last_settings ]] || last=$(trap - ERR; user_file "$last_settings" | jq -S -c .) || fail "$last_settings is no JSON"
   [[ -z $settings ]] || given=$(trap - ERR; jq -S -c . "$settings") || fail "--settings: $settings is no JSON"
-  owned=$(jq -n -c --arg machine "$machine" --arg class "$class" --arg state "$state" --arg image "$image" \
+  owned=$(jq -n -c --arg machine "$machine" --arg class "$class" --arg sandbox "$sandbox" --arg engine "$engine" \
+    --arg state "$state" --arg image "$image" \
     --arg console "$console" --arg github_api "$github_api" --arg build "$checkout" --argjson built "$built_here" '{
       machine: $machine,
       class: (if $class == "trusted" then $class else null end),
+      sandbox: (if $sandbox == "container" then $sandbox else null end),
+      engine: (if $sandbox == "container" then $engine else null end),
       state_dir: $state,
       build_folder: (if $built == 1 then $build else null end),
       image: $image,
