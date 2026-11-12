@@ -300,6 +300,47 @@ fn a_host_moved_from_containers_to_machines_loses_its_engine() {
     );
 }
 
+/// `kept_image` of the script, sourced: the image an enrolled host keeps of the one configured, for this prefix.
+fn kept(configured: &str, prefix: &str) -> String {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/host-setup.sh");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\" && kept_image \"$2\" \"$3\"",
+            "bash",
+            script,
+            configured,
+            prefix,
+        ])
+        .output()
+        .expect("bash runs");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).expect("UTF-8")
+}
+
+#[test]
+fn an_enrolled_host_keeps_its_image_only_while_its_sandbox_runs_that_kind() {
+    assert_eq!(
+        kept("amd64-image-2026.11.12-1", "amd64-image-"),
+        "amd64-image-2026.11.12-1\n"
+    );
+    assert_eq!(
+        kept("container-image-2026.11.12-1", "container-image-"),
+        "container-image-2026.11.12-1\n"
+    );
+    assert_eq!(
+        kept("amd64-image-2026.11.12-1", "amd64-container-image-"),
+        "",
+        "moved to containers"
+    );
+    assert_eq!(
+        kept("container-image-2026.11.12-1", "image-"),
+        "",
+        "moved to machines"
+    );
+    assert_eq!(kept("", "image-"), "", "none configured");
+}
+
 #[test]
 fn settings_that_name_an_owned_key_or_are_no_object_are_refused() {
     let refused = merged(

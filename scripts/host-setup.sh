@@ -155,6 +155,13 @@ merged_config() {
     end'
 }
 
+# The image an enrolled host's configuration names ($1), on standard output, while it is of the kind its sandbox runs,
+# whose names start with $2; nothing for one of the other kind, so a host moved between machines and containers
+# installs the newest of its new kind.
+kept_image() {
+  if [[ -n $1 && $1 == "$2"* ]]; then printf '%s\n' "$1"; fi
+}
+
 # Sourced (the tests), it only defines the above.
 if (return 0 2>/dev/null); then return 0; fi
 case ${1-} in
@@ -565,8 +572,12 @@ place_image() {
   step=image
   if ((enrolled)); then
     # The Runner keeps its image up to date itself; the configuration keeps the one it named.
-    image=$(user_file "$config" | jq -r '.image // empty')
-    return
+    local kept
+    kept=$(kept_image "$(user_file "$config" | jq -r '.image // empty')" "$image_prefix")
+    if [[ -n $kept ]]; then
+      image=$kept
+      return
+    fi
   fi
   if [[ -z $image ]]; then
     # The arm64 releases are image-…, the x86_64 ones amd64-image-… of the same build.
