@@ -7,5 +7,6 @@ pub mod gate;
 pub mod hook;
 pub mod init;
 mod job;
+mod lock_in;
 mod net;
 mod sys;

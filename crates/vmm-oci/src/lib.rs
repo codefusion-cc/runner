@@ -7,7 +7,11 @@
 //!
 //! - made from the image `codefusion-runner-guest:<version>` the engine holds ([`image_tag`]), with nothing of the
 //!   host's mounted in it: no folder, no device and never the engine's socket;
-//! - as the image's user `runner`, every capability dropped, `no-new-privileges`, never privileged;
+//! - never privileged, with `no-new-privileges`, and with no capability but the four its supervisor needs to lock the
+//!   job in: as the container's root it loads the machine's firewall into the container's own network namespace
+//!   (the host's networks, private ranges and metadata out of reach, DNS to the engine's forwarder only), checks that
+//!   the memory and process limits are in force, empties the bounding set, installs a seccomp filter against user
+//!   namespaces and becomes the image's user `runner`, with no capability left, before the job's first program;
 //! - held to the machine's size of memory with no swap ([`cf_vmm::VmSpec::memory_bytes`]), its CPUs, and 4096
 //!   processes;
 //! - its writable layer, where its job's files go, held to the job's scratch size: by the engine where its storage
@@ -470,7 +474,8 @@ impl OciVmm {
         let memory = spec.memory_bytes;
         let mut body = json!({
             "Image": image_tag(version),
-            "User": "runner",
+            // The supervisor locks the job in as the container's root, then becomes `runner` for good.
+            "User": "0:0",
             "Entrypoint": [SUPERVISOR],
             "Cmd": ["container-guest"],
             "Env": [],
@@ -492,7 +497,9 @@ impl OciVmm {
                 "NanoCpus": spec.cpus as u64 * 1_000_000_000,
                 "PidsLimit": PIDS,
                 "CapDrop": ["ALL"],
-                "CapAdd": [],
+                // The firewall of its own network namespace, the bounding set, and the change to the job's user:
+                // all gone, in every set, before the job's first program.
+                "CapAdd": ["NET_ADMIN", "SETGID", "SETPCAP", "SETUID"],
                 "SecurityOpt": ["no-new-privileges"],
                 "Privileged": false,
                 "ReadonlyRootfs": false,
@@ -1050,10 +1057,15 @@ mod tests {
         let body = vmm().create_body(&spec(), "image-20261112-7", Some("codefusion-host-1-vm-7-0"));
         let host = &body["HostConfig"];
         assert_eq!(body["Image"], "codefusion-runner-guest:image-20261112-7");
-        assert_eq!(body["User"], "runner", "never root");
+        // The supervisor starts as the container's root to lock the job in, with only what that takes: the
+        // firewall of its own network namespace, the bounding set and the change to the job's user `runner`.
+        assert_eq!(body["User"], "0:0");
         assert_eq!(host["Privileged"], false);
         assert_eq!(host["CapDrop"], json!(["ALL"]));
-        assert_eq!(host["CapAdd"], json!([]));
+        assert_eq!(
+            host["CapAdd"],
+            json!(["NET_ADMIN", "SETGID", "SETPCAP", "SETUID"])
+        );
         assert_eq!(host["SecurityOpt"], json!(["no-new-privileges"]));
         // Nothing of the host's: no folder, no device, no volume of another container, so never the engine's socket.
         for empty in ["Binds", "Mounts", "Devices", "VolumesFrom"] {

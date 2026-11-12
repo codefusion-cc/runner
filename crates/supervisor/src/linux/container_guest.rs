@@ -1,17 +1,21 @@
 //! The supervisor in a container of a Docker-compatible engine: the Runner's container mode (`container-guest`).
 //!
-//! The engine is the sandbox here: a container of the job's own, with the memory, CPU and process caps set on it by
-//! the host, every capability dropped and no new privileges. This process is the container's first, as the image's
-//! user `runner`, never root. It talks to the host on its standard input and output (the host attached to them
-//! before the container started) and writes what it says, and the workload's output, to its standard error, which
-//! the host keeps as the job's console log.
+//! The engine holds the container to the job's memory, CPUs and processes, with no new privileges. This process is
+//! the container's first, started as its root with four capabilities, and before any task it locks the job in
+//! ([`super::lock_in`]): the machine's firewall in the container's own network namespace, the limits checked in
+//! force, the bounding set emptied, a seccomp filter against user namespaces, and the image's user `runner`, with no
+//! capability left. It talks to the host on its standard input and output (the host attached to them before the
+//! container started) and writes what it says, and the workload's output, to its standard error, which the host
+//! keeps as the job's console log. Its input ends with the host's attach, and a job its host never ends it ends at
+//! the latest end the host gave.
 //!
-//! What a machine's supervisor does with disks, modules, the network and a firewall is the engine's here, so this
-//! runs the job and watches it as [`super::job`] does, and refuses what it cannot hold in: Docker jobs, which would
-//! need a daemon of their own, and trusted jobs, which stay on machines.
+//! What a machine's supervisor does with disks and modules is the engine's here, so this runs the job and watches
+//! it as [`super::job`] does, and refuses what it cannot hold in: Docker jobs, which would need a daemon of their
+//! own, and trusted jobs, which stay on machines.
 
 use super::init::{Event, Failure, Host, LAST_WORDS, describe};
 use super::job::{Sandbox, Watch, empty_summary, forward_output, share_in, usage_of};
+use super::lock_in::lock_in;
 use super::sys::{self, context, say};
 use cf_guest_proto::GuestEnd;
 use cf_guest_proto::{
@@ -108,6 +112,12 @@ pub fn run() -> ! {
             end_container();
         }
     };
+    // First, before any other thread and whatever the task: a probe proves the lock as a job needs it.
+    let blocked = match &start.task {
+        Task::Job(job) => job.blocked.clone(),
+        Task::Probe | Task::FormatScratch => Vec::new(),
+    };
+    let locked = lock_in(USER, &blocked);
     let (sender, events) = mpsc::channel();
     let to_watch = sender.clone();
     std::thread::spawn(move || {
@@ -125,7 +135,7 @@ pub fn run() -> ! {
             }
         }
     });
-    match perform(start, &host, sender, &events) {
+    match locked.and_then(|_| perform(start, &host, sender, &events)) {
         Ok(summary) => host.send(&GuestMessage::Exited(summary)),
         Err((stage, message)) => {
             say(&format!("{stage}: {message}"));
