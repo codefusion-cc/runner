@@ -94,6 +94,32 @@ impl Engine {
         Ok(Response { status, body })
     }
 
+    /// Sends `length` bytes of `body` as a request of this content type, read and sent as they come, and reads the
+    /// whole answer. A body that ends before `length` is an error, and the engine sees the request cut short.
+    pub fn upload(
+        &self,
+        path: &str,
+        kind: &str,
+        body: &mut dyn io::Read,
+        length: u64,
+        timeout: Option<Duration>,
+    ) -> io::Result<Response> {
+        let mut stream = self.connect(timeout)?;
+        send_head(&mut stream, "POST", path, Some(kind), length, &[])?;
+        let sent = io::copy(&mut io::Read::take(body, length), &mut stream)?;
+        if sent != length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("the body ended after {sent} of {length} bytes"),
+            ));
+        }
+        stream.flush()?;
+        let mut reader = BufReader::new(stream);
+        let (status, headers) = read_head(&mut reader)?;
+        let body = read_body(&mut reader, &headers)?;
+        Ok(Response { status, body })
+    }
+
     /// Attaches to a container's standard input, output and error. The answer is the connection itself, raw from
     /// here on, with what the engine sent of the streams with its head.
     pub fn attach(&self, path: &str) -> io::Result<(UnixStream, Vec<u8>)> {
@@ -129,12 +155,6 @@ fn send(
     body: &Body<'_>,
     extra: &[(&str, &str)],
 ) -> io::Result<()> {
-    if !path.starts_with('/') || path.bytes().any(|byte| byte.is_ascii_control() || byte == b' ') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no path for a request",
-        ));
-    }
     let json;
     let (kind, bytes): (Option<&str>, &[u8]) = match body {
         Body::Empty => (None, &[]),
@@ -144,11 +164,30 @@ fn send(
         }
         Body::Tar(bytes) => (Some("application/x-tar"), bytes),
     };
+    send_head(stream, method, path, kind, bytes.len() as u64, extra)?;
+    stream.write_all(bytes)?;
+    stream.flush()
+}
+
+fn send_head(
+    stream: &mut UnixStream,
+    method: &str,
+    path: &str,
+    kind: Option<&str>,
+    length: u64,
+    extra: &[(&str, &str)],
+) -> io::Result<()> {
+    if !path.starts_with('/') || path.bytes().any(|byte| byte.is_ascii_control() || byte == b' ') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no path for a request",
+        ));
+    }
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: engine\r\nUser-Agent: codefusion-runner\r\n");
     if let Some(kind) = kind {
         head.push_str(&format!("Content-Type: {kind}\r\n"));
     }
-    head.push_str(&format!("Content-Length: {}\r\n", bytes.len()));
+    head.push_str(&format!("Content-Length: {length}\r\n"));
     if extra.is_empty() {
         head.push_str("Connection: close\r\n");
     }
@@ -156,9 +195,7 @@ fn send(
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(bytes)?;
-    stream.flush()
+    stream.write_all(head.as_bytes())
 }
 
 fn bad(what: impl Into<String>) -> io::Error {
@@ -345,5 +382,87 @@ mod tests {
         );
         assert_eq!(escape("plain-1.2_3~"), "plain-1.2_3~");
         assert_eq!(escape("ż"), "%C5%BC");
+    }
+
+    /// A request's head and body, as the engine read them.
+    type Received = (String, Vec<u8>);
+
+    /// An engine at a socket of its own that reads one request, head and `Content-Length` bytes, answers 200 and
+    /// gives back what it read: `None` when the request was cut short.
+    fn one_request_engine() -> (
+        tempfile::TempDir,
+        Engine,
+        std::thread::JoinHandle<Option<Received>>,
+    ) {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let served = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().ok()?;
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).ok()?;
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))?
+                .trim()
+                .parse()
+                .ok()?;
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).ok()?;
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .ok()?;
+            Some((head, body))
+        });
+        (folder, Engine::new(&socket), served)
+    }
+
+    #[test]
+    fn an_upload_sends_its_body_as_it_is_read_and_one_that_ends_early_is_cut_short() {
+        let (_folder, engine, served) = one_request_engine();
+        let body: Vec<u8> = (0..3_000_000u32).map(|n| n as u8).collect();
+        let answer = engine
+            .upload(
+                "/images/create?fromSrc=-",
+                "application/x-tar",
+                &mut &body[..],
+                body.len() as u64,
+                None,
+            )
+            .unwrap();
+        assert_eq!((answer.status, answer.body.as_slice()), (200, &b"ok"[..]));
+        let (head, received) = served.join().unwrap().expect("the whole request");
+        assert!(
+            head.starts_with("POST /images/create?fromSrc=- HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Content-Type: application/x-tar\r\n"), "{head}");
+        assert!(received == body, "every byte, in order");
+
+        let (_folder, engine, served) = one_request_engine();
+        let said = engine
+            .upload(
+                "/images/create?fromSrc=-",
+                "application/x-tar",
+                &mut &body[..1000],
+                5000,
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap_err();
+        assert_eq!(said.kind(), io::ErrorKind::UnexpectedEof, "{said}");
+        assert_eq!(
+            served.join().unwrap(),
+            None,
+            "the engine never got a whole request"
+        );
     }
 }

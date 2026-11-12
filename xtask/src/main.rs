@@ -5,9 +5,10 @@
 //! - `guest`: builds the kernel and initramfs of the host's architecture into `target/guest`, signed with a key made
 //!   for that build.
 //! - `release --version V --out DIR --rootfs FILE (--key-file F | --ephemeral) [--guest DIR] [--arch A]
-//!   [--max-part BYTES]`: the signed release folder with the root filesystem in parts, as the image workflow
-//!   publishes it, verified before the task ends. `--guest` is where the kernel and initramfs are (default
-//!   `target/guest`), `--arch` what they are built for (default the host's).
+//!   [--max-part BYTES] [--rootfs-kind erofs|tar.gz]`: the signed release folder with the root filesystem in parts,
+//!   as the image workflow publishes it, verified before the task ends. `--guest` is where the kernel and initramfs
+//!   are (default `target/guest`), `--arch` what they are built for (default the host's), `--rootfs-kind` whether
+//!   the root filesystem is an erofs image (the default) or a gzip tar for container hosts.
 //! - `kernel check`: whether our copy of each architecture's pinned kernel package and Alpine still give it, and
 //!   whether Alpine has a newer one. Fails when our copy of either does not.
 //! - `cloud-hypervisor`: the Linux monitor pinned for the host's architecture into `target/vmm-programs`, where

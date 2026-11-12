@@ -251,16 +251,21 @@ fn version_of(bytes: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// The installed image's root file system; in container mode, its folder, as the engine holds the rest (`check`
+/// asks the engine).
 fn installed_image(config: &Config) -> Result<PathBuf, String> {
-    cf_image::store::Store::new(config.state_dir.join("images"))
-        .rootfs(&config.image)
-        .ok_or_else(|| {
-            format!(
-                "image {} is not installed in {}; run `image install`",
-                config.image,
-                config.state_dir.display()
-            )
-        })
+    let store = cf_image::store::Store::new(config.state_dir.join("images"));
+    let (installed, how) = match config.sandbox {
+        cf_budget::Sandbox::Vm => (store.rootfs(&config.image), "`image install`"),
+        cf_budget::Sandbox::Container => (store.installed(&config.image), "`image install` with `--engine`"),
+    };
+    installed.ok_or_else(|| {
+        format!(
+            "image {} is not installed in {}; run {how}",
+            config.image,
+            config.state_dir.display()
+        )
+    })
 }
 
 /// What only a Runner that runs gives its service; a command that only looks or cleans up gives none of it.
@@ -1604,6 +1609,27 @@ mod tests {
             "16.00 GiB and 8 cores, someone's own Mac: 9.60 GiB and 6 CPUs for machines while the person is away, none \
              otherwise; cf-2g with 2 CPUs, cf-4g with 3 CPUs, cf-6g with 4 CPUs, cf-8g with 4 CPUs; \
              2 cf-4g side by side"
+        );
+    }
+
+    #[test]
+    fn in_container_mode_an_image_is_installed_without_a_root_file_system_on_the_disk() {
+        let folder = tempfile::tempdir().expect("folder");
+        let state = folder.path().join("state");
+        let mut config = config(&state);
+        config.sandbox = cf_budget::Sandbox::Container;
+        let said = installed_image(&config).unwrap_err();
+        assert!(said.ends_with("run `image install` with `--engine`"), "{said}");
+        // What `image install --engine` leaves: the verified release's files, the root file system in the engine.
+        let image = state.join("images").join(&config.image);
+        std::fs::create_dir_all(&image).expect("the image's folder");
+        std::fs::write(image.join(cf_image::MANIFEST_NAME), "{}").expect("its manifest");
+        assert_eq!(installed_image(&config), Ok(image));
+        config.sandbox = cf_budget::Sandbox::Vm;
+        let said = installed_image(&config).unwrap_err();
+        assert!(
+            said.ends_with("run `image install`"),
+            "a machine boots from the file: {said}"
         );
     }
 

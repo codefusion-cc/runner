@@ -18,6 +18,7 @@
 //!   away by the next vm-host when the one that made it is gone ([`OciVmm::new`]).
 
 pub mod http;
+pub mod image;
 pub mod initramfs;
 mod stream;
 pub mod tar;

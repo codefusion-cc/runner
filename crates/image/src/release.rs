@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::ImageError;
 use crate::manifest::{
-    Asset, FORMAT, MANIFEST_NAME, Manifest, Rootfs, SIGNATURE_NAME, SUMS_NAME, valid_asset_name,
+    Asset, FORMAT, MANIFEST_NAME, Manifest, Rootfs, RootfsKind, SIGNATURE_NAME, SUMS_NAME, valid_asset_name,
 };
 use crate::verify::decode_key;
 
@@ -27,6 +27,8 @@ pub struct ReleaseInputs<'a> {
     pub initramfs: &'a Path,
     /// The root filesystem, when the release has one.
     pub rootfs: Option<&'a Path>,
+    /// What the root filesystem is: an erofs image, or a tar for container hosts.
+    pub rootfs_kind: RootfsKind,
     /// The largest size of one published part of the root filesystem (a release asset is at most 2 GiB).
     pub max_part: u64,
 }
@@ -61,7 +63,11 @@ pub fn write_release(out: &Path, inputs: &ReleaseInputs<'_>, key: &SigningKey) -
     let rootfs = inputs
         .rootfs
         .map(|path| split_rootfs(path, out, inputs.max_part))
-        .transpose()?;
+        .transpose()?
+        .map(|rootfs| Rootfs {
+            kind: inputs.rootfs_kind,
+            ..rootfs
+        });
     let manifest = Manifest {
         format: FORMAT,
         version: inputs.version.to_string(),
@@ -164,6 +170,7 @@ fn split_rootfs(from: &Path, out: &Path, max_part: u64) -> io::Result<Rootfs> {
         size,
         sha256: format!("{:x}", whole.finalize()),
         parts,
+        kind: RootfsKind::default(),
     })
 }
 

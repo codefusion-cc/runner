@@ -13,8 +13,12 @@
 //! that user stands in for the guest image.
 
 use cf_guest_proto::{Secret, Workload};
+use cf_image::store::{Store, Target};
+use cf_image::{ReleaseInputs, RootfsKind, write_release};
 use cf_vmhost::{End, Guest, JobRequest, JobState, Layout, Limits, run};
-use cf_vmm_oci::{Config, OciVmm};
+use cf_vmm_oci::http::{Body, Engine};
+use cf_vmm_oci::image::Images;
+use cf_vmm_oci::{Config, OciVmm, image_tag};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write as _;
@@ -355,5 +359,99 @@ fn two_jobs_at_once_do_not_see_each_others_files() {
     );
     assert!(!console.contains("first-secret"), "{console}");
     assert_eq!(end(&first), Some(End::Cancelled));
+    nothing_left(&vmm);
+}
+
+/// The files of the test image, as the image workflow exports the job image's: a container made from it, exported.
+fn exported_image() -> Vec<u8> {
+    let engine = Engine::new(socket());
+    let call = Some(Duration::from_secs(60));
+    let body = serde_json::json!({ "Image": image_tag(&setting("CF_GUEST_IMAGE")) });
+    let made = engine
+        .request("POST", "/containers/create", Body::Json(&body), call)
+        .expect("the engine answers");
+    assert!(made.ok(), "{}", made.message());
+    let id = made.json().unwrap()["Id"].as_str().unwrap().to_string();
+    let export = engine.request("GET", &format!("/containers/{id}/export"), Body::Empty, call);
+    let _ = engine.request("DELETE", &format!("/containers/{id}?force=1"), Body::Empty, call);
+    let export = export.expect("exported");
+    assert!(export.ok(), "{}", export.message());
+    export.body
+}
+
+/// A container-image release installed into the engine runs jobs: the store verifies it, the engine imports and
+/// names it, and a container made from it, which has none of the first image's settings, runs a job as `runner`.
+#[test]
+#[ignore = "needs a container engine: CF_ENGINE_SOCKET, CF_SUPERVISOR and CF_GUEST_IMAGE"]
+fn a_container_image_release_installed_into_the_engine_runs_a_job() {
+    let source = tempfile::tempdir().expect("a folder");
+    let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+    gz.write_all(&exported_image()).expect("compressed");
+    let tar = source.path().join("rootfs.tar.gz");
+    std::fs::write(&tar, gz.finish().expect("compressed")).expect("written");
+    std::fs::write(source.path().join("vmlinux"), b"unused here").expect("written");
+    std::fs::write(source.path().join("initramfs.cpio.gz"), initramfs()).expect("written");
+    let version = format!("it-imported-{}", std::process::id());
+    let release = tempfile::tempdir().expect("a folder");
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    write_release(
+        release.path(),
+        &ReleaseInputs {
+            version: &version,
+            built: 1,
+            arch: cf_image::HOST_ARCH,
+            kernel: &source.path().join("vmlinux"),
+            initramfs: &source.path().join("initramfs.cpio.gz"),
+            rootfs: Some(&tar),
+            rootfs_kind: RootfsKind::TarGz,
+            // Several parts, read back as one.
+            max_part: 1 << 20,
+        },
+        &signer,
+    )
+    .expect("a release");
+    let state = tempfile::tempdir().expect("a state folder");
+    let mut images = Images::new(&socket());
+    Store::new(state.path().join("images"))
+        .install_to(
+            release.path(),
+            &version,
+            &signer.verifying_key(),
+            Target::Engine(&mut images),
+        )
+        .expect("installed");
+
+    let vmm = engine(&machine("imported"));
+    let folder = tempfile::tempdir().expect("a state folder");
+    let mut request = request("imported", "echo uid=$(id -u); test \"$(id -u)\" = 1001", 60);
+    request.image = version.clone();
+    let (state, console) = job(&vmm, &folder, request, &AtomicBool::new(false));
+    let held = Engine::new(socket())
+        .request(
+            "GET",
+            &format!("/images/{}/json", image_tag(&version)),
+            Body::Empty,
+            Some(Duration::from_secs(60)),
+        )
+        .expect("the engine answers");
+    if let Some(id) = held
+        .json()
+        .ok()
+        .and_then(|image| Some(image.get("Id")?.as_str()?.to_string()))
+    {
+        cf_image::store::Engine::remove(&mut images, &id);
+    }
+    assert!(
+        held.ok(),
+        "the engine holds {}: {}",
+        image_tag(&version),
+        held.message()
+    );
+    assert_eq!(
+        (end(&state), exit_code(&state)),
+        (Some(End::Ok), Some(0)),
+        "{console}"
+    );
+    assert!(console.contains("uid=1001"), "{console}");
     nothing_left(&vmm);
 }

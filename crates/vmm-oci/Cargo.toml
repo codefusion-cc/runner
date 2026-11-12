@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 cf-guest-proto = { path = "../guest-proto" }
+cf-image = { path = "../image" }
 cf-vmm = { path = "../vmm" }
 flate2 = "1"
 libc.workspace = true
@@ -15,6 +16,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 cf-vmhost = { path = "../vmhost" }
+ed25519-dalek.workspace = true
 tempfile.workspace = true
 
 [lints]

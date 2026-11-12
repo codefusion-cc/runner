@@ -1,7 +1,7 @@
 //! The image store against what an installed image must be and the releases it must refuse.
 
-use cf_image::store::{ROOTFS_NAME, Store, StoreError};
-use cf_image::{ImageError, ReleaseInputs, write_release};
+use cf_image::store::{Engine, ROOTFS_NAME, Store, StoreError, Target};
+use cf_image::{ImageError, MANIFEST_NAME, ReleaseInputs, RootfsKind, write_release};
 use ed25519_dalek::SigningKey;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,9 +19,33 @@ fn release(version: &str, built: u64, with_rootfs: bool, signer: &SigningKey) ->
     release_for(cf_image::HOST_ARCH, version, built, with_rootfs, signer)
 }
 
+/// A container-image release: the same root file system, as a tar for an engine.
+fn container_release(version: &str, built: u64, signer: &SigningKey) -> tempfile::TempDir {
+    release_of(
+        cf_image::HOST_ARCH,
+        RootfsKind::TarGz,
+        version,
+        built,
+        true,
+        signer,
+    )
+}
+
 /// The same, built for `arch`.
 fn release_for(
     arch: &str,
+    version: &str,
+    built: u64,
+    with_rootfs: bool,
+    signer: &SigningKey,
+) -> tempfile::TempDir {
+    release_of(arch, RootfsKind::Erofs, version, built, with_rootfs, signer)
+}
+
+/// The same, with a root file system of this kind.
+fn release_of(
+    arch: &str,
+    kind: RootfsKind,
     version: &str,
     built: u64,
     with_rootfs: bool,
@@ -42,6 +66,7 @@ fn release_for(
             kernel: &src.path().join("Image"),
             initramfs: &src.path().join("initramfs"),
             rootfs: with_rootfs.then_some(rootfs.as_path()),
+            rootfs_kind: kind,
             max_part: 4096,
         },
         signer,
@@ -424,4 +449,185 @@ fn an_image_of_another_architecture_is_refused_and_nothing_is_installed() {
     let own = release("v1", 900, true, &key(1));
     store.install(own.path(), "v1", &trusted).unwrap();
     assert!(store.rootfs("v1").is_some());
+}
+
+/// A container engine's images: what it was given, and how it answers.
+#[derive(Default)]
+struct FakeEngine {
+    /// Imported images by id, with their bytes.
+    images: Vec<(String, Vec<u8>)>,
+    /// Names, each with the id it names.
+    names: Vec<(String, String)>,
+    /// Ids removed.
+    removed: Vec<String>,
+    /// Reads only this many bytes of a tar, as an engine that stops early.
+    reads_at_most: Option<usize>,
+    refuses_import: bool,
+    refuses_name: bool,
+}
+
+impl Engine for FakeEngine {
+    fn import(&mut self, tar: &mut dyn std::io::Read, size: u64) -> Result<String, String> {
+        if self.refuses_import {
+            return Err("no space left on device".into());
+        }
+        let mut bytes = Vec::new();
+        let limit = self.reads_at_most.map_or(size, |most| most as u64);
+        std::io::Read::read_to_end(&mut std::io::Read::take(tar, limit), &mut bytes)
+            .map_err(|error| error.to_string())?;
+        let id = format!("sha256:{}", self.images.len());
+        self.images.push((id.clone(), bytes));
+        Ok(id)
+    }
+
+    fn name(&mut self, id: &str, version: &str) -> Result<(), String> {
+        if self.refuses_name {
+            return Err("the engine is gone".into());
+        }
+        self.names.retain(|(name, _)| name != version);
+        self.names.push((version.into(), id.into()));
+        Ok(())
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.removed.push(id.into());
+        self.images.retain(|(image, _)| image != id);
+        self.names.retain(|(_, image)| image != id);
+    }
+}
+
+#[test]
+fn a_container_image_goes_whole_to_the_engine_named_after_its_version_and_the_folder_keeps_the_rest() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::new(state.path().join("images"));
+    let release = container_release("container-image-1", 1000, &key(1));
+    let mut engine = FakeEngine::default();
+    let manifest = store
+        .install_to(
+            release.path(),
+            "container-image-1",
+            &key(1).verifying_key(),
+            Target::Engine(&mut engine),
+        )
+        .unwrap();
+    assert_eq!(manifest.rootfs.unwrap().kind, RootfsKind::TarGz);
+    assert_eq!(
+        engine.images,
+        vec![("sha256:0".to_string(), rootfs())],
+        "the parts joined, every byte"
+    );
+    assert_eq!(
+        engine.names,
+        vec![("container-image-1".to_string(), "sha256:0".to_string())]
+    );
+    let folder = store.installed("container-image-1").expect("installed");
+    // No root file system and no parts on the disk: the engine holds it.
+    let held = names(&folder);
+    assert!(held.contains(&MANIFEST_NAME.to_string()), "{held:?}");
+    assert!(!held.iter().any(|name| name.contains("rootfs")), "{held:?}");
+    assert_eq!(store.rootfs("container-image-1"), None);
+    assert_eq!(store.newest_accepted().unwrap(), 1000);
+    assert_eq!(
+        names(&state.path().join("images")),
+        ["accepted.json", "container-image-1"]
+    );
+}
+
+#[test]
+fn each_host_takes_only_its_kind_of_root_file_system() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::new(state.path().join("images"));
+    let trusted = key(1).verifying_key();
+    let mut engine = FakeEngine::default();
+    let image = release("v1", 1000, true, &key(1));
+    match store.install_to(image.path(), "v1", &trusted, Target::Engine(&mut engine)) {
+        Err(StoreError::Kind { found, wanted }) => {
+            assert_eq!((found, wanted), (RootfsKind::Erofs, RootfsKind::TarGz))
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(engine.images.is_empty(), "nothing was imported");
+    let container = container_release("v1", 1000, &key(1));
+    let said = store
+        .install(container.path(), "v1", &trusted)
+        .unwrap_err()
+        .to_string();
+    assert!(said.contains("is tar.gz, and this host installs erofs"), "{said}");
+    assert_eq!(names(&state.path().join("images")), Vec::<String>::new());
+    assert_eq!(
+        store.newest_accepted().unwrap(),
+        0,
+        "a refused kind moves nothing forward"
+    );
+}
+
+#[test]
+fn what_the_engine_did_not_take_whole_or_could_not_name_is_removed_and_nothing_is_installed() {
+    let trusted = key(1).verifying_key();
+    for (case, mut engine) in [
+        (
+            "stops early",
+            FakeEngine {
+                reads_at_most: Some(5000),
+                ..FakeEngine::default()
+            },
+        ),
+        (
+            "cannot name",
+            FakeEngine {
+                refuses_name: true,
+                ..FakeEngine::default()
+            },
+        ),
+        (
+            "refuses",
+            FakeEngine {
+                refuses_import: true,
+                ..FakeEngine::default()
+            },
+        ),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let store = Store::new(state.path().join("images"));
+        let release = container_release("v1", 1000, &key(1));
+        let result = store.install_to(release.path(), "v1", &trusted, Target::Engine(&mut engine));
+        match (case, result) {
+            ("stops early", Err(StoreError::Refused(ImageError::HashMismatch(_)))) => {}
+            ("cannot name" | "refuses", Err(StoreError::Engine(said))) => assert!(!said.is_empty()),
+            (case, other) => panic!("{case}: {other:?}"),
+        }
+        assert!(
+            engine.images.is_empty() && engine.names.is_empty(),
+            "{case}: the import is gone"
+        );
+        assert_eq!(engine.removed.len(), usize::from(case != "refuses"), "{case}");
+        assert_eq!(store.installed("v1"), None, "{case}");
+        assert!(
+            !names(&state.path().join("images")).contains(&"v1".to_string()),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_container_image_with_a_changed_part_reaches_no_engine() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::new(state.path().join("images"));
+    let release = container_release("v1", 1000, &key(1));
+    let changed = part(release.path());
+    let mut bytes = fs::read(&changed).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&changed, bytes).unwrap();
+    let mut engine = FakeEngine::default();
+    let result = store.install_to(
+        release.path(),
+        "v1",
+        &key(1).verifying_key(),
+        Target::Engine(&mut engine),
+    );
+    assert!(matches!(result, Err(StoreError::Refused(_))), "{result:?}");
+    assert!(
+        engine.images.is_empty() && engine.removed.is_empty(),
+        "verified before anything is imported"
+    );
 }

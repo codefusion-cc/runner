@@ -26,7 +26,9 @@ const USAGE: &str = "usage: codefusion-runner
   resume --config <file> --hold <name>  lift the hold <name>; one not set is no error
   status --config <file> [--json]       the holds, whether the host takes jobs, and the machines that run
   image verify <folder> --version <v>
-  image install <folder> --version <v> --state-dir <folder>
+  image install <folder> --version <v> --state-dir <folder> [--engine <socket>]
+                                        with --engine, a container-image release, whose root file
+                                        system goes to that engine as codefusion-runner-guest:<v>
   vm --state-dir <folder> [--host-cpus <list>] [--engine <socket> --machine <name>]
                                         the vm-host of one job; on Linux --host-cpus are the CPUs its
                                         machine runs on (such as 4-7), by default the fastest; with
@@ -70,7 +72,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
             version,
             "--state-dir",
             state,
-        ] => install(folder, version, state),
+        ] => install(folder, version, state, None),
+        [
+            "image",
+            "install",
+            folder,
+            "--version",
+            version,
+            "--state-dir",
+            state,
+            "--engine",
+            socket,
+        ] => install(folder, version, state, Some(socket)),
         ["vm", "--state-dir", state, options @ ..] => vm_host(state, options),
         [
             command @ ("daemon" | "enroll" | "check" | "install" | "uninstall"),
@@ -96,12 +109,32 @@ fn verify_folder(folder: &str, version: &str) -> Result<(), String> {
 }
 
 /// Installs a downloaded release folder into the state folder's images, where a job's machine takes its root
-/// file system from. The store there remembers the newest release it accepted and refuses an older one.
-fn install(folder: &str, version: &str, state: &str) -> Result<(), String> {
+/// file system from; with an engine's socket, a container-image release, whose root file system the engine holds as
+/// an image. The store there remembers the newest release it accepted and refuses an older one.
+fn install(folder: &str, version: &str, state: &str, engine: Option<&str>) -> Result<(), String> {
     let key = parse_public_key(TRUSTED_PUBLIC_KEY).map_err(|error| error.to_string())?;
-    let manifest = Store::new(Path::new(state).join("images"))
-        .install(Path::new(folder), version, &key)
-        .map_err(|error| error.to_string())?;
+    let store = Store::new(Path::new(state).join("images"));
+    let installed = match engine {
+        None => store.install(Path::new(folder), version, &key),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        Some(socket) => {
+            if !Path::new(socket).is_absolute() {
+                return Err(format!(
+                    "--engine {socket}: the engine's socket is an absolute path"
+                ));
+            }
+            let mut images = cf_vmm_oci::image::Images::new(Path::new(socket));
+            store.install_to(
+                Path::new(folder),
+                version,
+                &key,
+                cf_image::store::Target::Engine(&mut images),
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Some(_) => return Err("container mode runs on macOS and Linux only".into()),
+    };
+    let manifest = installed.map_err(|error| error.to_string())?;
     println!("ok: image {} installed", manifest.version);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(said) = This::keep_state(Path::new(state)) {

@@ -1,11 +1,15 @@
 //! The images installed on this machine: a release is copied into a folder only the Runner writes to, verified
-//! there, and its root file system joined from its parts. What a job's machine is given is what was verified.
+//! there, and its root file system joined from its parts. What a job's machine is given is what was verified. On a
+//! host in container mode the joined root file system goes to the container engine instead ([`Target::Engine`]),
+//! which holds it as an image named after the version once its hash is the signed one; the folder keeps the rest.
 //!
 //! The store remembers the build time of the newest release it accepted and refuses an older one from then on,
 //! so a machine cannot be talked back into a release with a known hole. Downloading a release is not here: this
 //! takes a folder that has the release's files.
 
-use crate::{DirFiles, ImageError, MANIFEST_NAME, Manifest, SIGNATURE_NAME, SUMS_NAME, verify};
+use crate::{
+    Asset, DirFiles, ImageError, MANIFEST_NAME, Manifest, RootfsKind, SIGNATURE_NAME, SUMS_NAME, verify,
+};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -32,9 +36,78 @@ pub enum StoreError {
     /// until it is put right: read as "none yet", it would let every old release back in.
     #[error("{0} does not hold the build time of the newest release accepted: {1}")]
     Accepted(String, String),
+    /// The release's root file system is not of the kind this host installs.
+    #[error(
+        "the release's root file system is {}, and this host installs {}: a container-image release is for hosts in \
+         container mode, an image release for the others",
+        .found.name(),
+        .wanted.name()
+    )]
+    Kind {
+        /// What the release holds.
+        found: RootfsKind,
+        /// What the host installs.
+        wanted: RootfsKind,
+    },
+    /// The container engine did not take the image.
+    #[error("the container engine: {0}")]
+    Engine(String),
     /// A file could not be read or written.
     #[error("{0}: {1}")]
     Io(String, io::Error),
+}
+
+/// Where an installed image's root file system goes.
+pub enum Target<'a> {
+    /// A file in the image's folder, which machines boot from: an erofs image.
+    File,
+    /// A container engine, which imports the tar as an image named after the version (container mode).
+    Engine(&'a mut dyn Engine),
+}
+
+/// A container engine's images, as the store uses them.
+pub trait Engine {
+    /// Imports this gzip tar of `size` bytes as an image with no name yet and returns its id. It reads the whole of
+    /// it; the store checks its hash after.
+    fn import(&mut self, tar: &mut dyn Read, size: u64) -> Result<String, String>;
+    /// Names an imported image after the version, in place of any image of that name before.
+    fn name(&mut self, id: &str, version: &str) -> Result<(), String>;
+    /// Removes an imported image; what is not there is not an error.
+    fn remove(&mut self, id: &str);
+}
+
+/// The parts of a root file system read as one, hashed as they are read.
+struct Joined<'a> {
+    folder: &'a Path,
+    parts: std::slice::Iter<'a, Asset>,
+    file: Option<(File, PathBuf)>,
+    hash: Sha256,
+    read: u64,
+}
+
+impl Read for Joined<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.file.is_none() {
+                let Some(part) = self.parts.next() else {
+                    return Ok(0);
+                };
+                let path = self.folder.join(&part.name);
+                self.file = Some((File::open(&path)?, path));
+            }
+            let Some((file, _)) = self.file.as_mut() else {
+                return Ok(0);
+            };
+            let read = file.read(buffer)?;
+            if read == 0 {
+                self.file = None;
+                continue;
+            }
+            self.hash.update(&buffer[..read]);
+            self.read += read as u64;
+            return Ok(read);
+        }
+    }
 }
 
 /// The folder of installed images.
@@ -70,6 +143,12 @@ impl Store {
         self.0.join(version).join(ROOTFS_NAME)
     }
 
+    /// The folder of an installed image, if that version is installed, whatever its root file system's target.
+    pub fn installed(&self, version: &str) -> Option<PathBuf> {
+        let folder = self.0.join(version);
+        (is_version(version) && folder.join(MANIFEST_NAME).is_file()).then_some(folder)
+    }
+
     /// The build time of the newest release this store accepted; 0 before the first, when there is no record.
     /// A record that cannot be read, or holds something else than one number, is an error.
     pub fn newest_accepted(&self) -> Result<u64, StoreError> {
@@ -88,6 +167,19 @@ impl Store {
     /// list names is not installed. A release already installed is verified again all the same; a refused one
     /// leaves nothing behind. One install runs in a store at a time: a second one waits for the first.
     pub fn install(&self, source: &Path, version: &str, key: &VerifyingKey) -> Result<Manifest, StoreError> {
+        self.install_to(source, version, key, Target::File)
+    }
+
+    /// [`Store::install`], with the root file system going to `target`, which must take the release's kind: a file
+    /// an erofs image, an engine a tar. An image the engine imported is named only once all of the release is in
+    /// place, and removed when it is not.
+    pub fn install_to(
+        &self,
+        source: &Path,
+        version: &str,
+        key: &VerifyingKey,
+        target: Target<'_>,
+    ) -> Result<Manifest, StoreError> {
         if !is_version(version) {
             return Err(StoreError::Version(version.to_string()));
         }
@@ -103,7 +195,7 @@ impl Store {
             .map_err(|error| StoreError::Io(self.0.display().to_string(), error))?;
         // No version starts with a dot, so the store's own folders are never an installed image's.
         let partial = self.0.join(format!(".{version}.partial"));
-        let result = self.install_into(&partial, source, version, key);
+        let result = self.install_into(&partial, source, version, key, target);
         drop(lock);
         if result.is_err() {
             let _ = fs::remove_dir_all(&partial);
@@ -117,6 +209,7 @@ impl Store {
         source: &Path,
         version: &str,
         key: &VerifyingKey,
+        mut target: Target<'_>,
     ) -> Result<Manifest, StoreError> {
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         let io = |path: &Path| {
@@ -139,6 +232,16 @@ impl Store {
         let manifest = verify(&DirFiles::new(partial), key, version, newest)?.manifest;
         manifest.for_this_host()?;
         let rootfs = manifest.rootfs.as_ref().ok_or(StoreError::NoRootfs)?;
+        let wanted = match target {
+            Target::File => RootfsKind::Erofs,
+            Target::Engine(_) => RootfsKind::TarGz,
+        };
+        if rootfs.kind != wanted {
+            return Err(StoreError::Kind {
+                found: rootfs.kind,
+                wanted,
+            });
+        }
 
         // Only what was checked stays: a file the signed list does not name was read by nobody.
         let mut checked = vec![MANIFEST_NAME, SUMS_NAME, SIGNATURE_NAME];
@@ -150,34 +253,74 @@ impl Store {
             }
         }
 
-        // The parts are joined under the hash of the whole, so the file a machine boots from is the one signed.
-        // It is new and its owner's alone, whatever this process's mask for new files is.
-        let joined = partial.join(ROOTFS_NAME);
-        let mut out = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&joined)
-            .map_err(io(&joined))?;
-        let mut hash = Sha256::new();
-        let mut buffer = vec![0u8; 1 << 20];
-        for part in &rootfs.parts {
-            let path = partial.join(&part.name);
-            let mut file = File::open(&path).map_err(io(&path))?;
-            loop {
-                let read = file.read(&mut buffer).map_err(io(&path))?;
-                if read == 0 {
-                    break;
-                }
-                hash.update(&buffer[..read]);
-                out.write_all(&buffer[..read]).map_err(io(&joined))?;
+        // The parts are joined under the hash of the whole, so what a machine boots from, or a container is made
+        // from, is what was signed.
+        let mut joined = Joined {
+            folder: partial,
+            parts: rootfs.parts.iter(),
+            file: None,
+            hash: Sha256::new(),
+            read: 0,
+        };
+        let imported = match &mut target {
+            Target::File => {
+                // New and its owner's alone, whatever this process's mask for new files is.
+                let path = partial.join(ROOTFS_NAME);
+                let mut out = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(io(&path))?;
+                io::copy(&mut joined, &mut out).map_err(io(&path))?;
+                out.sync_all().map_err(io(&path))?;
+                None
             }
-            fs::remove_file(&path).map_err(io(&path))?;
+            Target::Engine(engine) => Some(
+                engine
+                    .import(&mut joined, rootfs.size)
+                    .map_err(StoreError::Engine)?,
+            ),
+        };
+        let Joined { hash, read, .. } = joined;
+        let result = (|| {
+            if read != rootfs.size || format!("{:x}", hash.finalize()) != rootfs.sha256 {
+                return Err(StoreError::Refused(ImageError::HashMismatch(ROOTFS_NAME.into())));
+            }
+            for part in &rootfs.parts {
+                let path = partial.join(&part.name);
+                fs::remove_file(&path).map_err(io(&path))?;
+            }
+            self.put_in_place(partial, version, &manifest, newest, |version| {
+                match (&mut target, &imported) {
+                    (Target::Engine(engine), Some(id)) => {
+                        engine.name(id, version).map_err(StoreError::Engine)
+                    }
+                    _ => Ok(()),
+                }
+            })
+        })();
+        if result.is_err()
+            && let (Target::Engine(engine), Some(id)) = (&mut target, &imported)
+        {
+            engine.remove(id);
         }
-        out.sync_all().map_err(io(&joined))?;
-        if format!("{:x}", hash.finalize()) != rootfs.sha256 {
-            return Err(StoreError::Refused(ImageError::HashMismatch(ROOTFS_NAME.into())));
-        }
+        result.map(|()| manifest)
+    }
+
+    /// Records the release as the newest accepted, names what the engine holds of it, and moves its folder in.
+    fn put_in_place(
+        &self,
+        partial: &Path,
+        version: &str,
+        manifest: &Manifest,
+        newest: u64,
+        name: impl FnOnce(&str) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let io = |path: &Path| {
+            let path = path.display().to_string();
+            move |error| StoreError::Io(path, error)
+        };
 
         // The record moves first: a release in place without it could be followed by one older than itself.
         if manifest.built > newest {
@@ -193,6 +336,7 @@ impl Store {
                 .and_then(|()| fs::rename(&new, &accepted))
                 .map_err(io(&accepted))?;
         }
+        name(version)?;
         let installed = self.0.join(version);
         // A version installed again is put aside, not deleted first: when the new one cannot take its place the old
         // one comes back.
@@ -206,6 +350,6 @@ impl Store {
             return Err(io(&installed)(error));
         }
         let _ = fs::remove_dir_all(&aside);
-        Ok(manifest)
+        Ok(())
     }
 }

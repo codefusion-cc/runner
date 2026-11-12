@@ -423,8 +423,10 @@ name = "cf-vmm-oci"
 version = "0.1.0"
 dependencies = [
  "cf-guest-proto",
+ "cf-image",
  "cf-vmhost",
  "cf-vmm",
+ "ed25519-dalek",
  "flate2",
  "libc",
  "serde_json",
