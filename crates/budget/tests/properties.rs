@@ -320,8 +320,12 @@ impl World {
     }
 
     /// Whether an assigned job waits that everything else has to let go first.
-    fn someone_waits(&self) -> bool {
-        self.waiting.iter().any(|(_, size)| self.can_run(*size))
+    /// Whether an assigned job waits that goes before a slot of `size`. On a headless host, which makes room for no
+    /// size here, one of another size holds nobody up.
+    fn someone_waits(&self, size: Size) -> bool {
+        self.waiting
+            .iter()
+            .any(|(_, waiting)| self.can_run(*waiting) && (!self.settings.headless || *waiting == size))
     }
 
     fn name_is_new(&self, id: SlotId) -> Result<(), TestCaseError> {
@@ -412,7 +416,7 @@ impl World {
                 match self.budget.claim(self.now, *size) {
                     Ok(grant) => {
                         self.check_grant(*size, false)?;
-                        prop_assert!(!self.someone_waits(), "a claim went past a job that waits");
+                        prop_assert!(!self.someone_waits(*size), "a claim went past a job that waits");
                         prop_assert_eq!(fits, Ok(()));
                         prop_assert!(free.of(*size) >= 1);
                         prop_assert_eq!(self.budget.level(self.now), Level::Open);
@@ -437,7 +441,7 @@ impl World {
                 }
             }
             Op::Assign(size) => {
-                let ahead = self.someone_waits();
+                let ahead = self.someone_waits(*size);
                 match self.budget.assign(self.now, *size) {
                     Assigned::Start(grant) => {
                         prop_assert!(!ahead, "started past a job that waits");
@@ -633,7 +637,10 @@ impl World {
                 .told_to_stop = true;
         }
         for grant in &observed.started {
-            let next = self.waiting.iter().position(|(_, size)| self.can_run(*size));
+            // A headless host starts what fits, the oldest of each size first; a Mac the oldest job, whatever its size.
+            let next = self.waiting.iter().position(|(_, size)| {
+                self.can_run(*size) && (!self.settings.headless || *size == grant.size)
+            });
             prop_assert!(next.is_some(), "a job started that did not wait");
             let (id, size) = self.waiting.remove(next.unwrap());
             prop_assert_eq!(
@@ -691,12 +698,10 @@ impl World {
         if self.budget.level(self.now) != Level::Open {
             prop_assert_eq!(free, Default::default(), "slots offered while not open");
         }
-        if self.someone_waits() {
-            prop_assert_eq!(
-                free,
-                Default::default(),
-                "slots offered while an assigned job waits"
-            );
+        for size in Size::ALL {
+            if self.someone_waits(size) {
+                prop_assert_eq!(free.of(size), 0, "slots offered while an assigned job waits");
+            }
         }
         Ok(())
     }
