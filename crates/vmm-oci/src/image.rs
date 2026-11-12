@@ -26,6 +26,85 @@ impl Images {
     }
 }
 
+/// What [`Images::prune`] did: the names it removed, and those the engine kept because a container uses them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// `codefusion-runner-guest:<version>` names removed, oldest first.
+    pub removed: Vec<String>,
+    /// Names the engine did not remove, as a container still uses them: left for the next install.
+    pub kept: Vec<String>,
+}
+
+impl Images {
+    /// Removes the engine's older job images once `version` is installed: every `codefusion-runner-guest` name but
+    /// `version`'s and the newest before it, which a Runner whose settings still name it runs until they move on.
+    /// The engine refuses to remove an image a container uses (a job's, or one not yet removed), which stays.
+    pub fn prune(&self, version: &str) -> Result<Pruned, String> {
+        let answer = self
+            .engine
+            .request("GET", "/images/json", Body::Empty, Some(CALL))
+            .map_err(|error| format!("the engine's images: {error}"))?;
+        if !answer.ok() {
+            return Err(format!(
+                "the engine's images ({}): {}",
+                answer.status,
+                answer.message()
+            ));
+        }
+        let listed = answer
+            .json()
+            .map_err(|error| format!("the engine's images: {error}"))?;
+        // Each name of ours with its image's age; Podman names an import `localhost/<repository>:<tag>`.
+        let mut ours: Vec<(i64, String, String)> = listed
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|image| {
+                let created = image
+                    .get("Created")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                image
+                    .get("RepoTags")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(move |name| {
+                        let (repository, tag) = name.rsplit_once(':')?;
+                        let repository = repository.strip_prefix("localhost/").unwrap_or(repository);
+                        (repository == IMAGE_REPOSITORY).then(|| (created, tag.to_string(), name.to_string()))
+                    })
+            })
+            .collect();
+        ours.sort();
+        // The newest other than the new one stays: a Runner may still name it.
+        let before = ours
+            .iter()
+            .rev()
+            .find(|(_, tag, _)| tag != version)
+            .map(|(_, tag, _)| tag.clone());
+        let mut pruned = Pruned::default();
+        for (_, tag, name) in ours {
+            if tag == version || Some(&tag) == before.as_ref() {
+                continue;
+            }
+            // Never forced: the engine keeps an image a container uses.
+            let removed = self.engine.request(
+                "DELETE",
+                &format!("/images/{}", escape(&name)),
+                Body::Empty,
+                Some(CALL),
+            );
+            match removed {
+                Ok(answer) if answer.ok() || answer.status == 404 => pruned.removed.push(name),
+                _ => pruned.kept.push(name),
+            }
+        }
+        Ok(pruned)
+    }
+}
+
 /// The id of the image an import made, from the engine's answer: one JSON object after another, the last naming
 /// the image (Docker: `{"status":"sha256:…"}`; Podman: `{"id":"…"}`), or one saying why there is none.
 pub fn imported_id(answer: &[u8]) -> Result<String, String> {
@@ -119,6 +198,7 @@ impl cf_image::store::Engine for Images {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::FakeEngine;
 
     const ID: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -156,6 +236,63 @@ mod tests {
                 "{:?}",
                 String::from_utf8_lossy(nothing)
             );
+        }
+    }
+
+    /// Each release adds a whole root file system to the engine: once a new one is in, the older ones go, but for
+    /// the one just before it, and one a container uses stays.
+    #[test]
+    fn an_install_leaves_the_new_image_and_the_one_before_and_removes_the_older_ones() {
+        let listed = serde_json::json!([
+            { "Id": "sha256:a", "RepoTags": ["localhost/codefusion-runner-guest:image-20261001-1"], "Created": 100 },
+            { "Id": "sha256:b", "RepoTags": ["codefusion-runner-guest:image-20261002-1"], "Created": 200 },
+            { "Id": "sha256:c", "RepoTags": ["codefusion-runner-guest:image-20261003-1"], "Created": 300 },
+            { "Id": "sha256:d", "RepoTags": ["codefusion-runner-guest:image-20261004-1"], "Created": 400 },
+            { "Id": "sha256:e", "RepoTags": ["localhost/codefusion-runner-guest:image-20261105-2"], "Created": 500 },
+            { "Id": "sha256:f", "RepoTags": ["busybox:latest", "codefusion-runner-guestx:1"], "Created": 50 },
+            { "Id": "sha256:g", "RepoTags": ["<none>:<none>"], "Created": 60 },
+            { "Id": "sha256:h", "RepoTags": null, "Created": 70 },
+        ])
+        .to_string();
+        let in_use = format!("/images/{}", escape("codefusion-runner-guest:image-20261003-1"));
+        let engine = FakeEngine::new(move |asked| match asked.method.as_str() {
+            "GET" if asked.path.starts_with("/images/json") => (200, listed.clone()),
+            "DELETE" if asked.path == in_use => {
+                (409, "{\"message\":\"image is in use by a container\"}".into())
+            }
+            "DELETE" => (200, "[]".into()),
+            _ => (404, "{}".into()),
+        });
+        let pruned = Images::new(&engine.socket).prune("image-20261105-2").unwrap();
+        assert_eq!(
+            pruned,
+            Pruned {
+                removed: vec![
+                    "localhost/codefusion-runner-guest:image-20261001-1".into(),
+                    "codefusion-runner-guest:image-20261002-1".into(),
+                ],
+                kept: vec!["codefusion-runner-guest:image-20261003-1".into()],
+            }
+        );
+        let deleted = engine.lines("DELETE");
+        assert_eq!(deleted.len(), 3, "{deleted:?}");
+        assert!(
+            deleted.iter().all(|line| !line.contains("force")),
+            "never forced off a container: {deleted:?}"
+        );
+    }
+
+    #[test]
+    fn an_engine_that_lists_nothing_or_fails_removes_nothing() {
+        for (status, body) in [(200, "[]"), (500, "{\"message\":\"down\"}"), (200, "not json")] {
+            let engine = FakeEngine::new(move |_| (status, body.into()));
+            let pruned = Images::new(&engine.socket).prune("image-20261105-2");
+            assert!(engine.lines("DELETE").is_empty());
+            if status == 200 && body == "[]" {
+                assert_eq!(pruned, Ok(Pruned::default()));
+            } else {
+                assert!(pruned.is_err(), "{pruned:?}");
+            }
         }
     }
 }

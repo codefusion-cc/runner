@@ -136,6 +136,21 @@ fn install(folder: &str, version: &str, state: &str, engine: Option<&str>) -> Re
     };
     let manifest = installed.map_err(|error| error.to_string())?;
     println!("ok: image {} installed", manifest.version);
+    // Each release is a whole root file system in the engine's storage: the older ones go.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(socket) = engine {
+        match cf_vmm_oci::image::Images::new(Path::new(socket)).prune(version) {
+            Ok(pruned) => {
+                for name in &pruned.removed {
+                    println!("ok: removed the older image {name}");
+                }
+                for name in &pruned.kept {
+                    eprintln!("note: {name} stays: a container uses it");
+                }
+            }
+            Err(error) => eprintln!("note: the older images stay: {error}"),
+        }
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(said) = This::keep_state(Path::new(state)) {
         eprintln!("note: {said}");
