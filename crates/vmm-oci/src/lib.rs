@@ -415,8 +415,8 @@ impl OciVmm {
             "Labels": self.labels(),
             "HostConfig": {
                 "Memory": memory,
+                // Memory and swap alike: no swap. No swappiness, which crun refuses under cgroup v2 (Podman).
                 "MemorySwap": memory,
-                "MemorySwappiness": 0,
                 "NanoCpus": spec.cpus as u64 * 1_000_000_000,
                 "PidsLimit": PIDS,
                 "CapDrop": ["ALL"],
@@ -855,6 +855,10 @@ mod tests {
         }
         assert_eq!(host["Memory"], 4u64 << 30);
         assert_eq!(host["MemorySwap"], host["Memory"], "no swap past the memory");
+        assert!(
+            host.get("MemorySwappiness").is_none(),
+            "crun under cgroup v2 refuses any swappiness"
+        );
         assert_eq!(host["NanoCpus"], 3_000_000_000u64);
         assert_eq!(host["PidsLimit"], PIDS);
         assert_eq!(host["PidMode"], "", "a process namespace of its own");
