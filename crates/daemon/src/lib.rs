@@ -39,7 +39,10 @@ pub use machines::{
     OFFER_STANDS, RESULT_WAIT, Registration, Reports, SizeRoom, Snapshot,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use platform::{HostMachines, HostService, HostSetup, Platform, This, host_service, records_dir};
+pub use platform::{
+    HostMachines, HostService, HostSetup, Platform, This, budget_settings, host_service, records_dir,
+    state_disk_bytes,
+};
 pub use records::{
     Disagrees, DiskStore, Ending, GithubJob, MemoryStore, RULES, Record, SavedSlot, Store, TestRunFacts,
     Upgrade,

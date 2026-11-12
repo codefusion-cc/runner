@@ -421,6 +421,44 @@ async fn when_the_mac_runs_out_of_memory_the_newest_job_is_stopped_and_only_one_
     assert_eq!(w.slots(), 1);
 }
 
+/// A small host whose settings lower the disk limits: its jobs get the disk the settings give, a job starts with
+/// free disk down to the hold and none under it, where the defaults took none at all.
+#[tokio::test]
+async fn a_small_disk_takes_jobs_down_to_the_hold_its_settings_give_with_the_disk_they_give() {
+    let free = |w: &World, bytes: u64| {
+        w.m.with_host(|host| host.set(|r| r.disk_free_bytes = bytes));
+        pass(&w.m, 61);
+    };
+    let defaults = World::new(2);
+    free(&defaults, 4 * GIB);
+    assert!(
+        matches!(defaults.m.claim(SIZE, None), Claim::Waits { why, .. } if why == "disk"),
+        "the default hold of 25 GiB"
+    );
+
+    let limits = cf_budget::Limits {
+        disk_hold_bytes: Some(3 * GIB),
+        disk_evict_bytes: Some(GIB),
+        job_disk_bytes: Some(6 * GIB),
+        ..cf_budget::Limits::default()
+    };
+    let mut w = World::on(cf_daemon::testing::settings_for(2).limited(&limits).unwrap());
+    free(&w, 3 * GIB);
+    let first = w.running().await;
+    assert_eq!(
+        w.parts
+            .vms
+            .started()
+            .iter()
+            .map(|request| (request.job.as_str(), request.scratch_bytes))
+            .collect::<Vec<_>>(),
+        [(job_name(&first), 6 * GIB)]
+    );
+    free(&w, 3 * GIB - 1);
+    assert!(matches!(w.m.claim(SIZE, None), Claim::Waits { why, .. } if why == "disk"));
+    assert!(w.parts.vms.stopped().is_empty(), "above the stop the job goes on");
+}
+
 #[tokio::test]
 async fn when_the_disk_runs_out_the_job_with_the_most_on_it_is_stopped() {
     let mut w = World::new(2);

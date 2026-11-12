@@ -107,6 +107,20 @@ pub struct Config {
     /// defaults (all but two on a host of its own). The sizes' vCPUs follow it unless `vcpus` names them.
     #[serde(default)]
     pub ci_cpus: Option<u32>,
+    /// The free disk under which no job starts, in GB of 2^30 bytes (`3`), at the file system of the state folder:
+    /// at least 1 and under the file system's size. Left out for 25. Set alone, it also lowers `disk_stop_gb` to
+    /// itself when that is higher.
+    #[serde(default)]
+    pub disk_hold_gb: Option<serde_json::Number>,
+    /// The free disk under which the job that wrote the most is stopped, in GB: at least 1 and no more than
+    /// `disk_hold_gb`. Left out for 5, or `disk_hold_gb` when that is less.
+    #[serde(default)]
+    pub disk_stop_gb: Option<serde_json::Number>,
+    /// The size of each job's disk, in GB: a machine's scratch disk, or the most a container writes into its layer
+    /// (the engine's `StorageOpt` size where it bounds one). 4 to 512 and no larger than the file system of the state
+    /// folder; left out for 40.
+    #[serde(default)]
+    pub job_disk_gb: Option<serde_json::Number>,
     /// vCPUs of a machine of each size named, by its label (`{"cf-4g": 3}`), 1 to 64 and no more than CI may use;
     /// the sizes left out keep the host's defaults.
     #[serde(default)]
@@ -286,20 +300,25 @@ impl Config {
                 Settings::FLOOR_PERCENT.end()
             ));
         }
-        if let Some(gb) = &self.ci_memory_gb
-            && !gb
-                .as_f64()
-                .is_some_and(|gb| gb.is_finite() && gb > 0.0 && gb <= CI_MEMORY_GB_MAX)
-        {
-            return Err(format!(
-                "ci_memory_gb: more than 0 and at most {CI_MEMORY_GB_MAX}"
-            ));
-        }
         if self
             .ci_cpus
             .is_some_and(|cpus| !(1..=CI_CPUS_MAX).contains(&cpus))
         {
             return Err(format!("ci_cpus: between 1 and {CI_CPUS_MAX}"));
+        }
+        for (key, gb, most) in [
+            ("ci_memory_gb", &self.ci_memory_gb, CI_MEMORY_GB_MAX),
+            ("disk_hold_gb", &self.disk_hold_gb, DISK_GB_MAX),
+            ("disk_stop_gb", &self.disk_stop_gb, DISK_GB_MAX),
+            ("job_disk_gb", &self.job_disk_gb, JOB_DISK_GB_MAX),
+        ] {
+            if let Some(gb) = gb
+                && !gb
+                    .as_f64()
+                    .is_some_and(|gb| gb.is_finite() && gb > 0.0 && gb <= most)
+            {
+                return Err(format!("{key}: more than 0 and at most {most}"));
+            }
         }
         if self.labels.len() > 8 {
             return Err("labels: 8 at most".into());
@@ -460,12 +479,11 @@ impl Config {
             idle_after: self.idle_minutes.map(|minutes| Millis::mins(minutes.into())),
             floor_percent: self.min_free_memory_percent,
             vcpus: Size::ALL.map(|size| self.vcpus.get(size.label()).copied()),
-            ci_bytes: self
-                .ci_memory_gb
-                .as_ref()
-                .and_then(serde_json::Number::as_f64)
-                .map(ci_bytes),
+            ci_bytes: gb_bytes(self.ci_memory_gb.as_ref()),
             ci_cpus: self.ci_cpus,
+            disk_hold_bytes: gb_bytes(self.disk_hold_gb.as_ref()),
+            disk_evict_bytes: gb_bytes(self.disk_stop_gb.as_ref()),
+            job_disk_bytes: gb_bytes(self.job_disk_gb.as_ref()),
         }
     }
 
@@ -561,16 +579,24 @@ const CI_CPUS_MAX: u32 = 1024;
 /// The most `ci_memory_gb` may say, far above any host's memory: the budget refuses more than the host has.
 const CI_MEMORY_GB_MAX: f64 = 4096.0;
 
-/// `ci_memory_gb` in bytes, to the byte below.
+/// The bytes of a number of GB of 2^30 bytes in the file, whole bytes down.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn ci_bytes(gb: f64) -> u64 {
-    // In range by the check: a finite number above 0 and at most CI_MEMORY_GB_MAX.
-    (gb * cf_budget::GIB as f64).floor() as u64
+fn gb_bytes(gb: Option<&serde_json::Number>) -> Option<u64> {
+    // In range by the check: a finite number above 0 and at most DISK_GB_MAX, far inside a u64.
+    gb.and_then(serde_json::Number::as_f64)
+        .map(|gb| (gb * cf_budget::GIB as f64).floor() as u64)
 }
+
+/// The most a disk setting may say, in GB: larger than any disk the Runner is on; the budget and the disk's size
+/// refuse what does not fit.
+const DISK_GB_MAX: f64 = 65536.0;
+
+/// The most `job_disk_gb` may say: the largest disk a job may have, which the budget checks again.
+const JOB_DISK_GB_MAX: f64 = (*Settings::JOB_DISK_RANGE.end() / cf_budget::GIB) as f64;
 
 #[cfg(test)]
 mod tests {
@@ -1179,6 +1205,61 @@ mod tests {
             with(|v| v["ci_memory_gb"] = serde_json::Value::Null).map(|c| c.limits().ci_bytes),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn the_disk_settings_are_gb_above_0_and_left_out_keep_the_defaults() {
+        let gib = cf_budget::GIB;
+        let whole = Config::parse(WHOLE).expect("config").limits();
+        assert_eq!(
+            (
+                whole.disk_hold_bytes,
+                whole.disk_evict_bytes,
+                whole.job_disk_bytes
+            ),
+            (None, None, None)
+        );
+        type Read = fn(&Limits) -> Option<u64>;
+        let keys: [(&str, Read, u64); 3] = [
+            ("disk_hold_gb", |l| l.disk_hold_bytes, 65536),
+            ("disk_stop_gb", |l| l.disk_evict_bytes, 65536),
+            ("job_disk_gb", |l| l.job_disk_bytes, 512),
+        ];
+        for (key, of, most) in keys {
+            for (gb, bytes) in [
+                (serde_json::json!(3), Some(3 * gib)),
+                (serde_json::json!(2.5), Some(5 * gib / 2)),
+                (serde_json::json!(1e-9), Some(1)),
+                (serde_json::json!(most), Some(most * gib)),
+                (serde_json::Value::Null, None),
+            ] {
+                assert_eq!(
+                    with(|v| v[key] = gb.clone()).map(|c| of(&c.limits())),
+                    Ok(bytes),
+                    "{key} {gb}"
+                );
+            }
+            for gb in [
+                serde_json::json!(0),
+                serde_json::json!(-0.0),
+                serde_json::json!(-1),
+                serde_json::json!(-1e300),
+                serde_json::json!(most as f64 + 0.5),
+                serde_json::json!(1e300),
+            ] {
+                let error = with(|v| v[key] = gb.clone()).expect_err("refused");
+                assert_eq!(error, format!("{key}: more than 0 and at most {most}"), "{gb}");
+            }
+            for gb in [
+                serde_json::json!("3"),
+                serde_json::json!([3]),
+                serde_json::json!({"gb": 3}),
+                serde_json::json!(true),
+            ] {
+                let error = with(|v| v[key] = gb.clone()).expect_err("refused");
+                assert!(error.contains("invalid type"), "{key} {gb}: {error}");
+            }
+        }
     }
 
     #[test]

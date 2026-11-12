@@ -47,6 +47,10 @@ impl Platform for Mac {
         }
     }
 
+    fn disk_bytes(folder: &Path) -> Option<u64> {
+        MacHost::new(folder).ok()?.disk_total_bytes()
+    }
+
     fn boot_session() -> Option<String> {
         boot_session()
     }

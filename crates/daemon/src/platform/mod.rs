@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cf_budget::{Host, HostError, HostFacts, Limits, Mode, Sandbox, Settings};
+use cf_budget::{DiskShort, Host, HostError, HostFacts, Limits, Mode, Sandbox, Settings};
 use cf_console_client::{Client, OUTBOX_CAPACITY, Outbox};
 use cf_ghapp::{Clock, GitHubApp, Http, RetryPolicy, SystemClock};
 use cf_guest_proto::Workload;
@@ -70,6 +70,10 @@ pub trait Platform {
     /// costs the host less ([`Settings::in_containers`]).
     fn settings(facts: HostFacts, mode: Mode, trusted: bool, sandbox: Sandbox) -> Settings;
 
+    /// The size of the file system `folder` is on, in bytes; `None` when the system will not say or the folder is
+    /// not there.
+    fn disk_bytes(folder: &Path) -> Option<u64>;
+
     /// A name for this start of the host: another one after every start, the same until the next, whatever the
     /// clock does meanwhile. `None` when the system will not say.
     fn boot_session() -> Option<String>;
@@ -114,6 +118,32 @@ pub type HostService = ServiceOf<This>;
 /// How long the console has to answer one call. A report that fails is not sent again at once: the next one
 /// carries what waits, and meanwhile the service's loop goes on.
 const CONSOLE_ANSWER: Duration = Duration::from_secs(15);
+
+/// The size of the file system the state folder is on, in bytes; 0 when the system will not say. A state folder not
+/// made yet (`check` and `install` before the first start) will be on its nearest folder's file system.
+pub fn state_disk_bytes<P: Platform>(state_dir: &Path) -> u64 {
+    state_dir.ancestors().find_map(P::disk_bytes).unwrap_or(0)
+}
+
+/// The budget's numbers on a host of this platform: its defaults with what the owner set on top (`limits`), checked,
+/// and checked against the state folder's file system of `disk_bytes` ([`state_disk_bytes`], 0 to check nothing
+/// against it: [`Settings::check_disk`]). With the settings comes what the disk settings leave short of, which the
+/// Runner starts on and says.
+pub fn budget_settings<P: Platform>(
+    facts: HostFacts,
+    mode: Mode,
+    trusted: bool,
+    sandbox: Sandbox,
+    limits: &Limits,
+    disk_bytes: u64,
+) -> Result<(Settings, Option<DiskShort>), String> {
+    let said = |error: cf_budget::SettingsError| format!("the limits for jobs: {error}");
+    let settings = P::settings(facts, mode, trusted, sandbox)
+        .limited(limits)
+        .map_err(said)?;
+    let short = settings.check_disk(limits, sandbox, disk_bytes).map_err(said)?;
+    Ok((settings, short))
+}
 
 /// Where the records of machines are kept in a state folder.
 pub fn records_dir(state_dir: &Path) -> PathBuf {
@@ -202,6 +232,17 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
         Some(console) => Arc::new(OutboxReports(console.outbox.clone())),
         None => Arc::new(LoggedReports),
     };
+    let (settings, short) = budget_settings::<P>(
+        facts,
+        setup.mode,
+        setup.policy.trusted.is_some(),
+        setup.sandbox.0,
+        &setup.limits,
+        state_disk_bytes::<P>(state),
+    )?;
+    if let Some(short) = short {
+        tracing::warn!(%short, "the disk settings leave a job's disk short");
+    }
     let mut config = MachineConfig::new(&setup.machine, &setup.image, &boot, setup.deadline);
     config.stand_in = setup.stand_in;
     config.docker_max_jobs = setup.policy.docker_max_jobs;
@@ -216,9 +257,7 @@ pub fn host_service<P: Platform>(setup: HostSetup) -> Result<(Arc<MachinesOf<P>>
             (Sandbox::Container, None) => return Err("a container host names its engine's socket".into()),
             (Sandbox::Vm, _) => P::vm_hosts(&setup.program, state),
         },
-        settings: P::settings(facts, setup.mode, setup.policy.trusted.is_some(), setup.sandbox.0)
-            .limited(&setup.limits)
-            .map_err(|error| format!("the limits for jobs: {error}"))?,
+        settings,
         config,
         roster: roster.clone(),
         store: Arc::new(store),

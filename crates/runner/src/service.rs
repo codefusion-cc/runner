@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cf_budget::{Budget, Host as _, HostFacts, HostReading, Settings, Size, admit};
+use cf_budget::{Budget, DiskShort, Host as _, HostFacts, HostReading, Settings, Size, admit};
 use cf_console_client::ConsoleTokens;
 use cf_daemon::names::ServePolicy;
 use cf_daemon::update::{STAYS_UP, SelfUpdate, SettingsChange, SettingsFile, SettingsLook, UpdateFile};
-use cf_daemon::{HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service};
+use cf_daemon::{
+    HostMachines, HostService, HostSetup, Lines, Platform, ROLL_AT, This, host_service, state_disk_bytes,
+};
 use cf_ghapp::{AppCredentials, GitHubApp, Http, KeyTokens, RetryPolicy, SystemClock, SystemMonotonic};
 use cf_secret::Secret;
 
@@ -134,16 +136,22 @@ fn console(config: &Config) -> Result<Option<(String, Secret<String>)>, String> 
     Ok(Some((address.clone(), Secret::new(token))))
 }
 
-/// The budget's numbers on this host under the configuration: the defaults with what the file sets on top.
-fn budget_of(facts: HostFacts, config: &Config) -> Result<Settings, String> {
-    This::settings(
+/// The budget's numbers on this host under the configuration: the defaults with what the file sets on top, checked
+/// against the state folder's file system of `disk_bytes` (0 checks nothing against it), with what its disk settings
+/// leave short of.
+fn budget_of(
+    facts: HostFacts,
+    config: &Config,
+    disk_bytes: u64,
+) -> Result<(Settings, Option<DiskShort>), String> {
+    cf_daemon::budget_settings::<This>(
         facts,
         config.mode(),
         config.class == Class::Trusted,
         config.sandbox,
+        &config.limits(),
+        disk_bytes,
     )
-    .limited(&config.limits())
-    .map_err(|error| format!("the limits for jobs: {error}"))
 }
 
 /// The settings in `path`, when a Runner can start on them: the file is one it takes, its limits are ones the budget
@@ -157,7 +165,7 @@ fn startable(path: &Path) -> Result<Config, String> {
     let facts = This::host(Path::new("/"))
         .and_then(|host| host.facts())
         .map_err(|error| format!("{}: {error}", This::SYSTEM))?;
-    budget_of(facts, &config)?;
+    budget_of(facts, &config, state_disk_bytes::<This>(&config.state_dir))?;
     installed_image(&config)?;
     app(&config)?;
     console(&config)?;
@@ -719,12 +727,18 @@ pub fn enroll(config: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// What this host gives jobs under the configuration: the sizes it runs, with their CPUs, and how many of the
-/// commonest fit side by side.
-fn room(config: &Config) -> Result<String, String> {
-    let facts = This::host(Path::new("/"))
+/// What this host gives jobs under the configuration, as lines of `check`: the sizes it runs, with their CPUs, and
+/// how many of the commonest fit side by side ([`room_line`]); then the disk limits they run under ([`disk_line`]).
+fn room(config: &Config) -> Vec<Result<String, String>> {
+    let disk = state_disk_bytes::<This>(&config.state_dir);
+    let read = This::host(Path::new("/"))
         .and_then(|host| host.facts())
-        .map_err(|error| format!("{}: {error}", This::SYSTEM))?;
+        .map_err(|error| format!("{}: {error}", This::SYSTEM));
+    let (facts, (settings, short)) = match read.and_then(|facts| Ok((facts, budget_of(facts, config, disk)?)))
+    {
+        Ok(read) => read,
+        Err(error) => return vec![Err(error)],
+    };
     #[cfg(target_os = "macos")]
     let (whose, when) = match config.mac_use {
         crate::config::Use::Dedicated => ("nobody works here", ""),
@@ -732,7 +746,29 @@ fn room(config: &Config) -> Result<String, String> {
     };
     #[cfg(not(target_os = "macos"))]
     let (whose, when) = ("nobody sits at it", "");
-    Ok(room_line(facts, &budget_of(facts, config)?, whose, when))
+    vec![
+        Ok(room_line(facts, &settings, whose, when)),
+        Ok(disk_line(&settings, disk, short)),
+    ]
+}
+
+/// [`room`]'s line of the disk limits on a state folder's file system of `disk_bytes` (0: not known), with what they
+/// leave short of.
+fn disk_line(settings: &Settings, disk_bytes: u64, short: Option<DiskShort>) -> String {
+    let disk = match disk_bytes {
+        0 => "the size of its file system cannot be read".to_string(),
+        bytes => format!("its file system has {}", gib(bytes)),
+    };
+    let line = format!(
+        "no job starts under {} free disk, a job is stopped under {}, each job's disk is {}; {disk}",
+        gib(settings.disk_hold_bytes),
+        gib(settings.disk_evict_bytes),
+        gib(settings.job_disk_bytes),
+    );
+    match short {
+        Some(short) => format!("{line}; but {short}"),
+        None => line,
+    }
 }
 
 /// [`room`]'s line for these facts and settings, in GiB as [`memory_now`]'s.
@@ -814,8 +850,8 @@ fn now_line(config: &Config) -> String {
         Ok((facts, host.read()?))
     });
     match read {
-        Ok((facts, reading)) => match budget_of(facts, config) {
-            Ok(settings) => memory_now(&settings, &reading),
+        Ok((facts, reading)) => match budget_of(facts, config, 0) {
+            Ok((settings, _)) => memory_now(&settings, &reading),
             Err(error) => error,
         },
         Err(error) => format!("{} could not be read: {error}", This::SYSTEM),
@@ -870,8 +906,8 @@ fn common_needs(config: &Config, program: &Path) -> Vec<Result<String, String>> 
             }
         }),
         This::fit(program).map(|()| format!("{} can start machines", program.display())),
-        room(config),
     ];
+    lines.extend(room(config));
     // Right after the image: the engine must hold it too.
     if let Some(socket) = &config.engine {
         lines.insert(1, cf_vmm_oci::probe(socket, &config.image));
@@ -1278,6 +1314,54 @@ mod tests {
 
         write(&started);
         assert_eq!(file.look(), SettingsLook::Same, "put back as it was");
+    }
+
+    /// The disk settings a small host's file gives reach the budget a Runner starts with, and one that no file system
+    /// of the state folder's size could meet makes the file one no Runner starts on.
+    #[test]
+    fn the_disk_settings_reach_the_budget_and_a_hold_past_the_state_folders_disk_is_refused() {
+        let here = Startable::new();
+        let gib = cf_budget::GIB;
+        here.write(&here.text("2026.10.1", ""));
+        let file = here.file();
+        let facts = This::host(Path::new("/"))
+            .and_then(|host| host.facts())
+            .expect("facts");
+        let budget = |more: &str| {
+            here.write(&here.text("2026.10.1", more));
+            let config = Config::load(&here.path).expect("a file");
+            budget_of(facts, &config, state_disk_bytes::<This>(&config.state_dir)).map(|(settings, _)| {
+                (
+                    settings.disk_hold_bytes,
+                    settings.disk_evict_bytes,
+                    settings.job_disk_bytes,
+                )
+            })
+        };
+        assert_eq!(budget(""), Ok((25 * gib, 5 * gib, 40 * gib)), "the defaults");
+        assert_eq!(
+            budget(r#", "disk_hold_gb": 3, "disk_stop_gb": 1.5, "job_disk_gb": 6"#),
+            Ok((3 * gib, 3 * gib / 2, 6 * gib))
+        );
+        assert!(matches!(file.look(), SettingsLook::Changed { .. }));
+        let unusable = |more: &str, why: &str| {
+            here.write(&here.text("2026.10.1", more));
+            match file.look() {
+                SettingsLook::Unusable { why: said } => assert!(said.contains(why), "{more}: {said}"),
+                other => panic!("{more}: {other:?}"),
+            }
+        };
+        let disk = This::disk_bytes(&here.state).expect("the state folder's disk");
+        let past = (disk / gib + 1).to_string();
+        unusable(&format!(r#", "disk_hold_gb": {past}"#), "no job would ever start");
+        unusable(r#", "disk_hold_gb": 0.5"#, "no job starts is under");
+        unusable(r#", "disk_stop_gb": 0.5"#, "a job is stopped is under");
+        unusable(
+            r#", "disk_hold_gb": 3, "disk_stop_gb": 4"#,
+            "is above the one under which no job starts",
+        );
+        unusable(r#", "job_disk_gb": 3"#, "a job's disk of");
+        unusable(r#", "disk_stop_gb": -1"#, "disk_stop_gb: more than 0");
     }
 
     /// The console's `settings` command, written by the Runner into its settings file: each setting is set or

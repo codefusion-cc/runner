@@ -43,8 +43,6 @@ pub struct MachineConfig {
     pub host: String,
     /// The version of the installed image jobs run in.
     pub image: String,
-    /// The size of a job's disk.
-    pub scratch_bytes: u64,
     /// The longest a job may run.
     pub deadline: Duration,
     /// The lifecycle's waits. One vm-host boots a machine twice by itself, so `starts` is 1 and `start` covers
@@ -72,7 +70,6 @@ impl MachineConfig {
         MachineConfig {
             host: host.to_string(),
             image: image.to_string(),
-            scratch_bytes: 40 << 30,
             deadline,
             limits: Limits {
                 // Two boots of the vm-host's own, each with its forced stop, and the disk's copy before them.
@@ -1587,7 +1584,7 @@ impl<H: Host + Send, V: Vms> Machines<H, V> {
             host: self.config.host.clone(),
             memory_bytes: grant.vm_bytes,
             cpus: grant.cpus,
-            scratch_bytes: self.config.scratch_bytes,
+            scratch_bytes: inner.budget.settings().job_disk_bytes,
             image: self.config.image.clone(),
             workload: own.workload,
             env: own.env,
@@ -2328,7 +2325,7 @@ impl<H: Host + Send, V: Vms> Hosts for Machines<H, V> {
             host: self.config.host.clone(),
             memory_bytes: grant.vm_bytes,
             cpus: grant.cpus,
-            scratch_bytes: self.config.scratch_bytes,
+            scratch_bytes: inner.budget.settings().job_disk_bytes,
             image: self.config.image.clone(),
             workload: self.config.stand_in.clone().unwrap_or(Workload::ActionsRunner {
                 jit_config: spec.jit_config,
