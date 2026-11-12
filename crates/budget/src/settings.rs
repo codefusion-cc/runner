@@ -91,6 +91,8 @@ pub struct Settings {
     /// Under this much free disk the job with the largest scratch disk is stopped. What the system would free does
     /// not count: a machine's writes need the space now.
     pub disk_evict_bytes: u64,
+    /// The size of each job's disk: a machine's scratch disk, or the most a container may write into its layer.
+    pub job_disk_bytes: u64,
     /// How long a reserved slot waits for its job before it is given back.
     pub reservation_ttl: Millis,
     /// A reading older than this, or two readings further apart, close the Mac.
@@ -113,6 +115,12 @@ pub struct Limits {
     /// The CPUs CI's machines may take together, from 1 to every core: for a host whose other work leaves CI more
     /// (or fewer) than the defaults give, such as a game server that takes CI jobs only while it is idle.
     pub ci_cpus: Option<u32>,
+    /// The free disk under which no job starts: [`Settings::disk_hold_bytes`].
+    pub disk_hold_bytes: Option<u64>,
+    /// The free disk under which a job is stopped: [`Settings::disk_evict_bytes`].
+    pub disk_evict_bytes: Option<u64>,
+    /// The size of each job's disk: [`Settings::job_disk_bytes`].
+    pub job_disk_bytes: Option<u64>,
 }
 
 /// A setting the budget refuses, with what is wrong. Settings come from a file, the tray and the console, so a bad
@@ -175,8 +183,60 @@ pub enum SettingsError {
     #[error("memory for CI of {ci_bytes} bytes holds no machine: the smallest needs {least_bytes}")]
     CiUnderSmallest { ci_bytes: u64, least_bytes: u64 },
     /// Jobs would be stopped for a full disk before slots stop opening for it.
-    #[error("the disk limit that stops a job is above the one that stops new slots")]
-    DiskLimitsCrossed,
+    #[error(
+        "the free disk under which a job is stopped, {evict_bytes} bytes, is above the one under which no job \
+         starts, {hold_bytes}"
+    )]
+    DiskLimitsCrossed { evict_bytes: u64, hold_bytes: u64 },
+    /// A free disk under which no job starts that is under the least a job is stopped at.
+    #[error("the free disk under which no job starts is under {least_bytes} bytes")]
+    DiskHoldTooLow { least_bytes: u64 },
+    /// A disk limit that leaves the Runner no room for its own records and logs before a job is stopped.
+    #[error("the free disk under which a job is stopped is under {least_bytes} bytes")]
+    DiskEvictTooLow { least_bytes: u64 },
+    /// A job's disk too small for a checkout and a build, or larger than any machine's disk may be.
+    #[error("a job's disk of {bytes} bytes is not between {least_bytes} and {most_bytes}")]
+    JobDisk {
+        bytes: u64,
+        least_bytes: u64,
+        most_bytes: u64,
+    },
+    /// A disk limit no file system of this size ever meets: no job would start.
+    #[error(
+        "the free disk under which no job starts, {hold_bytes} bytes, is not under the size of the file system of \
+         the state folder, {disk_bytes}: no job would ever start"
+    )]
+    DiskHoldOverDisk { hold_bytes: u64, disk_bytes: u64 },
+    /// A job's disk larger than the file system it is on.
+    #[error(
+        "a job's disk of {job_bytes} bytes is larger than the file system of the state folder, {disk_bytes}"
+    )]
+    JobDiskOverDisk { job_bytes: u64, disk_bytes: u64 },
+}
+
+/// What a container host's disk settings leave short of, though the Runner starts on them: the file system of the
+/// state folder holds less than the free disk under which no job starts and one job's whole disk together. A job
+/// that writes its whole layer then takes the host under that free disk, and may be stopped for it
+/// ([`Settings::check_disk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskShort {
+    /// [`Settings::disk_hold_bytes`].
+    pub hold_bytes: u64,
+    /// [`Settings::job_disk_bytes`].
+    pub job_bytes: u64,
+    /// The size of the file system of the state folder.
+    pub disk_bytes: u64,
+}
+
+impl std::fmt::Display for DiskShort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the free disk under which no job starts ({} bytes) and one job's disk ({}) do not fit the file system \
+             of the state folder ({}): a job that writes its whole disk may be stopped for a full disk",
+            self.hold_bytes, self.job_bytes, self.disk_bytes
+        )
+    }
 }
 
 impl Settings {
@@ -212,6 +272,25 @@ impl Settings {
 
     /// No Mac keeps less than this for itself, whatever a setting asks for.
     pub const LEAST_FLOOR: u64 = GIB;
+
+    /// The free disk under which no job starts unless the host's settings name another
+    /// ([`Settings::disk_hold_bytes`]).
+    pub const DISK_HOLD: u64 = 25 * GIB;
+
+    /// The free disk under which a job is stopped unless the host's settings name another
+    /// ([`Settings::disk_evict_bytes`]).
+    pub const DISK_EVICT: u64 = 5 * GIB;
+
+    /// The size of each job's disk unless the host's settings name another ([`Settings::job_disk_bytes`]).
+    pub const JOB_DISK: u64 = 40 * GIB;
+
+    /// The sizes a job's disk may have: a checkout, its dependencies and a build need a few gigabytes, and the
+    /// vm-host refuses a disk over 512 GiB.
+    pub const JOB_DISK_RANGE: std::ops::RangeInclusive<u64> = 4 * GIB..=512 * GIB;
+
+    /// The least free disk under which a job is stopped ([`Settings::disk_evict_bytes`]): the Runner's records,
+    /// its outbox and its log need room while a job is stopped.
+    pub const LEAST_DISK_EVICT: u64 = GIB;
 
     /// The defaults for a Mac of this size.
     ///
@@ -274,8 +353,9 @@ impl Settings {
             swap_growth_window: Millis::secs(60),
             evict_min_held_bytes: GIB,
             evict_every: Millis::secs(30),
-            disk_hold_bytes: 25 * GIB,
-            disk_evict_bytes: 5 * GIB,
+            disk_hold_bytes: Self::DISK_HOLD,
+            disk_evict_bytes: Self::DISK_EVICT,
+            job_disk_bytes: Self::JOB_DISK,
             reservation_ttl: Millis::mins(2),
             stale_after: Millis::secs(5),
         }
@@ -439,8 +519,23 @@ impl Settings {
     ///   floor stays the higher of the two. A cap that would leave the host less than its floor is lowered to what is left.
     /// - The memory for CI ([`Settings::ci_bytes`]), when set: the cap becomes what it leaves after one machine's
     ///   overhead, and a floor not set as a share becomes what it leaves the host, at least [`Settings::LEAST_FLOOR`].
+    /// - The free disk under which no job starts and the one under which a job is stopped, when set. A hold set
+    ///   without the other lowers the default stop to it, never raises it: a hold of 3 GiB stops jobs under 3 GiB.
+    /// - The size of each job's disk, when set.
     pub fn limited(mut self, limits: &Limits) -> Result<Settings, SettingsError> {
         self.max_machines = limits.max_machines.or(self.max_machines);
+        if let Some(hold) = limits.disk_hold_bytes {
+            self.disk_hold_bytes = hold;
+            if limits.disk_evict_bytes.is_none() {
+                self.disk_evict_bytes = self.disk_evict_bytes.min(hold);
+            }
+        }
+        if let Some(evict) = limits.disk_evict_bytes {
+            self.disk_evict_bytes = evict;
+        }
+        if let Some(job) = limits.job_disk_bytes {
+            self.job_disk_bytes = job;
+        }
         if let Some(idle_after) = limits.idle_after {
             self.idle_after = idle_after;
         }
@@ -603,10 +698,75 @@ impl Settings {
                 });
             }
         }
+        // Said of the hold first: one set alone takes the stop down with it, and the owner set the hold.
+        if self.disk_hold_bytes < Self::LEAST_DISK_EVICT {
+            return Err(SettingsError::DiskHoldTooLow {
+                least_bytes: Self::LEAST_DISK_EVICT,
+            });
+        }
+        if self.disk_evict_bytes < Self::LEAST_DISK_EVICT {
+            return Err(SettingsError::DiskEvictTooLow {
+                least_bytes: Self::LEAST_DISK_EVICT,
+            });
+        }
         if self.disk_evict_bytes > self.disk_hold_bytes {
-            return Err(SettingsError::DiskLimitsCrossed);
+            return Err(SettingsError::DiskLimitsCrossed {
+                evict_bytes: self.disk_evict_bytes,
+                hold_bytes: self.disk_hold_bytes,
+            });
+        }
+        if !Self::JOB_DISK_RANGE.contains(&self.job_disk_bytes) {
+            return Err(SettingsError::JobDisk {
+                bytes: self.job_disk_bytes,
+                least_bytes: *Self::JOB_DISK_RANGE.start(),
+                most_bytes: *Self::JOB_DISK_RANGE.end(),
+            });
         }
         Ok(())
+    }
+
+    /// These settings against the file system of the state folder, of `disk_bytes` (0 when the system will not
+    /// say, and then nothing is checked). Only what the owner set (`limits`) is refused, so a host on the defaults
+    /// starts as it always did:
+    ///
+    /// - a free disk under which no job starts that is not under the file system's size, since no file system is
+    ///   ever that free and no job would start;
+    /// - a job's disk larger than the file system.
+    ///
+    /// In containers, where every job writes onto that file system, a hold and one job's disk that do not fit it
+    /// together are [`DiskShort`]: the Runner starts and says so. Not refused, since a job's disk is the most it may
+    /// write, not what it takes: most jobs write a fraction of it, and the free disk under which a job is stopped
+    /// still keeps the host from filling up.
+    pub fn check_disk(
+        &self,
+        limits: &Limits,
+        sandbox: Sandbox,
+        disk_bytes: u64,
+    ) -> Result<Option<DiskShort>, SettingsError> {
+        if disk_bytes == 0 {
+            return Ok(None);
+        }
+        if limits.disk_hold_bytes.is_some() && self.disk_hold_bytes >= disk_bytes {
+            return Err(SettingsError::DiskHoldOverDisk {
+                hold_bytes: self.disk_hold_bytes,
+                disk_bytes,
+            });
+        }
+        if limits.job_disk_bytes.is_some() && self.job_disk_bytes > disk_bytes {
+            return Err(SettingsError::JobDiskOverDisk {
+                job_bytes: self.job_disk_bytes,
+                disk_bytes,
+            });
+        }
+        let fits = self
+            .disk_hold_bytes
+            .checked_add(self.job_disk_bytes)
+            .is_some_and(|both| both <= disk_bytes);
+        Ok((sandbox == Sandbox::Container && !fits).then_some(DiskShort {
+            hold_bytes: self.disk_hold_bytes,
+            job_bytes: self.job_disk_bytes,
+            disk_bytes,
+        }))
     }
 
     /// Whether this Mac could run a VM of this size at all: alone, with all its memory available and its person

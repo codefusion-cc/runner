@@ -26,9 +26,10 @@ daemon, the budget. `cf-vmm-oci` stands where cloud-hypervisor stands, and a "ma
 - held to its size's memory with no swap, its CPUs and 4096 processes, so a job that runs out ends `oom`; an engine
   that answers the create with any warning (a limit it could not set) gets its container removed and the job refused,
   and the supervisor refuses to start a job whose control group reads `max` for `memory.max` or `pids.max`;
-- held to the size's scratch disk: the vm-host reads the container's writable layer (`SizeRw`) every 2 seconds, ends
-  the job when it holds more, and reports its peak as the job's disk peak; where the engine's storage can bound a
-  layer (overlay on xfs, an engine with root) the create also asks for `StorageOpt.size`;
+- held to its disk, `job_disk_gb` (40 GB unless the host's settings say otherwise): the vm-host reads the
+  container's writable layer (`SizeRw`) every 2 seconds, ends the job when it holds more, and reports its peak as the
+  job's disk peak; where the engine's storage can bound a layer (overlay on xfs, an engine with root) the create also
+  asks for `StorageOpt.size` of that disk;
 - on a network of its own, which reaches no other job's container.
 
 The container's first process is the supervisor, as the container's root with only `NET_ADMIN`, `SETGID`, `SETPCAP`
@@ -88,6 +89,30 @@ The budget is the same as a machine host's, so a size's count is set by memory a
 | 6 | 11.4 GiB | 2 | 2 | 1 | 1 |
 | 4 | 7.6 GiB | 1 | 1 | 0 | 0 |
 
+## A small disk
+
+Every job's layer and the engine's images are on the file system of the state folder (with rootless Podman, the
+Runner user's home). The defaults are a Mac's: no job starts with less than 25 GB free, the job that wrote the most is
+stopped under 5 GB, and each job may write 40 GB. A host whose home is a file system of 12 GB never has 25 GB free and
+takes nothing, so its settings lower them:
+
+```json
+{ "disk_hold_gb": 3, "disk_stop_gb": 1, "job_disk_gb": 8 }
+```
+
+`scripts/host-setup.sh install --settings <file>` writes them into the configuration like any other key, and a
+running Runner takes them up as it takes up a changed file. The Runner refuses to start on
+
+- `disk_stop_gb` under 1 or above `disk_hold_gb` (a `disk_hold_gb` set alone lowers the default stop to itself);
+- `job_disk_gb` under 4 or over 512;
+- a `disk_hold_gb` that is not under the file system's size, since no file system is ever all free and no job would
+  start, or a `job_disk_gb` larger than the file system;
+
+and starts, saying so in its log and in `check`'s disk line, when `disk_hold_gb` and one job's disk together are
+more than the file system: a job's disk is the most it may write, not what it takes, so most jobs still run, and
+`disk_stop_gb` still stops the job that wrote the most before the disk fills. Settings left out are checked as before,
+so a host on the defaults starts on any disk.
+
 ## Tests
 
 - `crates/vmm-oci/tests/engine.rs`, against a real engine (CI's Linux jobs, with Docker and with rootless Podman): a
@@ -97,7 +122,11 @@ The budget is the same as a machine host's, so a size's count is set by memory a
   release installed into the engine runs a job.
 - `crates/supervisor/tests/container.rs`: the firewall's inputs and what it lets out, the limits check, the seccomp
   filter on each architecture (with a property test against its specification) and the look at the kernel's account.
-- `crates/vmhost/src/driver.rs`: a container that writes past its disk is stopped, and its disk peak is reported.
+- `crates/vmhost/tests/driver.rs`: a container that writes past its disk, of whatever size its request names, is
+  stopped, and its disk peak is reported.
+- `crates/budget/tests/disk.rs`: the disk settings' defaults, their edges, the checks against the file system, and a
+  small disk that takes a job once its hold is lowered and holds under it; `crates/daemon/tests/machines.rs`: a job
+  gets the disk the settings give.
 - `crates/image/tests/store.rs`: the image goes whole into the engine, each host takes only its kind, and an import
   that stops early, cannot be named or is refused leaves nothing.
 - `xtask/tests/host_setup.rs`: `--sandbox` and the keys it writes.

@@ -6,8 +6,8 @@
 mod common;
 
 use cf_budget::{
-    Assigned, Budget, Charge, EvictionCause, GIB, Hold, HostFacts, HostReading, Level, MIB, Millis, Mode,
-    Now, Pressure, Profile, Settings, Size, SlotId, Thermal, Usage, admit,
+    Assigned, Budget, Charge, EvictionCause, GIB, Hold, HostFacts, HostReading, Level, Limits, MIB, Millis,
+    Mode, Now, Pressure, Profile, Settings, Size, SlotId, Thermal, Usage, admit,
 };
 use common::*;
 use proptest::prelude::*;
@@ -162,6 +162,20 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 fn settings() -> impl Strategy<Value = Settings> {
+    // Disk limits a small host's settings give, in GiB: the hold and the stop, the lower of the two.
+    (host_settings(), prop::option::of((1..30u64, 1..30u64))).prop_map(|(settings, disk)| match disk {
+        None => settings,
+        Some((a, b)) => settings
+            .limited(&Limits {
+                disk_hold_bytes: Some(a.max(b) * GIB),
+                disk_evict_bytes: Some(a.min(b) * GIB),
+                ..Limits::default()
+            })
+            .expect("disk limits in order"),
+    })
+}
+
+fn host_settings() -> impl Strategy<Value = Settings> {
     (
         prop::sample::select(vec![8u64, 16, 32]),
         4..16u32,

@@ -195,7 +195,10 @@ fn every_bad_setting_is_refused_by_name() {
     );
     assert_eq!(
         bad(|s| s.disk_evict_bytes = s.disk_hold_bytes + 1),
-        SettingsError::DiskLimitsCrossed
+        SettingsError::DiskLimitsCrossed {
+            evict_bytes: 25 * GIB + 1,
+            hold_bytes: 25 * GIB
+        }
     );
     let durations: [fn(&mut Settings); 8] = [
         |s| s.idle_after = Millis::ZERO,
