@@ -13,7 +13,8 @@
 //! - on a network of its own, made with it and named as it is, or none;
 //! - with the guest's own supervisor, taken from the verified initramfs, put in at `/run/codefusion/supervisor`
 //!   before the container starts, as its first process (`container-guest`);
-//! - talked to over its standard input and output, attached before it starts; its standard error is the console;
+//! - talked to over its standard input and output, attached once before it starts, its input closed when that attach
+//!   goes, so the supervisor ends the job when its vm-host dies; its standard error is the console;
 //! - thrown away, with its anonymous volumes and its network, when the vm-host lets go of it, and found and thrown
 //!   away by the next vm-host when the one that made it is gone ([`OciVmm::new`]).
 
@@ -417,7 +418,8 @@ impl OciVmm {
             "AttachStdout": true,
             "AttachStderr": true,
             "OpenStdin": true,
-            "StdinOnce": false,
+            // The input ends with the one attach, the vm-host's: a vm-host that dies ends its job.
+            "StdinOnce": true,
             "Tty": false,
             "NetworkDisabled": network.is_none(),
             "Labels": self.labels(),
@@ -963,6 +965,19 @@ mod tests {
         );
         assert_eq!(offline["HostConfig"]["NetworkMode"], "none");
         assert_eq!(offline["NetworkDisabled"], true);
+    }
+
+    /// The supervisor ends the job when its standard input ends. With `StdinOnce: false` the engine keeps the
+    /// container's input open after the vm-host's attach goes, so a vm-host that dies (SIGKILL, OOM) would leave the
+    /// job running past its timeout.
+    #[test]
+    fn the_containers_input_ends_with_its_vm_hosts_attach() {
+        let body = vmm().create_body(&spec(), "image-20261112-7", Some("n"));
+        assert_eq!(body["OpenStdin"], true);
+        assert_eq!(
+            body["StdinOnce"], true,
+            "stdin stays open after the vm-host dies: the job outlives it"
+        );
     }
 
     #[test]

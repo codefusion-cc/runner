@@ -471,3 +471,67 @@ fn a_container_image_release_installed_into_the_engine_runs_a_job() {
     assert!(console.contains("uid=1001"), "{console}");
     nothing_left(&vmm);
 }
+
+/// A machine's firewall (`cf-vmm-ch` `firewall.rs`) drops `cf_nft::BLOCKED`, 127/8 and
+/// every network of the host; a container has nothing like it. A listener on all the host's addresses must not hear
+/// the job, whatever name or address the job tries, and nor must the cloud's metadata service.
+#[test]
+#[ignore = "needs a container engine: CF_ENGINE_SOCKET, CF_SUPERVISOR and CF_GUEST_IMAGE"]
+fn a_job_reaches_no_listener_of_the_host_and_no_metadata() {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("a listener");
+    listener.set_nonblocking(true).expect("non-blocking");
+    let port = listener.local_addr().expect("its port").port();
+    // The host's own addresses, as the job could learn them from DNS or the internet.
+    let own = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let script = format!(
+        "gw=$(ip route 2>/dev/null | awk '/default/ {{print $3}}'); \
+         for t in host.containers.internal host.docker.internal host.orb.internal 169.254.1.2 10.0.2.2 \
+                  127.0.0.1 $gw {own}; do \
+           wget -q -T 3 -O /dev/null http://$t:{port}/ 2>/dev/null; echo tried:$t; done; \
+         out=$(wget -T 3 -O /dev/null http://169.254.169.254/ 2>&1); echo \"metadata:[$out]\"; true"
+    );
+    let vmm = engine(&machine("egress"));
+    let folder = tempfile::tempdir().expect("a state folder");
+    let (state, console) = job(
+        &vmm,
+        &folder,
+        request("egress", &script, 120),
+        &AtomicBool::new(false),
+    );
+    let heard = std::iter::from_fn(|| listener.accept().ok())
+        .map(|(_, from)| from)
+        .collect::<Vec<_>>();
+    assert_eq!(end(&state), Some(End::Ok), "{console}");
+    assert_eq!(heard, [], "the job reached a listener of the host: {console}");
+    assert!(
+        console.contains("metadata:[") && !console.contains("200 OK") && !console.contains("saving to"),
+        "the job reached 169.254.169.254: {console}"
+    );
+    nothing_left(&vmm);
+}
+
+/// A job gains no capabilities in a user namespace of its own: in a machine that is the guest kernel's attack
+/// surface, in a container the host's (nf_tables and the rest).
+#[test]
+#[ignore = "needs a container engine: CF_ENGINE_SOCKET, CF_SUPERVISOR and CF_GUEST_IMAGE"]
+fn a_job_makes_no_user_namespace() {
+    let vmm = engine(&machine("userns"));
+    let folder = tempfile::tempdir().expect("a state folder");
+    let (state, console) = job(
+        &vmm,
+        &folder,
+        request(
+            "userns",
+            "if unshare -Urn sh -c 'grep CapEff /proc/self/status'; then echo made-userns; fi; true",
+            60,
+        ),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(end(&state), Some(End::Ok), "{console}");
+    assert!(!console.contains("made-userns"), "{console}");
+    nothing_left(&vmm);
+}
