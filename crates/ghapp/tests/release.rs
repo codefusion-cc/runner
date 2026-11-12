@@ -338,6 +338,90 @@ async fn a_download_is_stopped_when_the_runner_ends() {
     assert_eq!(fake.requests().len(), 1, "not asked again");
 }
 
+/// The Runner ends while the connection stalls, or while a download waits to be tried again: it ends at once, not
+/// after the read timeout or the wait GitHub asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_that_stalls_or_waits_ends_when_the_runner_ends() {
+    let body = program();
+    for reply in [
+        Reply::Stalled {
+            body: body.clone(),
+            sent: 1000,
+        },
+        Reply::empty(429).with_header("retry-after", "4"),
+    ] {
+        let fake = fake(move |_, _| reply.clone());
+        let mut target = target();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let began = std::time::Instant::now();
+        let ends = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let error = releases(&fake)
+            .download(
+                &format!("{}/f", fake.server.url()),
+                &mut target.file,
+                2 << 20,
+                &stop,
+            )
+            .await
+            .expect_err("stopped");
+        ends.join().unwrap();
+        assert_eq!(error, Error::Local("the download was stopped".into()));
+        assert!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+        assert_eq!(fake.requests().len(), 1);
+    }
+}
+
+/// GitHub's rate limit used up (403, no Retry-After, `x-ratelimit-remaining: 0`) is waited out until its reset; any
+/// other 403, or a reset later than the longest wait, is not asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_used_up_rate_limit_is_waited_out_until_its_reset() {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let limited = |reset: u64| {
+        Reply::status_json(403, &serde_json::json!({"message": "API rate limit exceeded"}))
+            .with_header("x-ratelimit-remaining", "0")
+            .with_header("x-ratelimit-reset", &reset.to_string())
+    };
+    let release = serde_json::json!({"tag_name": "runner-0.1.0-aaaaaaaaaaaa", "target_commitish": "x"});
+    for (first, asked, found) in [
+        (limited(now() + 1), 2, true),
+        (limited(now() - 30), 2, true),
+        (limited(now() + 3600), 1, false),
+        (
+            Reply::status_json(403, &serde_json::json!({"message": "Resource not accessible"})),
+            1,
+            false,
+        ),
+        (
+            Reply::status_json(403, &serde_json::json!({"message": "x"}))
+                .with_header("x-ratelimit-remaining", "12")
+                .with_header("x-ratelimit-reset", &(now() + 1).to_string()),
+            1,
+            false,
+        ),
+    ] {
+        let first = Mutex::new(Some(first));
+        let ok = Reply::json(&release);
+        let fake = fake(move |_, _| first.lock().unwrap().take().unwrap_or_else(|| ok.clone()));
+        let began = std::time::Instant::now();
+        let got = releases(&fake).by_tag("runner-0.1.0-aaaaaaaaaaaa").await;
+        assert_eq!(got.is_ok(), found, "{got:?}");
+        if !found {
+            assert_eq!(got.expect_err("refused").status(), Some(403));
+        }
+        assert_eq!(fake.requests().len(), asked);
+        assert!(began.elapsed() < Duration::from_secs(4), "{:?}", began.elapsed());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_compare_says_how_two_commits_stand_and_nothing_else() {
     for (status, said) in [
@@ -384,7 +468,7 @@ async fn a_page_of_releases_is_read_with_its_files() {
     let fake = fake(|request, _| {
         assert_eq!(
             (request.query("per_page"), request.query("page")),
-            (Some("100"), Some("2"))
+            (Some("30"), Some("2"))
         );
         Reply::json(&serde_json::json!([{
             "tag_name": "runner-0.1.0-aaaaaaaaaaaa",

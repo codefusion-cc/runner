@@ -48,6 +48,11 @@ pub trait SelfUpdate: Send + Sync {
     /// Ends what a build or a download under way started, as the Runner ends: the console sends its command again
     /// to the Runner that starts next. Nothing by default.
     fn end(&self) {}
+
+    /// What the console shows while [`SelfUpdate::build`] runs.
+    fn first_step(&self) -> &'static str {
+        "building"
+    }
 }
 
 /// What the console hears of a plain `update` on a host whose updates come as releases.

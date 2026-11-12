@@ -3939,9 +3939,14 @@ async fn a_runner_from_a_release_updates_only_to_a_commit_and_waits_for_its_mach
 
     let runner = rig.job_running().await;
     rig.updates.build_gives(Ok(NEWER));
+    rig.updates.build_takes(Duration::from_millis(1500));
     let to = rig
         .console
         .queue_command("update-to", Some(json!({"commit": "5c0ffee0a1b2"})));
+    rig.settles("the console hears it fetches, not builds", || {
+        last_status(&rig.console)["reason"] == json!("updating to 5c0ffee0a1b2: fetching its release")
+    })
+    .await;
     rig.settles("no new job while the machine stands", || {
         last_status(&rig.console)["reason"]
             == json!(format!("updating to {NEWER}: waiting for 1 machine to end"))

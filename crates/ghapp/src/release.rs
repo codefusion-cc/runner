@@ -20,8 +20,11 @@ const MAX_REDIRECTS: usize = 5;
 /// How long a download may go without a byte before it counts as dropped.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How many releases one page lists, GitHub's most.
-pub const RELEASES_PAGE: u32 = 100;
+/// How often a download that waits, for its next bytes or to try again, looks whether it was stopped.
+const STOP_LOOK: Duration = Duration::from_millis(200);
+
+/// How many releases one page lists: a new release is among the first, and an image release lists many files.
+pub const RELEASES_PAGE: u32 = 30;
 
 /// A release as GitHub's API lists it, with the fields an update reads.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -277,7 +280,14 @@ impl Releases {
                 None => crate::http::backoff(self.retry.base, self.retry.cap, attempt),
             };
             tracing::debug!(attempt, ?wait, "fetching a release's file again");
-            tokio::time::sleep(wait).await;
+            // A wait that `stop` ends early: a Retry-After may ask for minutes.
+            let until = tokio::time::Instant::now() + wait;
+            while tokio::time::Instant::now() < until {
+                if stop.load(Ordering::SeqCst) {
+                    return Err(stopped());
+                }
+                tokio::time::sleep_until(until.min(tokio::time::Instant::now() + STOP_LOOK)).await;
+            }
             attempt += 1;
         }
     }
@@ -314,14 +324,19 @@ impl Releases {
         }
         let mut hash = Sha256::new();
         let mut bytes = 0u64;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| Error::Transport(format!("the file ended early: {}", e.without_url())))?
-        {
+        loop {
             if stop.load(Ordering::SeqCst) {
-                return Err(Error::Local("the download was stopped".into()));
+                return Err(stopped());
             }
+            // A connection that stalls is looked at for `stop` while it waits for its next bytes.
+            let Ok(next) = tokio::time::timeout(STOP_LOOK, response.chunk()).await else {
+                continue;
+            };
+            let Some(chunk) =
+                next.map_err(|e| Error::Transport(format!("the file ended early: {}", e.without_url())))?
+            else {
+                break;
+            };
             bytes += chunk.len() as u64;
             if bytes > max {
                 return Err(too_long());
@@ -335,6 +350,10 @@ impl Releases {
             sha256: hash.finalize().into(),
         })
     }
+}
+
+fn stopped() -> Error {
+    Error::Local("the download was stopped".into())
 }
 
 /// A write on this host that failed: no room on its disk, most often.

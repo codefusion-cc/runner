@@ -954,4 +954,12 @@ impl crate::update::SelfUpdate for FakeUpdate {
     fn takes_head(&self) -> bool {
         !self.0.lock().expect("update").commits_only
     }
+
+    fn first_step(&self) -> &'static str {
+        if self.0.lock().expect("update").commits_only {
+            "fetching its release"
+        } else {
+            "building"
+        }
+    }
 }

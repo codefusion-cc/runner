@@ -64,6 +64,8 @@ pub enum Reply {
     Drop,
     /// Promise the whole body, send `sent` bytes of it, close.
     Truncated { status: u16, body: Vec<u8>, sent: usize },
+    /// Promise the whole body, send `sent` bytes of it, then keep the connection open and send nothing more.
+    Stalled { body: Vec<u8>, sent: usize },
     /// Wait, then do the inner reply.
     After(Duration, Box<Reply>),
 }
@@ -200,6 +202,17 @@ async fn serve_connection(stream: TcpStream, handler: Handler) -> std::io::Resul
                 write.write_all(head.as_bytes()).await?;
                 write.write_all(&body[..sent.min(body.len())]).await?;
                 write.flush().await?;
+                return Ok(());
+            }
+            Reply::Stalled { body, sent } => {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                write.write_all(head.as_bytes()).await?;
+                write.write_all(&body[..sent.min(body.len())]).await?;
+                write.flush().await?;
+                std::future::pending::<()>().await;
                 return Ok(());
             }
             Reply::Response {

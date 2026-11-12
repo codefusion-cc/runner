@@ -608,7 +608,7 @@ place_binary() {
       trap - ERR
       as_user "'$installed' version" 2>/dev/null
     ) || runs=''
-    runs=${runs#"$USER_NAME "}
+    runs=${runs#codefusion-runner }
     case $(runs_newer "$REPO_API" "${runs##*+}" "${version##*-}") in
       keep)
         say "it runs $runs, newer on main than $named: it stays, and $named waits for none"

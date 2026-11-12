@@ -9,7 +9,6 @@
 //! that commit. Plain `update` (main's head) is a build's: it is not offered here.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -33,10 +32,12 @@ const MAX_SUMS: u64 = 64 * 1024;
 /// The largest program taken: the Runner with its guest and cloud-hypervisor is some tens of megabytes.
 const MAX_PROGRAM: u64 = 512 * 1024 * 1024;
 /// How long a release that is not out is waited for: the console sends a commit once its CI is green, and the
-/// release workflow publishes it minutes after, from what it built while CI ran.
-pub const RELEASE_WAIT: Duration = Duration::from_secs(16 * 60);
+/// release workflow publishes it minutes after, from what it built while CI ran; as long as a build may take.
+pub const RELEASE_WAIT: Duration = Duration::from_secs(45 * 60);
 /// How often GitHub is asked for it meanwhile: GitHub answers 60 reads an hour to a host without a token.
-pub const ASK_EVERY: Duration = Duration::from_secs(2 * 60);
+pub const ASK_EVERY: Duration = Duration::from_secs(3 * 60);
+/// Of those looks, every how many also reads the newest releases, for a tag of another package version.
+const PAGE_EVERY: u32 = 5;
 /// The name a release's program is fetched to beside the installed one.
 const DOWNLOAD: &str = "download";
 
@@ -71,10 +72,8 @@ pub struct ReleaseUpdate {
     package: String,
     /// How long a release that is not out is waited for, asked for every so often.
     wait: (Duration, Duration),
-    /// Set as the Runner ends: a download or a wait under way ends with it.
+    /// Set as the Runner ends: a download or a wait under way ends with it. The service runs one update at a time.
     stop: AtomicBool,
-    /// Held while a release is fetched: one at a time.
-    fetching: Mutex<()>,
 }
 
 impl ReleaseUpdate {
@@ -112,7 +111,6 @@ impl ReleaseUpdate {
             package: env!("CARGO_PKG_VERSION").into(),
             wait: (RELEASE_WAIT, ASK_EVERY),
             stop: AtomicBool::new(false),
-            fetching: Mutex::new(()),
         })
     }
 
@@ -128,15 +126,17 @@ impl ReleaseUpdate {
     }
 
     /// The release of the commit `short`, its tag that of the running package's version or, after a version
-    /// changed, any `runner-<version>-<short>` of the newest releases. Waits for one that is not out yet.
+    /// changed, any `runner-<version>-<short>` of the newest releases (read at the first look and every
+    /// [`PAGE_EVERY`]th). Waits for one that is not out yet.
     async fn release_of(&self, short: &str) -> Result<Release, String> {
         let (wait, every) = self.wait;
         let began = Instant::now();
-        loop {
-            if let Some(release) = self.look_for(short).await? {
+        for look in 0u32.. {
+            let last = began.elapsed() + every > wait || self.stop.load(Ordering::SeqCst);
+            if let Some(release) = self.look_for(short, last || look % PAGE_EVERY == 0).await? {
                 return Ok(release);
             }
-            if began.elapsed() + every > wait || self.stop.load(Ordering::SeqCst) {
+            if last {
                 return Err(format!(
                     "{short} has no release of {REPO} (asked for {}); nothing was downloaded",
                     cf_daemon::update::spoken(began.elapsed())
@@ -145,9 +145,10 @@ impl ReleaseUpdate {
             tracing::info!(commit = short, "its release is not out yet; asking again");
             self.sleep(every).await;
         }
+        unreachable!("the looks end by the wait")
     }
 
-    async fn look_for(&self, short: &str) -> Result<Option<Release>, String> {
+    async fn look_for(&self, short: &str, with_page: bool) -> Result<Option<Release>, String> {
         let unread = |error: cf_ghapp::Error| {
             format!("the releases of {REPO} could not be read: {error}; nothing was downloaded")
         };
@@ -158,6 +159,9 @@ impl ReleaseUpdate {
             .map_err(unread)?
         {
             return Ok(Some(release));
+        }
+        if !with_page {
+            return Ok(None);
         }
         let ends = format!("-{short}");
         let page = self.releases.page(1).await.map_err(unread)?;
@@ -252,8 +256,10 @@ impl ReleaseUpdate {
             .download(&sums.browser_download_url, &mut listed, MAX_SUMS, &self.stop)
             .await
             .map_err(|error| fetched(SUMS, error))?;
-        let want = sum_of(&listed, &self.asset)
-            .ok_or_else(|| format!("{SUMS} of {tag} names no single SHA-256 of {}; {not}", self.asset))?;
+        let want = cf_image::parse_sums(&listed)
+            .map_err(|error| format!("{SUMS} of {tag} is no list of SHA-256s: {error}; {not}"))?
+            .remove(&self.asset)
+            .ok_or_else(|| format!("{SUMS} of {tag} names no SHA-256 of {}; {not}", self.asset))?;
         let path = self.download();
         let mut file = new_file(&path).map_err(|error| format!("{}: {error}; {not}", path.display()))?;
         let got = self
@@ -296,9 +302,6 @@ impl SelfUpdate for ReleaseUpdate {
         if short == running {
             return Ok(self.running.clone());
         }
-        let Ok(_one) = self.fetching.try_lock() else {
-            return Err(format!("a release is being fetched already; {not}"));
-        };
         let path = self.download();
         let fetched = block_on(self.fetch(name, short, running));
         let offered = match fetched {
@@ -322,6 +325,10 @@ impl SelfUpdate for ReleaseUpdate {
 
     fn end(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    fn first_step(&self) -> &'static str {
+        "fetching its release"
     }
 }
 
@@ -354,24 +361,6 @@ fn make_runnable(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
-/// The SHA-256 a `sha256sum` list names for `file`: one line `<64 hex>  <file>` (or ` *<file>`), and only one.
-pub fn sum_of(list: &[u8], file: &str) -> Option<String> {
-    let text = std::str::from_utf8(list).ok()?;
-    let mut found = text.lines().filter_map(|line| {
-        let (sum, name) = line.split_once(' ')?;
-        let name = name.strip_prefix(' ').or_else(|| name.strip_prefix('*'))?;
-        (name == file).then_some(sum)
-    });
-    let sum = found.next()?;
-    if found.next().is_some()
-        || sum.len() != 64
-        || !sum.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return None;
-    }
-    Some(sum.to_string())
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -379,7 +368,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use cf_daemon::update::{MAX_STARTS, UpdateFile};
     use cf_fake_github::httpd::{Handler, Reply, Request, Server};
@@ -780,25 +769,42 @@ mod tests {
     fn a_list_that_does_not_name_this_hosts_program_once_is_refused() {
         let bench = bench();
         let ours = program(&NEW[..12]);
-        for list in [
-            format!("{}  {OTHER}\n", sum(b"x")),
-            format!("{}  {ASSET}\n{}  {ASSET}\n", sum(&ours), sum(&ours)),
-            format!("{}  {ASSET}\n", &sum(&ours)[..63]),
-            format!("{}  {ASSET}\n", sum(&ours).to_uppercase()),
+        let tag = Bench::tag(NEW);
+        for (list, malformed) in [
+            (format!("{}  {OTHER}\n", sum(b"x")), false),
+            (String::new(), false),
+            (
+                format!("{}  {ASSET}\n{}  {ASSET}\n", sum(&ours), sum(&ours)),
+                true,
+            ),
+            (format!("{}  {ASSET}\n", &sum(&ours)[..63]), true),
+            (format!("{}  {ASSET}\n", sum(&ours).to_uppercase()), true),
+            (format!("{} *{ASSET}\n", sum(&ours)), true),
+            (
+                format!("{}  {OTHER}\nnot a line\n{}  {ASSET}\n", sum(b"x"), sum(&ours)),
+                true,
+            ),
         ] {
             bench
                 .hub
                 .lock()
                 .expect("hub")
                 .files
-                .insert(Bench::file_path(NEW, SUMS), list.into_bytes());
-            assert_eq!(
-                bench.update.build(Some(NEW)),
-                Err(format!(
-                    "SHA256SUMS of {} names no single SHA-256 of {ASSET}; nothing was installed",
-                    Bench::tag(NEW)
-                ))
-            );
+                .insert(Bench::file_path(NEW, SUMS), list.clone().into_bytes());
+            let said = bench.update.build(Some(NEW)).expect_err("refused");
+            if malformed {
+                assert!(
+                    said.starts_with(&format!("SHA256SUMS of {tag} is no list of SHA-256s: ")),
+                    "{list:?}: {said}"
+                );
+                assert!(said.ends_with("; nothing was installed"), "{said}");
+            } else {
+                assert_eq!(
+                    said,
+                    format!("SHA256SUMS of {tag} names no SHA-256 of {ASSET}; nothing was installed"),
+                    "{list:?}"
+                );
+            }
             untouched(&bench);
         }
     }
@@ -838,6 +844,42 @@ mod tests {
             ],
         );
         assert_eq!(bench.update.build(Some(NEW)), Ok(format!("0.1.0+{}", &NEW[..12])));
+        let seen = bench.seen();
+        let count = |path: &str| seen.iter().filter(|seen| *seen == path).count();
+        assert_eq!((count(&tags), count(&format!("/repos/{REPO}/releases"))), (3, 2));
+    }
+
+    /// While it waits, a look reads the tag alone; the newest releases only every few looks, and at the last.
+    #[test]
+    fn a_wait_reads_the_newest_releases_only_now_and_then() {
+        let mut bench = bench();
+        bench
+            .update
+            .wait_for(Duration::from_millis(1500), Duration::from_millis(100));
+        let none = "dddddddddddd3333333333333333333333333333";
+        bench.update.build(Some(none)).expect_err("no release");
+        let seen = bench.seen();
+        let tags = seen
+            .iter()
+            .filter(|path| path.contains("/releases/tags/"))
+            .count();
+        let mut page_after = Vec::new();
+        let mut look = 0usize;
+        for path in &seen {
+            if path.contains("/releases/tags/") {
+                look += 1;
+            } else {
+                page_after.push(look);
+            }
+        }
+        assert!(tags >= 10, "{seen:?}");
+        let mut wanted: Vec<usize> = (1..=tags)
+            .filter(|look| (look - 1) % PAGE_EVERY as usize == 0)
+            .collect();
+        if !wanted.contains(&tags) {
+            wanted.push(tags);
+        }
+        assert_eq!(page_after, wanted, "{seen:?}");
     }
 
     #[test]
@@ -1077,38 +1119,6 @@ mod tests {
     }
 
     /// The service runs one update at a time; a second fetch at once is refused all the same, and fetches nothing.
-    #[test]
-    fn a_second_update_while_one_fetches_is_refused() {
-        let bench = bench();
-        let tags = format!("/repos/{REPO}/releases/tags/{}", Bench::tag(NEW));
-        let slow = Reply::After(
-            Duration::from_secs(2),
-            Box::new(Reply::status_json(404, &serde_json::json!({}))),
-        );
-        bench.fault(&tags, vec![slow]);
-        bench.fault(
-            &format!("/repos/{REPO}/releases"),
-            vec![Reply::json(&serde_json::json!([]))],
-        );
-        std::thread::scope(|scope| {
-            let first = scope.spawn(|| bench.update.build(Some(NEW)));
-            let began = Instant::now();
-            while bench.seen().is_empty() {
-                assert!(began.elapsed() < Duration::from_secs(10), "the first asks");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert_eq!(
-                bench.update.build(Some(NEW)),
-                Err("a release is being fetched already; nothing was downloaded".into())
-            );
-            assert!(
-                first.join().expect("the first").is_err(),
-                "no release on the first look"
-            );
-        });
-        assert_eq!(bench.seen().len(), 2, "the second asked nothing");
-    }
-
     /// The Runner ends while a release is waited for: the wait ends with it.
     #[test]
     fn a_wait_for_a_release_ends_when_the_runner_ends() {
@@ -1154,28 +1164,6 @@ mod tests {
             .block_on(runtime.spawn_blocking(move || fetching.build(Some(NEW))))
             .expect("the thread");
         assert_eq!(said, Ok(format!("0.1.0+{}", &NEW[..12])));
-    }
-
-    #[test]
-    fn a_sum_is_read_from_its_one_line() {
-        let a = "a".repeat(64);
-        let b = "b".repeat(64);
-        assert_eq!(
-            sum_of(format!("{a}  x\n{b}  y\n").as_bytes(), "y"),
-            Some(b.clone())
-        );
-        assert_eq!(sum_of(format!("{a} *y\n").as_bytes(), "y"), Some(a.clone()));
-        for list in [
-            format!("{a}  y\n{b}  y\n"),
-            format!("{a}  yy\n"),
-            format!("{a} y\n"),
-            format!("{a}\ty\n"),
-            format!("{}  y\n", &a[..62]),
-            String::new(),
-        ] {
-            assert_eq!(sum_of(list.as_bytes(), "y"), None, "{list:?}");
-        }
-        assert_eq!(sum_of(b"\xff\xfe  y", "y"), None);
     }
 
     #[test]

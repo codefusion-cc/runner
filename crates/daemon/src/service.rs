@@ -2711,9 +2711,10 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 return Some((false, "an update is under way already".into()));
             }
             update.command = Some(id.to_string());
+            let step = updates.first_step();
             update.doing = Some(match &commit {
-                Some(commit) => format!("updating to {commit}: building"),
-                None => "updating: building".into(),
+                Some(commit) => format!("updating to {commit}: {step}"),
+                None => format!("updating: {step}"),
             });
         }
         let service = self.handle();

@@ -237,16 +237,26 @@ impl Http {
     }
 }
 
-/// The wait `Retry-After` asks for, in whole seconds. (GitHub sends seconds; a date is not read.)
+/// The wait an answer asks for: `Retry-After` in whole seconds (GitHub sends seconds; a date is not read), else, for
+/// a rate limit used up (`x-ratelimit-remaining: 0`), until `x-ratelimit-reset` by the answer's own clock (`Date`),
+/// at least a second.
 pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
+    if let Some(seconds) = number(RETRY_AFTER.as_str()) {
+        return Some(Duration::from_secs(seconds));
+    }
+    if number("x-ratelimit-remaining")? != 0 {
+        return None;
+    }
+    let reset = i64::try_from(number("x-ratelimit-reset")?).ok()?;
+    let now = server_time(headers).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
+    });
+    Some(Duration::from_secs(
+        u64::try_from(reset.saturating_sub(now)).unwrap_or(0).max(1),
+    ))
 }
 
 /// An exponential wait with jitter: between half and the whole of `base * 2^attempt`, at most `cap`.

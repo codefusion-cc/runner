@@ -180,7 +180,7 @@ A Linux Runner installed from a release (`host-setup.sh --version`, no `build_fo
 the whole commit, on `main` and newer than the commit that runs (GitHub's compare). It fetches `SHA256SUMS` and
 `codefusion-runner-linux-amd64` or `-arm64` for its own architecture, checks the program against its line, asks it its
 `version`, which must run on this host and name the commit, and then drains, installs and checks the start as a build
-does. A commit whose release is not out yet is waited for up to 16 minutes, asked every 2; a commit with no release,
+does. A commit whose release is not out yet is waited for up to 45 minutes, asked every 3; a commit with no release,
 an older one, a checksum that does not match, a missing file, a program of another architecture or a disk with no
 room leaves the running program as it was and says why. Releases are not signed: the checksum guards against a
 broken download, and HTTPS to GitHub and the publisher's name against anyone else. "Runner release" puts out a commit

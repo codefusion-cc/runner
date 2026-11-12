@@ -27,7 +27,7 @@ pub use manifest::{
     Asset, FORMAT, HOST_ARCH, MANIFEST_NAME, Manifest, Rootfs, RootfsKind, SIGNATURE_NAME, SUMS_NAME,
 };
 pub use release::{ReleaseInputs, parse_signing_key, public_key_text, write_release};
-pub use verify::{Verified, parse_public_key, verify};
+pub use verify::{Verified, parse_public_key, parse_sums, verify};
 
 /// The public key every downloaded image must be signed with (unpadded base64url), committed in `trusted-key.txt`.
 pub const TRUSTED_PUBLIC_KEY: &str = include_str!("../trusted-key.txt");

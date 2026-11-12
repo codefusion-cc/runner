@@ -168,7 +168,8 @@ fn hash_asset(files: &dyn Files, asset: &Asset, also: &mut [&mut Sha256]) -> Res
     Ok(())
 }
 
-fn parse_sums(sums: &[u8]) -> Result<BTreeMap<String, String>, ImageError> {
+/// A `sha256sum` list (`<64 lowercase hex>  <name>` a line, each name once and a plain file name), by name.
+pub fn parse_sums(sums: &[u8]) -> Result<BTreeMap<String, String>, ImageError> {
     let text = std::str::from_utf8(sums).map_err(|_| ImageError::SumsMalformed { line: 1 })?;
     let mut listed = BTreeMap::new();
     for (index, line) in text.lines().enumerate() {
