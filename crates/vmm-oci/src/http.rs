@@ -389,7 +389,11 @@ mod tests {
     fn a_chunk_size_that_overflows_is_an_error_not_a_panic() {
         let text = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\nffffffffffffffff\r\n";
         let result = std::panic::catch_unwind(|| answer(text).is_err());
-        assert_eq!(result.ok(), Some(true), "the vm-host panicked on the engine's answer");
+        assert_eq!(
+            result.ok(),
+            Some(true),
+            "the vm-host panicked on the engine's answer"
+        );
     }
 
     /// A request's head and body, as the engine read them.

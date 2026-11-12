@@ -8,6 +8,7 @@
 //! panics for what a host or a guest does.
 
 mod exit;
+mod owner;
 mod spec;
 pub mod testing;
 
@@ -17,19 +18,8 @@ use std::time::Duration;
 /// A pressure file's share of the last 10 s ([`Vm::cpu_pressure`]).
 pub use cf_guest_proto::Psi;
 pub use exit::ExitCell;
+pub use owner::{Owner, boot_of, start_of_stat};
 pub use spec::{Disk, MIN_MEMORY, Network, SpecError, VmSpec};
-
-/// Whether a process of this id is running, as a monitor asks of the vm-host that left a machine behind. One of
-/// another user's counts as running.
-pub fn alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: kill with signal 0 takes no pointers and sends nothing.
-    pid > 0
-        && (unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
-}
 
 /// The guest kernel's command line, the same under every monitor of an architecture. `console=hvc0` is the virtio
 /// console the monitor writes to the console file. `quiet` keeps the kernel's own lines off the console; `panic=-1`

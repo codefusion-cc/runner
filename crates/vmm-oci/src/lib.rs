@@ -18,25 +18,27 @@
 //! - thrown away, with its anonymous volumes and its network, when the vm-host lets go of it, and found and thrown
 //!   away by the next vm-host when the one that made it is gone ([`OciVmm::new`]).
 
+#[cfg(test)]
+mod fake;
 pub mod http;
 pub mod image;
 pub mod initramfs;
 mod stream;
 pub mod tar;
 
-use cf_vmm::{Channel, ExitCell, Network, Vm, VmExit, VmSpec, Vmm, VmmError};
+use cf_vmm::{Channel, ExitCell, Network, Owner, Vm, VmExit, VmSpec, Vmm, VmmError};
 use http::{Body, Engine, escape};
 use serde_json::json;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The label every container of the Runner's carries, with its machine's name.
 pub const LABEL_MACHINE: &str = "cc.codefusion.runner.machine";
-/// The label with the process id of the vm-host that made the container.
+/// The label with the vm-host that made the container: its process id, start and boot ([`cf_vmm::Owner::label`]).
 pub const LABEL_OWNER: &str = "cc.codefusion.runner.vm-host";
 /// The repository of the job images in the engine.
 pub const IMAGE_REPOSITORY: &str = "codefusion-runner-guest";
@@ -71,6 +73,8 @@ pub struct Config {
 pub struct OciVmm {
     engine: Engine,
     machine: String,
+    /// This process, as what it makes is labelled.
+    owner: Owner,
     next: AtomicU64,
 }
 
@@ -114,17 +118,20 @@ pub fn probe(socket: &std::path::Path, version: &str) -> Result<String, String> 
     ))
 }
 
+/// Throws away what vm-hosts of `machine` that are gone left in the engine at `socket`, as [`OciVmm::new`] does
+/// first: the daemon's own look, now and then, so that a container whose vm-host died goes while no vm-host starts.
+/// An engine that does not answer is left for the next look.
+pub fn sweep(socket: &Path, machine: &str) -> Result<(), String> {
+    OciVmm::of(socket, machine)?.sweep(Owner::alive);
+    Ok(())
+}
+
 impl OciVmm {
     /// The engine at `config.socket`, once it answers. Containers of this machine whose vm-host is gone are thrown
     /// away first, with what they hold.
     pub fn new(config: Config) -> Result<Self, VmmError> {
-        if !plain(&config.machine) {
-            return Err(VmmError::Unsupported(format!(
-                "{:?} is no machine name",
-                config.machine
-            )));
-        }
-        let engine = Engine::new(&config.socket);
+        let vmm = Self::of(&config.socket, &config.machine).map_err(VmmError::Unsupported)?;
+        let engine = vmm.engine.clone();
         let ping = engine
             .request("GET", "/_ping", Body::Empty, Some(Duration::from_secs(10)))
             .map_err(|error| {
@@ -150,42 +157,50 @@ impl OciVmm {
         if !config.rootful_for_tests {
             isolation(&info).map_err(VmmError::Unsupported)?;
         }
-        let vmm = Self {
-            engine,
-            machine: config.machine,
-            next: AtomicU64::new(0),
-        };
-        vmm.sweep(cf_vmm::alive);
+        vmm.sweep(Owner::alive);
         Ok(vmm)
     }
 
+    /// The engine at `socket` for the machine `machine`, asked nothing yet.
+    fn of(socket: &Path, machine: &str) -> Result<Self, String> {
+        if !plain(machine) {
+            return Err(format!("{machine:?} is no machine name"));
+        }
+        Ok(Self {
+            engine: Engine::new(socket),
+            machine: machine.to_string(),
+            owner: Owner::this().ok_or("the system does not say when this process started")?,
+            next: AtomicU64::new(0),
+        })
+    }
+
     /// Throws away every container and network of this machine whose vm-host is not `alive`, the containers first,
-    /// as a network a container is on cannot go.
-    pub fn sweep(&self, alive: impl Fn(u32) -> bool) {
+    /// as a network a container is on cannot go. What names no owner as [`Owner::label`] writes it is nobody's.
+    pub fn sweep(&self, alive: impl Fn(&Owner) -> bool) {
         for (id, owner) in self.containers() {
-            if !owner.is_some_and(&alive) {
+            if !owner.as_ref().is_some_and(&alive) {
                 remove(&self.engine, &id);
             }
         }
         for (id, owner) in self.networks() {
-            if !owner.is_some_and(&alive) {
+            if !owner.as_ref().is_some_and(&alive) {
                 remove_network(&self.engine, &id);
             }
         }
     }
 
     /// The containers of this machine, each with the vm-host that made it, when its label names one.
-    pub fn containers(&self) -> Vec<(String, Option<u32>)> {
+    pub fn containers(&self) -> Vec<(String, Option<Owner>)> {
         self.labelled("/containers/json?all=1&filters=")
     }
 
     /// The networks of this machine, each with the vm-host that made it, when its label names one.
-    pub fn networks(&self) -> Vec<(String, Option<u32>)> {
+    pub fn networks(&self) -> Vec<(String, Option<Owner>)> {
         self.labelled("/networks?filters=")
     }
 
     /// What a list call of the engine names of this machine's, with each one's vm-host.
-    fn labelled(&self, list: &str) -> Vec<(String, Option<u32>)> {
+    fn labelled(&self, list: &str) -> Vec<(String, Option<Owner>)> {
         let filters = json!({ "label": [format!("{LABEL_MACHINE}={}", self.machine)] }).to_string();
         let path = format!("{list}{}", escape(&filters));
         let Ok(answer) = self.engine.request("GET", &path, Body::Empty, Some(CALL)) else {
@@ -201,7 +216,7 @@ impl OciVmm {
                     .get("Labels")
                     .and_then(|labels| labels.get(LABEL_OWNER))
                     .and_then(|owner| owner.as_str())
-                    .and_then(|owner| owner.parse().ok());
+                    .and_then(Owner::parse);
                 Some((id, owner))
             })
             .collect()
@@ -211,7 +226,7 @@ impl OciVmm {
     fn labels(&self) -> serde_json::Value {
         json!({
             LABEL_MACHINE: self.machine,
-            LABEL_OWNER: std::process::id().to_string(),
+            LABEL_OWNER: self.owner.label(),
         })
     }
 
@@ -899,11 +914,7 @@ mod tests {
     }
 
     fn vmm() -> OciVmm {
-        OciVmm {
-            engine: Engine::new("/nowhere.sock"),
-            machine: "host-1".into(),
-            next: AtomicU64::new(0),
-        }
+        OciVmm::of(Path::new("/nowhere.sock"), "host-1").unwrap()
     }
 
     #[test]
@@ -952,7 +963,7 @@ mod tests {
         assert_eq!(host["NetworkMode"], "codefusion-host-1-vm-7-0");
         assert_eq!(host["LogConfig"]["Type"], "none");
         assert_eq!(body["Labels"][LABEL_MACHINE], "host-1");
-        assert_eq!(body["Labels"][LABEL_OWNER], std::process::id().to_string());
+        assert_eq!(body["Labels"][LABEL_OWNER], Owner::this().unwrap().label());
         assert_eq!(body["Entrypoint"], json!([SUPERVISOR]));
         assert_eq!(body["Cmd"], json!(["container-guest"]));
         let offline = vmm().create_body(
@@ -977,6 +988,80 @@ mod tests {
         assert_eq!(
             body["StdinOnce"], true,
             "stdin stays open after the vm-host dies: the job outlives it"
+        );
+    }
+
+    /// An engine on a rootless host that holds one container and one network of `host-1` for each owner label.
+    fn holding(owners: &[String]) -> fake::FakeEngine {
+        let listed = |kind: &str| {
+            serde_json::Value::Array(
+                owners
+                    .iter()
+                    .enumerate()
+                    .map(|(n, owner)| {
+                        json!({ "Id": format!("{kind}{n}"), "Labels": { LABEL_MACHINE: "host-1", LABEL_OWNER: owner } })
+                    })
+                    .collect(),
+            )
+            .to_string()
+        };
+        let (containers, networks) = (listed("c"), listed("n"));
+        fake::FakeEngine::new(move |asked| match (asked.method.as_str(), asked.path.as_str()) {
+            ("GET", "/_ping") => (200, "\"OK\"".into()),
+            ("GET", "/info") => (
+                200,
+                json!({ "SecurityOptions": ["name=rootless"], "OperatingSystem": "Ubuntu 26.04 LTS" })
+                    .to_string(),
+            ),
+            ("GET", path) if path.starts_with("/containers/json") => (200, containers.clone()),
+            ("GET", path) if path.starts_with("/networks") => (200, networks.clone()),
+            ("DELETE", _) => (204, String::new()),
+            _ => (404, "{\"message\":\"no such thing\"}".into()),
+        })
+    }
+
+    /// After a reboot or a wrap the number a container's vm-host had is another process's. Pid 1 is init or
+    /// launchd, never a vm-host: what a vm-host of that number left goes, with its writable layer and its network.
+    #[test]
+    fn a_pid_that_is_now_another_process_is_not_a_live_vm_host() {
+        let this = Owner::this().unwrap();
+        // macOS tells another user's process's start to root only.
+        let init = Owner::of(1).unwrap_or(Owner {
+            pid: 1,
+            start: 1,
+            boot: this.boot,
+        });
+        let engine = holding(&[
+            "1".to_string(),
+            Owner {
+                start: init.start + 1,
+                ..init
+            }
+            .label(),
+            this.label(),
+            Owner {
+                boot: this.boot ^ 1,
+                ..this
+            }
+            .label(),
+            String::new(),
+        ]);
+        OciVmm::new(Config {
+            socket: engine.socket.clone(),
+            machine: "host-1".into(),
+            rootful_for_tests: false,
+        })
+        .expect("the engine answers");
+        let removed = |kind: &str, at: &str| {
+            [0, 1, 3, 4]
+                .map(|n| format!("DELETE /{kind}/{kind:.1}{n}{at}"))
+                .to_vec()
+        };
+        let (containers, networks) = (removed("containers", "?force=1&v=1"), removed("networks", ""));
+        assert_eq!(
+            engine.lines("DELETE"),
+            [containers, networks].concat(),
+            "only what this live vm-host labelled stays; pid 1 (init) is never a vm-host that owns a container"
         );
     }
 

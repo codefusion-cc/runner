@@ -129,6 +129,31 @@ pub fn owner(name: &str) -> Option<u32> {
     host.parse().ok()
 }
 
+/// The file in a machine's folder that names the vm-host that made it, as [`cf_vmm::Owner::label`] writes it. The
+/// machine's cgroup has the folder's name, so it names the cgroup's vm-host too.
+pub const OWNER_FILE: &str = "owner";
+
+/// Whether the vm-host that made the machine `name`, whose number the name holds (`pid`, [`owner`]), still runs.
+/// The machine's folder in `dir` names its owner: the process of that number, start and boot. A folder a Runner
+/// before this one made names none; then the number alone answers, as it did then.
+pub fn host_runs(dir: &std::path::Path, name: &str, pid: u32) -> bool {
+    match std::fs::read_to_string(dir.join(name).join(OWNER_FILE)) {
+        Ok(text) => cf_vmm::Owner::parse(&text).is_some_and(|owner| owner.pid == pid && owner.alive()),
+        Err(_) => pid_runs(pid),
+    }
+}
+
+/// Whether any process has this number; one of another user's counts.
+fn pid_runs(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill with signal 0 takes no pointers and sends nothing.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
 /// Whether a machine may run where its cgroup has no [`SWAP_MAX`]: only when the host swaps to nothing, as
 /// `/proc/swaps` (a line of headings, then one line per device) says. Otherwise the refusal says what to do.
 pub fn without_swap_account(proc_swaps: &str) -> Result<(), String> {
@@ -261,10 +286,16 @@ mod linux {
         }
 
         /// Removes what machines of hosts that are gone left: the cgroup of a machine is named after the process
-        /// that started it ([`super::owner`]), and one whose process is not `alive` is killed and removed.
-        pub fn sweep(&self, alive: impl Fn(u32) -> bool) {
+        /// that started it ([`super::owner`]), and one whose process is not `alive` (given the cgroup's name and
+        /// that number) is killed and removed.
+        pub fn sweep(&self, alive: impl Fn(&str, u32) -> bool) {
             for (owner, group) in self.groups() {
-                if !alive(owner) {
+                let name = group
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if !alive(name, owner) {
                     group.remove(Duration::from_secs(1));
                 }
             }
@@ -689,6 +720,70 @@ mod tests {
             assert_eq!(owner(name), None, "{name:?}");
         }
         assert!(plain_name(&machine_name(u32::MAX, u64::MAX)));
+    }
+
+    /// A machine's folder names its vm-host by number, start and boot: a number the kernel gave to another process
+    /// since (pid 1 after a reboot, any process after a wrap) is not its vm-host, and what it left goes.
+    #[test]
+    fn a_machine_is_its_vm_hosts_only_while_that_very_process_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let this = cf_vmm::Owner::this().unwrap();
+        let made = |name: &str, owner: Option<String>| {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            if let Some(owner) = owner {
+                std::fs::write(dir.path().join(name).join(OWNER_FILE), owner).unwrap();
+            }
+            name.to_string()
+        };
+        let pid = this.pid;
+        let own = made(&machine_name(pid, 0), Some(this.label()));
+        assert!(host_runs(dir.path(), &own, pid), "this process's");
+        let init = cf_vmm::Owner::of(1).unwrap_or(cf_vmm::Owner {
+            pid: 1,
+            start: 1,
+            boot: this.boot,
+        });
+        for (n, (pid, owner)) in [
+            (
+                1,
+                cf_vmm::Owner {
+                    start: init.start + 1,
+                    ..init
+                }
+                .label(),
+            ),
+            (
+                pid,
+                cf_vmm::Owner {
+                    start: this.start + 1,
+                    ..this
+                }
+                .label(),
+            ),
+            (
+                pid,
+                cf_vmm::Owner {
+                    boot: this.boot ^ 1,
+                    ..this
+                }
+                .label(),
+            ),
+            // The number in the name and the file's must be one.
+            (1, this.label()),
+            (pid, "not an owner".into()),
+            (pid, String::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = made(&machine_name(pid, n as u64 + 1), Some(owner.clone()));
+            assert!(!host_runs(dir.path(), &name, pid), "{name}: {owner:?}");
+        }
+        // A folder of a Runner before owners were written down: the number alone, as then.
+        let earlier = made(&machine_name(pid, 99), None);
+        assert!(host_runs(dir.path(), &earlier, pid));
+        let gone = made(&machine_name(u32::MAX - 1, 99), None);
+        assert!(!host_runs(dir.path(), &gone, u32::MAX - 1));
     }
 
     #[test]

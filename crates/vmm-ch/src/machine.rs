@@ -1,6 +1,6 @@
 //! [`ChVmm`] and its machines.
 
-use crate::cgroup::{Delegation, Limits, MachineGroup, machine_name, owner};
+use crate::cgroup::{Delegation, Limits, MachineGroup, OWNER_FILE, host_runs, machine_name, owner};
 use crate::command::{self, Files};
 use crate::cpus::{self, List};
 use crate::ending::{self, Ending, Recent, Status};
@@ -8,7 +8,7 @@ use crate::events::{Event, Events};
 use crate::sandbox::{self, Access, Sandbox};
 use crate::{programs, vsock};
 use cf_nft::Ip;
-use cf_vmm::{Channel, DiskIo, ExitCell, Network, Psi, Vm, VmExit, VmSpec, Vmm, VmmError};
+use cf_vmm::{Channel, DiskIo, ExitCell, Network, Owner, Psi, Vm, VmExit, VmSpec, Vmm, VmmError};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
@@ -51,6 +51,8 @@ pub struct Config {
 /// The monitor: cloud-hypervisor under KVM.
 pub struct ChVmm {
     config: Config,
+    /// This process, as each machine's folder names it ([`OWNER_FILE`]).
+    owner: Owner,
     pasta: OnceLock<Result<PathBuf, String>>,
     delegation: Delegation,
     cores: Vec<u32>,
@@ -84,15 +86,16 @@ impl ChVmm {
             *path = fs::canonicalize(&path)
                 .map_err(|e| VmmError::Unsupported(format!("{}: {e}", path.display())))?;
         }
-        delegation.sweep(cf_vmm::alive);
+        let me = Owner::this().ok_or_else(|| {
+            VmmError::Unsupported("the system does not say when this process started".into())
+        })?;
+        // The cgroups first: each is judged by its folder, which names its vm-host.
+        delegation.sweep(|name, host| host_runs(&config.dir, name, host));
         if let Ok(entries) = fs::read_dir(&config.dir) {
             for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_str()
-                    .and_then(owner)
-                    .is_some_and(|host| !cf_vmm::alive(host))
-                {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if owner(name).is_some_and(|host| !host_runs(&config.dir, name, host)) {
                     let _ = fs::remove_dir_all(entry.path());
                 }
             }
@@ -103,6 +106,7 @@ impl ChVmm {
         }
         Ok(ChVmm {
             config,
+            owner: me,
             pasta,
             delegation,
             cores,
@@ -137,7 +141,7 @@ impl Vmm for ChVmm {
             .open(&spec.console)
             .map_err(|e| VmmError::Start(format!("{}: {e}", spec.console.display())))?;
         let spec = &resolved(spec)?;
-        let name = machine_name(std::process::id(), self.next.fetch_add(1, Ordering::Relaxed));
+        let name = machine_name(self.owner.pid, self.next.fetch_add(1, Ordering::Relaxed));
         let dir = self.config.dir.join(&name);
         let (vsock, events) = (dir.join("vsock"), dir.join("events"));
         if vsock.as_os_str().len() > SOCKET_PATH_MAX {
@@ -190,7 +194,11 @@ impl Vmm for ChVmm {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
-            .map_err(|e| VmmError::Start(format!("{}: {e}", dir.display())))?;
+            .and_then(|()| fs::write(dir.join(OWNER_FILE), self.owner.label()))
+            .map_err(|e| {
+                let _ = fs::remove_dir_all(&dir);
+                VmmError::Start(format!("{}: {e}", dir.display()))
+            })?;
         let group = match self.delegation.machine(&name, &limits) {
             Ok(group) => group,
             Err(error) => {
