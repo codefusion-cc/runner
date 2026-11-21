@@ -77,6 +77,17 @@ const ROUND_STALL: Duration = Duration::from_secs(30);
 /// The pump's pause between rounds on an idle Mac.
 const ROUND_PAUSE: Duration = Duration::from_millis(15);
 
+/// How long GitHub's long poll waits for a message before it answers with none, on an idle Mac.
+const POLL_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// How long GitHub's tokens and sessions last in [`Rig::lasting`]: longer than any script's hours (at most 40 steps of
+/// at most 11 minutes, and 16 minutes more). [`Rig::later`] moves GitHub's clock by minutes at once, while calls are
+/// under way: a token GitHub took as a call began is expired by the time it answers, and a long poll whose token was
+/// just refreshed can find it expired again within the same call, which fails its listener. A real clock moves 50
+/// seconds in a long poll, not an hour. A token that expires during a poll and is refreshed is the scale set client's
+/// own test (`a_token_that_expires_during_a_poll_is_replaced_and_the_wait_goes_on`).
+const LASTING: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// How long a real Mac's update waits for the machines that stand.
 fn default_update_limit() -> Duration {
     ServiceConfig::new(MACHINE, "", "", RUNNING).update_limit
@@ -128,11 +139,26 @@ impl Rig {
         Rig::with(settings_for(machines), update_limit).await
     }
 
+    /// [`Rig::new`], whose GitHub's tokens and sessions outlast every hour [`Rig::later`] lets pass ([`LASTING`]).
+    async fn lasting(machines: u32) -> Rig {
+        Rig::with_tokens(settings_for(machines), default_update_limit(), Some(LASTING)).await
+    }
+
     async fn with(settings: Settings, update_limit: Duration) -> Rig {
+        Rig::with_tokens(settings, update_limit, None).await
+    }
+
+    /// [`Rig::with`], whose GitHub's tokens and sessions last `tokens` of GitHub's clock, or as long as GitHub's
+    /// own defaults say.
+    async fn with_tokens(settings: Settings, update_limit: Duration, tokens: Option<Duration>) -> Rig {
+        let defaults = Options::default();
         let github = FakeGithub::start(Options {
-            poll_timeout: Duration::from_millis(150),
+            poll_timeout: POLL_TIMEOUT,
             auto_assign: true,
-            ..Options::default()
+            installation_token_ttl: tokens.unwrap_or(defaults.installation_token_ttl),
+            admin_token_ttl: tokens.unwrap_or(defaults.admin_token_ttl),
+            session_token_ttl: tokens.unwrap_or(defaults.session_token_ttl),
+            ..defaults
         })
         .await;
         github.add_repo(REPO, true);
@@ -2309,14 +2335,106 @@ fn happens_around_removals() -> impl Strategy<Value = Happens> {
     ]
 }
 
-/// How soon, in these tests' timings, the Mac offers room for a job it serves that waits while a machine of its size
-/// fits: a session GitHub forgot opens again (the backoff here waits 100 ms at most), and two polls show the room (the
-/// fake GitHub answers each within 150 ms).
-const OFFERS_WITHIN: Duration = Duration::from_secs(3);
+/// How many polls each scale set makes, at most, before the Mac offers room for a job it serves that waits while a
+/// machine of its size fits, or before a job GitHub handed out has its machine: two polls show the room, the offer
+/// goes round the two scale sets two polls at a time, a nudge ends a poll early, and the assignment comes with the
+/// next poll. Counted in polls, not seconds: a loaded Mac makes each poll slower, not more of them needed (issue #91).
+const OFFER_POLLS: usize = 12;
 
-/// How soon GitHub's look at its queue, while the Mac offers room, moves a job this Mac serves: the assignment and the
-/// start follow.
-const STARTS_WITHIN: Duration = Duration::from_secs(3);
+/// How loaded the Mac a script runs on is: each of the Runner's rounds pauses `rounds`, GitHub answers a long poll
+/// that brings nothing after `polls`, and every poll and acknowledgement only `answers` after it came. Other work on
+/// the Mac makes all of them slower.
+#[derive(Debug, Clone, Copy)]
+struct Load {
+    rounds: Duration,
+    polls: Duration,
+    answers: Duration,
+}
+
+/// An idle Mac.
+const IDLE: Load = Load {
+    rounds: ROUND_PAUSE,
+    polls: POLL_TIMEOUT,
+    answers: Duration::ZERO,
+};
+
+/// Waits until `done` holds while the Mac's polls and rounds go on: every scale set's session is open again within
+/// [`ROUNDS`] of the Runner's rounds; once all are, the wait lasts until the slowest scale set made [`OFFER_POLLS`]
+/// polls, each within [`ROUNDS`] rounds of the one before, and [`ROUNDS`] rounds went by. What the polls show waits
+/// on GitHub's answers and on the budget, whose clock moves a second a round. No wall time counts but a round that
+/// never ends ([`ROUND_STALL`]). Says how far the polls and rounds went when they ran out.
+async fn by_polls(rig: &Rig, done: impl Fn(&Rig) -> bool) -> Result<(), String> {
+    // Each scale set's polls so far, once every one of them has its session.
+    let polls = |rig: &Rig| -> Option<Vec<usize>> {
+        let sets = rig.github.scale_sets();
+        sets.iter().all(|set| set.has_session).then(|| {
+            sets.iter()
+                .map(|set| {
+                    rig.github.count(&format!(
+                        "GET /svc/_apis/runtime/runnerscalesets/{}/messages",
+                        set.id
+                    ))
+                })
+                .collect()
+        })
+    };
+    // The polls when every session was last seen open, and the round then; the slowest scale set's polls since,
+    // and the round they last changed; the last round, and when it ended.
+    let mut open: Option<(Vec<usize>, usize)> = None;
+    let mut slowest = (None, rig.rounds());
+    let mut round = (rig.rounds(), std::time::Instant::now());
+    while !done(rig) {
+        let rounds = rig.rounds();
+        if rounds != round.0 {
+            round = (rounds, std::time::Instant::now());
+        } else if round.1.elapsed() >= ROUND_STALL {
+            return Err(format!(
+                "the Runner's round {rounds} has not ended in {ROUND_STALL:?}"
+            ));
+        }
+        let made = match polls(rig) {
+            Some(now) => {
+                let (since, _) = open.get_or_insert_with(|| (now.clone(), rounds));
+                Some(
+                    now.iter()
+                        .zip(since.iter())
+                        .map(|(now, since)| now.saturating_sub(*since))
+                        .min()
+                        .unwrap_or(0),
+                )
+            }
+            None => {
+                open = None;
+                None
+            }
+        };
+        if made != slowest.0 {
+            slowest = (made, rounds);
+        }
+        let quiet = rounds - slowest.1;
+        let since_open = open.as_ref().map_or(0, |(_, at)| rounds - at);
+        match made {
+            None if quiet >= ROUNDS => {
+                return Err(format!(
+                    "a scale set's session was not open again in {quiet} rounds of the Runner"
+                ));
+            }
+            Some(made) if made >= OFFER_POLLS && since_open >= ROUNDS => {
+                return Err(format!(
+                    "in {made} polls of each scale set and {since_open} rounds of the Runner"
+                ));
+            }
+            Some(made) if quiet >= ROUNDS => {
+                return Err(format!(
+                    "a scale set made no poll in {quiet} rounds of the Runner, after {made}"
+                ));
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
 
 /// How soon, in the Runner's rounds, a job whose start and end went with a session is at the console once its machine
 /// is gone: the wait for GitHub's word ([`cf_daemon::RESULT_WAIT`], two minutes of the Mac's clock, a second of which
@@ -2408,17 +2526,21 @@ fn one_machine_per_assignment(rig: &Rig) -> Result<(), TestCaseError> {
 }
 
 async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
-    live_with(slots, script, ROUND_PAUSE).await
+    live_with(slots, script, IDLE).await
 }
 
-/// [`live`] on a Mac whose rounds pause `round_pause`.
-async fn live_with(slots: u32, script: Vec<Happens>, round_pause: Duration) -> Result<(), TestCaseError> {
-    let mut rig = Rig::new(slots).await;
-    rig.slow_rounds(round_pause).await;
+/// [`live`] on a Mac this loaded.
+async fn live_with(slots: u32, script: Vec<Happens>, load: Load) -> Result<(), TestCaseError> {
+    let mut rig = Rig::lasting(slots).await;
+    rig.slow_rounds(load.rounds).await;
+    rig.github.set_poll_timeout(load.polls);
+    if !load.answers.is_zero() {
+        rig.github.delay("/messages", load.answers, usize::MAX);
+    }
     rig.github.add_repo(SECOND, true);
     rig.github.set_workflow(SECOND, "ci.yml", WORKFLOW);
     rig.service.discover().await;
-    until("a session for each repository's scale set", || {
+    rig.settles("a session for each repository's scale set", || {
         let sets = rig.github.scale_sets();
         sets.len() == 2 && sets.iter().all(|s| s.has_session)
     })
@@ -2679,31 +2801,24 @@ async fn live_with(slots: u32, script: Vec<Happens>, round_pause: Duration) -> R
         if before == 0 || standing >= slots {
             break;
         }
+        let moved = |rig: &Rig| (waiting(rig), rig.standing().len()) != (before, standing);
         // The Mac's polls show the room for a waiting job, once a session GitHub forgot is open again; then GitHub
         // looks. A look before that hands nothing out, and GitHub looks again only at its own moments. A machine that
         // stands up meanwhile for a job assigned before may take the last slot: then the room is looked at anew.
-        let free = std::time::Instant::now();
-        while !offered(&rig) && (waiting(&rig), rig.standing().len()) == (before, standing) {
-            prop_assert!(
-                free.elapsed() < OFFERS_WITHIN,
+        if let Err(why) = by_polls(&rig, |rig| offered(rig) || moved(rig)).await {
+            return Err(TestCaseError::fail(format!(
                 "{before} jobs wait at GitHub and {standing} of {slots} machines stand, and the Mac offered no room \
-                 for them in {:?}",
-                free.elapsed()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+                 for them: {why}"
+            )));
         }
-        if (waiting(&rig), rig.standing().len()) != (before, standing) {
+        if moved(&rig) {
             continue;
         }
         rig.github.github_looks();
-        let looked = std::time::Instant::now();
-        while waiting(&rig) == before && rig.standing().len() == standing {
-            prop_assert!(
-                looked.elapsed() < STARTS_WITHIN,
-                "{before} jobs wait at GitHub and {standing} of {slots} machines stand, {:?} after GitHub looked",
-                looked.elapsed()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Err(why) = by_polls(&rig, moved).await {
+            return Err(TestCaseError::fail(format!(
+                "{before} jobs wait at GitHub and {standing} of {slots} machines stand after GitHub looked: {why}"
+            )));
         }
     }
     one_machine_per_assignment(&rig)?;
@@ -2990,9 +3105,57 @@ async fn on_a_loaded_mac_every_job_that_ran_is_heard_once_the_rounds_of_the_wait
         Completed(59, false),
         RemovalsFail(true),
     ];
-    live_with(2, script, Duration::from_millis(100))
+    let load = Load {
+        rounds: Duration::from_millis(100),
+        ..IDLE
+    };
+    live_with(2, script, load)
         .await
         .expect("every job that ran is heard");
+}
+
+/// Issue #91 on Linux: GitHub's clock passed the hour of the sessions' tokens while the Runner listened, minutes at
+/// a time, and a long poll found its just refreshed token expired again within the same call: the sessions opened
+/// again with no cause the test counts. Hours pass here while the sessions stand, on a Mac whose rounds and GitHub's
+/// polls are slow, so that a long poll spans the jumps. With tokens of an hour ([`Rig::new`]) it fails every time;
+/// the scripts' tokens ([`Rig::lasting`]) outlast them, and no session opens again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_loaded_mac_hours_that_pass_while_the_sessions_stand_open_none_again() {
+    let load = Load {
+        rounds: Duration::from_millis(100),
+        polls: Duration::from_secs(1),
+        ..IDLE
+    };
+    live_with(2, vec![Happens::Minutes(6); 24], load)
+        .await
+        .expect("no session opens again");
+}
+
+/// Issue #91 on Apple silicon: a job waits while a machine fits, on a Mac where GitHub's answer to each poll comes
+/// 1.6 s late, so two polls outlast the 3 s the test once gave. The room comes within so many polls of the Mac,
+/// however long a loaded Mac makes each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_loaded_mac_a_job_that_waits_while_a_machine_fits_gets_room_within_the_polls() {
+    use Happens::{Completed, Queued, RemovalsFail, RestStale, SlowBoot};
+    let script = vec![
+        RestStale(true),
+        SlowBoot(false),
+        Queued(true),
+        Completed(78, true),
+        Completed(14, false),
+        RemovalsFail(true),
+        Completed(196, false),
+        RestStale(true),
+        RestStale(true),
+    ];
+    let load = Load {
+        rounds: Duration::from_millis(100),
+        answers: Duration::from_millis(1600),
+        ..IDLE
+    };
+    live_with(1, script, load)
+        .await
+        .expect("the waiting job gets room");
 }
 
 /// How often each scale set's session was opened.
