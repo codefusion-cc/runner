@@ -154,6 +154,7 @@ pub(crate) fn value(inner: &str, vars: &BTreeMap<String, String>) -> Option<Valu
         tokens: &tokens,
         at: 0,
         vars,
+        skipped: 0,
     };
     let value = parser.or(0)?;
     (parser.at == tokens.len()).then_some(value)
@@ -278,6 +279,10 @@ struct Parser<'a> {
     tokens: &'a [Token],
     at: usize,
     vars: &'a BTreeMap<String, String>,
+    /// How many operands around the current one GitHub skips, because an earlier `||` or `&&` operand already decided
+    /// the result. GitHub does not evaluate a skipped operand, so a comparison or call in it that cannot be evaluated
+    /// does not make the whole unread; it still has to parse.
+    skipped: usize,
 }
 
 impl Parser<'_> {
@@ -295,16 +300,16 @@ impl Parser<'_> {
         (self.next()? == *token).then_some(())
     }
 
-    /// `a || b || ...`: the first operand that is truthy, else the last. Every operand is read, so one this reader
-    /// cannot read makes the whole unread.
+    /// `a || b || ...`: the first operand that is truthy, else the last. The operands after a truthy one are skipped.
     fn or(&mut self, depth: usize) -> Option<Value> {
         if depth > MAX_DEPTH {
             return None;
         }
         let mut chosen: Option<Value> = None;
         loop {
-            let operand = self.and(depth)?;
-            if !chosen.as_ref().is_some_and(truthy) {
+            let decided = chosen.as_ref().is_some_and(truthy);
+            let operand = self.skipping(decided, |parser| parser.and(depth))?;
+            if !decided {
                 chosen = Some(operand);
             }
             if self.peek() != Some(&Token::Or) {
@@ -314,12 +319,13 @@ impl Parser<'_> {
         }
     }
 
-    /// `a && b && ...`: the first operand that is falsy, else the last. Every operand is read, as in [`Parser::or`].
+    /// `a && b && ...`: the first operand that is falsy, else the last. The operands after a falsy one are skipped.
     fn and(&mut self, depth: usize) -> Option<Value> {
         let mut chosen: Option<Value> = None;
         loop {
-            let operand = self.equality(depth)?;
-            if chosen.as_ref().is_none_or(truthy) {
+            let decided = chosen.as_ref().is_some_and(|value| !truthy(value));
+            let operand = self.skipping(decided, |parser| parser.equality(depth))?;
+            if !decided {
                 chosen = Some(operand);
             }
             if self.peek() != Some(&Token::And) {
@@ -327,6 +333,14 @@ impl Parser<'_> {
             }
             self.at += 1;
         }
+    }
+
+    /// Reads one operand, as skipped when `skip` holds.
+    fn skipping(&mut self, skip: bool, read: impl FnOnce(&mut Self) -> Option<Value>) -> Option<Value> {
+        self.skipped += usize::from(skip);
+        let value = read(self);
+        self.skipped -= usize::from(skip);
+        value
     }
 
     /// `a == b` and `a != b`, left to right.
@@ -340,7 +354,11 @@ impl Parser<'_> {
             };
             self.at += 1;
             let right = self.not(depth)?;
-            left = Value::Bool(equal(&left, &right)? != negated);
+            left = match equal(&left, &right) {
+                Some(same) => Value::Bool(same != negated),
+                None if self.skipped > 0 => Value::Null,
+                None => return None,
+            };
         }
     }
 
@@ -376,7 +394,10 @@ impl Parser<'_> {
                 _ if self.peek() == Some(&Token::Open) => {
                     self.at += 1;
                     let args = self.arguments(depth + 1)?;
-                    call(&word, args)
+                    match call(&word, args) {
+                        None if self.skipped > 0 && FUNCTIONS.contains(&word.as_str()) => Some(Value::Null),
+                        value => value,
+                    }
                 }
                 _ => None,
             },
@@ -433,6 +454,9 @@ impl Parser<'_> {
         }
     }
 }
+
+/// The functions [`call`] knows. GitHub refuses a call to any other while it parses, even in a skipped operand.
+const FUNCTIONS: [&str; 3] = ["tojson", "fromjson", "format"];
 
 fn call(function: &str, args: Vec<Value>) -> Option<Value> {
     let mut args = args.into_iter();
@@ -521,13 +545,22 @@ fn bounded(text: String) -> Option<Value> {
     (text.len() <= MAX_VALUE_BYTES).then_some(Value::String(text))
 }
 
+/// One character as GitHub's ordinal ignore-case compares it: upper case when that is one character, else itself.
+fn fold(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(one), None) => one,
+        _ => c,
+    }
+}
+
 /// GitHub's `==`: texts without regard to case, values of one kind as they are, and values of two kinds as numbers
 /// ([`as_number`]), where NaN equals nothing. GitHub calls a list or an object equal only to itself, which no
 /// `runs-on` means: `None`, not read.
 fn equal(a: &Value, b: &Value) -> Option<bool> {
     match (a, b) {
         (Value::Array(_) | Value::Object(_), _) | (_, Value::Array(_) | Value::Object(_)) => None,
-        (Value::String(x), Value::String(y)) => Some(x.to_uppercase() == y.to_uppercase()),
+        (Value::String(x), Value::String(y)) => Some(x.chars().map(fold).eq(y.chars().map(fold))),
         (Value::Bool(x), Value::Bool(y)) => Some(x == y),
         (Value::Null, Value::Null) => Some(true),
         _ => Some(as_number(a) == as_number(b)),
@@ -759,6 +792,40 @@ mod tests {
             Some(json!(true)),
             "left to right"
         );
+    }
+
+    #[test]
+    fn an_operand_github_skips_needs_only_to_parse() {
+        // GitHub stops at the operand that decides `||` or `&&`, so what follows is never compared or called.
+        let lists = "fromJSON('[1]') == fromJSON('[1]')";
+        assert_eq!(
+            text(&format!("vars.EMPTY && {lists} || 'cf-2g'")).unwrap(),
+            "cf-2g"
+        );
+        assert_eq!(text(&format!("'cf-4g' || {lists}")).unwrap(), "cf-4g");
+        assert_eq!(text("'cf-4g' || format('{0:x}', 1)").unwrap(), "cf-4g");
+        assert_eq!(
+            text(&format!("false && ({lists} || 'x') || 'cf-2g'")).unwrap(),
+            "cf-2g"
+        );
+        // An operand that is reached is still read, and one that does not parse is never read.
+        assert_eq!(of(&format!("vars.A && {lists} || 'cf-2g'")), None);
+        assert_eq!(of(&format!("vars.EMPTY || {lists}")), None);
+        assert_eq!(
+            of("'cf-4g' || hashFiles('x')"),
+            None,
+            "GitHub refuses a function it does not know"
+        );
+        assert_eq!(of("'cf-4g' || =="), None);
+        assert_eq!(of("'cf-4g' || ("), None);
+    }
+
+    #[test]
+    fn texts_are_equal_by_each_character_in_any_case() {
+        assert_eq!(of("'Straße' == 'STRASSE'"), Some(json!(false)));
+        assert_eq!(of("'straße' == 'STRAßE'"), Some(json!(true)));
+        assert_eq!(of("'Żółć' == 'żÓŁĆ'"), Some(json!(true)));
+        assert_eq!(of("'ab' == 'abc'"), Some(json!(false)));
     }
 
     #[test]

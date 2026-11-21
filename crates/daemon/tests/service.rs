@@ -5888,7 +5888,11 @@ async fn a_held_job_gets_one_of_its_own_while_a_job_with_fewer_labels_of_its_siz
     assert_eq!(log.lines("only some of its labels"), Vec::<String>::new());
     // It comes online, GitHub looks, and the held job is handed out.
     rig.github.runner_online(&own.into_iter().next().expect("one"));
-    assert_ne!(rig.github.job_state(jobs[0]), Some(JobState::Available));
+    let state = rig.github.job_state(jobs[0]);
+    assert!(
+        matches!(state, Some(JobState::Acquired(_) | JobState::Running(_))),
+        "{state:?}"
+    );
 }
 
 // added: two scale sets of one size with jobs queued share the Mac's one free slot, and its offer goes round them. Each

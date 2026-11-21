@@ -620,7 +620,7 @@ impl GitHubApp {
                 now.listings.insert(path, (tag, page));
             }
         }
-        // Queued runs first, whose jobs all wait, then those under way, each the oldest first; a run in both
+        // Queued runs first, which have a job that waits, then those under way, each the oldest first; a run in both
         // listings (it started between them) once, as queued.
         runs.sort_unstable_by_key(|(rank, run)| (*rank, run.id));
         let mut seen = std::collections::HashSet::new();
