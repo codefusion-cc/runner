@@ -96,6 +96,7 @@ sudo -n sh -c 'dd if=/dev/zero of=/tmp/swap bs=1M count=8 2>/dev/null && chmod 6
 echo swaps=$(tail -n +2 /proc/swaps | wc -l)
 grep -Eq '^overlay / overlay [^ ]*nodev' /proc/mounts; echo root-nodev=$?
 grep -Eq '^overlay / overlay [^ ]*xino=on' /proc/mounts; echo root-xino=$?
+test -d /sys/module/nft_limit; echo nft-limit=$?
 sudo -n perl -e '
   $SIG{ALRM} = sub { print "vsock-host=silent\n"; exit };
   alarm 5;
@@ -1761,6 +1762,14 @@ fn inside(bench: &Bench) -> Fallible<Vec<String>> {
         format!(
             "the job's root has no stable inode numbers: root-xino={}",
             value("root-xino")
+        ),
+    )?;
+    // The kernel has nft_limit, which a job's own rules with a rate limit need (guest.rs, MODULES).
+    expect(
+        value("nft-limit") == "0",
+        format!(
+            "the guest's kernel has no nft_limit, so a job's rules with a limit are refused: nft-limit={}",
+            value("nft-limit")
         ),
     )?;
     // What the job wrote at the pipe its end is reported on changed nothing: its end is its own exit code.

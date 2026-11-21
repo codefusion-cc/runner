@@ -21,7 +21,9 @@ use crate::pinned::{Curl, ensure};
 use crate::{Result, cargo, run_command};
 
 /// The modules the guest loads at boot, with what they need: the machine's devices, the file systems of a job's
-/// disks, and what its network and firewall take.
+/// disks, and what its network and firewall take. `nft_limit` is for jobs: a job that checks its own firewall rules
+/// in a network namespace of its own (`unshare -rn nft -c -f`) gets "No such file or directory" for any `limit`,
+/// such as a per-source meter, without it. The guest has no module tree to load it from later.
 const MODULES: &[&str] = &[
     "virtio_blk",
     "virtio_net",
@@ -33,6 +35,7 @@ const MODULES: &[&str] = &[
     "af_packet",
     "nf_tables",
     "nft_ct",
+    "nft_limit",
 ];
 /// The modules only a Docker job loads, with what they need beyond [`MODULES`]: the daemon's bridge and its
 /// container links, the tun device pasta joins the daemon's network with, and what the daemon's iptables rules take
