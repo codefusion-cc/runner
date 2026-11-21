@@ -2407,6 +2407,8 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
     let mut lost = BTreeSet::new();
     // Each step with the count of GitHub's requests before it, for the story of a failure.
     let mut timeline: Vec<(usize, String)> = Vec::new();
+    // Each listener failure the scale sets' states showed after a step, with that step's place in the timeline.
+    let mut failures: Vec<(usize, String)> = Vec::new();
     for step in script {
         timeline.push((rig.github.requests().len(), format!("{step:?}")));
         if rig.store.crashed() {
@@ -2564,10 +2566,19 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
         one_machine_per_assignment(&rig)?;
         no_running_job_stopped(&rig, &jobs)?;
         stored_facts_agree(&rig)?;
+        for set in rig.service.sets() {
+            if let Some(error) = set.error {
+                let failure = format!("set {}: {error}", set.id);
+                if failures.last().is_none_or(|(_, last)| *last != failure) {
+                    failures.push((timeline.len() - 1, failure));
+                }
+            }
+        }
         let opens = session_opens(&rig);
         prop_assert!(
             opens.iter().zip(&causes).all(|(opened, may)| opened <= may),
-            "sessions opened {opens:?} times, with cause for {causes:?}"
+            "sessions opened {opens:?} times, with cause for {causes:?}\n{}",
+            sessions_story(&rig, &timeline, &failures)
         );
         if uninstall {
             break;
@@ -2770,6 +2781,41 @@ fn story_of(rig: &Rig, timeline: &[(usize, String)], runner: &str) -> String {
     }
     for write in rig.store.history(job_name(runner)) {
         story.push_str(&format!("\n  record: {write}"));
+    }
+    story
+}
+
+/// Each session GitHub was asked to open, in the step it came in, what the console's audit says of its opens, and the
+/// listener failures seen after each step: the story of sessions opened more often than anything gave cause for.
+fn sessions_story(rig: &Rig, timeline: &[(usize, String)], failures: &[(usize, String)]) -> String {
+    let step_of = |at: usize| {
+        timeline
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (before, _))| *before <= at)
+            .map_or("before the first step".to_string(), |(n, (_, step))| {
+                format!("step {n} {step}")
+            })
+    };
+    let mut story = String::from("session opens:");
+    for (at, request) in rig.github.requests().iter().enumerate() {
+        if request.line.starts_with("POST ") && request.line.ends_with("/sessions") {
+            story.push_str(&format!("\n  request {at}, in {}: {}", step_of(at), request.line));
+        }
+    }
+    story.push_str("\nthe console's session calls:");
+    for row in rig.console.scaleset_audit() {
+        if row.kind.starts_with("session") {
+            story.push_str(&format!(
+                "\n  {} set {:?}: {} {}",
+                row.kind, row.set_id, row.outcome, row.detail
+            ));
+        }
+    }
+    story.push_str("\nlistener failures:");
+    for (step, failure) in failures {
+        story.push_str(&format!("\n  after step {step} {}: {failure}", timeline[*step].1));
     }
     story
 }
