@@ -480,3 +480,50 @@ async fn a_mac_the_console_names_still_waits_ten_minutes_before_offering_a_place
         "a Mac offered a cf-6g place at once because the console named it"
     );
 }
+
+// added: gcp-ci-4 on 2026-11-12, 10:22 to 10:42 Z. A cf-6g job was assigned to a pool host the console did not name
+// while two cf-4g machines ran. It never fit, as the host makes no room for a size it is not named for, and while it
+// waited every other size was refused as "assigned-first": the room for a third cf-4g stood empty for twenty minutes
+// while GitHub took the cf-6g job back and handed it here again every five.
+#[tokio::test]
+async fn a_pool_host_the_console_does_not_name_runs_what_fits_beside_a_larger_job_that_waits() {
+    let mut w = gcp();
+    for _ in 0..2 {
+        w.running_sized(Size::G4).await;
+    }
+    pass(&w.m, 2);
+    assert_eq!(w.m.open_slots(Size::G4), 1, "a third cf-4g fits");
+    let (cf6g, why) = waits(w.m.claim(Size::G6, None));
+    assert_eq!(why, "full");
+    pass(&w.m, 2);
+    for size in [Size::G2, Size::G4] {
+        assert_ne!(
+            w.m.snapshot().room(size).why,
+            Some("assigned-first"),
+            "a {size:?} job that fits was held back for the cf-6g job"
+        );
+    }
+    assert_eq!(
+        w.m.open_slots(Size::G4),
+        1,
+        "the room for a third cf-4g is offered"
+    );
+    let ticket = match w.m.claim(Size::G4, None) {
+        Claim::Start(ticket) => ticket,
+        other => panic!("the cf-4g job that fits did not start: {other:?}"),
+    };
+    w.start_as(ticket, Size::G4).await.expect("starts");
+    assert!(!w.m.ready(cf6g), "the cf-6g job still does not fit");
+
+    // The host the console names keeps it first: nothing else starts while it waits.
+    let mut w = gcp();
+    for _ in 0..2 {
+        w.running_sized(Size::G4).await;
+    }
+    w.m.make_room_for(Some(Size::G6));
+    pass(&w.m, 2);
+    waits(w.m.claim(Size::G6, None));
+    pass(&w.m, 2);
+    assert_eq!(w.m.open_slots(Size::G4), 0);
+    waits(w.m.claim(Size::G4, None));
+}

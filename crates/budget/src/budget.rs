@@ -517,8 +517,8 @@ impl Budget {
             let size = self.waiting[index].size;
             if self.waiter_fits(now, size, &self.waiting[index].turn).is_err() {
                 // A job that may be turned away holds up nobody behind it while it is: each behind it asks for
-                // itself.
-                if self.waiting[index].turn.refusable {
+                // itself. Nor does one a pool host makes no room for ([`Budget::passed_over`]).
+                if self.waiting[index].turn.refusable || self.passed_over(&self.waiting[index]) {
                     continue;
                 }
                 break;
@@ -906,16 +906,26 @@ impl Budget {
 
     /// What whoever comes after the waiting jobs is told: how many of them go first, before a slot of `size`, or
     /// of any size. A job the settings have since made impossible goes before nobody, so it does not count; nor
-    /// does one of another size when room is made for `size` ([`Budget::make_room`]): that size is first in line.
+    /// does one of another size when room is made for `size` ([`Budget::make_room`]): that size is first in line;
+    /// nor, on a headless host, one of another size it makes no room for ([`Budget::passed_over`]).
     fn assigned_first(&self, size: Option<Size>) -> Option<Refusal> {
         let made = size.filter(|&size| self.making_room == Some(size));
         let waiting = self
             .waiting
             .iter()
             .filter(|waiter| made.is_none_or(|made| waiter.size == made))
+            .filter(|waiter| !self.passed_over(waiter) || size == Some(waiter.size))
             .filter(|waiter| self.settings.can_run(waiter.size).is_ok())
             .count();
         (waiting > 0).then_some(Refusal::AssignedFirst { waiting })
+    }
+
+    /// A job that waits on a headless host for a size the host makes no room for ([`Budget::make_room`]): it starts
+    /// when it fits, but holds up no job of another size, which a Mac's line would. A pool host makes room only for
+    /// the size the console names; a job of another size would hold everything back for as long as GitHub left it
+    /// here, and GitHub takes it back after five minutes and hands it to a host with room.
+    fn passed_over(&self, waiter: &Waiter) -> bool {
+        self.settings.headless && self.making_room != Some(waiter.size)
     }
 
     /// A repository started an assigned job: its other jobs go after those of repositories that did not since.
@@ -943,7 +953,8 @@ impl Budget {
                     .unwrap_or(waiter),
                 Err(_) => waiter,
             })
-            .map(|Waiter { slot, size, turn, .. }| {
+            .map(|waiter| {
+                let Waiter { slot, size, turn, .. } = waiter;
                 let (slot, size) = (*slot, *size);
                 let ruled_out = self.settings.can_run(size).err();
                 let why = match ruled_out {
@@ -952,7 +963,7 @@ impl Budget {
                     None if ahead == 0 => self.waiter_fits(now, size, turn).err(),
                     None => Some(Refusal::AssignedFirst { waiting: ahead }),
                 };
-                ahead += usize::from(ruled_out.is_none());
+                ahead += usize::from(ruled_out.is_none() && !self.passed_over(waiter));
                 Waiting {
                     slot,
                     size,
