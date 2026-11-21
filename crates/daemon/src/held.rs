@@ -13,6 +13,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use cf_budget::Size;
+use cf_workflows::DOCKER_LABEL;
+
 /// The scale set ID of an Actions runner of its own: GitHub numbers its scale sets from 1.
 pub const OWN: i64 = 0;
 
@@ -109,16 +112,32 @@ pub fn held(now: SystemTime, sets: &[SetView]) -> Vec<HeldSet> {
     held
 }
 
-/// Whether a queued job asks for only some of a scale set's `labels`: `queued` are the repositories and label sets of
-/// the jobs queued now. An Actions runner of the set's own carries all of them, so GitHub could give it such a job of
-/// its `repo`, which wants a machine of another size.
+/// Whether a queued job asks for only some of a scale set's `labels` and for a machine of another `size` than the
+/// set's, or names none: `queued` are the repositories and label sets of the jobs queued now. An Actions runner of the
+/// set's own carries all of them, so GitHub could give it such a job of its `repo`. One of the same size runs on its
+/// machine as on its own set's: heimforge's `[cf-4g]` beside its `[cf-4g, cf-macos]`.
 pub fn narrower_waits<'a>(
     repo: &str,
     labels: &[String],
+    size: Size,
     queued: impl IntoIterator<Item = (&'a str, &'a [String])>,
 ) -> bool {
     queued.into_iter().any(|(other_repo, other)| {
-        other_repo == repo && other.len() < labels.len() && other.iter().all(|label| labels.contains(label))
+        other_repo == repo
+            && other.len() < labels.len()
+            && other.iter().all(|label| labels.contains(label))
+            && size_of(other) != Some(size)
+    })
+}
+
+/// The size of machine a job of these labels gets, as the service serves them: its size label, or 4 GB for
+/// `self-hosted` or `cf-docker` alone; none for labels that name no size.
+fn size_of(labels: &[String]) -> Option<Size> {
+    Size::of_labels(labels.iter().map(String::as_str)).or_else(|| {
+        labels
+            .iter()
+            .any(|label| label == DOCKER_LABEL)
+            .then_some(Size::G4)
     })
 }
 
@@ -330,37 +349,82 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_job_with_only_some_of_the_labels_could_go_to_one_of_its_own() {
-        let set = labels(&["cf-4g", "self-hosted"]);
-        let narrower = |queued: &[(&str, Vec<String>)]| {
+    fn a_queued_job_with_only_some_of_the_labels_and_another_size_could_go_to_one_of_its_own() {
+        let narrower = |set: &[&str], size: Size, queued: &[(&str, Vec<String>)]| {
             narrower_waits(
                 "org/app",
-                &set,
+                &labels(set),
+                size,
                 queued.iter().map(|(repo, labels)| (*repo, labels.as_slice())),
             )
         };
-        assert!(narrower(&[("org/app", labels(&["self-hosted"]))]));
-        assert!(narrower(&[("org/app", labels(&["cf-4g"]))]));
-        assert!(narrower(&[
-            ("org/app", labels(&["cf-4g", "self-hosted", "docker"])),
-            ("org/app", labels(&["self-hosted"]))
-        ]));
-        assert!(narrower(&[("org/app", vec![])]), "a job without labels");
-        assert!(!narrower(&[]), "nothing queued");
+        let small = ["cf-2g", "self-hosted"];
+        // `self-hosted` alone is a 4 GB machine.
+        assert!(narrower(
+            &small,
+            Size::G2,
+            &[("org/app", labels(&["self-hosted"]))]
+        ));
+        assert!(narrower(
+            &small,
+            Size::G2,
+            &[
+                ("org/app", labels(&["cf-2g"])),
+                ("org/app", labels(&["self-hosted"]))
+            ]
+        ));
         assert!(
-            !narrower(&[("org/app", set.clone())]),
+            narrower(&small, Size::G2, &[("org/app", vec![])]),
+            "a job without labels names no size"
+        );
+        let mac = ["cf-4g", "cf-macos"];
+        assert!(
+            narrower(&mac, Size::G4, &[("org/app", labels(&["cf-macos"]))]),
+            "a host label alone names no size"
+        );
+        assert!(!narrower(&mac, Size::G4, &[]), "nothing queued");
+        assert!(
+            !narrower(&mac, Size::G4, &[("org/app", labels(&mac))]),
             "its own set's jobs are what it is for"
         );
         assert!(
-            !narrower(&[("org/app", labels(&["self-hosted", "cf-2g"]))]),
-            "another size"
+            !narrower(&mac, Size::G4, &[("org/app", labels(&["cf-4g"]))]),
+            "heimforge's wasm beside its check-build (2026-11-21): the same size, which runs as well on it"
         );
         assert!(
-            !narrower(&[("org/app", labels(&["cf-4g", "self-hosted", "docker"]))]),
+            !narrower(
+                &["cf-4g", "self-hosted"],
+                Size::G4,
+                &[("org/app", labels(&["self-hosted"]))]
+            ),
+            "`self-hosted` alone is the same 4 GB"
+        );
+        assert!(
+            !narrower(&small, Size::G2, &[("org/app", labels(&["cf-2g"]))]),
+            "the same size"
+        );
+        assert!(
+            narrower(
+                &["cf-8g", "cf-docker"],
+                Size::G8,
+                &[("org/app", labels(&["cf-docker"]))]
+            ),
+            "`cf-docker` alone is 4 GB"
+        );
+        assert!(
+            !narrower(&mac, Size::G4, &[("org/app", labels(&["cf-2g", "self-hosted"]))]),
+            "another size, but not some of its labels"
+        );
+        assert!(
+            !narrower(
+                &mac,
+                Size::G4,
+                &[("org/app", labels(&["cf-4g", "cf-macos", "docker"]))]
+            ),
             "more labels"
         );
         assert!(
-            !narrower(&[("org/shop", labels(&["self-hosted"]))]),
+            !narrower(&small, Size::G2, &[("org/shop", labels(&["self-hosted"]))]),
             "another repository's: its Actions runners are not this one's"
         );
     }

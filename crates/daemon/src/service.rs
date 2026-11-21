@@ -1660,13 +1660,13 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !held.own.due(now, &set.name, waits) {
                     continue;
                 }
-                // It carries all the set's labels, so GitHub could give it a job that asks for only some of them,
+                // It carries all the set's labels, so GitHub could give it a job that asks for only some of them
                 // and wants a machine of another size.
                 let others = queued
                     .jobs
                     .values()
                     .map(|other| (other.repo.as_str(), other.labels.as_slice()));
-                if held::narrower_waits(&set.repo, &set.labels, others) {
+                if held::narrower_waits(&set.repo, &set.labels, state.size, others) {
                     held.own.tried(now, &set.name, String::new());
                     tracing::info!(
                         repo = %set.repo,

@@ -140,9 +140,11 @@ pub(crate) fn evaluate(label: &str, vars: &BTreeMap<String, String>) -> Option<V
 /// The value of the inside of a `${{ ... }}` when it is made of what this reader knows, as GitHub evaluates it:
 /// string literals (`''` is a quote), `true`, `false`, `null` and numbers, `vars.NAME` and `vars['NAME']` (a name
 /// is matched without regard to case, an unset one is empty), `a || b` (the first operand that is truthy, else the
-/// last), parentheses, and the functions `format`, `toJSON` and `fromJSON`. `None` for anything else: another
-/// context, operator or function, a `format` GitHub would refuse, nesting deeper than [`MAX_DEPTH`], a value longer
-/// than [`MAX_VALUE_BYTES`].
+/// last), `a && b` (the first operand that is falsy, else the last), `!a`, `a == b` and `a != b` ([`equal`]),
+/// parentheses, and the functions `format`, `toJSON` and `fromJSON`; `!` binds tightest, then `==` and `!=`, then
+/// `&&`, then `||`. `None` for anything else: another context, operator or function, a comparison of a list or an
+/// object, a `format` GitHub would refuse, nesting deeper than [`MAX_DEPTH`], a value longer than
+/// [`MAX_VALUE_BYTES`].
 ///
 /// One leniency: `fromJSON` of a text that is not JSON is that text, where GitHub fails the job. Read so, the job
 /// asks for the scale set its author meant.
@@ -169,10 +171,14 @@ enum Token {
     Comma,
     Dot,
     Or,
+    And,
+    Not,
+    Equal,
+    NotEqual,
 }
 
-/// The tokens of an expression; `None` at a character this reader does not know, an operator other than `||`, or
-/// a literal left open.
+/// The tokens of an expression; `None` at a character this reader does not know, an operator other than `||`,
+/// `&&`, `!`, `==` and `!=`, or a literal left open.
 fn tokens(inner: &str) -> Option<Vec<Token>> {
     let bytes = inner.as_bytes();
     let mut out = Vec::new();
@@ -218,6 +224,22 @@ fn tokens(inner: &str) -> Option<Vec<Token>> {
             b'|' if bytes.get(i + 1) == Some(&b'|') => {
                 i += 2;
                 Token::Or
+            }
+            b'&' if bytes.get(i + 1) == Some(&b'&') => {
+                i += 2;
+                Token::And
+            }
+            b'=' if bytes.get(i + 1) == Some(&b'=') => {
+                i += 2;
+                Token::Equal
+            }
+            b'!' if bytes.get(i + 1) == Some(&b'=') => {
+                i += 2;
+                Token::NotEqual
+            }
+            b'!' => {
+                i += 1;
+                Token::Not
             }
             b'0'..=b'9' => {
                 let start = i;
@@ -281,7 +303,7 @@ impl Parser<'_> {
         }
         let mut chosen: Option<Value> = None;
         loop {
-            let operand = self.primary(depth)?;
+            let operand = self.and(depth)?;
             if !chosen.as_ref().is_some_and(truthy) {
                 chosen = Some(operand);
             }
@@ -290,6 +312,51 @@ impl Parser<'_> {
             }
             self.at += 1;
         }
+    }
+
+    /// `a && b && ...`: the first operand that is falsy, else the last. Every operand is read, as in [`Parser::or`].
+    fn and(&mut self, depth: usize) -> Option<Value> {
+        let mut chosen: Option<Value> = None;
+        loop {
+            let operand = self.equality(depth)?;
+            if chosen.as_ref().is_none_or(truthy) {
+                chosen = Some(operand);
+            }
+            if self.peek() != Some(&Token::And) {
+                return chosen;
+            }
+            self.at += 1;
+        }
+    }
+
+    /// `a == b` and `a != b`, left to right.
+    fn equality(&mut self, depth: usize) -> Option<Value> {
+        let mut left = self.not(depth)?;
+        loop {
+            let negated = match self.peek() {
+                Some(Token::Equal) => false,
+                Some(Token::NotEqual) => true,
+                _ => return Some(left),
+            };
+            self.at += 1;
+            let right = self.not(depth)?;
+            left = Value::Bool(equal(&left, &right)? != negated);
+        }
+    }
+
+    /// `!a`, as many times as it is written.
+    fn not(&mut self, depth: usize) -> Option<Value> {
+        let mut nots = 0usize;
+        while self.peek() == Some(&Token::Not) {
+            self.at += 1;
+            nots += 1;
+        }
+        let value = self.primary(depth)?;
+        Some(if nots == 0 {
+            value
+        } else {
+            Value::Bool(truthy(&value) == nots.is_multiple_of(2))
+        })
     }
 
     fn primary(&mut self, depth: usize) -> Option<Value> {
@@ -454,6 +521,34 @@ fn bounded(text: String) -> Option<Value> {
     (text.len() <= MAX_VALUE_BYTES).then_some(Value::String(text))
 }
 
+/// GitHub's `==`: texts without regard to case, values of one kind as they are, and values of two kinds as numbers
+/// ([`as_number`]), where NaN equals nothing. GitHub calls a list or an object equal only to itself, which no
+/// `runs-on` means: `None`, not read.
+fn equal(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Array(_) | Value::Object(_), _) | (_, Value::Array(_) | Value::Object(_)) => None,
+        (Value::String(x), Value::String(y)) => Some(x.to_uppercase() == y.to_uppercase()),
+        (Value::Bool(x), Value::Bool(y)) => Some(x == y),
+        (Value::Null, Value::Null) => Some(true),
+        _ => Some(as_number(a) == as_number(b)),
+    }
+}
+
+/// A value as GitHub's comparisons read it as a number: null is 0, `true` 1, `false` 0, an empty text 0, a text a
+/// number as a literal writes it, and any other text NaN.
+fn as_number(value: &Value) -> f64 {
+    match value {
+        Value::Null => 0.0,
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+        Value::String(s) => match s.trim() {
+            "" => 0.0,
+            text => number(text).unwrap_or(f64::NAN),
+        },
+        Value::Array(_) | Value::Object(_) => f64::NAN,
+    }
+}
+
 /// GitHub's truthiness: `false`, `0`, `''` and `null` are false, everything else true.
 fn truthy(value: &Value) -> bool {
     match value {
@@ -602,11 +697,16 @@ mod tests {
     #[test]
     fn what_the_reader_does_not_do_is_still_not_read() {
         for inner in [
-            "vars.A && vars.B",
-            "!vars.A",
-            "vars.A == 'x'",
-            "vars.A != 'x'",
             "vars.A < 'x'",
+            "vars.A <= 'x'",
+            "vars.A = 'x'",
+            "vars.A === 'x'",
+            "vars.A &&",
+            "&& vars.A",
+            "!",
+            "vars.A !",
+            "fromJSON(vars.LIST) == fromJSON(vars.LIST)",
+            "fromJSON('{}') != 'x'",
             "contains(vars.A, 'x')",
             "github.ref",
             "vars.A.b",
@@ -619,6 +719,67 @@ mod tests {
         ] {
             assert_eq!(of(inner), None, "{inner}");
         }
+    }
+
+    #[test]
+    fn and_not_and_equality_read_as_github_reads_them() {
+        // `a && b`: the first operand that is falsy, else the last.
+        assert_eq!(text("vars.A && 'x'").unwrap(), "x");
+        assert_eq!(text("vars.EMPTY && 'x'").unwrap(), "");
+        assert_eq!(of("false && vars.A"), Some(json!(false)));
+        assert_eq!(of("!vars.A"), Some(json!(false)));
+        assert_eq!(of("!vars.EMPTY"), Some(json!(true)));
+        assert_eq!(of("!!vars.A"), Some(json!(true)));
+        assert_eq!(of("! (vars.EMPTY || null)"), Some(json!(true)));
+        // Strings are equal without regard to case; values of two kinds are compared as numbers.
+        assert_eq!(of("vars.A == 'CF-2G'"), Some(json!(true)));
+        assert_eq!(of("vars.A != 'cf-2g'"), Some(json!(false)));
+        assert_eq!(of("vars.A != 'cf-4g'"), Some(json!(true)));
+        assert_eq!(of("vars.MISSING == ''"), Some(json!(true)));
+        assert_eq!(of("1 == '1'"), Some(json!(true)));
+        assert_eq!(of("null == 0"), Some(json!(true)));
+        assert_eq!(of("'' == 0"), Some(json!(true)));
+        assert_eq!(of("true == 1"), Some(json!(true)));
+        assert_eq!(
+            of("'abc' == 0"),
+            Some(json!(false)),
+            "a text that is no number is NaN"
+        );
+        assert_eq!(of("'abc' != 0"), Some(json!(true)));
+        assert_eq!(of("null == null"), Some(json!(true)));
+        assert_eq!(of("2.5 == 2.50"), Some(json!(true)));
+        // `!` before `==` before `&&` before `||`.
+        assert_eq!(of("!vars.A == false"), Some(json!(true)));
+        assert_eq!(text("vars.A == 'cf-2g' && 'x' || 'y'").unwrap(), "x");
+        assert_eq!(text("vars.A == 'cf-4g' && 'x' || 'y'").unwrap(), "y");
+        assert_eq!(text("'y' || vars.EMPTY && 'x'").unwrap(), "y");
+        assert_eq!(text("vars.EMPTY || 'a' && 'b'").unwrap(), "b");
+        assert_eq!(
+            of("vars.A == 'cf-2g' == true"),
+            Some(json!(true)),
+            "left to right"
+        );
+    }
+
+    #[test]
+    fn a_runs_on_that_falls_back_unless_a_variable_names_another_runner_is_read() {
+        // heimforge's check-build (2026-11-21), with its variable set to the pool's label.
+        let heavy =
+            "${{ vars.HEAVY != 'self-hosted' && vars.HEAVY || fromJSON('[\"cf-4g\",\"cf-macos\"]') }}";
+        let labels = |vars: &[(&str, &str)]| {
+            let vars = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            evaluate(heavy, &vars)
+        };
+        let mac = Some(vec!["cf-4g".to_string(), "cf-macos".to_string()]);
+        assert!(is_pool_expression(heavy));
+        assert_eq!(labels(&[("HEAVY", "self-hosted")]), mac);
+        assert_eq!(
+            labels(&[("HEAVY", "SELF-HOSTED")]),
+            mac,
+            "GitHub compares without regard to case"
+        );
+        assert_eq!(labels(&[]), mac, "unset, the variable is empty");
+        assert_eq!(labels(&[("HEAVY", "cf-8g")]), Some(vec!["cf-8g".to_string()]));
     }
 
     #[test]
@@ -729,6 +890,9 @@ mod tests {
         leaf().prop_recursive(4, 24, 3, |inner| {
             prop_oneof![
                 (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("{a} || {b}")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) && ({b})")),
+                inner.clone().prop_map(|a| format!("!({a})")),
+                (leaf(), leaf()).prop_map(|(a, b)| format!("({a} != {b})")),
                 inner.clone().prop_map(|a| format!("({a})")),
                 inner.clone().prop_map(|a| format!("toJSON({a})")),
                 inner.clone().prop_map(|a| format!("fromJSON({a})")),
@@ -778,6 +942,33 @@ mod tests {
             prop_assert_eq!(of(&wrapped), plain.clone());
             // And once more around what is wrapped already: the same again.
             prop_assert_eq!(of(&format!("({wrapped})")), plain);
+        }
+
+        #[test]
+        fn and_gives_the_first_operand_that_is_empty_else_the_last(a in expression(), b in expression()) {
+            let (x, y) = (of(&a).expect("a is read"), of(&b).expect("b is read"));
+            let expected = if truthy(&x) { y } else { x };
+            prop_assert_eq!(of(&format!("({a}) && ({b})")), Some(expected));
+        }
+
+        #[test]
+        fn not_is_the_opposite_of_truthy(a in expression()) {
+            let x = of(&a).expect("a is read");
+            prop_assert_eq!(of(&format!("!({a})")), Some(json!(!truthy(&x))));
+        }
+
+        #[test]
+        fn equality_is_symmetric_and_the_opposite_of_inequality(a in leaf(), b in leaf()) {
+            let equal = of(&format!("{a} == {b}"));
+            prop_assume!(equal.is_some(), "a list is no value to compare");
+            prop_assert_eq!(of(&format!("{b} == {a}")), equal.clone());
+            prop_assert_eq!(of(&format!("{a} != {b}")), equal.map(|e| json!(e != json!(true))));
+        }
+
+        #[test]
+        fn a_text_equals_itself_in_any_case(x in "[a-zA-Z0-9 -]{0,20}") {
+            prop_assert_eq!(of(&format!("{} == {}", quote(&x), quote(&x.to_uppercase()))), Some(json!(true)));
+            prop_assert_eq!(of(&format!("{} != {}", quote(&x), quote(&x.to_lowercase()))), Some(json!(false)));
         }
 
         #[test]

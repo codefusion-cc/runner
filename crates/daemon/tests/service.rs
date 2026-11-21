@@ -5850,6 +5850,47 @@ async fn a_held_job_gets_none_of_its_own_while_one_with_fewer_labels_waits() {
     );
 }
 
+// added: heimforge's check-build (job 136692631361, 2026-11-21) asks for [cf-4g, cf-macos] through a variable that
+// names the pool's label, and its wasm for [cf-4g]. Main's workflows name that set, and when GitHub holds its job
+// back from a Mac with room, the job of [cf-4g] waiting beside it, which wants the same size, keeps no Actions runner
+// of its own from it: none is refused "with only some of its labels", and the job runs.
+#[tokio::test]
+async fn a_held_job_gets_one_of_its_own_while_a_job_with_fewer_labels_of_its_size_waits() {
+    let log = support::Log::start();
+    // Room for a machine of each set's own.
+    let rig = Rig::new(6).await;
+    rig.github.set_workflow(
+        REPO,
+        "ci.yml",
+        "on: push\njobs:\n  check-build:\n    runs-on: ${{ vars.CI_RUNNER_HEAVY != 'self-hosted' && vars.CI_RUNNER_HEAVY || fromJSON('[\"cf-4g\",\"cf-macos\"]') }}\n    steps: []\n  wasm:\n    runs-on: cf-4g\n    steps: []\n",
+    );
+    rig.github.set_variable(REPO, "CI_RUNNER_HEAVY", "self-hosted");
+    let (served, _) = rig.service.survey().await;
+    assert!(
+        served.contains(&"org/app: [cf-4g, cf-macos] as cf-4g".to_string()),
+        "{served:?}"
+    );
+    let mac = vec!["cf-4g".to_string(), "cf-macos".to_string()];
+    let jobs = held_jobs(&rig, &[&["cf-4g", "cf-macos"], &["cf-4g"]]).await;
+    let mut own = BTreeSet::new();
+    for _ in 0..4 {
+        rig.later(Duration::from_secs(40));
+        rig.service.look_at_queue().await;
+        own.extend(
+            rig.github
+                .plain_runners()
+                .into_iter()
+                .filter(|(_, _, labels)| *labels == mac)
+                .map(|(name, ..)| name),
+        );
+    }
+    assert_eq!(own.len(), 1, "one of its own: {own:?}");
+    assert_eq!(log.lines("only some of its labels"), Vec::<String>::new());
+    // It comes online, GitHub looks, and the held job is handed out.
+    rig.github.runner_online(&own.into_iter().next().expect("one"));
+    assert_ne!(rig.github.job_state(jobs[0]), Some(JobState::Available));
+}
+
 // added: two scale sets of one size with jobs queued share the Mac's one free slot, and its offer goes round them. Each
 // set's clock of room runs on while the other's poll offers the slot, so GitHub holding both jobs still gets one an
 // Actions runner of its own after two minutes, however often the offer went round.

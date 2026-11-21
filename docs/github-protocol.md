@@ -98,8 +98,10 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
   would otherwise wait for ever. The Runner reads them with `actions: read`, about once a minute
   (`GET /repos/{repo}/actions/runs?status=queued`, the same with `in_progress`, then `/actions/runs/{id}/jobs`): the
   10 of the newest 100 runs, queued ones before those under way and each the oldest first, and one page of each run's jobs. A listing names the ETag of its last answer, so a queue that did
-  not change costs 304s, which GitHub does not count against the rate limit; the jobs of a run whose `updated_at`
-  did not change are not asked for again, and those of one that did are asked for with their ETag. A job's labels
+  not change costs 304s, which GitHub does not count against the rate limit; the jobs of a run under way whose
+  `updated_at` did not change and that had none queued are not asked for again, and all others are asked for with
+  their ETag. A run's `updated_at` stays put while its jobs start and end, and a run reads as queued again once those
+  that ran ended and others wait: run 44852909274 kept 01:55:00 and read queued while its jobs ran until 03:56. A job's labels
   pass the same rules as a workflow's (`LabelSet::served`), and such a set is served for 30 minutes after a job of
   it was last seen queued or running, 8 of a repository and 32 of a host at most, the newest first. On a public
   repository, a pull request's from a fork (its run's `head_repository` is another, or none) makes no set: it is a

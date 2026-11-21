@@ -490,11 +490,33 @@ fn a_reusable_workflow_input_and_a_list_item_read_variables_too() {
     assert_eq!(keys(&set), ["cf-2g", "cf-4g,heyhubs"]);
 }
 
+// added: heimforge's ci.yml (2026-11-21) sends its heavy jobs to the Macs unless a variable names another Actions
+// runner; with the variable at the pool's label they ask for [cf-4g, cf-macos] and [cf-2g, cf-macos], and those are
+// the sets, not the pool's label.
+#[test]
+fn a_runs_on_that_falls_back_unless_a_variable_names_another_runner_is_its_fallback() {
+    let wf = files(&[(
+        "ci.yml",
+        "jobs:\n  check-build:\n    runs-on: ${{ vars.CI_RUNNER_HEAVY != 'self-hosted' && vars.CI_RUNNER_HEAVY || fromJSON('[\"cf-4g\",\"cf-macos\"]') }}\n  check:\n    runs-on: ${{ vars.CI_RUNNER_HEAVY != 'self-hosted' && vars.CI_RUNNER_HEAVY || fromJSON('[\"cf-2g\",\"cf-macos\"]') }}\n",
+    )]);
+    assert_eq!(
+        keys(&self_hosted_with(
+            &wf,
+            &vars(&[("CI_RUNNER_HEAVY", "self-hosted")])
+        )),
+        ["cf-2g,cf-macos", "cf-4g,cf-macos"]
+    );
+    assert_eq!(
+        keys(&self_hosted_with(&wf, &vars(&[("CI_RUNNER_HEAVY", "cf-8g")]))),
+        ["cf-8g"]
+    );
+}
+
 #[test]
 fn an_expression_the_evaluator_cannot_read_still_stands_for_the_pool_label() {
     let wf = files(&[(
         "ci.yml",
-        "jobs:\n  a:\n    runs-on: ${{ vars.A && vars.B }}\n  b:\n    runs-on: ${{ format('{1}', vars.CI_RUNNER) }}\n",
+        "jobs:\n  a:\n    runs-on: ${{ vars.A < vars.B }}\n  b:\n    runs-on: ${{ format('{1}', vars.CI_RUNNER) }}\n",
     )]);
     assert_eq!(
         keys(&self_hosted_with(

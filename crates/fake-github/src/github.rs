@@ -473,16 +473,17 @@ impl State {
             .collect()
     }
 
-    /// A run's status as its REST view says it: `queued` while every job waits, `completed` once all ended,
-    /// `in_progress` between.
+    /// A run's status as its REST view says it: `completed` once all its jobs ended, `in_progress` while one runs,
+    /// and `queued` while none runs and one waits, also after others ended: GitHub's run 44852909274 read `queued`,
+    /// `updated_at` 01:55:00, while its jobs ran until 03:56 and three more were queued at 03:51.
     fn run_status(&self, run_id: i64) -> &'static str {
         let states = self.run_states(run_id);
-        if states.iter().all(|s| *s == "queued") {
-            "queued"
-        } else if states.iter().all(|s| *s == "completed") {
+        if states.iter().all(|s| *s == "completed") {
             "completed"
-        } else {
+        } else if states.contains(&"in_progress") {
             "in_progress"
+        } else {
+            "queued"
         }
     }
 
