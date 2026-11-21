@@ -65,6 +65,8 @@ struct Rig {
     update_limit: Duration,
     /// Lets time pass on the Mac and runs the service's rounds, as its loop does, and counts them.
     pump: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>, Arc<AtomicUsize>)>,
+    /// The pump's pause between rounds: a loaded Mac's rounds are slower ([`Rig::slow_rounds`]).
+    round_pause: Duration,
 }
 
 /// The rounds of the Runner within which [`Rig::settles`] wants what it waits for: on an idle Mac a round takes some
@@ -72,6 +74,8 @@ struct Rig {
 const ROUNDS: usize = 400;
 /// How long one round may take before [`Rig::settles`] calls the Runner stuck.
 const ROUND_STALL: Duration = Duration::from_secs(30);
+/// The pump's pause between rounds on an idle Mac.
+const ROUND_PAUSE: Duration = Duration::from_millis(15);
 
 /// How long a real Mac's update waits for the machines that stand.
 fn default_update_limit() -> Duration {
@@ -204,12 +208,14 @@ impl Rig {
             settings,
             update_limit,
             pump: None,
+            round_pause: ROUND_PAUSE,
         };
         rig.pump();
         rig
     }
 
     fn pump(&mut self) {
+        let pause = self.round_pause;
         let stop = Arc::new(AtomicBool::new(false));
         let rounds = Arc::new(AtomicUsize::new(0));
         let (stopped, done, machines, service) = (
@@ -226,7 +232,7 @@ impl Rig {
                 service.look_at_holds();
                 service.report().await;
                 done.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(15)).await;
+                tokio::time::sleep(pause).await;
             }
         });
         self.pump = Some((stop, task, rounds));
@@ -235,14 +241,14 @@ impl Rig {
     /// Waits until `condition` holds, for as many of the Runner's rounds as [`ROUNDS`]: what the rounds bring about
     /// comes within so many of them however slow a loaded Mac makes each. Without the pump it waits as [`until`].
     async fn settles(&self, what: &str, condition: impl Fn() -> bool) {
-        let Some((_, _, rounds)) = &self.pump else {
+        if self.pump.is_none() {
             return until(what, condition).await;
-        };
+        }
         let began = std::time::Instant::now();
-        let first = rounds.load(Ordering::Relaxed);
+        let first = self.rounds();
         let mut last = (first, began);
         while !condition() {
-            let now = rounds.load(Ordering::Relaxed);
+            let now = self.rounds();
             if now != last.0 {
                 last = (now, std::time::Instant::now());
             }
@@ -260,6 +266,21 @@ impl Rig {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// From now on each of the Runner's rounds pauses `pause`, as on a Mac loaded by other work: the Runner's
+    /// clock moves a second a round, so fewer seconds a wall second.
+    async fn slow_rounds(&mut self, pause: Duration) {
+        self.stop_pump().await;
+        self.round_pause = pause;
+        self.pump();
+    }
+
+    /// How many rounds the pump has done: the Runner's clock, a second a round.
+    fn rounds(&self) -> usize {
+        self.pump
+            .as_ref()
+            .map_or(0, |(_, _, rounds)| rounds.load(Ordering::Relaxed))
     }
 
     async fn stop_pump(&mut self) {
@@ -2297,10 +2318,11 @@ const OFFERS_WITHIN: Duration = Duration::from_secs(3);
 /// start follow.
 const STARTS_WITHIN: Duration = Duration::from_secs(3);
 
-/// How soon a job whose start and end went with a session is at the console once its machine is gone: the wait for
-/// GitHub's word ([`cf_daemon::RESULT_WAIT`], two minutes of the Mac's clock, which the rig runs at a minute a
-/// second), and a sweep.
-const HEARD_WITHIN: Duration = Duration::from_secs(10);
+/// How soon, in the Runner's rounds, a job whose start and end went with a session is at the console once its machine
+/// is gone: the wait for GitHub's word ([`cf_daemon::RESULT_WAIT`], two minutes of the Mac's clock, a second of which
+/// passes each round), then as many rounds as any other wait of the Runner's ([`ROUNDS`]) for the sweep and the report.
+/// Counted in rounds, not wall time: a loaded Mac makes each round slower, not more of them needed (issue #91).
+const HEARD_WITHIN: usize = RESULT_WAIT.as_secs() as usize + ROUNDS;
 
 /// Failed acknowledgements that outlast the HTTP retries ([`fast`]: two) and fail the listener once.
 const PAST_RETRIES: usize = 3;
@@ -2386,7 +2408,13 @@ fn one_machine_per_assignment(rig: &Rig) -> Result<(), TestCaseError> {
 }
 
 async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
+    live_with(slots, script, ROUND_PAUSE).await
+}
+
+/// [`live`] on a Mac whose rounds pause `round_pause`.
+async fn live_with(slots: u32, script: Vec<Happens>, round_pause: Duration) -> Result<(), TestCaseError> {
     let mut rig = Rig::new(slots).await;
+    rig.slow_rounds(round_pause).await;
     rig.github.add_repo(SECOND, true);
     rig.github.set_workflow(SECOND, "ci.yml", WORKFLOW);
     rig.service.discover().await;
@@ -2695,7 +2723,8 @@ async fn live(slots: u32, script: Vec<Happens>) -> Result<(), TestCaseError> {
 /// its own (GitHub's answer implied the job, or the registration went before a crash) has its end only once the
 /// machine is gone and the wait for GitHub's word is over: that end is waited for too.
 async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -> Result<(), TestCaseError> {
-    let heard_from = std::time::Instant::now();
+    let first = rig.rounds();
+    let mut last = (first, std::time::Instant::now());
     loop {
         let unheard: Vec<&String> = ran
             .iter()
@@ -2714,9 +2743,16 @@ async fn all_heard(rig: &Rig, ran: &BTreeSet<String>, lost: &BTreeSet<String>) -
         if unheard.is_empty() && unended.is_empty() {
             break;
         }
+        let now = rig.rounds();
+        if now != last.0 {
+            last = (now, std::time::Instant::now());
+        }
+        let passed = now.saturating_sub(first);
         prop_assert!(
-            heard_from.elapsed() < HEARD_WITHIN,
-            "jobs that ran here and never reached the console: {unheard:?}; started and never ended: {unended:?}"
+            passed < HEARD_WITHIN && last.1.elapsed() < ROUND_STALL,
+            "jobs that ran here and never reached the console: {unheard:?}; started and never ended: {unended:?}, \
+             after {passed} rounds of the Runner, the last {:.1?} ago",
+            last.1.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -2904,6 +2940,59 @@ proptest! {
             .expect("a runtime")
             .block_on(live(2, script))?;
     }
+}
+
+/// The script of issue #91, on a Mac whose rounds are slow: a job heard only once the wait for GitHub's word is over
+/// is at the console after that wait's rounds of the Runner, however long a loaded Mac makes each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_loaded_mac_every_job_that_ran_is_heard_once_the_rounds_of_the_wait_went_by() {
+    use Happens::{
+        Cancelled, Completed, Crash, GithubLooks, LostWith, Minutes, Queued, RemovalsFail, RestFails,
+        SlowBoot, Started, Up, Wait, WaitingCancelled,
+    };
+    let script = vec![
+        Minutes(33),
+        Minutes(14),
+        RemovalsFail(false),
+        Completed(212, false),
+        Minutes(195),
+        Queued(true),
+        Completed(67, false),
+        LostWith(222, Lost::Start),
+        GithubLooks,
+        Cancelled(15, true),
+        Queued(false),
+        RemovalsFail(false),
+        LostWith(5, Lost::Both),
+        Minutes(92),
+        Minutes(25),
+        Queued(true),
+        Up(155),
+        WaitingCancelled,
+        RestFails(109),
+        Crash(101, true),
+        RestFails(120),
+        Wait(11),
+        LostWith(81, Lost::Start),
+        RestFails(64),
+        Minutes(66),
+        Minutes(175),
+        GithubLooks,
+        Queued(false),
+        Crash(124, true),
+        Minutes(123),
+        Started(192),
+        SlowBoot(false),
+        Queued(false),
+        LostWith(74, Lost::End),
+        GithubLooks,
+        Queued(true),
+        Completed(59, false),
+        RemovalsFail(true),
+    ];
+    live_with(2, script, Duration::from_millis(100))
+        .await
+        .expect("every job that ran is heard");
 }
 
 /// How often each scale set's session was opened.
