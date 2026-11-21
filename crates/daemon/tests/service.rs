@@ -84,7 +84,8 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(150);
 /// at most 11 minutes, and 16 minutes more). [`Rig::later`] moves GitHub's clock by minutes at once, while calls are
 /// under way: a token GitHub took as a call began is expired by the time it answers, and a long poll whose token was
 /// just refreshed can find it expired again within the same call, which fails its listener. A real clock moves 50
-/// seconds in a long poll, not an hour; how tokens expire and are refreshed is for the scale set client's own tests.
+/// seconds in a long poll, not an hour. A token that expires during a poll and is refreshed is the scale set client's
+/// own test (`a_token_that_expires_during_a_poll_is_replaced_and_the_wait_goes_on`).
 const LASTING: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// How long a real Mac's update waits for the machines that stand.
@@ -140,22 +141,24 @@ impl Rig {
 
     /// [`Rig::new`], whose GitHub's tokens and sessions outlast every hour [`Rig::later`] lets pass ([`LASTING`]).
     async fn lasting(machines: u32) -> Rig {
-        Rig::with_tokens(settings_for(machines), default_update_limit(), LASTING).await
+        Rig::with_tokens(settings_for(machines), default_update_limit(), Some(LASTING)).await
     }
 
     async fn with(settings: Settings, update_limit: Duration) -> Rig {
-        Rig::with_tokens(settings, update_limit, Options::default().session_token_ttl).await
+        Rig::with_tokens(settings, update_limit, None).await
     }
 
-    /// [`Rig::with`], whose GitHub's tokens and sessions last `tokens` of GitHub's clock.
-    async fn with_tokens(settings: Settings, update_limit: Duration, tokens: Duration) -> Rig {
+    /// [`Rig::with`], whose GitHub's tokens and sessions last `tokens` of GitHub's clock, or as long as GitHub's
+    /// own defaults say.
+    async fn with_tokens(settings: Settings, update_limit: Duration, tokens: Option<Duration>) -> Rig {
+        let defaults = Options::default();
         let github = FakeGithub::start(Options {
             poll_timeout: POLL_TIMEOUT,
             auto_assign: true,
-            installation_token_ttl: tokens,
-            admin_token_ttl: tokens,
-            session_token_ttl: tokens,
-            ..Options::default()
+            installation_token_ttl: tokens.unwrap_or(defaults.installation_token_ttl),
+            admin_token_ttl: tokens.unwrap_or(defaults.admin_token_ttl),
+            session_token_ttl: tokens.unwrap_or(defaults.session_token_ttl),
+            ..defaults
         })
         .await;
         github.add_repo(REPO, true);
@@ -2355,70 +2358,56 @@ const IDLE: Load = Load {
     answers: Duration::ZERO,
 };
 
-/// What [`by_polls`] waited for.
-enum Polled {
-    Done,
-    Changed,
-}
-
-/// Waits until `done` holds, or `changed` does, while the Mac's polls and rounds go on: every scale set's session is
-/// open again within [`ROUNDS`] of the Runner's rounds, and once all are, until the slowest scale set made
-/// [`OFFER_POLLS`] polls, each within [`ROUNDS`] rounds of the one before, and [`ROUNDS`] rounds went by: what the
-/// polls show waits on GitHub's answers and on the budget, whose clock moves a second a round. No wall time counts, but for a round that
-/// never ends ([`ROUND_STALL`]): the test's clock is the Mac's polls and rounds. Says how far they went otherwise.
-async fn by_polls(
-    rig: &Rig,
-    done: impl Fn(&Rig) -> bool,
-    changed: impl Fn(&Rig) -> bool,
-) -> Result<Polled, String> {
+/// Waits until `done` holds while the Mac's polls and rounds go on: every scale set's session is open again within
+/// [`ROUNDS`] of the Runner's rounds; once all are, the wait lasts until the slowest scale set made [`OFFER_POLLS`]
+/// polls, each within [`ROUNDS`] rounds of the one before, and [`ROUNDS`] rounds went by. What the polls show waits
+/// on GitHub's answers and on the budget, whose clock moves a second a round. No wall time counts but a round that
+/// never ends ([`ROUND_STALL`]). Says how far the polls and rounds went when they ran out.
+async fn by_polls(rig: &Rig, done: impl Fn(&Rig) -> bool) -> Result<(), String> {
     // Each scale set's polls so far, once every one of them has its session.
     let polls = |rig: &Rig| -> Option<Vec<usize>> {
         let sets = rig.github.scale_sets();
-        if !sets.iter().all(|set| set.has_session) {
-            return None;
-        }
-        let requests = rig.github.requests();
-        Some(
+        sets.iter().all(|set| set.has_session).then(|| {
             sets.iter()
                 .map(|set| {
-                    let line = format!("GET /svc/_apis/runtime/runnerscalesets/{}/messages", set.id);
-                    requests.iter().filter(|request| request.line == line).count()
+                    rig.github.count(&format!(
+                        "GET /svc/_apis/runtime/runnerscalesets/{}/messages",
+                        set.id
+                    ))
                 })
-                .collect(),
-        )
+                .collect()
+        })
     };
-    // The polls when every session was last seen open; the slowest scale set's polls since, and the round it made
-    // its last; the last round, and when it ended.
+    // The polls when every session was last seen open, and the round then; the slowest scale set's polls since,
+    // and the round they last changed; the last round, and when it ended.
     let mut open: Option<(Vec<usize>, usize)> = None;
     let mut slowest = (None, rig.rounds());
     let mut round = (rig.rounds(), std::time::Instant::now());
-    loop {
-        if done(rig) {
-            return Ok(Polled::Done);
-        }
-        if changed(rig) {
-            return Ok(Polled::Changed);
-        }
+    while !done(rig) {
         let rounds = rig.rounds();
         if rounds != round.0 {
             round = (rounds, std::time::Instant::now());
-        }
-        if round.1.elapsed() >= ROUND_STALL {
+        } else if round.1.elapsed() >= ROUND_STALL {
             return Err(format!(
                 "the Runner's round {rounds} has not ended in {ROUND_STALL:?}"
             ));
         }
-        let made = polls(rig).map(|now| {
-            let (since, _) = open.get_or_insert_with(|| (now.clone(), rounds));
-            now.iter()
-                .zip(since.iter())
-                .map(|(now, since)| now - since)
-                .min()
-                .unwrap_or(0)
-        });
-        if made.is_none() {
-            open = None;
-        }
+        let made = match polls(rig) {
+            Some(now) => {
+                let (since, _) = open.get_or_insert_with(|| (now.clone(), rounds));
+                Some(
+                    now.iter()
+                        .zip(since.iter())
+                        .map(|(now, since)| now.saturating_sub(*since))
+                        .min()
+                        .unwrap_or(0),
+                )
+            }
+            None => {
+                open = None;
+                None
+            }
+        };
         if made != slowest.0 {
             slowest = (made, rounds);
         }
@@ -2442,8 +2431,9 @@ async fn by_polls(
             }
             _ => {}
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    Ok(())
 }
 
 /// How soon, in the Runner's rounds, a job whose start and end went with a session is at the console once its machine
@@ -2815,7 +2805,7 @@ async fn live_with(slots: u32, script: Vec<Happens>, load: Load) -> Result<(), T
         // The Mac's polls show the room for a waiting job, once a session GitHub forgot is open again; then GitHub
         // looks. A look before that hands nothing out, and GitHub looks again only at its own moments. A machine that
         // stands up meanwhile for a job assigned before may take the last slot: then the room is looked at anew.
-        if let Err(why) = by_polls(&rig, offered, moved).await {
+        if let Err(why) = by_polls(&rig, |rig| offered(rig) || moved(rig)).await {
             return Err(TestCaseError::fail(format!(
                 "{before} jobs wait at GitHub and {standing} of {slots} machines stand, and the Mac offered no room \
                  for them: {why}"
@@ -2825,7 +2815,7 @@ async fn live_with(slots: u32, script: Vec<Happens>, load: Load) -> Result<(), T
             continue;
         }
         rig.github.github_looks();
-        if let Err(why) = by_polls(&rig, moved, |_| false).await {
+        if let Err(why) = by_polls(&rig, moved).await {
             return Err(TestCaseError::fail(format!(
                 "{before} jobs wait at GitHub and {standing} of {slots} machines stand after GitHub looked: {why}"
             )));
@@ -3124,14 +3114,16 @@ async fn on_a_loaded_mac_every_job_that_ran_is_heard_once_the_rounds_of_the_wait
         .expect("every job that ran is heard");
 }
 
-/// Issue #91 on Linux: GitHub's clock passed the hour of the sessions' tokens while the Runner listened, in minutes
-/// at a time, and the sessions opened again with no cause the test counted. Hours pass here while the sessions stand,
-/// on a Mac whose rounds and GitHub's polls are slow, so that a long poll spans the jumps: no session opens again.
+/// Issue #91 on Linux: GitHub's clock passed the hour of the sessions' tokens while the Runner listened, minutes at
+/// a time, and a long poll found its just refreshed token expired again within the same call: the sessions opened
+/// again with no cause the test counts. Hours pass here while the sessions stand, on a Mac whose rounds and GitHub's
+/// polls are slow, so that a long poll spans the jumps. With tokens of an hour ([`Rig::new`]) it fails every time;
+/// the scripts' tokens ([`Rig::lasting`]) outlast them, and no session opens again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_a_loaded_mac_hours_that_pass_while_the_sessions_stand_open_none_again() {
     let load = Load {
         rounds: Duration::from_millis(100),
-        polls: Duration::from_secs(3),
+        polls: Duration::from_secs(1),
         ..IDLE
     };
     live_with(2, vec![Happens::Minutes(6); 24], load)
