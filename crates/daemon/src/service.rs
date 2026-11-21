@@ -1660,20 +1660,24 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                 if !held.own.due(now, &set.name, waits) {
                     continue;
                 }
-                // It carries all the set's labels, so GitHub could give it a job that asks for only some of them,
-                // and wants a machine of another size.
-                let others = queued
-                    .jobs
-                    .values()
-                    .map(|other| (other.repo.as_str(), other.labels.as_slice()));
-                if held::narrower_waits(&set.repo, &set.labels, others) {
+                // It carries all the set's labels, so GitHub could give it a job that asks for only some of them
+                // and that this host serves not, or with a machine of another size.
+                let others = queued.jobs.iter().map(|(name, other)| {
+                    let served = sets
+                        .iter()
+                        .find(|served| served.name == *name)
+                        .map(|served| served.size);
+                    (other.repo.as_str(), other.labels.as_slice(), served)
+                });
+                if held::narrower_waits(&set.repo, &set.labels, state.size, others) {
                     held.own.tried(now, &set.name, String::new());
                     tracing::info!(
                         repo = %set.repo,
                         labels = %set.labels.join(","),
                         job = set.oldest,
                         "GitHub holds a job back from a scale set with room, but no Actions runner of its own is \
-                         started for it: a queued job of the repository with only some of its labels could go to it"
+                         started for it: a queued job of the repository with only some of its labels, which this host \
+                         serves not or at another size, could go to it"
                     );
                     continue;
                 }

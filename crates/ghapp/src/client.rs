@@ -103,7 +103,9 @@ pub struct Waiting {
 struct Run {
     id: i64,
     /// When it last changed. It moves with the run's status, not when one of its jobs starts or ends while the run
-    /// is under way (run 42595725821 kept 09:45:03 while its jobs started until 09:46:12).
+    /// is under way (run 42595725821 kept 09:45:03 while its jobs started until 09:46:12), and not always with its
+    /// status either: run 44852909274 kept 01:55:00 while it went from queued to under way and back, its jobs ran
+    /// until 03:56, and three more were queued at 03:51.
     updated: String,
     from_fork: bool,
 }
@@ -578,11 +580,12 @@ impl GitHubApp {
     ///
     /// The listings name the ETag of their last answer, so a queue that did not change costs 304s, which do not
     /// count against the rate limit. A run's jobs are asked for again, with their ETag, when its `updated_at` moved,
-    /// and on every look while a run under way had a job queued when they were last read: its `updated_at` does not
-    /// move when one of its jobs starts ([`Run::updated`]), so a job read as queued would wait on here after it
-    /// started. Those of a queued run (all its jobs wait; its first start moves its `updated_at`) and of a run under
-    /// way with none queued are kept while its `updated_at` stays. The jobs of a running run change with each step,
-    /// so each of those reads is answered in full and counts against the rate limit. Needs the App's
+    /// on every look while it is queued, and on every look while a run under way had a job queued when they were
+    /// last read: its `updated_at` does not move when one of its jobs starts or ends ([`Run::updated`]), and a run
+    /// reads as queued again, as it did, once those that ran ended and others wait, so a job read as queued would
+    /// wait on here after it ran. A queued run whose jobs did not change costs a 304. Those of a run under way with
+    /// none queued are kept while its `updated_at` stays: the jobs of a running run change with each step, so each
+    /// of those reads is answered in full and counts against the rate limit. Needs the App's
     /// `Actions: read` permission: without it GitHub answers 403 (or 404), which comes back as the error. Any failure
     /// is an error, not an empty queue; only a run gone between its listing and the read of its jobs is left out.
     pub async fn waiting_jobs(&self, installation: i64, repo: &str) -> Result<Waiting, Error> {
@@ -617,7 +620,7 @@ impl GitHubApp {
                 now.listings.insert(path, (tag, page));
             }
         }
-        // Queued runs first, whose jobs all wait, then those under way, each the oldest first; a run in both
+        // Queued runs first, which have a job that waits, then those under way, each the oldest first; a run in both
         // listings (it started between them) once, as queued.
         runs.sort_unstable_by_key(|(rank, run)| (*rank, run.id));
         let mut seen = std::collections::HashSet::new();
@@ -636,9 +639,10 @@ impl GitHubApp {
         for (under_way, run) in runs {
             let jobs = match last.runs.remove(&run.id) {
                 Some(known)
-                    if !run.updated.is_empty()
+                    if under_way
+                        && !run.updated.is_empty()
                         && known.updated == run.updated
-                        && !(under_way && known.read.jobs.iter().any(|job| !job.queued.is_empty())) =>
+                        && known.read.jobs.iter().all(|job| job.queued.is_empty()) =>
                 {
                     known
                 }
