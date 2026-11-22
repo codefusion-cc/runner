@@ -743,12 +743,38 @@ pub struct Answer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub make_room_for: Option<String>,
     /// Game servers to look at from outside, each every [`Answer::probe_every_seconds`]; left out (and so none) when
-    /// the console asks for none. A Runner from before ignores it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// the console asks for none. A Runner from before ignores it. Read loosely: an entry this does not read (a
+    /// field missing or of another type) is left out, and a value that is no list is none, so a probe never makes
+    /// the rest of the answer unread.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "loose_probes"
+    )]
     pub probes: Vec<ProbeTarget>,
-    /// Seconds between looks at the probes; [`PROBE_EVERY_DEFAULT_S`] when left out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Seconds between looks at the probes; [`PROBE_EVERY_DEFAULT_S`] when left out or not a whole number of them.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "loose_seconds"
+    )]
     pub probe_every_seconds: Option<u64>,
+}
+
+/// [`Answer::probes`]: the entries read as [`ProbeTarget`]s, the others left out; none for a value that is no list.
+fn loose_probes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ProbeTarget>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// [`Answer::probe_every_seconds`]: a whole number of seconds, or none.
+fn loose_seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_u64())
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
