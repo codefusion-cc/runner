@@ -199,6 +199,7 @@ pub fn is_host(host: &str) -> bool {
 
 /// Asks `host:port` for its info on a socket of its own: resolve, send, and on a challenge send once more. Ends
 /// within `timeout`, the name's lookup included. Only the target's address is heard: the socket is connected to it.
+/// Of a name's addresses each is asked in turn while the one before refuses at once.
 ///
 /// # Errors
 ///
@@ -218,11 +219,23 @@ pub async fn query(host: &str, port: u16, timeout: Duration) -> Result<Answer, Q
 }
 
 async fn exchange(host: &str, port: u16) -> Result<Answer, QueryError> {
-    let address = tokio::net::lookup_host((host, port))
+    let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| QueryError::Resolve(e.to_string()))?
-        .next()
-        .ok_or_else(|| QueryError::Resolve("none".into()))?;
+        .collect();
+    // A name may have several addresses (`localhost`: `::1` before `127.0.0.1`): one the host refuses at once, as
+    // nothing listens there, gives way to the next.
+    let mut last = QueryError::Resolve("none".into());
+    for address in addresses {
+        match ask(address).await {
+            Err(QueryError::Io(why)) => last = QueryError::Io(why),
+            done => return done,
+        }
+    }
+    Err(last)
+}
+
+async fn ask(address: std::net::SocketAddr) -> Result<Answer, QueryError> {
     let local = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let io = |e: std::io::Error| QueryError::Io(e.to_string());
     let socket = UdpSocket::bind(local).await.map_err(io)?;

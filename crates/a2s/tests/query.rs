@@ -213,3 +213,12 @@ async fn a_name_with_no_address_ends_in_time() {
     }
     assert!(started.elapsed() < QUICK * 3);
 }
+
+#[tokio::test]
+async fn a_name_whose_first_address_refuses_is_asked_at_the_next() {
+    // `localhost` names `::1` and `127.0.0.1` on most hosts, often `::1` first; the server listens on IPv4 alone.
+    let fake = Fake::start(|_| vec![info_reply(b"Heimforge NA", 3, 10)]).await;
+    let answer = query("localhost", fake.port, QUICK).await.expect("an answer");
+    assert_eq!(answer.info.name, "Heimforge NA");
+    assert_eq!(fake.seen(), vec![request(None)]);
+}
