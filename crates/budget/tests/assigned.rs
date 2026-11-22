@@ -8,7 +8,7 @@ use std::thread;
 
 use cf_budget::{
     Assigned, Budget, Free, GIB, Held, Hold, HostFacts, HostReading, Level, Millis, Mode, Origin, Pressure,
-    Refusal, Settings, Size, SlotId, Trouble, UnknownSlot, Waiting,
+    Refusal, Settings, Size, SlotId, Trouble, UnknownSlot, Usage, Waiting,
 };
 use common::*;
 
@@ -262,14 +262,15 @@ fn it_counts_against_the_cap_and_the_cpus_the_mac_has_without_its_person() {
 
 #[test]
 fn jobs_that_wait_start_in_the_order_they_came() {
-    let mut budget = open(dedicated());
-    // 5 GB available: a VM of 2 GB would fit (2 + 2 GB floor), one of 8 GB not.
-    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    let mut budget = open(one_vcpu(dedicated()));
+    // A 6 GB job of ours runs: under the 12 GB cap one of 8 GB waits for it to end, one of 2 GB would fit.
+    let ours = budget.adopt(Size::G6);
     let (big, why) = waits(budget.assign(secs(61), Size::G8));
     assert_eq!(
         why,
-        Refusal::Memory {
-            short_bytes: 8 * GIB + OVERHEAD + 2 * GIB - 5 * GIB
+        Refusal::Full {
+            cap_bytes: 12 * GIB,
+            committed_bytes: 6 * GIB
         }
     );
     let (small, why) = waits(budget.assign(secs(61), Size::G2));
@@ -279,9 +280,10 @@ fn jobs_that_wait_start_in_the_order_they_came() {
     assert!(big < small && small < third);
 
     // Room for the small ones is not room for the one in front of them.
-    assert_eq!(watch(&mut budget, 62, 100, |r| r.available_bytes = 9 * GIB), []);
+    assert_eq!(watch(&mut budget, 62, 100, |_| {}), []);
     assert_eq!(budget.waiting(), 3);
-    // Room for the big one and one small one: 8 + 2 GB of VMs, their overheads and the floor.
+    // Ours ends. Room for the big one and one small one: 8 + 2 GB of VMs, their overheads and the floor.
+    budget.release(ours.slot).unwrap();
     let enough = 10 * GIB + 2 * OVERHEAD + 2 * GIB;
     let started = watch(&mut budget, 101, 101, |r| r.available_bytes = enough);
     assert_eq!(
@@ -306,8 +308,10 @@ fn jobs_that_wait_start_in_the_order_they_came() {
 
 #[test]
 fn while_a_job_waits_nothing_else_is_granted_or_offered() {
-    let mut budget = open(dedicated());
-    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    let mut budget = open(one_vcpu(dedicated()));
+    // A 4 GB job of ours has yet to take its memory: it is what keeps 8 GB out of the 12 GB available.
+    let ours = budget.adopt(Size::G4);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 12 * GIB);
     assert!(budget.fits(secs(61), Size::G2).is_ok());
     let (slot, _) = waits(budget.assign(secs(61), Size::G8));
 
@@ -318,10 +322,11 @@ fn while_a_job_waits_nothing_else_is_granted_or_offered() {
     assert_eq!(budget.free(secs(61)), Free::default());
     let status = budget.status(secs(61));
     assert_eq!((status.level, status.closed_by), (Level::Tight, Some(refusal)));
-    assert_eq!(budget.slots(), 0);
+    assert_eq!(budget.slots(), 1);
 
     // Why the Mac is closed is one question, why the job itself waits another: the status answers both, for
-    // every job in the line. An 8 GB VM needs its size, 192 MB and the 2 GB floor; 5 GB are available.
+    // every job in the line. An 8 GB VM needs its size, 192 MB and the 2 GB floor besides the 4 GB and 192 MB
+    // ours is still to take; 12 GB are available.
     let (behind, _) = waits(budget.assign(secs(61), Size::G2));
     let waiting = |slot, size, why| Waiting {
         slot,
@@ -330,7 +335,7 @@ fn while_a_job_waits_nothing_else_is_granted_or_offered() {
         never: false,
     };
     let short = Refusal::Memory {
-        short_bytes: 8 * GIB + OVERHEAD + 2 * GIB - 5 * GIB,
+        short_bytes: 4 * GIB + OVERHEAD + 8 * GIB + OVERHEAD + 2 * GIB - 12 * GIB,
     };
     assert_eq!(
         budget.status(secs(61)).waiting,
@@ -360,7 +365,8 @@ fn while_a_job_waits_nothing_else_is_granted_or_offered() {
     assert_eq!(full.status(secs(60)).waiting, [waiting(next, Size::G8, None)]);
     assert_eq!(watch(&mut full, 61, 61, |_| {})[0].1.slot, next);
 
-    // Once it runs, the Mac takes jobs again.
+    // Ours ends, the next reading starts it, and once it runs the Mac takes jobs again.
+    budget.release(ours.slot).unwrap();
     let started = watch(&mut budget, 62, 62, |_| {});
     assert_eq!(started[0].1.slot, slot);
     assert_eq!(budget.level(secs(62)), Level::Open);
@@ -505,8 +511,10 @@ fn a_size_the_mac_can_never_run_does_not_wait() {
 
 #[test]
 fn a_waiting_job_the_settings_made_impossible_keeps_its_place_and_holds_nobody_up() {
-    let mut budget = open(dedicated());
-    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    let mut budget = open(one_vcpu(dedicated()));
+    // A 4 GB job of ours has yet to take its memory: 12 GB available leave 8 GB no room until it ends.
+    let ours = budget.adopt(Size::G4);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 12 * GIB);
     let (big, _) = waits(budget.assign(secs(61), Size::G8));
     let (small, _) = waits(budget.assign(secs(61), Size::G2));
 
@@ -532,6 +540,7 @@ fn a_waiting_job_the_settings_made_impossible_keeps_its_place_and_holds_nobody_u
         [small]
     );
     assert_eq!(budget.waiting(), 1);
+    budget.release(ours.slot).unwrap();
     // It waits for good unless the settings change, and the status says so: the limit that rules it out.
     assert_eq!(
         budget.status(secs(62)).waiting,
@@ -567,8 +576,10 @@ fn a_waiting_job_the_settings_made_impossible_keeps_its_place_and_holds_nobody_u
 
 #[test]
 fn a_job_github_took_back_stops_waiting_and_the_next_one_moves_up() {
-    let mut budget = open(dedicated());
-    watch(&mut budget, 61, 61, |r| r.available_bytes = 5 * GIB);
+    let mut budget = open(one_vcpu(dedicated()));
+    // A 4 GB job of ours has yet to take its memory: 12 GB available leave 8 GB no room until it ends.
+    let ours = budget.adopt(Size::G4);
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 12 * GIB);
     let (big, _) = waits(budget.assign(secs(61), Size::G8));
     let (small, _) = waits(budget.assign(secs(61), Size::G2));
 
@@ -581,14 +592,15 @@ fn a_job_github_took_back_stops_waiting_and_the_next_one_moves_up() {
     assert_eq!(budget.withdraw(SlotId(999)), Err(UnknownSlot(SlotId(999))));
     assert_eq!(budget.waiting(), 1);
 
-    let started = watch(&mut budget, 62, 62, |r| r.available_bytes = 5 * GIB);
+    let started = watch(&mut budget, 62, 62, |r| r.available_bytes = 12 * GIB);
     assert_eq!(
         started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
         [small]
     );
     // A job that started is not withdrawn: it is released.
     assert_eq!(budget.withdraw(small), Err(UnknownSlot(small)));
-    assert_eq!(budget.slots(), 1);
+    assert_eq!(budget.slots(), 2);
+    assert!(budget.release(ours.slot).is_ok());
     assert!(budget.release(small).is_ok());
     // The name of a job that was withdrawn is not given to another.
     let next = starts(budget.assign(secs(62), Size::G2));
@@ -723,4 +735,101 @@ fn forty_jobs_assigned_at_once_from_many_threads_start_two_and_keep_thirty_eight
         (budget.slots(), budget.waiting(), budget.committed_bytes()),
         (2, 38, 8 * GIB)
     );
+}
+
+#[test]
+fn a_job_the_host_itself_keeps_out_holds_nobody_up_until_only_our_jobs_are_in_its_way() {
+    // The Mac mini, 2026-11-21 19:11 to 00:30 Z: a cf-6g job GitHub gave it waited for memory its person's apps
+    // held, nothing of the Runner's ran, and every job behind it waited too, for five hours. Waiting frees nothing
+    // there: no job of ours ends to make the room.
+    let mut budget = open(dedicated());
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 3 * GIB);
+    let (big, why) = waits(budget.assign(secs(61), Size::G6));
+    assert_eq!(
+        why,
+        Refusal::Memory {
+            short_bytes: 6 * GIB + OVERHEAD + 2 * GIB - 3 * GIB
+        }
+    );
+    // 2 GB needs 2 GiB, 192 MB and the 2 GiB floor: 3 GiB is short of it too, so it waits behind for itself.
+    let (small, why) = waits(budget.assign(secs(61), Size::G2));
+    assert_eq!(
+        why,
+        Refusal::Memory {
+            short_bytes: 2 * GIB + OVERHEAD + 2 * GIB - 3 * GIB
+        }
+    );
+
+    // The host gives some memory back, not enough for 6 GB: the job behind starts, the one ahead keeps its place.
+    let started = watch(&mut budget, 62, 62, |r| r.available_bytes = 5 * GIB);
+    assert_eq!(
+        started.iter().map(|(_, grant)| grant.slot).collect::<Vec<_>>(),
+        [small]
+    );
+    let status = budget.status(secs(62));
+    assert_eq!(status.waiting.len(), 1);
+    assert_eq!(status.waiting[0].slot, big);
+    // The 2 GB one has yet to take its memory: 6 GB needs that besides its own size, overhead and the floor.
+    assert_eq!(
+        status.waiting[0].why,
+        Some(Refusal::Memory {
+            short_bytes: 2 * GIB + OVERHEAD + 6 * GIB + OVERHEAD + 2 * GIB - 5 * GIB
+        })
+    );
+    assert_eq!(status.closed_by, None);
+    let running = started[0].1.slot;
+    // It takes 512 MiB of the host's memory; the next reading shows the host without it.
+    budget
+        .usage(
+            secs(62),
+            running,
+            Usage {
+                resident_bytes: GIB / 2,
+                scratch_bytes: 0,
+            },
+        )
+        .unwrap();
+
+    // With 7 GiB, a second 2 GB job is offered and starts at once beside the first: 6 GB would still not fit
+    // with nothing of ours running, the 512 MiB ours holds given back.
+    watch(&mut budget, 63, 63, |r| r.available_bytes = 7 * GIB);
+    assert!(budget.fits(secs(63), Size::G2).is_ok());
+    assert_eq!(budget.free(secs(63)).of(Size::G2), 1);
+    let second = starts(budget.assign(secs(63), Size::G2));
+
+    // Now the host has enough for 6 GB once ours end: they are what keeps it out, so it goes first again and
+    // nothing else is granted or offered.
+    watch(&mut budget, 64, 64, |r| r.available_bytes = 9 * GIB);
+    let refusal = Refusal::AssignedFirst { waiting: 1 };
+    assert_eq!(budget.fits(secs(64), Size::G2), Err(refusal));
+    assert_eq!(budget.free(secs(64)), Free::default());
+    assert_eq!(budget.status(secs(64)).closed_by, Some(refusal));
+    let (late, why) = waits(budget.assign(secs(64), Size::G2));
+    assert_eq!(why, refusal);
+
+    // Ours end; the next reading starts the 6 GB job before the 2 GB one that came after it.
+    budget.release(running).unwrap();
+    budget.release(second.slot).unwrap();
+    let started = watch(&mut budget, 65, 65, |r| r.available_bytes = 9 * GIB);
+    assert_eq!(started[0].1.slot, big);
+    assert_eq!(budget.status(secs(65)).waiting[0].slot, late);
+}
+
+#[test]
+fn a_job_of_ours_nobody_measured_yet_counts_with_all_it_may_hold_when_deciding_who_keeps_a_job_out() {
+    // After a restart the Runner adopts a 4 GB machine that already holds its memory; nothing measured it yet.
+    let mut budget = open(one_vcpu(dedicated()));
+    let ours = budget.adopt(Size::G4);
+    // 6 GiB available: 8 GB needs 8 GiB, 192 MB and the 2 GiB floor, which the host has once ours ends.
+    watch(&mut budget, 61, 61, |r| r.available_bytes = 6 * GIB);
+    let (big, _) = waits(budget.assign(secs(61), Size::G8));
+    let refusal = Refusal::AssignedFirst { waiting: 1 };
+    assert_eq!(budget.fits(secs(61), Size::G2), Err(refusal));
+    assert_eq!(budget.status(secs(61)).closed_by, Some(refusal));
+    assert_eq!(budget.free(secs(61)), Free::default());
+
+    // Ours ends and gives the memory back: the one that waited starts first.
+    budget.release(ours.slot).unwrap();
+    let started = watch(&mut budget, 62, 62, |r| r.available_bytes = 10 * GIB + OVERHEAD);
+    assert_eq!(started[0].1.slot, big);
 }

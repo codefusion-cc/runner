@@ -335,7 +335,25 @@ impl World {
 
     /// Whether an assigned job waits that everything else has to let go first.
     fn someone_waits(&self) -> bool {
-        self.waiting.iter().any(|(_, size)| self.can_run(*size))
+        self.waiting.iter().any(|(_, size)| self.holds_up(*size))
+    }
+
+    /// Whether a waiting job of this size surely holds up those behind it: it could run here, and the newest
+    /// reading has room for it once nothing of ours runs, counting none of what ours hold as coming back. The
+    /// budget counts what they hold too, so it holds up at least these; one the host itself keeps out holds up
+    /// nobody.
+    fn holds_up(&self, size: Size) -> bool {
+        if !self.can_run(size) {
+            return false;
+        }
+        let Some(reading) = self.watched_calm() else {
+            return false;
+        };
+        let limits = Profile {
+            floor_bytes: self.limits(&reading).floor_bytes,
+            ..self.settings.away
+        };
+        admit(&self.settings, &limits, reading.available_bytes, &[], size).is_ok()
     }
 
     fn name_is_new(&self, id: SlotId) -> Result<(), TestCaseError> {
@@ -647,9 +665,14 @@ impl World {
                 .told_to_stop = true;
         }
         for grant in &observed.started {
-            let next = self.waiting.iter().position(|(_, size)| self.can_run(*size));
+            let next = self.waiting.iter().position(|(id, _)| *id == grant.slot);
             prop_assert!(next.is_some(), "a job started that did not wait");
-            let (id, size) = self.waiting.remove(next.unwrap());
+            let next = next.unwrap();
+            prop_assert!(
+                self.waiting[..next].iter().all(|(_, size)| !self.holds_up(*size)),
+                "started past a job that holds up those behind it"
+            );
+            let (id, size) = self.waiting.remove(next);
             prop_assert_eq!(
                 (grant.slot, grant.size, grant.expires),
                 (id, size, None),
