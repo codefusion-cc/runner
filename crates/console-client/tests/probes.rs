@@ -17,7 +17,7 @@ fn an_answer_without_probes_asks_for_none() {
 fn an_answer_with_probes_names_them_as_the_console_sends_them() {
     let answer: Answer = serde_json::from_value(json!({
         "paused": false, "reportEvery": 60, "commands": [],
-        "probes": [{ "name": "heimforge/na", "host": "na.heimforge.net", "port": 2457, "kind": "a2s" }],
+        "probes": [{ "name": "heimforge/na", "host": "na.example.net", "port": 2457, "kind": "a2s" }],
         "probeEverySeconds": 120,
         "somethingNewer": true,
     }))
@@ -26,7 +26,7 @@ fn an_answer_with_probes_names_them_as_the_console_sends_them() {
         answer.probes,
         vec![ProbeTarget {
             name: "heimforge/na".into(),
-            host: "na.heimforge.net".into(),
+            host: "na.example.net".into(),
             port: 2457,
             kind: "a2s".into()
         }]
