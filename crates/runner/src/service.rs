@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn the_memory_line_of_a_check_says_what_is_there_now_against_the_floor_and_what_fits() {
         use cf_budget::{GIB, MIB, Millis, Mode};
-        // The Air on 2026-10-11: 0.3 GiB above the floor, and `check` still read "2 cf-4g side by side".
+        // A Mac laptop on 2026-10-11: 0.3 GiB above the floor, and `check` still read "2 cf-4g side by side".
         assert_eq!(
             memory_line(Mode::Dedicated, 2 * GIB + 307 * MIB, Millis::ZERO),
             "2.30 GiB of memory available, 0.30 GiB above the floor of 2.00 GiB; no machine fits beside what runs"

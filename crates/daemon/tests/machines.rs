@@ -22,7 +22,7 @@ use support::world::{REPO, SET, SIZE, World, ids};
 
 #[tokio::test]
 async fn a_clock_that_moves_on_while_the_mac_is_read_closes_nothing() {
-    // The Air, 2026-10-11: a look whose reading crossed a millisecond was thrown away as one of another moment,
+    // A Mac laptop, 2026-10-11: a look whose reading crossed a millisecond was thrown away as one of another moment,
     // and each time the Mac was closed for another calm minute.
     let w = World::new(2);
     w.m.with_host(|host| host.read_takes(Millis(1), Millis::ZERO));
@@ -1405,7 +1405,7 @@ fn memory_for_no_machine(w: &World) -> u64 {
 
 #[test]
 fn the_last_slot_one_scale_set_takes_ends_the_polls_that_still_offer_it() {
-    // The Air, 2026-10-12: eight scale sets each offered GitHub the one slot that was free, GitHub assigned a job
+    // A Mac laptop, 2026-10-12: eight scale sets each offered GitHub the one slot that was free, GitHub assigned a job
     // to several, and all but one waited in line for memory while the other Mac had room.
     let w = World::new(2);
     assert_eq!(w.m.open_slots(SIZE), 2, "a listener begins its poll with room");
@@ -1536,7 +1536,7 @@ fn a_size_no_listener_asked_about_and_a_pause_the_listeners_heard_of_ring_no_bel
 
 #[test]
 fn an_open_mac_with_no_room_for_a_size_says_so_once_and_when_one_fits_again() {
-    // The mini, 2026-10-12: open for hours, "taking jobs", and not one job, because its other programs left room
+    // The mac16, 2026-10-12: open for hours, "taking jobs", and not one job, because its other programs left room
     // for no machine of the only size it serves. Its log said nothing.
     let w = World::new(2);
     let log = Log::start();
@@ -1788,11 +1788,11 @@ fn a_mac_its_own_machines_fill_says_full_for_the_size() {
 
 #[tokio::test]
 async fn the_minis_second_machine_its_first_keeps_out_is_full_with_what_it_needs() {
-    // The mini of 2026-10-13 with its first cf-4g machine: a second one needs 6515 MiB available. Short of that
+    // A 16 GB Mac host of 2026-10-13 with its first cf-4g machine: a second one needs 6515 MiB available. Short of that
     // because of the first, the Mac is full, not short of memory, and the console hears both numbers.
-    let (w, _) = mini::with_one(mini::PEAK, Some(mini::HELD)).await;
-    let available = mini::needed(mini::HELD) - GIB;
-    assert!(!mini::second_fits(&w, available));
+    let (w, _) = mac16::with_one(mac16::PEAK, Some(mac16::HELD)).await;
+    let available = mac16::needed(mac16::HELD) - GIB;
+    assert!(!mac16::second_fits(&w, available));
     let room = room_of(&w, Size::G4);
     assert_eq!(
         (room.free, room.why, room.need_bytes, room.short_bytes),
@@ -1800,8 +1800,8 @@ async fn the_minis_second_machine_its_first_keeps_out_is_full_with_what_it_needs
     );
     // Its other programs take all but 100 MiB over the floor: with what the first holds given back, a second still
     // would not fit.
-    let available = mini::settings().away.floor_bytes + 100 * MIB;
-    assert!(!mini::second_fits(&w, available));
+    let available = mac16::settings().away.floor_bytes + 100 * MIB;
+    assert!(!mac16::second_fits(&w, available));
     let room = room_of(&w, Size::G4);
     assert_eq!(
         (room.free, room.why, room.need_bytes, room.short_bytes),
@@ -1816,15 +1816,15 @@ async fn the_minis_second_machine_its_first_keeps_out_is_full_with_what_it_needs
 
 // --- what the Mac holds for a machine --------------------------------------------------------------------------------
 
-/// The Mac mini of 2026-10-13: 16 GB, dedicated (a cap of 12 GB, a floor of 2 GB, 6 vCPUs), one cf-4g machine at a
+/// A 16 GB Mac host of 2026-10-13: 16 GB, dedicated (a cap of 12 GB, a floor of 2 GB, 6 vCPUs), one cf-4g machine at a
 /// time while every repository's CI waited for it. Its machine's Virtualization process had a footprint of 4109 MiB a
 /// minute after its start (the guest's kernel and page cache had touched 4061 MiB of its 4096), while the job's own
 /// peak said 1.54 GiB. The budget took the job's peak for what the Mac held, so it counted 2.6 GiB as still to come
 /// that the Mac had already given, and refused a second machine whenever 6.4 to 8.8 GiB were available.
-mod mini {
+mod mac16 {
     use super::*;
     pub use support::world::{
-        MINI_HELD as HELD, MINI_PEAK as PEAK, mini as settings, mini_with_one as with_one,
+        MAC16_HELD as HELD, MAC16_PEAK as PEAK, mac16 as settings, mac16_with_one as with_one,
     };
 
     /// Whether a second cf-4g machine gets a slot with this much memory available.
@@ -1845,13 +1845,13 @@ mod mini {
 
 #[tokio::test]
 async fn a_second_machine_is_counted_against_what_the_mac_holds_for_the_first_not_its_jobs_peak() {
-    let (w, _) = mini::with_one(mini::PEAK, Some(mini::HELD)).await;
+    let (w, _) = mac16::with_one(mac16::PEAK, Some(mac16::HELD)).await;
     // 4288 MiB a machine with its overhead, 179 MiB of the first still to come, and the floor: 6515 MiB, where the
     // job's peak would have asked for 9047 MiB.
-    let needed = mini::needed(mini::HELD);
+    let needed = mac16::needed(mac16::HELD);
     assert_eq!(needed, 6515 * MIB);
-    assert!(!mini::second_fits(&w, needed - 1), "a byte under is not enough");
-    assert!(mini::second_fits(&w, needed), "to the byte is");
+    assert!(!mac16::second_fits(&w, needed - 1), "a byte under is not enough");
+    assert!(mac16::second_fits(&w, needed), "to the byte is");
     let Claim::Start(_) = w.m.claim(Size::G4, None) else {
         panic!("the second machine got no slot");
     };
@@ -1861,8 +1861,8 @@ async fn a_second_machine_is_counted_against_what_the_mac_holds_for_the_first_no
 async fn the_minis_own_reading_carries_no_second_machine() {
     // 11:35 that day: the first machine held 4136 MiB, and the Mac had 3.59 GiB available. Its other programs leave
     // no second machine room, however it is counted.
-    let (w, _) = mini::with_one(mini::PEAK, Some(4136 * MIB)).await;
-    assert!(!mini::second_fits(&w, 3676 * MIB));
+    let (w, _) = mac16::with_one(mac16::PEAK, Some(4136 * MIB)).await;
+    assert!(!mac16::second_fits(&w, 3676 * MIB));
     assert_eq!(
         w.m.snapshot().short_of(Size::G4),
         None,
@@ -1875,10 +1875,10 @@ async fn a_machine_whose_hold_is_not_known_counts_by_its_jobs_peak_and_says_so()
     // A vm-host that could not read its machine's process, or one of a Runner from before: the job's peak is the
     // least the machine holds, so the rest of its size is still to come.
     let log = Log::start();
-    let (w, runner) = mini::with_one(mini::PEAK, None).await;
-    assert!(!mini::second_fits(&w, 7 * GIB));
-    assert!(!mini::second_fits(&w, mini::needed(mini::PEAK) - 1));
-    assert!(mini::second_fits(&w, mini::needed(mini::PEAK)));
+    let (w, runner) = mac16::with_one(mac16::PEAK, None).await;
+    assert!(!mac16::second_fits(&w, 7 * GIB));
+    assert!(!mac16::second_fits(&w, mac16::needed(mac16::PEAK) - 1));
+    assert!(mac16::second_fits(&w, mac16::needed(mac16::PEAK)));
     assert_eq!(
         log.lines("is not known"),
         [format!(
@@ -1894,10 +1894,10 @@ async fn a_machine_that_holds_more_than_it_is_counted_with_takes_no_more_off_and
     // A footprint above the machine's size and overhead would mean the overhead is too low: the budget takes off
     // at most what it counts the machine with, and the log says what the machine holds.
     let log = Log::start();
-    let (w, runner) = mini::with_one(mini::PEAK, Some(6 * GIB)).await;
-    let counted = mini::settings().host_bytes(Size::G4);
-    assert!(!mini::second_fits(&w, mini::needed(counted) - 1));
-    assert!(mini::second_fits(&w, mini::needed(counted)));
+    let (w, runner) = mac16::with_one(mac16::PEAK, Some(6 * GIB)).await;
+    let counted = mac16::settings().host_bytes(Size::G4);
+    assert!(!mac16::second_fits(&w, mac16::needed(counted) - 1));
+    assert!(mac16::second_fits(&w, mac16::needed(counted)));
     assert_eq!(
         log.lines("more than it is counted with"),
         [format!(
@@ -1911,7 +1911,7 @@ async fn a_machine_that_holds_more_than_it_is_counted_with_takes_no_more_off_and
 #[tokio::test]
 async fn a_hold_not_known_is_said_once_the_guest_is_up_and_again_when_it_is_lost() {
     let log = Log::start();
-    let mut w = World::on(mini::settings());
+    let mut w = World::on(mac16::settings());
     w.parts.vms.slow_boot(true);
     let runner = w.start_sized(Size::G4).await;
     let job = job_name(&runner).to_string();
@@ -1924,7 +1924,7 @@ async fn a_hold_not_known_is_said_once_the_guest_is_up_and_again_when_it_is_lost
     w.parts.vms.ready(&job);
     pass(&w.m, 3);
     assert_eq!(log.lines("is not known").len(), 1, "said once the guest is up");
-    w.parts.vms.resident(&job, Some(mini::HELD));
+    w.parts.vms.resident(&job, Some(mac16::HELD));
     pass(&w.m, 3);
     w.parts.vms.resident(&job, None);
     pass(&w.m, 3);
@@ -1940,7 +1940,7 @@ async fn a_hold_not_known_is_said_again_by_a_daemon_that_starts_again() {
     // A Runner updated under a running machine of the one before: its vm-host never says what the machine holds,
     // and the log of the new daemon says so once.
     let log = Log::start();
-    let (mut w, _) = mini::with_one(mini::PEAK, None).await;
+    let (mut w, _) = mac16::with_one(mac16::PEAK, None).await;
     assert_eq!(log.lines("is not known").len(), 1);
     w.restart();
     pass(&w.m, 3);
@@ -1951,12 +1951,12 @@ async fn a_hold_not_known_is_said_again_by_a_daemon_that_starts_again() {
 async fn a_machine_on_its_way_down_is_not_said_to_have_a_hold_not_known() {
     // Once the guest is done or the machine is stopped by force, its process may be gone before the vm-host is.
     let log = Log::start();
-    let (w, runner) = mini::with_one(mini::PEAK, Some(mini::HELD)).await;
+    let (w, runner) = mac16::with_one(mac16::PEAK, Some(mac16::HELD)).await;
     for stage in [cf_vmhost::Stage::Done, cf_vmhost::Stage::Killing] {
         w.parts.vms.stage(job_name(&runner), stage);
         w.parts.vms.resident(job_name(&runner), None);
         pass(&w.m, 2);
-        w.parts.vms.resident(job_name(&runner), Some(mini::HELD));
+        w.parts.vms.resident(job_name(&runner), Some(mac16::HELD));
         pass(&w.m, 2);
     }
     assert_eq!(log.lines("is not known").len(), 0);
@@ -1965,8 +1965,8 @@ async fn a_machine_on_its_way_down_is_not_said_to_have_a_hold_not_known() {
 #[tokio::test]
 async fn a_machine_that_holds_exactly_what_it_is_counted_with_is_not_said_to_hold_more() {
     let log = Log::start();
-    let counted = mini::settings().host_bytes(Size::G4);
-    let (w, runner) = mini::with_one(mini::PEAK, Some(counted)).await;
+    let counted = mac16::settings().host_bytes(Size::G4);
+    let (w, runner) = mac16::with_one(mac16::PEAK, Some(counted)).await;
     pass(&w.m, 2);
     assert_eq!(log.lines("more than it is counted with").len(), 0);
     w.parts.vms.resident(job_name(&runner), Some(counted + 1));

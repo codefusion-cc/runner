@@ -20,9 +20,9 @@ pub const SIZE: Size = Size::G2;
 pub const REPO: &str = "org/app";
 pub const SET: i64 = 7;
 
-/// The Mac mini of 2026-10-13: 16 GB and 8 cores, given to CI. A cap of 12 GiB, a floor of 2 GiB, 6 vCPUs: a cf-2g
+/// A 16 GB Mac host of 2026-10-13: 16 GB and 8 cores, given to CI. A cap of 12 GiB, a floor of 2 GiB, 6 vCPUs: a cf-2g
 /// machine takes 2 of them, a cf-4g 3, a cf-6g or cf-8g 4.
-pub fn mini() -> cf_budget::Settings {
+pub fn mac16() -> cf_budget::Settings {
     cf_budget::Settings::for_host(
         cf_budget::HostFacts {
             total_bytes: 16 * cf_budget::GIB,
@@ -32,13 +32,13 @@ pub fn mini() -> cf_budget::Settings {
     )
 }
 
-/// The peak of the job on the mini's first cf-4g machine, and what the Mac held for that machine.
-pub const MINI_PEAK: u64 = 1577 * cf_budget::MIB;
-pub const MINI_HELD: u64 = 4109 * cf_budget::MIB;
+/// The peak of the job on the Mac host's first cf-4g machine, and what the Mac held for that machine.
+pub const MAC16_PEAK: u64 = 1577 * cf_budget::MIB;
+pub const MAC16_HELD: u64 = 4109 * cf_budget::MIB;
 
-/// The mini with its first machine running, a cf-4g one, its job's peak and the vm-host's reading of the Mac as given.
-pub async fn mini_with_one(peak: u64, held: Option<u64>) -> (World, String) {
-    let mut w = World::on(mini());
+/// The 16 GB Mac with its first machine running, a cf-4g one, its job's peak and the vm-host's reading of the Mac as given.
+pub async fn mac16_with_one(peak: u64, held: Option<u64>) -> (World, String) {
+    let mut w = World::on(mac16());
     let runner = w.running_sized(Size::G4).await;
     w.parts.vms.usage(job_name(&runner), peak, 0);
     w.parts.vms.resident(job_name(&runner), held);

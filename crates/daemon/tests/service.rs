@@ -2062,7 +2062,7 @@ async fn a_report_says_the_memory_that_is_available_what_the_runner_keeps_free_a
     );
 }
 
-/// The Air and the mini, 2026-10-12. Each of a Mac's scale sets offers GitHub the Mac's free slot with its long
+/// Two Mac hosts, 2026-10-12. Each of a Mac's scale sets offers GitHub the Mac's free slot with its long
 /// poll, and GitHub assigns against that number for as long as the poll stands. A slot one repository's job took
 /// must end the other repositories' polls, or their next job is assigned to this Mac, where it waits in line,
 /// instead of staying at GitHub for a Mac with room.

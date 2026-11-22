@@ -918,7 +918,7 @@ mod tests {
             "http://localhost@example.com",
             "http://[::1]x",
             "http://localhost:80a",
-            "http://192.168.1.10:8787",
+            "http://192.0.2.10:8787",
             "https://",
         ] {
             assert!(with(|v| v["console"] = url.into()).is_err(), "{url}");

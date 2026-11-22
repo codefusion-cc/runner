@@ -1,5 +1,5 @@
-//! Room made for a larger size, on the mini of 2026-10-13: a cf-6g job waited for hours while cf-4g and cf-2g jobs
-//! took every slot that freed, and GitHub took it back every five minutes. Every number here is the mini's: with
+//! Room made for a larger size, on the Mac host of 2026-10-13: a cf-6g job waited for hours while cf-4g and cf-2g jobs
+//! took every slot that freed, and GitHub took it back every five minutes. Every number here is the Mac host's: with
 //! one cf-4g machine holding 4109 MiB, its other programs left 5 GiB available, 9229 MiB without the machine. That
 //! carries a cf-2g machine beside the cf-4g one, a cf-6g one only on its own (and never beside it: 7 vCPUs of 6), and
 //! never a cf-8g one.
@@ -12,14 +12,14 @@ use cf_daemon::testing::pass;
 use cf_daemon::{Claim, EventKind, Slots, Ticket};
 use cf_vmhost::End;
 use support::Log;
-use support::world::{MINI_HELD, MINI_PEAK, World, mini, mini_with_one};
+use support::world::{MAC16_HELD, MAC16_PEAK, World, mac16, mac16_with_one};
 
-const HELD: u64 = MINI_HELD;
+const HELD: u64 = MAC16_HELD;
 const AVAILABLE: u64 = 5 * GIB;
 
-/// The mini with a cf-4g machine running.
-async fn mini_with_a_cf4g() -> (World, String) {
-    let (w, runner) = mini_with_one(MINI_PEAK, Some(HELD)).await;
+/// The 16 GB Mac with a cf-4g machine running.
+async fn mac16_with_a_cf4g() -> (World, String) {
+    let (w, runner) = mac16_with_one(MAC16_PEAK, Some(HELD)).await;
     w.m.with_host(|host| host.set(|r| r.available_bytes = AVAILABLE));
     pass(&w.m, 1);
     (w, runner)
@@ -53,7 +53,7 @@ fn polls(w: &World, size: Size, seconds: u64) -> Vec<usize> {
 #[tokio::test]
 async fn a_cf6g_that_waits_holds_back_the_cf2g_jobs_that_keep_coming_for_the_second_slot() {
     let log = Log::start();
-    let (w, cf4g) = mini_with_a_cf4g().await;
+    let (w, cf4g) = mac16_with_a_cf4g().await;
     assert_eq!(
         w.m.open_slots(Size::G2),
         1,
@@ -96,7 +96,7 @@ async fn a_cf6g_that_waits_holds_back_the_cf2g_jobs_that_keep_coming_for_the_sec
 
 #[tokio::test]
 async fn without_a_larger_job_waiting_the_cf2g_jobs_take_the_second_slot() {
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     assert!(matches!(w.m.claim(Size::G2, None), Claim::Start(_)));
 }
 
@@ -104,7 +104,7 @@ async fn without_a_larger_job_waiting_the_cf2g_jobs_take_the_second_slot() {
 async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_line_and_a_size_the_mac_never_runs_is_not()
  {
     let log = Log::start();
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     // The first poll that found no room was at second 1: the one ten minutes later offers a place.
     let offered = polls(&w, Size::G6, 601);
     assert!(offered[..600].iter().all(|offered| *offered == 0), "{offered:?}");
@@ -136,7 +136,7 @@ async fn a_size_whose_polls_found_no_room_for_ten_minutes_is_offered_a_place_in_
 
 #[tokio::test]
 async fn a_place_in_line_rings_the_bells_once_and_not_at_every_look() {
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     polls(&w, Size::G6, 599);
     let before = w.nudges();
     pass(&w.m, 10);
@@ -149,7 +149,7 @@ async fn a_place_in_line_rings_the_bells_once_and_not_at_every_look() {
 #[tokio::test]
 async fn a_job_github_takes_back_keeps_its_place_and_the_room_is_given_up_when_it_does_not_come_again() {
     let log = Log::start();
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     let (first, _) = waits(w.m.claim(Size::G6, None));
     pass(&w.m, 1);
     assert_eq!(
@@ -189,7 +189,7 @@ async fn a_job_github_takes_back_keeps_its_place_and_the_room_is_given_up_when_i
 #[tokio::test]
 async fn room_is_made_for_half_an_hour_at_most_and_then_for_none_for_as_long() {
     let log = Log::start();
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     // GitHub takes the job back every five minutes and hands it here again at once.
     let (mut cf6g, _) = waits(w.m.claim(Size::G6, None));
     for _ in 0..5 {
@@ -230,7 +230,7 @@ async fn room_is_made_for_half_an_hour_at_most_and_then_for_none_for_as_long() {
 #[tokio::test]
 async fn an_empty_mac_whose_other_programs_hold_the_room_stops_making_it() {
     let log = Log::start();
-    let (w, cf4g) = mini_with_a_cf4g().await;
+    let (w, cf4g) = mac16_with_a_cf4g().await;
     let (cf6g, _) = waits(w.m.claim(Size::G6, None));
     // The cf-4g job ends, but what else runs on the Mac takes the memory it gave back.
     w.parts.vms.end(job_name(&cf4g), End::Ok);
@@ -251,7 +251,7 @@ async fn an_empty_mac_whose_other_programs_hold_the_room_stops_making_it() {
 #[tokio::test]
 async fn no_room_is_made_for_a_size_the_mac_already_runs_or_while_it_takes_no_jobs() {
     let log = Log::start();
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     // A second cf-4g job waits for the memory the first holds: the room comes back when the first ends.
     let (second, why) = waits(w.m.claim(Size::G4, None));
     assert_eq!(why, "memory");
@@ -274,7 +274,7 @@ async fn no_room_is_made_for_a_size_the_mac_already_runs_or_while_it_takes_no_jo
 #[tokio::test]
 async fn a_job_handed_here_again_once_the_room_is_there_ends_the_making_at_once() {
     for promised in [false, true] {
-        let (w, cf4g) = mini_with_a_cf4g().await;
+        let (w, cf4g) = mac16_with_a_cf4g().await;
         let (cf6g, _) = waits(w.m.claim(Size::G6, None));
         pass(&w.m, 300);
         w.m.withdraw(cf6g);
@@ -297,7 +297,7 @@ async fn a_job_handed_here_again_once_the_room_is_there_ends_the_making_at_once(
 #[tokio::test]
 async fn a_job_behind_one_a_hold_keeps_out_has_no_room_made_for_it() {
     let log = Log::start();
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     w.m.pause(true);
     let (_, why) = waits(w.m.claim(Size::G2, None));
     assert_eq!(why, "paused");
@@ -311,11 +311,11 @@ async fn a_job_behind_one_a_hold_keeps_out_has_no_room_made_for_it() {
 #[tokio::test]
 async fn room_made_for_a_size_the_settings_then_rule_out_is_given_up_at_once() {
     let log = Log::start();
-    let (w, _) = mini_with_a_cf4g().await;
+    let (w, _) = mac16_with_a_cf4g().await;
     let _ = waits(w.m.claim(Size::G6, None));
     pass(&w.m, 1);
     assert_eq!(w.m.snapshot().room(Size::G2).why, Some("making-room"));
-    let mut settings = mini();
+    let mut settings = mac16();
     settings.away.cap_bytes = 5 * GIB;
     settings.in_use.cap_bytes = settings.in_use.cap_bytes.min(5 * GIB);
     w.m.set_settings(settings).expect("settings");
@@ -336,7 +336,7 @@ async fn room_made_for_a_size_the_settings_then_rule_out_is_given_up_at_once() {
 
 #[tokio::test]
 async fn the_size_room_is_made_for_is_promised_the_room_before_the_jobs_held_back_for_it() {
-    let (w, cf4g) = mini_with_a_cf4g().await;
+    let (w, cf4g) = mac16_with_a_cf4g().await;
     let (cf6g, _) = waits(w.m.claim(Size::G6, None));
     pass(&w.m, 1);
     let (cf2g, why) = waits(w.m.claim(Size::G2, None));
@@ -472,7 +472,7 @@ async fn the_pool_host_the_console_names_starts_the_cf6g_job_within_one_jobs_len
 // nothing.
 #[tokio::test]
 async fn a_mac_the_console_names_still_waits_ten_minutes_before_offering_a_place() {
-    let (w, _cf4g) = mini_with_a_cf4g().await;
+    let (w, _cf4g) = mac16_with_a_cf4g().await;
     w.m.make_room_for(Some(Size::G6));
     assert_eq!(
         w.m.open_slots(Size::G6),

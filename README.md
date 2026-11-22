@@ -16,7 +16,7 @@ not yet to be reused.
 
 The Runner takes jobs from GitHub and runs each in a machine of its own, as a service of the Mac. It has run so
 against a fake GitHub and a fake console with real machines (`cargo xtask it --only service`), and on 2026-10-11
-its first jobs from the real GitHub on a MacBook Air: one that passed, one that failed and one cancelled while it
+its first jobs from the real GitHub on a Mac laptop: one that passed, one that failed and one cancelled while it
 ran, each in a machine that was gone when the job ended. What is there:
 
 - the service (`codefusion-runner daemon`, kept running by launchd on a Mac and by systemd on Linux): it reads which repositories and `runs-on`
@@ -135,12 +135,12 @@ launchd itself says is in `launchd.log` there.
 What the log says between a start and a job, each once and again when it changes:
 
 ```
-the Runner starts version="0.1.0+446125c0a1b2" machine=air-vm
-a scale set at GitHub set=air-vm--cf-4g-177a1a95 id=10 repo=org/app labels=cf-4g size="cf-4g"
-a session is open: the Runner listens for this scale set's jobs set=air-vm--cf-4g-177a1a95
+the Runner starts version="0.1.0+446125c0a1b2" machine=mac-host
+a scale set at GitHub set=mac-host--cf-4g-177a1a95 id=10 repo=org/app labels=cf-4g size="cf-4g"
+a session is open: the Runner listens for this scale set's jobs set=mac-host--cf-4g-177a1a95
 the host is closed: a new job waits why="calming" opens_in_s=60
 the host is open: a new job gets a machine
-job started runner=air-vm-j1766ef2 job=build at=2026-10-11T09:54:18Z heard_after_s=41
+job started runner=mac-host-j1766ef2 job=build at=2026-10-11T09:54:18Z heard_after_s=41
 ```
 
 A Mac opens after a minute in which nothing was wrong with it, and a job that comes sooner waits for that. `why`

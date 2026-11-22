@@ -930,7 +930,7 @@ impl Budget {
     /// when the Mac is closed for every job alike, and when the jobs of ours that run are what keeps it out, since
     /// they end. When it would not fit even with none of ours running, the memory, cap or CPUs it lacks are the
     /// host's, held by its person's apps or its settings: no job of ours ends to give them, and holding the others
-    /// back would leave the host idle for as long as that lasts (the Mac mini, five hours on 2026-11-21). It
+    /// back would leave the host idle for as long as that lasts (a Mac host, five hours on 2026-11-21). It
     /// keeps its place and starts as soon as it fits; once the host gives back enough that only our jobs are in
     /// its way, it holds everyone up again until they end.
     fn holds_up(&self, now: Now, waiter: &Waiter) -> bool {

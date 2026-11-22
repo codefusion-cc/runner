@@ -538,11 +538,11 @@ async fn another_machines_scale_set_or_runner_is_not_yours() {
             .map(|_| ()),
     );
     // A name that only starts like another machine's is its own.
-    let mini = enrolled(&rig.console, "mac-a-mini", support::http()).await;
+    let two = enrolled(&rig.console, "mac-a-two", support::http()).await;
     assert_eq!(
-        mini.scaleset_list(REPO).await.unwrap(),
+        two.scaleset_list(REPO).await.unwrap(),
         vec![],
-        "mac-a--… is not mac-a-mini's"
+        "mac-a--… is not mac-a-two's"
     );
     assert_eq!(
         rig.github.runners(),
