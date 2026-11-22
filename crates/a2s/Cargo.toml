@@ -1,0 +1,19 @@
+[package]
+name = "cf-a2s"
+description = "An outside look at a game server: one A2S_INFO query over UDP, its reply read as untrusted input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cf-guest-proto = { path = "../guest-proto" }
+thiserror.workspace = true
+tokio = { version = "1", features = ["net", "time"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

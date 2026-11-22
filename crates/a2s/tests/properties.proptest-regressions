@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7cd84c53e5f764a0b85746783d2fc704cb41a22dcdf62b24d68ab029a1ebd159 # shrinks to name = [1], map = [], folder = [], game = [], players = 0, max = 0, tail = []
+cc ba1af92366bc3e2d1b477cb9e047dcda9ecc31c72af8ea504c8bdbfa5f545300 # shrinks to name = [], players = 0, max = 0, cut = Index(17361641481138401521)

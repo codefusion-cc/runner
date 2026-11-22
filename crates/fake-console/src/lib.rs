@@ -101,6 +101,8 @@ struct State {
     paused: bool,
     /// The size the answers name the Mac to make room for.
     make_room_for: Option<String>,
+    /// The answers' `probes` and `probeEverySeconds`, as the console sends them to a probing host; none when unset.
+    probes: Option<(Value, u64)>,
     watched: bool,
     faults: Faults,
     /// The Runners App's installations, as the console reaches them with its key; none until a test attaches one.
@@ -346,6 +348,11 @@ impl State {
             json!({ "paused": self.paused, "reportEvery": if quick { 5 } else { 60 }, "commands": commands });
         if let Some(size) = &self.make_room_for {
             answer["makeRoomFor"] = json!(size);
+        }
+        // runners/agent.ts: only while a world's a2sProbe is on, and only to a host that probes.
+        if let Some((targets, every)) = &self.probes {
+            answer["probes"] = targets.clone();
+            answer["probeEverySeconds"] = json!(every);
         }
         Reply::json(&answer)
     }
@@ -630,6 +637,13 @@ impl FakeConsole {
     /// The size the answers name the Mac to make room for (`makeRoomFor`), or none.
     pub fn make_room_for(&self, size: Option<&str>) {
         self.lock().make_room_for = size.map(String::from);
+    }
+
+    /// The game servers the answers ask the host to look at (`probes`, as sent: a list of `{name, host, port,
+    /// kind}`) and how often, or none (the field left out, as a console with every a2sProbe off sends it). The
+    /// console reads a report's `probeResults` loosely and never refuses one for them, and so does this.
+    pub fn probes(&self, targets: Option<(Value, u64)>) {
+        self.lock().probes = targets;
     }
 
     /// Whether someone watches the console's page: `reportEvery` is 5 instead of 60.
