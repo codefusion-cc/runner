@@ -142,7 +142,8 @@ pub enum Assigned {
     /// It starts now. The slot is the job's until it is released.
     Start(Grant),
     /// It waits under this name, for this reason. [`Budget::observe`] hands out its grant
-    /// ([`Observed::started`]) when the Mac has room; until then no other slot is granted.
+    /// ([`Observed::started`]) when the Mac has room; until then no other slot is granted, unless the host itself
+    /// keeps it out ([`Budget::holds_up`]).
     Waits { slot: SlotId, why: Refusal },
     /// This Mac can never run a VM of this size with its settings, so nothing waits. Hand the job back, and do
     /// not offer this size here ([`Settings::can_run`]).
@@ -516,9 +517,9 @@ impl Budget {
             };
             let size = self.waiting[index].size;
             if self.waiter_fits(now, size, &self.waiting[index].turn).is_err() {
-                // A job that may be turned away holds up nobody behind it while it is: each behind it asks for
-                // itself.
-                if self.waiting[index].turn.refusable {
+                // A job that may be turned away holds up nobody behind it while it is, nor one the host itself
+                // keeps out ([`Budget::holds_up`]): each behind it asks for itself.
+                if self.waiting[index].turn.refusable || !self.holds_up(now, &self.waiting[index]) {
                     continue;
                 }
                 break;
@@ -560,7 +561,9 @@ impl Budget {
     ///
     /// Jobs that wait start in the order of [`Budget::line`], and while one waits no other slot is granted
     /// ([`Refusal::AssignedFirst`], and [`Budget::free`] is zero, so the Runner offers GitHub nothing), but one of
-    /// the size room is made for ([`Budget::make_room`]), which goes before the jobs of other sizes.
+    /// the size room is made for ([`Budget::make_room`]), which goes before the jobs of other sizes. One the host
+    /// itself keeps out, which would not fit even with none of ours running ([`Budget::holds_up`]), keeps its place
+    /// and holds nobody up.
     pub fn assign(&mut self, now: Now, size: Size) -> Assigned {
         self.assign_in_turn(now, size, Turn::default())
     }
@@ -572,7 +575,7 @@ impl Budget {
         }
         let slot = self.next_id();
         let fits = self
-            .in_turn(size)
+            .in_turn(now, size)
             .and_then(|()| self.waiter_fits(now, size, &turn));
         match fits {
             Ok(()) => {
@@ -604,8 +607,9 @@ impl Budget {
     /// in it: it holds nobody up.
     ///
     /// No job waits for ever while room is made for no size: each one that waits reaches the group of the overdue
-    /// after [`DEFER_LIMIT`], and nothing that comes later goes before it then. Room is made for as long as the
-    /// caller says.
+    /// after [`DEFER_LIMIT`], and nothing that comes later goes before it then, unless the host itself keeps it
+    /// out ([`Budget::holds_up`]): then those behind start while it keeps its place, and it holds them up again
+    /// once only our jobs are in its way. Room is made for as long as the caller says.
     pub fn line(&self, now: Now) -> Vec<SlotId> {
         let mut last = self.started_last.clone();
         let mut starts = self.starts;
@@ -669,7 +673,7 @@ impl Budget {
     /// time it is read: only [`Budget::claim`] decides.
     pub fn fits(&self, now: Now, size: Size) -> Result<(), Refusal> {
         let reading = self.takes_jobs(now)?;
-        self.in_turn(size)?;
+        self.in_turn(now, size)?;
         self.admits(reading, profile_for(&self.settings, Some(reading)), size)
     }
 
@@ -777,7 +781,7 @@ impl Budget {
         let mut held = self.charges();
         held.extend(offered.iter().copied().map(unstarted));
         Free(Size::ALL.map(|size| {
-            if self.in_turn(size).is_err() {
+            if self.in_turn(now, size).is_err() {
                 return 0;
             }
             let mut charges = held.clone();
@@ -824,7 +828,9 @@ impl Budget {
 
     /// Why the Mac takes no job of any size now: it does not take jobs, or jobs in line go first.
     fn closed_by(&self, now: Now) -> Option<Refusal> {
-        self.takes_jobs(now).err().or_else(|| self.assigned_first(None))
+        self.takes_jobs(now)
+            .err()
+            .or_else(|| self.assigned_first(now, None))
     }
 
     /// [`Budget::health`], and a person at a Mac that takes no new job while they are.
@@ -891,9 +897,9 @@ impl Budget {
 
     /// Whether a slot of `size` may go before what waits: room made for another size is why it may not, more than
     /// the jobs in line, since none of them gets a slot either.
-    fn in_turn(&self, size: Size) -> Result<(), Refusal> {
+    fn in_turn(&self, now: Now, size: Size) -> Result<(), Refusal> {
         self.made_for(size)?;
-        self.assigned_first(Some(size)).map_or(Ok(()), Err)
+        self.assigned_first(now, Some(size)).map_or(Ok(()), Err)
     }
 
     /// Whether a slot of `size` may be granted while room is made ([`Budget::make_room`]).
@@ -907,15 +913,52 @@ impl Budget {
     /// What whoever comes after the waiting jobs is told: how many of them go first, before a slot of `size`, or
     /// of any size. A job the settings have since made impossible goes before nobody, so it does not count; nor
     /// does one of another size when room is made for `size` ([`Budget::make_room`]): that size is first in line.
-    fn assigned_first(&self, size: Option<Size>) -> Option<Refusal> {
+    /// Nor does one that the host itself keeps out ([`Budget::holds_up`]).
+    fn assigned_first(&self, now: Now, size: Option<Size>) -> Option<Refusal> {
         let made = size.filter(|&size| self.making_room == Some(size));
         let waiting = self
             .waiting
             .iter()
             .filter(|waiter| made.is_none_or(|made| waiter.size == made))
             .filter(|waiter| self.settings.can_run(waiter.size).is_ok())
+            .filter(|waiter| self.holds_up(now, waiter))
             .count();
         (waiting > 0).then_some(Refusal::AssignedFirst { waiting })
+    }
+
+    /// Whether a waiting job holds up those behind it: whether waiting can get it room. It can when it fits now,
+    /// when the Mac is closed for every job alike, and when the jobs of ours that run are what keeps it out, since
+    /// they end. When it would not fit even with none of ours running, the memory, cap or CPUs it lacks are the
+    /// host's, held by its person's apps or its settings: no job of ours ends to give them, and holding the others
+    /// back would leave the host idle for as long as that lasts (the Mac mini, five hours on 2026-11-21). It
+    /// keeps its place and starts as soon as it fits; once the host gives back enough that only our jobs are in
+    /// its way, it holds everyone up again until they end.
+    fn holds_up(&self, now: Now, waiter: &Waiter) -> bool {
+        let Ok(reading) = self.health(now) else {
+            return true;
+        };
+        let limits = if waiter.turn.refusable {
+            *profile_for(&self.settings, Some(reading))
+        } else {
+            Profile {
+                floor_bytes: profile_for(&self.settings, Some(reading)).floor_bytes,
+                ..self.settings.away
+            }
+        };
+        // What our machines hold of the host's memory comes back when they end. One nobody measured yet counts with
+        // all it may hold: it may already hold it (one adopted after a restart, one that just started), and
+        // counting it as nothing would take the room its end gives back for the host's and let others in first.
+        let ours = self.slots.values().fold(0u64, |sum, slot| {
+            sum.saturating_add(slot.held_bytes().max(slot.charge().resident_bytes))
+        });
+        admit(
+            &self.settings,
+            &limits,
+            reading.available_bytes.saturating_add(ours),
+            &[],
+            waiter.size,
+        )
+        .is_ok()
     }
 
     /// A repository started an assigned job: its other jobs go after those of repositories that did not since.
@@ -943,7 +986,8 @@ impl Budget {
                     .unwrap_or(waiter),
                 Err(_) => waiter,
             })
-            .map(|Waiter { slot, size, turn, .. }| {
+            .map(|waiter| {
+                let Waiter { slot, size, turn, .. } = waiter;
                 let (slot, size) = (*slot, *size);
                 let ruled_out = self.settings.can_run(size).err();
                 let why = match ruled_out {
@@ -952,7 +996,8 @@ impl Budget {
                     None if ahead == 0 => self.waiter_fits(now, size, turn).err(),
                     None => Some(Refusal::AssignedFirst { waiting: ahead }),
                 };
-                ahead += usize::from(ruled_out.is_none());
+                // One the host itself keeps out goes before nobody, as in `observe`.
+                ahead += usize::from(ruled_out.is_none() && self.holds_up(now, waiter));
                 Waiting {
                     slot,
                     size,
