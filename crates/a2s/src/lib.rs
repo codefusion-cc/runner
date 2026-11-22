@@ -242,7 +242,7 @@ async fn ask(address: std::net::SocketAddr) -> Result<Answer, QueryError> {
     socket.connect(address).await.map_err(io)?;
     let started = Instant::now();
     socket.send(&request(None)).await.map_err(io)?;
-    let mut buf = vec![0u8; READ_BYTES];
+    let mut buf = [0u8; READ_BYTES];
     let mut challenged = false;
     loop {
         let n = socket.recv(&mut buf).await.map_err(io)?;

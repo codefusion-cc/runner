@@ -13,9 +13,9 @@ use cf_console_client::{
 };
 
 /// The one kind of target there is.
-pub const KIND_A2S: &str = "a2s";
+const KIND_A2S: &str = "a2s";
 /// The most characters of why a look found no answer.
-pub const ERROR_MAX: usize = 200;
+const ERROR_MAX: usize = 200;
 
 /// The targets and what their looks found, between reports.
 #[derive(Default)]
@@ -26,7 +26,6 @@ pub struct Probes {
 #[derive(Default)]
 struct State {
     targets: Vec<ProbeTarget>,
-    every: Duration,
     last: Option<Instant>,
     running: bool,
     pending: Vec<ProbeResult>,
@@ -39,7 +38,7 @@ impl Probes {
     pub fn answered(&self, answer: &Answer, now: Instant) -> Option<Vec<ProbeTarget>> {
         let mut state = self.state.lock().expect("probes");
         state.targets = targets_of(answer);
-        state.every = Duration::from_secs(
+        let every = Duration::from_secs(
             answer
                 .probe_every_seconds
                 .unwrap_or(PROBE_EVERY_DEFAULT_S)
@@ -50,9 +49,7 @@ impl Probes {
             state.pending.clear();
             return None;
         }
-        let due = state
-            .last
-            .is_none_or(|last| now.duration_since(last) >= state.every);
+        let due = state.last.is_none_or(|last| now.duration_since(last) >= every);
         if state.running || !due {
             return None;
         }
