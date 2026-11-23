@@ -12,8 +12,10 @@ ARG TARGETARCH
 ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256_arm64=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
 ARG NODE_SHA256_amd64=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
-# Only for the system libraries browsers need; each repository still installs its own Playwright and browsers.
-ARG PLAYWRIGHT_VERSION=1.63.0
+# Only for the system libraries browsers need; each repository still installs its own Playwright and browsers. Kept
+# at the version codefusion uses: a job whose browsers load a library this image lacks runs apt for it, which a slow
+# archive.ubuntu.com once stretched past the job's step.
+ARG PLAYWRIGHT_VERSION=1.65.0
 # Docker Compose for `cf-docker` jobs; the Actions runner image has the engine, the CLI and buildx already.
 ARG COMPOSE_VERSION=5.6.0
 ARG COMPOSE_SHA256_arm64=733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2
@@ -30,6 +32,16 @@ RUN case "${TARGETARCH}" in \
       amd64) printf 'NODE_ARCH=x64\nNODE_SHA256=%s\nCOMPOSE_ARCH=x86_64\nCOMPOSE_SHA256=%s\n' "${NODE_SHA256_amd64}" "${COMPOSE_SHA256_amd64}" ;; \
       *) echo "no image is pinned for '${TARGETARCH}'" >&2; exit 1 ;; \
     esac > /tmp/arch.env
+
+# amd64's Ubuntu packages come from Azure's mirror of archive.ubuntu.com, the one GitHub's own runners use, for this
+# build and for each job's apt: on 2026-11-23 archive.ubuntu.com sent 6-60 kB/s, and an amd64 build that takes 4
+# minutes was cancelled at its 60. arm64's come from ports.ubuntu.com, which Azure doesn't mirror. apt gives up on a
+# mirror that stops answering after 20 s and retries each download.
+RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do \
+      if [ -f "$file" ]; then sed -i -E 's#https?://(archive|security)\.ubuntu\.com/#http://azure.archive.ubuntu.com/#g' "$file"; fi; \
+    done \
+ && printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n' > /etc/apt/apt.conf.d/80-retries \
+ && if [ "${TARGETARCH}" = amd64 ]; then grep -rqs 'azure.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d/; fi
 
 # Tools workflows call directly, and a compiler for npm packages with native parts.
 RUN apt-get update \
@@ -57,8 +69,8 @@ RUN . /tmp/arch.env \
  && rm /tmp/node.tar.xz \
  && node --version
 
-# The libraries Chromium, Firefox and WebKit load. `playwright install --with-deps` then finds them installed and
-# only downloads the browsers.
+# The libraries Chromium, Firefox and WebKit load. A job's browser install checks them with ldd and runs apt only
+# for one that is missing (codefusion's .github/actions/playwright-browsers).
 RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium firefox webkit \
  && rm -rf /var/lib/apt/lists/* /root/.npm
 
