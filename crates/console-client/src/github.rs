@@ -91,7 +91,7 @@ pub fn is_label(label: &str) -> bool {
 }
 
 /// Whether `name` is an Actions runner of `machine` as the console makes them (`isRunnerOf`): exactly `<machine>-j`
-/// and seven lowercase hex digits, so `mac` never names a runner of `mac-mini`.
+/// and seven lowercase hex digits, so `mac` never names a runner of `mac-two`.
 pub fn is_runner_of(machine: &str, name: &str) -> bool {
     let slug = is_slug(machine);
     let suffix = name

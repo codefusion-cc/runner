@@ -1363,8 +1363,8 @@ mod tests {
     #[test]
     fn names_that_go_into_containers_and_labels_are_plain() {
         assert!(plain("host-1"));
-        assert!(plain("mac-mini-2"));
-        for name in ["", "Dal1", "a b", "a/b", "a=b", &"a".repeat(65)] {
+        assert!(plain("mac-b-2"));
+        for name in ["", "Host1", "a b", "a/b", "a=b", &"a".repeat(65)] {
             assert!(!plain(name), "{name:?}");
         }
     }

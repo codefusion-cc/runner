@@ -441,13 +441,13 @@ fn a_mac_whose_cores_differ_gives_ci_its_performance_cores_alone() {
         };
         Settings::for_host(facts, mode).on_fast_cores(performance)
     };
-    // An M1 Mac mini: 4 performance cores of 8. All but two gave CI 6 and a cf-4g 3, and two jobs side by side ran
+    // An M1 Mac m1: 4 performance cores of 8. All but two gave CI 6 and a cf-4g 3, and two jobs side by side ran
     // on the efficiency cores too.
-    let mini = mac(8, 4, Mode::Dedicated);
-    assert_eq!(mini.check(), Ok(()));
-    assert_eq!((mini.away.cpus, mini.in_use.cpus), (4, 4));
-    assert_eq!(mini.vcpus, [2, 2, 4, 4]);
-    let mut budget = Budget::new(mini).unwrap();
+    let m1 = mac(8, 4, Mode::Dedicated);
+    assert_eq!(m1.check(), Ok(()));
+    assert_eq!((m1.away.cpus, m1.in_use.cpus), (4, 4));
+    assert_eq!(m1.vcpus, [2, 2, 4, 4]);
+    let mut budget = Budget::new(m1).unwrap();
     watch(&mut budget, 0, 60, |r| r.available_bytes = 16 * GIB);
     assert_eq!(budget.claim(secs(60), G4).map(|grant| grant.cpus), Ok(2));
     assert_eq!(budget.claim(secs(60), G4).map(|grant| grant.cpus), Ok(2));

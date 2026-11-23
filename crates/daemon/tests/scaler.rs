@@ -1077,7 +1077,7 @@ async fn the_log_names_a_jobs_start_by_githubs_time_and_says_how_late_its_word_c
 // --- two repositories whose scale sets have the same number --------------------------------------------------------
 
 /// An Actions runner this Mac has for another repository's scale set, which GitHub gave the number this one has:
-/// GitHub counts scale sets within a repository. The Air and the mini, 2026-10-12: four repositories' scale sets
+/// GitHub counts scale sets within a repository. Two Mac hosts, 2026-10-12: four repositories' scale sets
 /// were number 6 on one and number 7 on the other.
 fn of_another_repository(h: &Harness, name: &str, ticket: Option<Ticket>, age: Duration) -> Runner {
     Runner {

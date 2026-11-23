@@ -10,14 +10,14 @@ use cf_budget::{
 };
 use common::*;
 
-/// heimforge's dal1: 11 GiB, 12 cores alike, no KVM, jobs in containers.
-const DAL1: HostFacts = HostFacts {
+/// A Linux VPS: 11 GiB, 12 cores alike, no KVM, jobs in containers.
+const LINUX_HOST: HostFacts = HostFacts {
     total_bytes: 11 * GIB,
     cores: 12,
 };
 
-fn dal1() -> Settings {
-    Settings::for_headless_in(DAL1, 0, Sandbox::Container)
+fn linux_host() -> Settings {
+    Settings::for_headless_in(LINUX_HOST, 0, Sandbox::Container)
 }
 
 fn disk(hold: Option<u64>, evict: Option<u64>, job: Option<u64>) -> Limits {
@@ -34,9 +34,9 @@ fn every_kind_of_host_keeps_the_disk_defaults() {
     let hosts = [
         dedicated(),
         workstation(),
-        Settings::for_headless(DAL1, 0),
-        dal1(),
-        Settings::for_headless(DAL1, 0).one_at_a_time(0),
+        Settings::for_headless(LINUX_HOST, 0),
+        linux_host(),
+        Settings::for_headless(LINUX_HOST, 0).one_at_a_time(0),
     ];
     for settings in hosts {
         assert_eq!(
@@ -58,11 +58,11 @@ fn every_kind_of_host_keeps_the_disk_defaults() {
 
 #[test]
 fn a_hold_alone_lowers_the_stop_to_it_and_never_raises_it() {
-    let low = dal1().limited(&disk(Some(3 * GIB), None, None)).unwrap();
+    let low = linux_host().limited(&disk(Some(3 * GIB), None, None)).unwrap();
     assert_eq!((low.disk_hold_bytes, low.disk_evict_bytes), (3 * GIB, 3 * GIB));
-    let high = dal1().limited(&disk(Some(10 * GIB), None, None)).unwrap();
+    let high = linux_host().limited(&disk(Some(10 * GIB), None, None)).unwrap();
     assert_eq!((high.disk_hold_bytes, high.disk_evict_bytes), (10 * GIB, 5 * GIB));
-    let both = dal1()
+    let both = linux_host()
         .limited(&disk(Some(3 * GIB), Some(GIB), Some(8 * GIB)))
         .unwrap();
     assert_eq!(
@@ -70,7 +70,7 @@ fn a_hold_alone_lowers_the_stop_to_it_and_never_raises_it() {
         (3 * GIB, GIB, 8 * GIB)
     );
     // A stop set alone keeps the default hold.
-    let stop = dal1().limited(&disk(None, Some(2 * GIB), None)).unwrap();
+    let stop = linux_host().limited(&disk(None, Some(2 * GIB), None)).unwrap();
     assert_eq!((stop.disk_hold_bytes, stop.disk_evict_bytes), (25 * GIB, 2 * GIB));
 }
 
@@ -79,21 +79,24 @@ fn the_disk_limits_at_their_edges() {
     let too_low = Err(SettingsError::DiskEvictTooLow { least_bytes: GIB });
     let hold_too_low = Err(SettingsError::DiskHoldTooLow { least_bytes: GIB });
     // A hold of nothing, or of a byte, is said of the hold, though it takes the stop down with it.
-    assert_eq!(dal1().limited(&disk(Some(0), None, None)), hold_too_low);
-    assert_eq!(dal1().limited(&disk(Some(1), None, None)), hold_too_low);
-    assert_eq!(dal1().limited(&disk(Some(GIB - 1), None, None)), hold_too_low);
+    assert_eq!(linux_host().limited(&disk(Some(0), None, None)), hold_too_low);
+    assert_eq!(linux_host().limited(&disk(Some(1), None, None)), hold_too_low);
     assert_eq!(
-        dal1().limited(&disk(Some(GIB - 1), Some(GIB - 1), None)),
+        linux_host().limited(&disk(Some(GIB - 1), None, None)),
         hold_too_low
     );
-    assert_eq!(dal1().limited(&disk(None, Some(0), None)), too_low);
-    assert_eq!(dal1().limited(&disk(None, Some(GIB - 1), None)), too_low);
+    assert_eq!(
+        linux_host().limited(&disk(Some(GIB - 1), Some(GIB - 1), None)),
+        hold_too_low
+    );
+    assert_eq!(linux_host().limited(&disk(None, Some(0), None)), too_low);
+    assert_eq!(linux_host().limited(&disk(None, Some(GIB - 1), None)), too_low);
     // The least of both, equal.
-    let least = dal1().limited(&disk(Some(GIB), Some(GIB), None)).unwrap();
+    let least = linux_host().limited(&disk(Some(GIB), Some(GIB), None)).unwrap();
     assert_eq!((least.disk_hold_bytes, least.disk_evict_bytes), (GIB, GIB));
     // A stop above the hold, by a byte.
     assert_eq!(
-        dal1().limited(&disk(Some(3 * GIB), Some(3 * GIB + 1), None)),
+        linux_host().limited(&disk(Some(3 * GIB), Some(3 * GIB + 1), None)),
         Err(SettingsError::DiskLimitsCrossed {
             evict_bytes: 3 * GIB + 1,
             hold_bytes: 3 * GIB
@@ -101,7 +104,7 @@ fn the_disk_limits_at_their_edges() {
     );
     // A stop set alone above the default hold.
     assert_eq!(
-        dal1().limited(&disk(None, Some(26 * GIB), None)),
+        linux_host().limited(&disk(None, Some(26 * GIB), None)),
         Err(SettingsError::DiskLimitsCrossed {
             evict_bytes: 26 * GIB,
             hold_bytes: 25 * GIB
@@ -109,7 +112,7 @@ fn the_disk_limits_at_their_edges() {
     );
     // The largest numbers do not overflow anything.
     assert_eq!(
-        dal1()
+        linux_host()
             .limited(&disk(Some(u64::MAX), Some(u64::MAX), None))
             .map(|s| s.disk_hold_bytes),
         Ok(u64::MAX)
@@ -118,7 +121,7 @@ fn the_disk_limits_at_their_edges() {
 
 #[test]
 fn a_jobs_disk_is_between_four_and_512_gib() {
-    let job = |bytes| dal1().limited(&disk(None, None, Some(bytes)));
+    let job = |bytes| linux_host().limited(&disk(None, None, Some(bytes)));
     let refused = |bytes| {
         Err(SettingsError::JobDisk {
             bytes,
@@ -137,7 +140,7 @@ fn a_jobs_disk_is_between_four_and_512_gib() {
 #[test]
 fn a_hold_that_no_file_system_of_this_size_meets_is_refused() {
     let limits = disk(Some(12 * GIB), Some(GIB), Some(4 * GIB));
-    let settings = dal1().limited(&limits).unwrap();
+    let settings = linux_host().limited(&limits).unwrap();
     let check = |disk_bytes| settings.check_disk(&limits, Sandbox::Container, disk_bytes);
     let over = |disk_bytes| {
         Err(SettingsError::DiskHoldOverDisk {
@@ -170,7 +173,7 @@ fn a_hold_that_no_file_system_of_this_size_meets_is_refused() {
 #[test]
 fn a_jobs_disk_larger_than_the_file_system_is_refused() {
     let limits = disk(Some(2 * GIB), None, Some(16 * GIB));
-    let settings = dal1().limited(&limits).unwrap();
+    let settings = linux_host().limited(&limits).unwrap();
     assert_eq!(
         settings.check_disk(&limits, Sandbox::Container, 16 * GIB - 1),
         Err(SettingsError::JobDiskOverDisk {
@@ -191,7 +194,7 @@ fn a_jobs_disk_larger_than_the_file_system_is_refused() {
 #[test]
 fn a_container_host_whose_hold_and_one_jobs_disk_do_not_fit_starts_and_says_so() {
     let limits = disk(Some(4 * GIB), Some(GIB), Some(8 * GIB));
-    let settings = dal1().limited(&limits).unwrap();
+    let settings = linux_host().limited(&limits).unwrap();
     // To the byte: 12 GiB holds both.
     assert_eq!(
         settings.check_disk(&limits, Sandbox::Container, 12 * GIB),
@@ -215,21 +218,21 @@ fn a_container_host_whose_hold_and_one_jobs_disk_do_not_fit_starts_and_says_so()
         "it says what is short"
     );
     // Machines are left as they are.
-    let vm = Settings::for_headless(DAL1, 0).limited(&limits).unwrap();
+    let vm = Settings::for_headless(LINUX_HOST, 0).limited(&limits).unwrap();
     assert_eq!(vm.check_disk(&limits, Sandbox::Vm, 12 * GIB - 1), Ok(None));
 }
 
 #[test]
 fn the_defaults_are_never_refused_for_a_small_disk() {
     // A host on the defaults starts on any disk as it did; a container host on them is told why it may take nothing.
-    for settings in [dedicated(), Settings::for_headless(DAL1, 0)] {
+    for settings in [dedicated(), Settings::for_headless(LINUX_HOST, 0)] {
         assert_eq!(
             settings.check_disk(&Limits::default(), Sandbox::Vm, 20 * GIB),
             Ok(None)
         );
     }
     assert_eq!(
-        dal1().check_disk(&Limits::default(), Sandbox::Container, 20 * GIB),
+        linux_host().check_disk(&Limits::default(), Sandbox::Container, 20 * GIB),
         Ok(Some(DiskShort {
             hold_bytes: 25 * GIB,
             job_bytes: 40 * GIB,
@@ -250,15 +253,15 @@ fn watched_with_free(settings: Settings, free: u64) -> cf_budget::Budget {
 
 #[test]
 fn a_small_disk_takes_a_job_once_its_hold_is_lowered_and_holds_under_it() {
-    // dal1's home: about 12 GiB, 4 GiB of it free.
+    // linux_host's home: about 12 GiB, 4 GiB of it free.
     let free = 4 * GIB;
-    let mut defaults = watched_with_free(dal1(), free);
+    let mut defaults = watched_with_free(linux_host(), free);
     assert_eq!(
         defaults.claim(secs(60), Size::G2).map(|_| ()),
         Err(Refusal::Trouble(Trouble::DiskLow)),
         "today's 25 GiB hold takes nothing"
     );
-    let lowered = dal1()
+    let lowered = linux_host()
         .limited(&disk(Some(3 * GIB), Some(GIB), Some(6 * GIB)))
         .unwrap();
     let mut budget = watched_with_free(lowered.clone(), free);

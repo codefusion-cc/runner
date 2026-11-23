@@ -28,11 +28,11 @@ pub struct Options {
     /// seen at GitHub (the probes ran 2026-10-12 against a throwaway repository, `docs/github-protocol.md`):
     ///
     /// - It looks at its queue when a job is queued, ends, is cancelled or is taken elsewhere. Seen: probes E, I and
-    ///   J2 (a job queued, or one GitHub took back, and waiting jobs were assigned within a second); the Mac mini's
+    ///   J2 (a job queued, or one GitHub took back, and waiting jobs were assigned within a second); a Mac host's
     ///   log at 18:52:50 (a job queued, a burst of assignments). That an end makes it look is inferred from the log.
     /// - It looks at no other time unless a test says so ([`FakeGithub::github_looks`]). Seen: GitHub also looks by
     ///   itself, sometimes within 30 s of room (probes J1, I2), sometimes after 2.5 minutes (A, G), sometimes not in
-    ///   3 minutes (J2, J3), and not for 13 minutes on the mini (18:39 to 18:52). Nothing the Runner does makes it
+    ///   3 minutes (J2, J3), and not for 13 minutes on a Mac host (18:39 to 18:52). Nothing the Runner does makes it
     ///   look: not a session opened (probes E, F), not a scale set updated (I1, L), not an Actions runner registered
     ///   (J1 to J3, L), but for one registered outside any scale set that comes online (N,
     ///   [`FakeGithub::runner_online`]).
@@ -1649,8 +1649,8 @@ impl FakeGithub {
     }
 }
 
-/// How long GitHub leaves a job with a scale set whose Actions runner does not take it. Seen: probe J2 and the Mac
-/// mini at 18:57:52 (`docs/github-protocol.md`).
+/// How long GitHub leaves a job with a scale set whose Actions runner does not take it. Seen: probe J2 and a Mac
+/// host at 18:57:52 (`docs/github-protocol.md`).
 pub const TAKE_BACK_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// Takes back every assignment no Actions runner took within [`TAKE_BACK_AFTER`]: the scale set hears a

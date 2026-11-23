@@ -17,8 +17,8 @@ const FACTS: HostFacts = HostFacts {
 /// Free (61972), file-backed (268905) and purgeable (18337) pages: 349214, 5.33 GiB.
 const READY_PAGES: u64 = 349_214;
 
-/// The idle Mac mini: `kern.memorystatus_level` 76, pressure normal, 247 MiB of swap that does not grow.
-fn idle_mini() -> Raw {
+/// The idle 16 GB Mac: `kern.memorystatus_level` 76, pressure normal, 247 MiB of swap that does not grow.
+fn idle_mac16() -> Raw {
     Raw {
         page_bytes: PAGE,
         free_pages: 61_972 + 16_322,
@@ -82,18 +82,18 @@ fn budget_after_a_minute(raw_at: impl Fn(u64) -> Raw) -> Result<(), Refusal> {
 }
 
 #[test]
-fn the_idle_mini_counts_its_inactive_program_pages_at_what_compressing_them_frees() {
+fn the_idle_mac16_counts_its_inactive_program_pages_at_what_compressing_them_frees() {
     // Inactive pages split as file pages share the active and inactive ones: 252583 file pages that are not
     // speculative, of 694241, puts 123487 file pages and 215926 program pages in the 339413 inactive ones. The
     // compressor stores 202918 pages in 68977: compressing frees 133941 of every 202918, 142527 pages.
-    assert_eq!(available(&idle_mini()), (READY_PAGES + 142_527) * PAGE);
+    assert_eq!(available(&idle_mac16()), (READY_PAGES + 142_527) * PAGE);
     assert_eq!(needed_for_a_4g(), 405_504 * PAGE, "6.19 GiB");
-    assert_eq!(admits_a_4g(available(&idle_mini())), Ok(()));
-    assert_eq!(budget_after_a_minute(|_| idle_mini()), Ok(()));
+    assert_eq!(admits_a_4g(available(&idle_mac16())), Ok(()));
+    assert_eq!(budget_after_a_minute(|_| idle_mac16()), Ok(()));
 }
 
 #[test]
-fn without_its_inactive_program_pages_the_mini_refuses_a_4g_as_it_did() {
+fn without_its_inactive_program_pages_the_mac_refuses_a_4g_as_it_did() {
     let strict = READY_PAGES * PAGE;
     assert_eq!(
         admits_a_4g(strict),
@@ -108,7 +108,7 @@ fn under_a_pressure_warning_or_critical_only_the_strict_count_is_left() {
     for level in [2, 4] {
         let raw = Raw {
             pressure_level: level,
-            ..idle_mini()
+            ..idle_mac16()
         };
         assert_eq!(available(&raw), READY_PAGES * PAGE, "pressure level {level}");
         assert!(admits_a_4g(available(&raw)).is_err());
@@ -123,7 +123,7 @@ fn under_a_pressure_warning_or_critical_only_the_strict_count_is_left() {
 fn a_low_memorystatus_level_counts_nothing_more_and_the_calm_level_does() {
     let low = Raw {
         memorystatus_level: Some(CALM_LEVEL - 1),
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&low), READY_PAGES * PAGE);
     assert_eq!(
@@ -134,7 +134,7 @@ fn a_low_memorystatus_level_counts_nothing_more_and_the_calm_level_does() {
     );
     let calm = Raw {
         memorystatus_level: Some(CALM_LEVEL),
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&calm), (READY_PAGES + 142_527) * PAGE);
     assert_eq!(budget_after_a_minute(|_| calm), Ok(()));
@@ -146,7 +146,7 @@ fn a_compressor_with_a_quarter_of_the_memory_counts_nothing_more() {
     let heavy = Raw {
         compressor_pages: quarter,
         compressed_pages: 3 * quarter,
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&heavy), READY_PAGES * PAGE);
     let just_under = Raw {
@@ -159,9 +159,9 @@ fn a_compressor_with_a_quarter_of_the_memory_counts_nothing_more() {
 #[test]
 fn swap_that_moves_refuses_the_job_whatever_is_counted() {
     let swapping = budget_after_a_minute(|second| Raw {
-        swapouts: idle_mini().swapouts + second,
-        swap_used_bytes: idle_mini().swap_used_bytes + second * 4 * PAGE,
-        ..idle_mini()
+        swapouts: idle_mac16().swapouts + second,
+        swap_used_bytes: idle_mac16().swap_used_bytes + second * 4 * PAGE,
+        ..idle_mac16()
     });
     assert_eq!(swapping, Err(Refusal::Trouble(Trouble::Swapping)));
 }
@@ -170,7 +170,7 @@ fn swap_that_moves_refuses_the_job_whatever_is_counted() {
 fn without_a_memorystatus_level_nothing_more_is_counted() {
     let unknown = Raw {
         memorystatus_level: None,
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&unknown), READY_PAGES * PAGE);
 }
@@ -180,7 +180,7 @@ fn a_memorystatus_level_over_a_hundred_is_an_error_and_a_hundred_is_not() {
     for level in [101, u32::MAX] {
         let raw = Raw {
             memorystatus_level: Some(level),
-            ..idle_mini()
+            ..idle_mac16()
         };
         assert_eq!(
             read(&raw),
@@ -192,7 +192,7 @@ fn a_memorystatus_level_over_a_hundred_is_an_error_and_a_hundred_is_not() {
     }
     let full = Raw {
         memorystatus_level: Some(100),
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&full), (READY_PAGES + 142_527) * PAGE);
 }
@@ -204,7 +204,7 @@ fn the_count_never_passes_what_memorystatus_says_holds_nothing_compressed() {
         memorystatus_level: Some(50),
         inactive_pages: 2_000_000,
         anonymous_pages: 2_000_000,
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&raw), 8 * GIB);
     // A level under the strict count takes nothing from it.
@@ -235,7 +235,7 @@ fn plain(free: u64, inactive: u64) -> Raw {
         compressor_pages: 0,
         compressed_pages: 0,
         memorystatus_level: Some(100),
-        ..idle_mini()
+        ..idle_mac16()
     }
 }
 
@@ -269,7 +269,7 @@ fn zero_counts_give_zero_and_no_error() {
         compressor_pages: 0,
         compressed_pages: 0,
         memorystatus_level: Some(0),
-        ..idle_mini()
+        ..idle_mac16()
     };
     assert_eq!(available(&nothing), 0);
     let no_queues = Raw {
@@ -286,7 +286,7 @@ fn a_compressor_that_saves_nothing_or_less_than_nothing_frees_nothing() {
         let raw = Raw {
             compressed_pages: stored,
             compressor_pages: occupied,
-            ..idle_mini()
+            ..idle_mac16()
         };
         assert_eq!(available(&raw), READY_PAGES * PAGE, "{stored} in {occupied}");
     }
@@ -341,7 +341,7 @@ fn any_raw() -> impl Strategy<Value = Raw> {
                 compressed_pages: stored,
                 memorystatus_level: level,
                 pressure_level: pressure,
-                ..idle_mini()
+                ..idle_mac16()
             },
         )
 }

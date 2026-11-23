@@ -488,7 +488,7 @@ fn merged(now: &str, last: &str, owned: &str, settings: &str) -> Result<serde_js
     }
 }
 
-const OWNED: &str = r#"{"machine": "lon1", "class": null, "sandbox": null, "engine": null, "state_dir": "/s", "build_folder": null, "image": "i1",
+const OWNED: &str = r#"{"machine": "linux-1", "class": null, "sandbox": null, "engine": null, "state_dir": "/s", "build_folder": null, "image": "i1",
     "console": "https://c", "github_api": null, "use": "dedicated"}"#;
 
 #[test]
@@ -496,7 +496,7 @@ fn a_first_configuration_is_the_owned_keys_without_nulls_and_the_settings() {
     assert_eq!(
         merged("{}", "{}", OWNED, r#"{"ci_memory_gb": 10.6, "ci_cpus": 6}"#),
         Ok(serde_json::json!({
-            "machine": "lon1", "state_dir": "/s", "image": "i1", "console": "https://c", "use": "dedicated",
+            "machine": "linux-1", "state_dir": "/s", "image": "i1", "console": "https://c", "use": "dedicated",
             "ci_memory_gb": 10.6, "ci_cpus": 6
         }))
     );
@@ -504,14 +504,14 @@ fn a_first_configuration_is_the_owned_keys_without_nulls_and_the_settings() {
 
 #[test]
 fn keys_the_runner_or_the_console_set_stay_and_settings_left_out_go() {
-    let now = r#"{"machine": "lon1", "state_dir": "/s", "image": "i0", "console": "https://c", "use": "dedicated",
+    let now = r#"{"machine": "linux-1", "state_dir": "/s", "image": "i0", "console": "https://c", "use": "dedicated",
         "build_folder": "/home/r/runner", "github_api": "http://127.0.0.1:1", "class": "trusted",
         "max_jobs": 2, "ci_memory_gb": 10, "ci_cpus": 6, "vcpus": {"cf-4g": 2}}"#;
     let last = r#"{"ci_memory_gb": 10, "ci_cpus": 6, "vcpus": {"cf-4g": 2}}"#;
     assert_eq!(
         merged(now, last, OWNED, r#"{"ci_memory_gb": 10.6}"#),
         Ok(serde_json::json!({
-            "machine": "lon1", "state_dir": "/s", "image": "i1", "console": "https://c", "use": "dedicated",
+            "machine": "linux-1", "state_dir": "/s", "image": "i1", "console": "https://c", "use": "dedicated",
             "max_jobs": 2, "ci_memory_gb": 10.6
         })),
         "the console's max_jobs stays; ci_cpus and vcpus, set by the last run alone, go; an owned key now null goes"
@@ -690,14 +690,14 @@ const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 #[test]
 fn each_step_takes_only_its_own_options() {
     let this = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-    let base = ["--machine", "lon1", "--console", "https://console.example"];
+    let base = ["--machine", "linux-1", "--console", "https://console.example"];
     let cases: Vec<(Vec<&str>, &str)> = vec![
         (
             vec!["install", "--code-file", "/root/code"],
             "install takes no code; enroll does",
         ),
         (
-            vec!["enroll", "--machine", "lon1"],
+            vec!["enroll", "--machine", "linux-1"],
             "enroll takes --machine from the configuration",
         ),
         (
@@ -821,7 +821,7 @@ fn right_options_get_as_far_as_asking_for_root() {
         return;
     }
     let this = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-    let base = ["--machine", "lon1", "--console", "https://console.example"];
+    let base = ["--machine", "linux-1", "--console", "https://console.example"];
     for args in [
         [
             &["install"][..],

@@ -48,15 +48,15 @@ of them GitHub assigned it by itself first, 4 to 102 s after room appeared.
 
 Every count in every probe said `totalAvailableJobs: 0` while a job waited unassigned.
 
-The Mac mini's log of the same day agrees: at 18:39 a slot freed while the other scale sets' newest polls offered 0,
+A Mac host's log of the same day agrees: at 18:39 a slot freed while the other scale sets' newest polls offered 0,
 and nothing was assigned until a job was queued elsewhere at 18:52:50, two seconds before a burst of assignments.
 
 ## The rules the fake keeps
 
 | Rule | Evidence | Seen or inferred |
 |---|---|---|
-| GitHub looks at its queue when a job is queued, ends, is cancelled or taken back | E/F, I2, J2, the mini at 18:52:50 | Seen for a queued job and a take-back; inferred for an end and a cancel |
-| It also looks by itself, at moments nobody can predict: within 30 s of room, or not in 3 minutes, or 13 minutes on the mini. The fake looks only when a test says so (`github_looks`) | A, G, I2, J1, J3, K, the mini 18:39 to 18:52 | Seen; the pattern behind the moments is unknown |
+| GitHub looks at its queue when a job is queued, ends, is cancelled or taken back | E/F, I2, J2, a Mac host at 18:52:50 | Seen for a queued job and a take-back; inferred for an end and a cancel |
+| It also looks by itself, at moments nobody can predict: within 30 s of room, or not in 3 minutes, or 13 minutes on a Mac host. The fake looks only when a test says so (`github_looks`) | A, G, I2, J1, J3, K, the mini 18:39 to 18:52 | Seen; the pattern behind the moments is unknown |
 | No call to the scale set service makes it look every time: not a session opened, refreshed or opened again, not a scale set updated, not an Actions runner of a scale set registered | E, F, I1, J1 to J3, L1 to L4 | Seen; the assignments that followed a call came 13 to 45 s later, as GitHub's own looks do, and each call also failed once |
 | An Actions runner registered outside any scale set makes it look as it comes online, and the job may go to a scale set rather than to it. The fake looks when a test says it came online (`runner_online`) | N | Seen five times of five |
 | Such an Actions runner carries exactly the labels it was registered with, and takes a queued job of its repository whose labels it has | M | Seen for the labels; that it takes such a job is GitHub's documented meaning, and in N the scale set got the job first |
@@ -65,7 +65,7 @@ and nothing was assigned until a job was queued elsewhere at 18:52:50, two secon
 | The counts never name a job GitHub holds | every probe | Seen |
 | A session that ends or is forgotten takes its pending messages with it, and messages queued while there is none are lost | D kept one across a delete | GitHub was kinder in D; one sample is no promise, so the fake drops them |
 | A refresh (`PATCH`) brings no counts | C | Seen |
-| An assignment never acquired is taken back after 5 minutes as `JobCompleted` `canceled`, and queued again | J2, the mini at 18:57:52 | Seen; that it is queued again is inferred from J2, where it was handed out again at once |
+| An assignment never acquired is taken back after 5 minutes as `JobCompleted` `canceled`, and queued again | J2, a Mac host at 18:57:52 | Seen; that it is queued again is inferred from J2, where it was handed out again at once |
 | The REST view of an Actions runner says whether it is busy, and 404 once it is gone | H | Seen for an idle one; `busy: true` for a running job is GitHub's documented meaning, not probed. How fresh it is was not probed: the fake can answer one read behind (`set_rest_stale`), never from before the registration's own answer |
 
 ## What follows for the Runner

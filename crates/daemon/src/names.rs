@@ -381,7 +381,7 @@ mod tests {
         for labels in [
             &["cf-8g", "cf-linux"][..],
             &["cf-8g", "cf-macos", "cf-linux"],
-            &["cf-8g", "cf-mini"],
+            &["cf-8g", "cf-spare"],
         ] {
             assert!(!mac.serves_labels(&set(labels)), "{labels:?}");
         }

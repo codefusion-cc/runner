@@ -739,7 +739,7 @@ fn forty_jobs_assigned_at_once_from_many_threads_start_two_and_keep_thirty_eight
 
 #[test]
 fn a_job_the_host_itself_keeps_out_holds_nobody_up_until_only_our_jobs_are_in_its_way() {
-    // The Mac mini, 2026-11-21 19:11 to 00:30 Z: a cf-6g job GitHub gave it waited for memory its person's apps
+    // A Mac host, 2026-11-21 19:11 to 00:30 Z: a cf-6g job GitHub gave it waited for memory its person's apps
     // held, nothing of the Runner's ran, and every job behind it waited too, for five hours. Waiting frees nothing
     // there: no job of ours ends to make the room.
     let mut budget = open(dedicated());
