@@ -12,8 +12,10 @@ ARG TARGETARCH
 ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256_arm64=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
 ARG NODE_SHA256_amd64=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
-# Only for the system libraries browsers need; each repository still installs its own Playwright and browsers.
-ARG PLAYWRIGHT_VERSION=1.63.0
+# Only for the system libraries browsers need; each repository still installs its own Playwright and browsers. Kept
+# at the version codefusion uses: a job whose browsers load a library this image lacks runs apt for it, which a slow
+# archive.ubuntu.com once stretched past the job's step.
+ARG PLAYWRIGHT_VERSION=1.65.0
 # Docker Compose for `cf-docker` jobs; the Actions runner image has the engine, the CLI and buildx already.
 ARG COMPOSE_VERSION=5.6.0
 ARG COMPOSE_SHA256_arm64=733ec76717ceb59052a9609b9dadfb523b2df8eab57a54212872d10a58078ea2
@@ -57,8 +59,8 @@ RUN . /tmp/arch.env \
  && rm /tmp/node.tar.xz \
  && node --version
 
-# The libraries Chromium, Firefox and WebKit load. `playwright install --with-deps` then finds them installed and
-# only downloads the browsers.
+# The libraries Chromium, Firefox and WebKit load. A job's browser install checks them with ldd and runs apt only
+# for one that is missing (codefusion's .github/actions/playwright-browsers).
 RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium firefox webkit \
  && rm -rf /var/lib/apt/lists/* /root/.npm
 
