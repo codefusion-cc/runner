@@ -4257,8 +4257,8 @@ async fn a_runner_from_a_release_updates_only_to_a_commit_and_waits_for_its_mach
     let rig = Rig::new(2).await;
     rig.updates.commits_only();
     rig.service.discover().await;
-    let calls = rig.console.calls();
-    until("a report", || rig.console.calls() > calls).await;
+    // A report itself, not any call: the console's first call may be another one, before any report.
+    until("a report", || !rig.console.reports().is_empty()).await;
     let commands = last_status(&rig.console)["commands"].clone();
     assert_eq!(
         commands,
