@@ -641,6 +641,62 @@ pub struct Report {
     pub jobs: Vec<JobEvent>,
     /// What came of commands, at most 50.
     pub results: Vec<CommandResult>,
+    /// What came of the outside looks at game servers the console asked for ([`Answer::probes`]), at most
+    /// [`MAX_PROBE_RESULTS`], each kept until a report that carried it was answered. Left out while there are none;
+    /// a console from before ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_results: Vec<ProbeResult>,
+}
+
+/// The most targets the Runner looks at: those past it in an answer are left out.
+pub const MAX_PROBE_TARGETS: usize = 8;
+/// The most probe results in one report.
+pub const MAX_PROBE_RESULTS: usize = 16;
+/// The most characters of a target's name.
+pub const PROBE_NAME_MAX: usize = 64;
+/// How often the Runner looks at its targets when the console does not say: `probeEverySeconds`.
+pub const PROBE_EVERY_DEFAULT_S: u64 = 120;
+/// The least and most of `probeEverySeconds`: anything else is held to these.
+pub const PROBE_EVERY_BOUNDS_S: (u64, u64) = (30, 3600);
+
+/// A game server the console asks this host to look at from outside, as a player would: `{name, host, port, kind}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeTarget {
+    /// The console's name for it, which the result names, 1 to [`PROBE_NAME_MAX`] characters.
+    pub name: String,
+    /// Its host name or address.
+    pub host: String,
+    /// Its query port.
+    pub port: u16,
+    /// How to ask it: `a2s` (one `A2S_INFO` query, `cf-a2s`) is the one kind there is. Another is not asked.
+    pub kind: String,
+}
+
+/// What one look at a [`ProbeTarget`] found. Of the server's answer only its name and player counts: never a player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeResult {
+    /// The target's name.
+    pub target: String,
+    /// Whether it answered.
+    pub ok: bool,
+    /// When the look began, RFC 3339.
+    pub at: String,
+    /// Milliseconds from the query to its answer, challenge included; left out when it did not answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// The name the server answered with, at most `cf_a2s::NAME_CHARS` characters, no control characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_name: Option<String>,
+    /// Players on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub players: Option<u32>,
+    /// The most players it takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u32>,
+    /// Why it did not answer, at most 200 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A command the console wants the host to run.
@@ -686,6 +742,39 @@ pub struct Answer {
     /// serve them, to make room for; left out for none. A label the Runner does not know names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub make_room_for: Option<String>,
+    /// Game servers to look at from outside, each every [`Answer::probe_every_seconds`]; left out (and so none) when
+    /// the console asks for none. A Runner from before ignores it. Read loosely: an entry this does not read (a
+    /// field missing or of another type) is left out, and a value that is no list is none, so a probe never makes
+    /// the rest of the answer unread.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "loose_probes"
+    )]
+    pub probes: Vec<ProbeTarget>,
+    /// Seconds between looks at the probes; [`PROBE_EVERY_DEFAULT_S`] when left out or not a whole number of them.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "loose_seconds"
+    )]
+    pub probe_every_seconds: Option<u64>,
+}
+
+/// [`Answer::probes`]: the entries read as [`ProbeTarget`]s, the others left out; none for a value that is no list.
+fn loose_probes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ProbeTarget>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// [`Answer::probe_every_seconds`]: a whole number of seconds, or none.
+fn loose_seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_u64())
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference

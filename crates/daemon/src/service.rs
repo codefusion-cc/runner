@@ -29,6 +29,7 @@ use crate::held::{self, HeldSet, OwnRunners, SetView};
 use crate::holds::{self as local, Hold, LocalStatus, StatusMachine, StatusSize};
 use crate::machines::{self, JobReport, Machines, Reports, Snapshot};
 use crate::names::{ServePolicy, scale_set_name};
+use crate::probes::{self, Probes};
 use crate::queued::{Bounds, Look, Queued, QueuedSet};
 use crate::roster::{Roster, Runner};
 use crate::scaler::{Room, Scaler, ScalerConfig, Start, reconcile, start_runner};
@@ -403,6 +404,8 @@ struct Shared<H, V> {
     /// The key the host still holds, and why it keeps it (for the report): none once taken out.
     held_key: Option<HeldKey>,
     key_kept: Mutex<Option<String>>,
+    /// The game servers the console asks this host to look at, and what the looks found until a report carried it.
+    probes: Probes,
     /// Rung when the label sets are to be read again before the next discovery in its turn: the looks at GitHub
     /// take it one at a time with the others.
     rediscover: Notify,
@@ -734,6 +737,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     None => app_key_said.map(|said| cut(said, KEY_KEPT_MAX)),
                 }),
                 held_key: parts.held_key,
+                probes: Probes::default(),
                 rediscover: Notify::new(),
                 results: Mutex::new(kept_results(parts.results.as_deref())),
                 results_file: parts.results,
@@ -2270,6 +2274,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             image: None,
             jobs: Vec::new(),
             results: Vec::new(),
+            probe_results: Vec::new(),
         }
     }
 
@@ -2307,6 +2312,8 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
             .cloned()
             .collect();
         report.results.clone_from(&results);
+        let probed = shared.probes.pending();
+        report.probe_results.clone_from(&probed);
         // Read before the events are taken for the report: one queued meanwhile is news after it.
         let queued = console.outbox.queued();
         let delivered = console.client.deliver(&console.outbox, report).await;
@@ -2324,6 +2331,7 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
                     kept.retain(|result| !results.iter().any(|said| said.id == result.id));
                     self.keep(&kept);
                 }
+                shared.probes.sent(&probed);
                 self.answered(answer).await
             }
             Err(error) => {
@@ -2369,6 +2377,14 @@ impl<H: Host + Send + 'static, V: Vms + 'static> Service<H, V> {
         shared
             .machines
             .make_room_for(answer.make_room_for.as_deref().and_then(Size::from_label));
+        if let Some(targets) = shared.probes.answered(&answer, Instant::now()) {
+            let service = self.handle();
+            let at = iso(secs(shared.clock.now()));
+            tokio::spawn(async move {
+                let results = probes::look(targets, cf_a2s::TIMEOUT, at).await;
+                service.shared.probes.finished(results);
+            });
+        }
         for command in answer.commands {
             // A result names its command by the id. One the console would not read back cannot be answered, and a
             // result it refuses would hold up every report after it: such a command is not done at all.

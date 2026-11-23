@@ -123,6 +123,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-a2s"
+version = "0.1.0"
+dependencies = [
+ "cf-guest-proto",
+ "proptest",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "cf-budget"
 version = "0.1.0"
 dependencies = [
@@ -161,6 +171,7 @@ dependencies = [
 name = "cf-daemon"
 version = "0.1.0"
 dependencies = [
+ "cf-a2s",
  "cf-budget",
  "cf-console-client",
  "cf-fake-console",

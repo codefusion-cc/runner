@@ -6992,3 +6992,129 @@ async fn the_size_the_console_names_to_make_room_for_reaches_the_machines() {
         "named again once it answers"
     );
 }
+
+/// A game server on 127.0.0.1 that answers every `A2S_INFO` query at once, counting them.
+async fn game_server(name: &'static str) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = asked.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            assert_eq!(
+                &buf[..n],
+                cf_a2s::request(None).as_slice(),
+                "only A2S_INFO is ever sent"
+            );
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut reply = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x49, 17];
+            for s in [name, "Meadows", "valheim", "Valheim"] {
+                reply.extend_from_slice(s.as_bytes());
+                reply.push(0);
+            }
+            reply.extend_from_slice(&[0, 0, 3, 10, 0]);
+            let _ = socket.send_to(&reply, from).await;
+        }
+    });
+    (port, asked)
+}
+
+fn probe_results(console: &FakeConsole) -> Vec<Value> {
+    console
+        .reports()
+        .iter()
+        .flat_map(|report| report["probeResults"].as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_game_servers_the_console_names_are_looked_at_once_a_round_and_said_once() {
+    let rig = Rig::new(1).await;
+    let (port, asked) = game_server("Heimforge NA").await;
+    // Off, as every console is until a world's switch is on: nothing is asked and no report says anything of it.
+    rig.service.report().await;
+    rig.service.report().await;
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(
+        rig.console
+            .reports()
+            .iter()
+            .all(|r| r.get("probeResults").is_none())
+    );
+
+    rig.console.probes(Some((
+        json!([
+            { "name": "heimforge/na", "host": "127.0.0.1", "port": port, "kind": "a2s" },
+            // A kind it does not know, and the same name twice: neither is asked.
+            { "name": "heimforge/players", "host": "127.0.0.1", "port": port, "kind": "a2s-player" },
+            { "name": "heimforge/na", "host": "127.0.0.1", "port": port, "kind": "a2s" },
+        ]),
+        120,
+    )));
+    rig.service.report().await;
+    until("the server was asked", || asked.load(Ordering::SeqCst) == 1).await;
+    let mut said = Vec::new();
+    for _ in 0..50 {
+        rig.service.report().await;
+        said = probe_results(&rig.console);
+        if !said.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(said.len(), 1, "{said:?}");
+    let r = &said[0];
+    assert_eq!(r["target"], json!("heimforge/na"));
+    assert_eq!(r["ok"], json!(true));
+    assert_eq!(r["worldName"], json!("Heimforge NA"));
+    assert_eq!((r["players"].clone(), r["max"].clone()), (json!(3), json!(10)));
+    assert!(r["latencyMs"].as_u64().is_some_and(|ms| ms < 3000), "{r}");
+    assert!(r.get("error").is_none());
+
+    // Said once, and the next round waits its two minutes: more reports ask nothing again.
+    rig.service.report().await;
+    rig.service.report().await;
+    assert_eq!(probe_results(&rig.console).len(), 1, "a result went twice");
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "a round before its time");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_look_that_finds_nothing_waits_for_a_console_that_answers_and_off_asks_nothing() {
+    let rig = Rig::new(1).await;
+    // A port nothing answers on: the look ends by its timeout or the host's refusal, never sooner by a retry.
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let port = silent.local_addr().expect("address").port();
+    rig.console.probes(Some((
+        json!([{ "name": "heimforge/eu", "host": "127.0.0.1", "port": port, "kind": "a2s" }]),
+        30,
+    )));
+    // The console is away while the look ends: what it found waits for the next report it answers.
+    rig.service.report().await;
+    rig.console.down(true);
+    tokio::time::sleep(cf_a2s::TIMEOUT + Duration::from_millis(300)).await;
+    rig.service.report().await;
+    rig.console.down(false);
+    rig.service.report().await;
+    // The client may send a report again whose answer it lost: the same look, never another.
+    let said = probe_results(&rig.console);
+    assert!(!said.is_empty() && said.iter().all(|r| r == &said[0]), "{said:?}");
+    assert_eq!(said[0]["ok"], json!(false));
+    assert_eq!(said[0]["error"], json!("no answer in 3 s"));
+    assert!(said[0].get("worldName").is_none() && said[0].get("latencyMs").is_none());
+
+    // Turned off: an answer with no probes, and nothing is asked again.
+    rig.console.probes(None);
+    rig.service.report().await;
+    rig.service.report().await;
+    assert_eq!(probe_results(&rig.console).len(), said.len(), "said again");
+    let mut buf = [0u8; 64];
+    let asked = tokio::time::timeout(Duration::from_millis(200), silent.recv(&mut buf)).await;
+    assert!(asked.is_ok(), "the one look reached the server");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), silent.recv(&mut buf))
+            .await
+            .is_err(),
+        "asked again once turned off"
+    );
+}

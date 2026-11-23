@@ -18,6 +18,7 @@ mod making;
 pub mod names;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod platform;
+pub mod probes;
 mod queued;
 mod records;
 mod roster;

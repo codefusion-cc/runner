@@ -150,6 +150,7 @@ pub fn report(machine: &str) -> Report {
         image: None,
         jobs: vec![],
         results: vec![],
+        probe_results: vec![],
     }
 }
 
