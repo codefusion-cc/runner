@@ -33,6 +33,16 @@ RUN case "${TARGETARCH}" in \
       *) echo "no image is pinned for '${TARGETARCH}'" >&2; exit 1 ;; \
     esac > /tmp/arch.env
 
+# amd64's Ubuntu packages come from Azure's mirror of archive.ubuntu.com, the one GitHub's own runners use, for this
+# build and for each job's apt: on 2026-11-23 archive.ubuntu.com sent 6-60 kB/s, and an amd64 build that takes 4
+# minutes was cancelled at its 60. arm64's come from ports.ubuntu.com, which Azure doesn't mirror. apt gives up on a
+# mirror that stops answering after 20 s and retries each download.
+RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do \
+      if [ -f "$file" ]; then sed -i -E 's#https?://(archive|security)\.ubuntu\.com/#http://azure.archive.ubuntu.com/#g' "$file"; fi; \
+    done \
+ && printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n' > /etc/apt/apt.conf.d/80-retries \
+ && if [ "${TARGETARCH}" = amd64 ]; then grep -rqs 'azure.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d/; fi
+
 # Tools workflows call directly, and a compiler for npm packages with native parts.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
